@@ -451,26 +451,20 @@ public abstract class StreamingShuffleMessage implements Encodable {
       // unknown id is rejected by fromId, and the switch below is exhaustive over the enum, so a
       // message type added later cannot be forgotten here without failing to compile.
       //
-      // Each arm becomes a delegation to that type's own static decode(ByteBuf) as the concrete
-      // per-type message classes land. Until an arm's class is available it reports the type it
-      // cannot yet materialise rather than returning null, so a premature caller fails loudly
-      // and precisely here instead of propagating a null message down the pipeline. The switch
-      // stays exhaustive over the enum throughout, preserving the compile-time guarantee above.
+      // Every arm delegates to that type's own static decode(ByteBuf), which reads the shared
+      // header through readHeader before its own body, mirroring exactly what toByteBuffer wrote:
+      // the type byte is already consumed above, so each decoder receives the buffer positioned at
+      // the first header field. Dispatching here rather than in each caller keeps the wire format
+      // knowledge in one place, and the exhaustive switch means a new message type cannot be added
+      // to the discriminator without this dispatch failing to compile until it is handled.
       StreamingShuffleMessageType resolved = StreamingShuffleMessageType.fromId(type);
-      throw switch (resolved) {
-        case DATA_BLOCK, ACK, HEARTBEAT, RETRANSMIT_REQUEST, STREAM_TERMINATION ->
-            undecodable(resolved);
+      return switch (resolved) {
+        case DATA_BLOCK -> DataBlockMessage.decode(buf);
+        case ACK -> AckMessage.decode(buf);
+        case HEARTBEAT -> HeartbeatMessage.decode(buf);
+        case RETRANSMIT_REQUEST -> RetransmitRequestMessage.decode(buf);
+        case STREAM_TERMINATION -> StreamTerminationMessage.decode(buf);
       };
-    }
-
-    /**
-     * Builds the failure raised when a message type is recognised by the discriminator but its
-     * concrete message class is not available to decode the body.
-     */
-    private static UnsupportedOperationException undecodable(StreamingShuffleMessageType type) {
-      return new UnsupportedOperationException(
-        "No decoder is registered for streaming shuffle message type " + type +
-          "; the concrete message class for this type is not available yet");
     }
   }
 }
