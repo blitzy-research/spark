@@ -24,7 +24,18 @@ private[spark] object StaticSources {
    * The set of all static sources. These sources may be reported to from any class, including
    * static classes, without requiring reference to a SparkEnv.
    */
-  val allSources = Seq(CodegenMetrics, HiveCatalogMetrics)
+  // Appending to allSources here is the entire registration mechanism for the streaming
+  // shuffle metrics: the metrics system registers every element of this sequence when it
+  // starts, on the driver and on every executor alike, so the four shuffle.streaming metrics
+  // reach operators over the already-configured sinks -- notably JMX -- with no new sink and
+  // no executor-lifecycle code touched. The source is referenced fully qualified rather than
+  // imported, keeping this purely additive feature free of any existing import-list change.
+  // Streaming shuffle coexists with sort-based shuffle; sort remains the default.
+  val allSources =
+    Seq(
+      CodegenMetrics,
+      HiveCatalogMetrics,
+      org.apache.spark.shuffle.streaming.StreamingShuffleMetricsSource)
 }
 
 /**
