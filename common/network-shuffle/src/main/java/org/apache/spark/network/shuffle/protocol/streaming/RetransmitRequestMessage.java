@@ -21,6 +21,8 @@ import java.util.Objects;
 
 import io.netty.buffer.ByteBuf;
 
+import org.apache.spark.annotation.Private;
+
 /**
  * Asks a streaming shuffle producer to replay a contiguous run of data blocks that the consumer
  * could not use.
@@ -30,14 +32,14 @@ import io.netty.buffer.ByteBuf;
  * numbers within one partition's stream: {@code sequenceNumber}, inherited from the header, is the
  * inclusive lower bound of that interval, and {@link #lastSequenceNumber()} is its inclusive upper
  * bound. Both ends belong to the request, so a single block is asked for by making the two equal,
- * and {@link #blockCount()} is consequently never zero. The interval is written
- * {@code [sequenceNumber(), lastSequenceNumber()]} throughout, {@link #firstSequenceNumber()}
- * names its lower bound in the vocabulary of the window, and {@link #contains(long)} answers
- * whether a particular block falls inside it.
+ * and {@link #blockCount()} is consequently never zero. The interval is written {@code
+ * [sequenceNumber(), lastSequenceNumber()]} throughout, {@link #firstSequenceNumber()} names its
+ * lower bound in the vocabulary of the window, and {@link #contains(long)} answers whether a
+ * particular block falls inside it.
  *
  * Scope: the unacknowledged window. Retransmission is bounded to the blocks the producer has not
- * yet seen acknowledged, and that bound is a contract rather than a convenience. A producer frees
- * a buffered block as soon as the consumer acknowledges having consumed past it, which is exactly
+ * yet seen acknowledged, and that bound is a contract rather than a convenience. A producer frees a
+ * buffered block as soon as the consumer acknowledges having consumed past it, which is exactly
  * what keeps the producer's memory inside its budget; once freed, those bytes are gone, and no
  * message can conjure them back. A request whose interval lies within the unacknowledged window is
  * therefore serviceable, and the producer replays those blocks from memory or from spill. A request
@@ -63,7 +65,11 @@ import io.netty.buffer.ByteBuf;
  * </pre>
  *
  * Instances are immutable and validated on construction: an interval whose upper bound falls below
- * its lower bound is rejected with {@link IllegalArgumentException}. Because the static
+ * its lower bound is rejected with {@link IllegalArgumentException}, and the inherited
+ * {@code shuffleId}, {@code partitionId} and {@code sequenceNumber} -- the last of which is this
+ * window's lower bound -- are all required to be non-negative by
+ * {@link StreamingShuffleMessage}, so a request can name neither an impossible partition nor a
+ * negative window. Because the static
  * {@link #decode(ByteBuf)} builds its result through a public constructor, an inverted interval
  * arriving from a peer is refused on exactly the same terms as one built locally, and there is no
  * route by which such an object can come into existence. Like the rest of this family the class
@@ -72,17 +78,35 @@ import io.netty.buffer.ByteBuf;
  *
  * @since 4.2.0
  */
-public class RetransmitRequestMessage extends StreamingShuffleMessage {
+@Private
+public final class RetransmitRequestMessage extends StreamingShuffleMessage {
 
   /**
    * Bytes this message adds after the shared header: eight, for the inclusive upper bound, which is
    * the only field of its own that it carries.
    *
-   * The count is a named constant rather than a literal repeated at each use, so that
-   * {@link #encodedLength()} and the body-length check in {@link #decode(ByteBuf)} cannot drift
-   * apart. Added to {@link #HEADER_ENCODED_LENGTH} it yields an encoded length of 25 bytes.
+   * The count is a named constant rather than a literal repeated at each use, so that {@link
+   * #encodedLength()} and the body-length check in {@link #decode(ByteBuf)} cannot drift apart.
+   * Added to {@link #HEADER_ENCODED_LENGTH} it yields an encoded length of 25 bytes.
    */
   private static final int BODY_ENCODED_LENGTH = 8;
+
+  /**
+   * Most blocks a single retransmission request may name.
+   *
+   * A request names a closed window of sequence numbers, and without a ceiling on its width a peer
+   * could name every number a {@code long} can express. The producer answering such a request would
+   * be asked to walk a window of 2^63 positions, which is a denial of service written in five
+   * well-formed fields -- and it is worth noting that {@link #blockCount()} had to saturate at
+   * {@link Long#MAX_VALUE} precisely because the width was unbounded. Bounding the width removes
+   * the need for that saturation to ever come into play.
+   *
+   * The value is deliberately generous rather than tight: at the two-mebibyte block cap, 4096
+   * blocks is eight gibibytes of retransmission, far more than a producer can be holding when
+   * buffers are capped at half of executor memory. It therefore never refuses a request a real
+   * consumer would make, while refusing every request no real consumer could.
+   */
+  public static final long MAX_REQUESTED_BLOCKS = 4096L;
 
   private final long lastSequenceNumber;
 
@@ -116,6 +140,26 @@ public class RetransmitRequestMessage extends StreamingShuffleMessage {
         lastSequenceNumber + " is below lower bound " + sequenceNumber + " for shuffle " +
         shuffleId + " partition " + partitionId);
     }
+    // Both bounds are positions counted from zero. readHeader already refuses a negative lower
+    // bound on every decode path, and the inversion check above then makes the upper bound
+    // non-negative too, but a locally constructed request reaches this constructor without passing
+    // through readHeader, so the bound is checked here as well rather than assumed.
+    if (lastSequenceNumber < 0L) {
+      throw new IllegalArgumentException("Retransmission window upper bound cannot be negative: " +
+        lastSequenceNumber + " for shuffle " + shuffleId + " partition " + partitionId);
+    }
+    // Compared as a span rather than as a count. Both bounds are non-negative and ordered by this
+    // point, so their difference always lands in [0, Long.MAX_VALUE] and cannot overflow -- but
+    // adding one to it can, and does for exactly one input pair: an upper bound of Long.MAX_VALUE
+    // against a lower bound of zero wraps the count to Long.MIN_VALUE, which would slip past a
+    // greater-than test and admit the widest possible window. Since the window includes both of its
+    // ends, a span of MAX_REQUESTED_BLOCKS - 1 is the widest legal one.
+    long span = lastSequenceNumber - sequenceNumber;
+    if (span > MAX_REQUESTED_BLOCKS - 1L) {
+      throw new IllegalArgumentException("Retransmission window spans more block(s) than the " +
+        "maximum of " + MAX_REQUESTED_BLOCKS + ": bounds [" + sequenceNumber + ", " +
+        lastSequenceNumber + "] for shuffle " + shuffleId + " partition " + partitionId);
+    }
     this.lastSequenceNumber = lastSequenceNumber;
   }
 
@@ -142,8 +186,8 @@ public class RetransmitRequestMessage extends StreamingShuffleMessage {
   /**
    * Creates a request from a header the base class has just read off the wire. This is the
    * constructor {@link #decode(ByteBuf)} uses: passing the header as one value rather than as four
-   * positional arguments removes any chance of transposing {@code shuffleId} and
-   * {@code partitionId} on the way in.
+   * positional arguments removes any chance of transposing {@code shuffleId} and {@code
+   * partitionId} on the way in.
    *
    * @param header the decoded header, whose {@code sequenceNumber} is the inclusive lower bound of
    *               the requested window; must not be null
@@ -207,14 +251,15 @@ public class RetransmitRequestMessage extends StreamingShuffleMessage {
   /**
    * Number of blocks the requested window spans, counting both of its ends.
    *
-   * The result is always at least one, because the window is inclusive at both ends and the
-   * constructor refuses an upper bound below the lower one. It saturates at {@link Long#MAX_VALUE}
-   * rather than wrapping to a negative count for a window wider than the {@code long} range; a
-   * real unacknowledged window is bounded by the producer's buffer budget and is many orders of
-   * magnitude smaller than that, so saturation is a guard against nonsense input rather than a
-   * case that arises in service.
+   * The result lies in {@code [1, }{@link #MAX_REQUESTED_BLOCKS}{@code ]}: the window is inclusive
+   * at both ends, the constructor refuses an upper bound below the lower one, and it also refuses a
+   * span wider than the ceiling. The saturation below is therefore unreachable from any window that
+   * exists; it is kept as the one place where an arithmetic overflow could otherwise turn a
+   * nonsense window into a small, plausible-looking count, so that a future relaxation of the
+   * ceiling cannot reintroduce that failure silently.
    *
-   * @return the count of sequence numbers in the requested window, never below one
+   * @return the count of sequence numbers in the requested window, never below one and never above
+   *         {@link #MAX_REQUESTED_BLOCKS}
    */
   public long blockCount() {
     long span = lastSequenceNumber - sequenceNumber();
@@ -256,25 +301,28 @@ public class RetransmitRequestMessage extends StreamingShuffleMessage {
   }
 
   /**
-   * Reads a request back off the wire, header first and in exactly the order
-   * {@link #encode(ByteBuf)} wrote it.
+   * Reads a request back off the wire, header first and in exactly the order {@link
+   * #encode(ByteBuf)} wrote it.
    *
    * The remaining length is checked rather than asserted, because these bytes arrive from a remote
-   * peer and a truncated frame must be reported the same way in production as it is under test.
-   * The result is built through a public constructor, so a peer that sends an inverted window is
+   * peer and a truncated frame must be reported the same way in production as it is under test. The
+   * result is built through a public constructor, so a peer that sends an inverted window is
    * refused on exactly the same terms as a local caller that tries to build one.
    *
    * @param buf the buffer to read from, positioned at the first header byte
    * @return the decoded request
    * @throws NullPointerException if buf is null
-   * @throws IllegalArgumentException if the frame is truncated, or if the window it carries is
-   *         inverted
+   * @throws IllegalArgumentException if the frame is truncated, if the window it carries is
+   *         inverted, or if its header carries a negative shuffle id, partition id or sequence
+   *         number
    */
-  public static RetransmitRequestMessage decode(ByteBuf buf) {
+  static RetransmitRequestMessage decode(ByteBuf buf) {
     Header header = readHeader(buf);
-    if (buf.readableBytes() < BODY_ENCODED_LENGTH) {
-      throw new IllegalArgumentException("Truncated retransmission request: expected " +
-        BODY_ENCODED_LENGTH + " byte(s) of body but only " + buf.readableBytes() + " remain");
+    // Exactly, not at least: a surplus is content the codec would never examine, and tolerating it
+    // would let a peer append bytes that survive the message boundary unparsed.
+    if (buf.readableBytes() != BODY_ENCODED_LENGTH) {
+      throw new IllegalArgumentException("Malformed retransmission request: expected exactly " +
+        BODY_ENCODED_LENGTH + " byte(s) of body but " + buf.readableBytes() + " remain");
     }
     long lastSequenceNumber = buf.readLong();
     return new RetransmitRequestMessage(header, lastSequenceNumber);

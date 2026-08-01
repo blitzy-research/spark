@@ -47,6 +47,19 @@ import org.apache.spark.shuffle.BaseShuffleHandle
  *  - `coordinatorEpoch`, the epoch stamped by the streaming shuffle coordinator at
  *    registration, which lets a reader recognize that it is talking to a stale producer
  *    generation after an upstream stage has been recomputed.
+ *  - `capabilityToken`, the bearer credential minted by the coordinator when the shuffle was
+ *    registered on the driver. Every coordinator operation on this shuffle -- registering a
+ *    producer, heartbeating one, looking producers up, invalidating a generation, unregistering
+ *    the shuffle -- must present it, because the coordinator is an `RpcEnv` endpoint that every
+ *    peer of the application can reach and a shuffle id is a small guessable integer.
+ *
+ * Carrying the token here is what makes it reach executors safely. The handle travels inside the
+ * serialized task binary, which is the same channel that already carries the shuffle dependency
+ * and the closure, and is delivered only to executors the driver has assigned work to. A peer
+ * that was never given a task for this shuffle therefore never learns the token, and so cannot
+ * hijack, invalidate or drop the shuffle's registration. The token is deliberately not logged and
+ * is deliberately absent from `toString`, so that a handle can be rendered into a diagnostic or an
+ * assertion message without disclosing the credential.
  *
  * `ShuffleHandle` extends `java.io.Serializable` and the handle is shipped to executors inside
  * the serialized task binary, so this class is deliberately an immutable value object whose
@@ -57,9 +70,10 @@ import org.apache.spark.shuffle.BaseShuffleHandle
  * Example use, at registration time on the driver and then on an executor:
  *
  * {{{
- *   // In StreamingShuffleManager.registerShuffle:
+ *   // In StreamingShuffleManager.registerShuffle, from the coordinator's registration grant:
  *   new StreamingShuffleHandle(shuffleId, dependency,
- *     dependency.partitioner.numPartitions, protocolVersion, coordinatorEpoch)
+ *     dependency.partitioner.numPartitions, protocolVersion,
+ *     grant.coordinatorEpoch, grant.capabilityToken)
  *
  *   // In StreamingShuffleManager.getWriter, matching without an erasure warning:
  *   handle match {
@@ -80,13 +94,15 @@ import org.apache.spark.shuffle.BaseShuffleHandle
  * @param numPartitions number of reduce partitions this shuffle streams to; must be positive
  * @param protocolVersion streaming wire-protocol version in use; must be positive
  * @param coordinatorEpoch coordinator epoch stamped at registration; must be non-negative
+ * @param capabilityToken coordinator capability token for this shuffle; must be non-empty
  */
 private[spark] class StreamingShuffleHandle[K, V, C](
     shuffleId: Int,
     dependency: ShuffleDependency[K, V, C],
     val numPartitions: Int,
     val protocolVersion: Byte,
-    val coordinatorEpoch: Long)
+    val coordinatorEpoch: Long,
+    val capabilityToken: String)
   extends BaseShuffleHandle[K, V, C](shuffleId, dependency) {
 
   // The streaming registration state is validated once, at construction time on the driver, so
@@ -103,14 +119,23 @@ private[spark] class StreamingShuffleHandle[K, V, C](
   require(coordinatorEpoch >= 0L,
     s"coordinatorEpoch must be non-negative for shuffle ${this.shuffleId}, " +
       s"but was $coordinatorEpoch")
+  // Checked for presence but never echoed: a require message becomes an exception message, which is
+  // logged, so the token's value must not appear in it.
+  require(capabilityToken != null && capabilityToken.nonEmpty,
+    s"capabilityToken must be non-empty for shuffle ${this.shuffleId}")
 
   /**
    * A stable, allocation-light rendering of the streaming registration state, used in
    * diagnostics such as `require` failures raised further downstream and assertion messages in
    * tests. Derived purely from primitives, so it is safe to call on any thread and never
    * touches the shuffle dependency.
+   *
+   * `capabilityToken` is deliberately omitted. This rendering ends up in exception messages and
+   * log records, and a credential that is printed there is a credential that has leaked, so the
+   * token's presence is reported without its value.
    */
   override def toString: String =
     s"StreamingShuffleHandle(shuffleId=${this.shuffleId}, numPartitions=$numPartitions, " +
-      s"protocolVersion=$protocolVersion, coordinatorEpoch=$coordinatorEpoch)"
+      s"protocolVersion=$protocolVersion, coordinatorEpoch=$coordinatorEpoch, " +
+      s"capabilityToken=<redacted>)"
 }

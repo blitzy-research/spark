@@ -17,25 +17,28 @@
 
 package org.apache.spark.shuffle.streaming
 
-import java.io.File
+import java.io.{File, InputStream}
 import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 import scala.jdk.CollectionConverters._
 import scala.util.control.NonFatal
 
 import org.apache.spark.{SecurityManager, SparkConf, SparkEnv, SparkException}
 import org.apache.spark.internal.Logging
-import org.apache.spark.internal.LogKeys.{BLOCK_ID, COUNT, FILE_NAME, MAP_ID, NUM_BYTES, SHUFFLE_ID}
-import org.apache.spark.internal.config.SHUFFLE_STREAMING_DEBUG
-import org.apache.spark.network.buffer.{FileSegmentManagedBuffer, ManagedBuffer, NioManagedBuffer}
+import org.apache.spark.internal.LogKeys.{BLOCK_ID, COUNT, FILE_NAME, MAP_ID, NUM_BYTES,
+  SHUFFLE_ID, TASK_ATTEMPT_ID}
+import org.apache.spark.internal.config.{SHUFFLE_MANAGER, SHUFFLE_STREAMING_DEBUG,
+  SHUFFLE_STREAMING_ENABLED}
+import org.apache.spark.network.buffer.{FileSegmentManagedBuffer, ManagedBuffer}
 import org.apache.spark.network.netty.SparkTransportConf
 import org.apache.spark.network.shuffle.{ExecutorDiskUtils, MergedBlockMeta}
 import org.apache.spark.network.util.TransportConf
 import org.apache.spark.shuffle.ShuffleBlockResolver
 import org.apache.spark.shuffle.streaming.MemorySpillManager.SpilledBlock
-import org.apache.spark.shuffle.streaming.StreamingShuffleBlockResolver.ProducerKey
+import org.apache.spark.shuffle.streaming.StreamingShuffleBlockResolver.{LeasedSegmentBuffer,
+  ProducerKey, RegisteredProducer}
 import org.apache.spark.storage.{BlockId, BlockManager, DiskBlockManager, ShuffleBlockBatchId,
   ShuffleBlockId, ShuffleMergedBlockId, TempShuffleBlockId}
 import org.apache.spark.util.Utils
@@ -59,24 +62,48 @@ import org.apache.spark.util.Utils
  * segment is a `SerializerManager`-wrapped unit, so the two are not interchangeable encodings and
  * must never be concatenated.
  *
- * Why it is deliberately not index based. This class is intentionally not an
- * `IndexShuffleBlockResolver` and intentionally does not mix in `MigratableResolver`. That single
- * decision is the whole coexistence strategy: `ShuffleWriteProcessor` decides whether to start a
- * push-based merge by pattern matching on the manager's resolver type, and any resolver that is
- * not an `IndexShuffleBlockResolver` falls through its empty default branch. Streaming therefore
- * declines to participate in push-based merge, and in block migration, without a single line of
- * change to `ShuffleWriteProcessor`, to `SortShuffleManager`, or to any other shared shuffle
- * class. Sort-based shuffle keeps its own `IndexShuffleBlockResolver`, keeps being the default and
- * keeps being the fallback: when the streaming kill switch is off, `StreamingShuffleManager`
- * exposes the sort delegate's resolver rather than this one, so the push-merge branch fires exactly
- * as it always did and behaviour is indistinguishable from sort-based shuffle.
+ * Why a response carries exactly one segment. Every spilled segment was committed on its own
+ * through `DiskBlockObjectWriter`, so each one carries its own serializer, compression and
+ * encryption framing and is decodable only on its own. Physically concatenating two of them yields
+ * bytes that no consumer can decode, so a request resolving to more than one segment is refused
+ * outright and the caller is directed at [[getSpilledSegments]], which hands back one independently
+ * decodable buffer per segment. Nothing is ever assembled into a heap buffer here: what is served
+ * is a file segment whose bytes are never copied, and the size one response may carry is capped.
+ *
+ * Why every served buffer is leased. A file segment buffer opens its file lazily, when the consumer
+ * first reads it, which is necessarily after this resolver has returned. A consumer acknowledgement
+ * can retire the last record naming that file in the interval between. Every buffer handed out from
+ * here therefore holds a reader lease on its file, taken before the buffer is constructed and
+ * dropped when the buffer is released, and the owning producer unlinks a file only once that file
+ * is both retired and unleased.
+ *
+ * Why it is deliberately not index based. This class is not an `IndexShuffleBlockResolver` and does
+ * not mix in `MigratableResolver`. `ShuffleWriteProcessor` selects a push-based merge by pattern
+ * matching on the manager's resolver type, and a resolver that is not an
+ * `IndexShuffleBlockResolver` falls through its empty default branch, so streaming takes no part in
+ * push-based merge or in block migration. Sort-based shuffle keeps its own
+ * `IndexShuffleBlockResolver` and remains both the default and the fallback: with the streaming
+ * kill switch off, `StreamingShuffleManager` exposes the sort delegate's resolver rather than
+ * this one, so the push-merge branch fires and behaviour is indistinguishable from sort-based
+ * shuffle.
  *
  * Lifecycle and thread safety. An instance is created once per driver or executor, from
- * `StreamingShuffleManager`'s constructor, and is then shared by every task on that JVM. All
- * mutable state is a single concurrent map plus one atomic flag, so every method is safe to call
- * from any thread, including a Netty event-loop thread. No environment object is dereferenced
+ * `StreamingShuffleManager`'s constructor, and is then shared by every task on that JVM. One
+ * monitor guards the producer registry and the stopped flag together, so a registration cannot land
+ * after [[stop]] has cleared the registry and no lookup survives a stop -- not even the
+ * constructor-supplied fallback. Every method is therefore safe to call from any thread, including
+ * a Netty event-loop thread, and the monitor is held only long enough to snapshot registry state,
+ * never while a producer, the disk or the network is touched. No environment object is dereferenced
  * during construction; see the deferred-access section of the implementation for why that is
- * mandatory rather than merely tidy. [[stop]] is idempotent and never throws.
+ * mandatory rather than merely tidy. [[stop]] is idempotent, and it contains and logs any non-fatal
+ * failure it meets rather than propagating it.
+ *
+ * Producer generations. A map output may be produced more than once, because a task attempt can be
+ * retried or speculated, and only the newest attempt's spill files are valid. Producers are
+ * therefore registered under a generation -- the task attempt id, which Spark allocates from one
+ * monotonically increasing per-application counter -- and every registry mutation is conditioned on
+ * it. A stale attempt can neither displace a newer producer nor, when it finally completes, evict
+ * the replacement that superseded it.
  *
  * @param conf the configuration this resolver reads once and then holds immutably, which is what
  *             makes "configuration changes require an executor restart" true by construction
@@ -113,14 +140,29 @@ private[spark] class StreamingShuffleBlockResolver(
   // files and is the only component that knows where their segments live.
   // ----------------------------------------------------------------------------------------------
 
+  /**
+   * The one monitor that makes this object's lifecycle atomic.
+   *
+   * It guards [[stopped]] and [[producers]] jointly, which is the whole point: guarding them
+   * separately -- a flag read followed by an unrelated map mutation -- lets a registration pass the
+   * stop check and then insert itself into a registry that [[stop]] has already cleared, leaving a
+   * producer reachable on a resolver that has shut down. Held only to snapshot or mutate registry
+   * state, never across a call into a producer, the disk or the network, so it cannot be the inner
+   * lock of any lock-ordering cycle.
+   */
+  private val lifecycle = new Object
+
   /** The constructor-supplied producer, if any. Tolerates a null argument by design. */
   private val rootProducer: Option[MemorySpillManager] = Option(spillManager)
 
-  /** Live producers, keyed by the map output they are producing. */
-  private val producers = new ConcurrentHashMap[ProducerKey, MemorySpillManager]()
+  /**
+   * Live producers, keyed by the map output they are producing and carrying the generation that
+   * registered them. Read and written only while holding [[lifecycle]].
+   */
+  private val producers = new ConcurrentHashMap[ProducerKey, RegisteredProducer]()
 
-  /** Guards [[stop]] so that repeated calls are harmless. */
-  private val stopped = new AtomicBoolean(false)
+  /** Whether [[stop]] has run. Read and written only while holding [[lifecycle]]. */
+  private var stopped: Boolean = false
 
   // ----------------------------------------------------------------------------------------------
   // Deferred environment access.
@@ -163,45 +205,119 @@ private[spark] class StreamingShuffleBlockResolver(
   /**
    * Registers the producer of one map output so that its spilled blocks become servable.
    *
-   * Registering the same key twice replaces the previous producer, which is the correct behaviour
-   * for a retried task attempt: only the newest attempt's spill files are still valid. A
-   * registration that arrives after [[stop]] is ignored rather than retained, so a late writer
-   * cannot resurrect state on a resolver that is shutting down.
+   * The registration is conditioned on its generation, so that concurrent attempts at the same map
+   * output resolve deterministically rather than by arrival order. A newer generation replaces an
+   * older one, because only the newest attempt's spill files are valid; the same generation
+   * re-registering is accepted as a refresh; an older generation is declined, because it has
+   * already been superseded and its files are the ones being abandoned. The whole decision,
+   * including the check that this resolver has not been stopped, is taken under one monitor, so a
+   * registration can never land in a registry that [[stop]] has already cleared.
    *
    * @param shuffleId the shuffle being produced
    * @param mapId the map output being produced
+   * @param taskAttemptId the generation registering, which is the producing task's attempt id.
+   *                      Spark allocates attempt ids from a single monotonically increasing
+   *                      per-application counter, so a larger value is unambiguously a newer
+   *                      attempt
    * @param producer the spill manager that owns that map output's buffers and spill files
+   * @return true when the registration took effect, false when it was declined because a newer
+   *         generation is already registered or because this resolver has been stopped
    */
-  def registerProducer(shuffleId: Int, mapId: Long, producer: MemorySpillManager): Unit = {
+  def registerProducer(
+      shuffleId: Int,
+      mapId: Long,
+      taskAttemptId: Long,
+      producer: MemorySpillManager): Boolean = {
     require(producer != null, "producer must not be null")
-    if (stopped.get()) {
+    require(taskAttemptId >= 0L, s"taskAttemptId must be non-negative, but was $taskAttemptId")
+    val key = ProducerKey(shuffleId, mapId)
+    val incoming = RegisteredProducer(taskAttemptId, producer)
+    var declinedBy = -1L
+    val accepted = lifecycle.synchronized {
+      if (stopped) {
+        false
+      } else {
+        // compute() decides and mutates in one step, so the comparison can never be made against a
+        // generation that a concurrent registration has already replaced.
+        val resolved = producers.compute(key, (_, existing) => {
+          if (existing == null || incoming.supersedes(existing)) incoming else existing
+        })
+        if (resolved eq incoming) {
+          true
+        } else {
+          declinedBy = resolved.taskAttemptId
+          false
+        }
+      }
+    }
+    if (accepted) {
+      if (debugEnabled) {
+        logDebug(log"Registered streaming shuffle producer for shuffle " +
+          log"${MDC(SHUFFLE_ID, shuffleId)} map ${MDC(MAP_ID, mapId)} generation " +
+          log"${MDC(TASK_ATTEMPT_ID, taskAttemptId)}, ${MDC(COUNT, registeredProducerCount)} " +
+          log"producer(s) now registered")
+      }
+    } else if (declinedBy >= 0L) {
+      // Not a debug-gated line: a stale attempt still trying to register is worth seeing, because
+      // it means a superseded task is still running and still holding buffers.
+      logWarning(log"Declined streaming shuffle producer registration for shuffle " +
+        log"${MDC(SHUFFLE_ID, shuffleId)} map ${MDC(MAP_ID, mapId)} from superseded generation " +
+        log"${MDC(TASK_ATTEMPT_ID, taskAttemptId)}; generation " +
+        log"${MDC(COUNT, declinedBy)} is registered")
+    } else if (debugEnabled) {
       logDebug(log"Ignoring streaming shuffle producer registration for shuffle " +
         log"${MDC(SHUFFLE_ID, shuffleId)} map ${MDC(MAP_ID, mapId)} because the block resolver " +
         log"has already been stopped")
-    } else {
-      producers.put(ProducerKey(shuffleId, mapId), producer)
-      if (debugEnabled) {
-        logDebug(log"Registered streaming shuffle producer for shuffle " +
-          log"${MDC(SHUFFLE_ID, shuffleId)} map ${MDC(MAP_ID, mapId)}, " +
-          log"${MDC(COUNT, producers.size())} producer(s) now registered")
-      }
     }
+    accepted
   }
 
   /**
    * Drops one producer, which is what a task must do on completion so that neither the producer
    * nor its buffers are reachable from this JVM-scoped object any longer.
    *
-   * @return true if a producer was registered under that key and has now been dropped
+   * Removal is conditioned on the generation, and that condition is the whole point of this
+   * method's shape. A retried or speculated attempt completes at an arbitrary time, frequently
+   * after the attempt that superseded it has already registered; an unconditional removal would
+   * then delete the live replacement's registration and make its perfectly valid spill data
+   * unservable. Passing the caller's own generation makes a completing task able to retract only
+   * its own registration.
+   *
+   * @param shuffleId the shuffle that was produced
+   * @param mapId the map output that was produced
+   * @param taskAttemptId the generation retracting its registration
+   * @return true if that exact generation was registered and has now been dropped
    */
-  def unregisterProducer(shuffleId: Int, mapId: Long): Boolean = {
-    val removed = producers.remove(ProducerKey(shuffleId, mapId)) != null
-    if (removed && debugEnabled) {
-      logDebug(log"Unregistered streaming shuffle producer for shuffle " +
-        log"${MDC(SHUFFLE_ID, shuffleId)} map ${MDC(MAP_ID, mapId)}, " +
-        log"${MDC(COUNT, producers.size())} producer(s) still registered")
+  def unregisterProducer(shuffleId: Int, mapId: Long, taskAttemptId: Long): Boolean = {
+    val key = ProducerKey(shuffleId, mapId)
+    var dropped = false
+    lifecycle.synchronized {
+      // compute() removes the mapping when the remapping function returns null, so the generation
+      // comparison and the removal are one indivisible step against the current entry. A
+      // value-based remove() would not do: it would compare the producer reference too, which says
+      // nothing about which generation is registered.
+      producers.compute(key, (_, existing) => {
+        if (existing != null && existing.taskAttemptId == taskAttemptId) {
+          dropped = true
+          null
+        } else {
+          existing
+        }
+      })
     }
-    removed
+    if (debugEnabled) {
+      if (dropped) {
+        logDebug(log"Unregistered streaming shuffle producer for shuffle " +
+          log"${MDC(SHUFFLE_ID, shuffleId)} map ${MDC(MAP_ID, mapId)} generation " +
+          log"${MDC(TASK_ATTEMPT_ID, taskAttemptId)}, ${MDC(COUNT, registeredProducerCount)} " +
+          log"producer(s) still registered")
+      } else {
+        logDebug(log"Left the streaming shuffle producer of shuffle " +
+          log"${MDC(SHUFFLE_ID, shuffleId)} map ${MDC(MAP_ID, mapId)} in place: generation " +
+          log"${MDC(TASK_ATTEMPT_ID, taskAttemptId)} is not the registered one")
+      }
+    }
+    dropped
   }
 
   /**
@@ -213,11 +329,13 @@ private[spark] class StreamingShuffleBlockResolver(
    */
   def removeShuffle(shuffleId: Int): Int = {
     var dropped = 0
-    val iterator = producers.keySet().iterator()
-    while (iterator.hasNext) {
-      if (iterator.next().shuffleId == shuffleId) {
-        iterator.remove()
-        dropped += 1
+    lifecycle.synchronized {
+      val iterator = producers.keySet().iterator()
+      while (iterator.hasNext) {
+        if (iterator.next().shuffleId == shuffleId) {
+          iterator.remove()
+          dropped += 1
+        }
       }
     }
     if (dropped > 0 && debugEnabled) {
@@ -233,16 +351,46 @@ private[spark] class StreamingShuffleBlockResolver(
    * Falls back to the constructor-supplied producer when nothing is registered under the key. That
    * fallback is what makes the two-argument constructor meaningful: a single-producer embedding can
    * hand its spill manager straight to the resolver and skip registration entirely.
+   *
+   * Returns nothing at all once [[stop]] has run, and the fallback is suppressed along with the
+   * registry. A stopped resolver holds no serving authority whatsoever, so continuing to answer
+   * from a producer that happened to be supplied at construction would be the one lookup able to
+   * outlive the shutdown that was meant to end all of them. The decision is taken under the
+   * lifecycle monitor so that a lookup racing a stop resolves one way or the other and never half
+   * way.
    */
   def producerFor(shuffleId: Int, mapId: Long): Option[MemorySpillManager] = {
-    Option(producers.get(ProducerKey(shuffleId, mapId))).orElse(rootProducer)
+    lifecycle.synchronized {
+      if (stopped) {
+        None
+      } else {
+        Option(producers.get(ProducerKey(shuffleId, mapId)))
+          .map(registered => registered.producer)
+          .orElse(rootProducer)
+      }
+    }
+  }
+
+  /**
+   * The generation registered for one map output, if any. Intended for diagnostics and tests, and
+   * for a caller that needs to know whether its own attempt is still the serving one.
+   */
+  def registeredGeneration(shuffleId: Int, mapId: Long): Option[Long] = {
+    lifecycle.synchronized {
+      if (stopped) {
+        None
+      } else {
+        Option(producers.get(ProducerKey(shuffleId, mapId)))
+          .map(registered => registered.taskAttemptId)
+      }
+    }
   }
 
   /** How many producers are currently registered. Intended for diagnostics and tests. */
-  def registeredProducerCount: Int = producers.size()
+  def registeredProducerCount: Int = lifecycle.synchronized(producers.size())
 
   /** Whether [[stop]] has already run. */
-  def isStopped: Boolean = stopped.get()
+  def isStopped: Boolean = lifecycle.synchronized(stopped)
 
   // ----------------------------------------------------------------------------------------------
   // ShuffleBlockResolver: block retrieval.
@@ -259,16 +407,24 @@ private[spark] class StreamingShuffleBlockResolver(
    *  - `ShuffleBlockId` resolves to the spilled segments of one reduce partition of one map output.
    *  - `ShuffleBlockBatchId` resolves to the spilled segments of a contiguous reduce range,
    *    partition-major and in ascending sequence order within each partition, which is the same
-   *    ordering a batched fetch of sort-based output observes.
+   *    ordering a batched fetch of sort-based output observes. The range is validated against the
+   *    producer's own reduce partition count before anything is iterated, so a malformed batch
+   *    identity is rejected rather than turned into a traversal of billions of empty partitions.
    *  - `TempShuffleBlockId` resolves to a whole spill file. This is the exact one-to-one identity,
    *    because a spill file is allocated as a temporary shuffle block and so this identity names
    *    precisely one file.
    *
-   * A request that resolves to a single segment is answered with a zero-copy file segment. One that
-   * resolves to several is answered with their byte-exact, ordered concatenation: a faithful
-   * transfer of the requested bytes, but not itself a single decodable stream, because each segment
-   * was committed on its own and is unwrapped on its own. A caller that needs those boundaries
-   * should use [[getSpilledSegments]], which hands back one buffer per segment.
+   * A request that resolves to a single segment is answered with a leased, zero-copy file segment.
+   * One that resolves to several is refused, and refusal is the only correct answer: each segment
+   * was committed on its own and carries its own serializer, compression and encryption framing, so
+   * their concatenation is not a decodable stream, and handing it out as one buffer would give a
+   * consumer bytes it can only fail on -- silently, and as a deserialization error attributed to
+   * the wrong layer. A caller that wants those segments must ask for them individually through
+   * [[getSpilledSegments]], which hands back one independently decodable buffer per segment.
+   *
+   * Every buffer returned from here holds a reader lease on the file behind it and must be released
+   * by the caller, exactly as the buffers the sort-based resolver returns must be. That release is
+   * what finally lets the producer unlink a spill file whose records have all been acknowledged.
    *
    * @param blockId the block being requested
    * @param dirs local directories to read from instead of this executor's own. Honoured for the
@@ -281,6 +437,11 @@ private[spark] class StreamingShuffleBlockResolver(
   override def getBlockData(
       blockId: BlockId,
       dirs: Option[Array[String]] = None): ManagedBuffer = {
+    // The lifecycle gate covers every identity, not only the ones answered from the registry. A
+    // temporary block identity can otherwise be resolved by name straight off local disk, which
+    // would let exactly one kind of lookup keep serving bytes -- and serving them unleased -- from
+    // a resolver whose stop was meant to end all serving.
+    requireNotStopped(blockId)
     blockId match {
       case ShuffleBlockId(shuffleId, mapId, reduceId) =>
         spilledReduceRange(blockId, shuffleId, mapId, reduceId, reduceId + 1)
@@ -305,23 +466,77 @@ private[spark] class StreamingShuffleBlockResolver(
    * independently decodable unit. An empty result means that partition has nothing on disk, which
    * on the streaming happy path is the normal case rather than an error.
    *
+   * Each returned buffer holds its own reader lease and must be released by the caller. A segment
+   * whose lease cannot be taken is omitted rather than returned, because the only way a lease is
+   * refused is that the file has already been retired -- which happens precisely when the consumer
+   * has acknowledged every record in it, so the bytes are no longer owed to anyone.
+   *
    * @param shuffleId the shuffle the partition belongs to
    * @param mapId the map output the partition belongs to
-   * @param reduceId the reduce partition to report on; must be non-negative
+   * @param reduceId the reduce partition to report on; must be non-negative and, once the producer
+   *                 has registered its reduce partition count, must be a partition that producer
+   *                 actually owns
    */
   def getSpilledSegments(shuffleId: Int, mapId: Long, reduceId: Int): Seq[ManagedBuffer] = {
     require(reduceId >= 0, s"reduceId must be non-negative, but was $reduceId")
+    requireNotStopped(ShuffleBlockId(shuffleId, mapId, reduceId))
     producerFor(shuffleId, mapId) match {
       case Some(producer) =>
-        producer.spilledBlocks(reduceId).map(segment => segmentBuffer(segment))
+        requireOwnedPartition(producer, shuffleId, mapId, reduceId)
+        producer.spilledBlocks(reduceId).flatMap(segment => leasedSegment(producer, segment))
       case None =>
         Seq.empty
     }
   }
 
   /**
+   * Refuses any retrieval once [[stop]] has run.
+   *
+   * A stopped resolver has released its serving authority, and the producers it could have
+   * consulted are on their way down with it. Refusing here rather than returning an empty result is
+   * deliberate: a caller asking a shut-down resolver for bytes has a real ordering defect, and
+   * reporting it as one is what makes that defect findable.
+   */
+  private def requireNotStopped(blockId: BlockId): Unit = {
+    if (isStopped) {
+      throw SparkException.internalError(
+        s"the streaming shuffle block resolver has been stopped and cannot serve $blockId",
+        category = "SHUFFLE")
+    }
+  }
+
+  /**
+   * Refuses a reduce partition the given producer cannot own.
+   *
+   * Validated only once the producer has registered its reduce partition count, because until then
+   * there is no ownership to check against: a producer with no registered count has admitted no
+   * block and so has nothing spilled, and the empty result it yields is already the correct answer.
+   */
+  private def requireOwnedPartition(
+      producer: MemorySpillManager,
+      shuffleId: Int,
+      mapId: Long,
+      reduceId: Int): Unit = {
+    if (producer.partitionCountRegistered && reduceId >= producer.numPartitions) {
+      throw SparkException.internalError(
+        s"reduce partition $reduceId is not part of shuffle $shuffleId map $mapId, whose " +
+          s"producer owns ${producer.numPartitions} reduce partition(s)", category = "SHUFFLE")
+    }
+  }
+
+  /**
    * Answers a reduce-partition or reduce-range request from the spilled segments the owning
    * producer still retains.
+   *
+   * The range is validated in two stages, and the order matters. Sign and ordering are checked
+   * before a producer is even looked up, because they are checkable without one. The upper bound is
+   * then checked against that producer's own reduce partition count, which is the only authority on
+   * which partitions exist: without it, a batch identity naming `[0, Int.MaxValue)` would be
+   * traversed partition by partition before yielding nothing, turning one malformed request into
+   * two billion map lookups. A producer that has not yet registered a count cannot have that bound
+   * applied, so such a request is confined to a single partition instead -- which is exactly what
+   * an unbatched `ShuffleBlockId` asks for, and the only shape that needs no partition count to be
+   * meaningful.
    *
    * @param blockId the identity being served, carried through solely so that every diagnostic
    *                names the block the caller actually asked for
@@ -341,11 +556,39 @@ private[spark] class StreamingShuffleBlockResolver(
         s"invalid reduce range [$startReduceId, $endReduceId) requested for block $blockId",
         category = "SHUFFLE")
     }
+    // The width is bounded before anything is looked up, and independently of any producer. A range
+    // is a request to perform one lookup per partition in it, each taking the producing manager's
+    // monitor, so an unchecked width is an unbounded amount of work purchased with a single
+    // fixed-size request. The producer's own partition count bounds it too, but only once one is
+    // registered and only as far as that count reaches; this bound holds in every case and is what
+    // makes the cost of a request proportional to the request rather than to the largest number the
+    // requester can name.
+    val rangeWidth = endReduceId.toLong - startReduceId.toLong
+    if (rangeWidth > StreamingShuffleBlockResolver.MAX_REDUCE_RANGE_WIDTH) {
+      throw SparkException.internalError(
+        s"reduce range [$startReduceId, $endReduceId) requested for block $blockId spans " +
+          s"$rangeWidth partitions, which exceeds the maximum of " +
+          s"${StreamingShuffleBlockResolver.MAX_REDUCE_RANGE_WIDTH} partitions a single " +
+          "request may cover; fetch the range in smaller batches", category = "SHUFFLE")
+    }
     val producer = producerFor(shuffleId, mapId).getOrElse {
       throw SparkException.internalError(
         s"no streaming shuffle producer is registered for block $blockId, so none of its data " +
           "can be served from local storage; the producing task either never spilled or has " +
           "already released its buffers", category = "SHUFFLE")
+    }
+    if (producer.partitionCountRegistered) {
+      val owned = producer.numPartitions
+      if (endReduceId > owned) {
+        throw SparkException.internalError(
+          s"reduce range [$startReduceId, $endReduceId) of block $blockId exceeds the " +
+            s"$owned reduce partition(s) its producer owns", category = "SHUFFLE")
+      }
+    } else if (endReduceId - startReduceId > 1) {
+      throw SparkException.internalError(
+        s"reduce range [$startReduceId, $endReduceId) of block $blockId spans several " +
+          "partitions, but its producer has not registered a reduce partition count, so the " +
+          "range cannot be validated and is refused rather than traversed", category = "SHUFFLE")
     }
     val segments = (startReduceId until endReduceId)
       .flatMap(reduceId => producer.spilledBlocks(reduceId))
@@ -355,49 +598,69 @@ private[spark] class StreamingShuffleBlockResolver(
           "buffered in memory are replayed by retransmission over the streaming channel and are " +
           "deliberately not served from here", category = "SHUFFLE")
     }
-    val buffer: ManagedBuffer = if (segments.length == 1) {
-      // The overwhelmingly common shape, and the one worth optimising: a single committed segment
-      // is handed out as a file segment, so the bytes are never copied through the heap at all.
-      segmentBuffer(segments.head)
-    } else {
-      new NioManagedBuffer(concatenateSegments(blockId, segments))
+    if (segments.length > 1) {
+      // Refusal rather than concatenation, and deliberately so. Each of these segments was
+      // committed on its own through DiskBlockObjectWriter, so each carries its own serializer,
+      // compression and encryption framing and is decodable only on its own. Their bytes laid end
+      // to end are not a stream any consumer can read, and presenting them as one ManagedBuffer
+      // would surface as a deserialization failure blamed on the serializer rather than on the
+      // composition. There is no heap assembly path here for the same reason there is no correct
+      // one.
+      throw SparkException.internalError(
+        s"block $blockId resolves to ${segments.length} independently committed spill segments, " +
+          "which cannot be served as one buffer because each segment carries its own serializer, " +
+          "compression and encryption framing and is decodable only on its own; request the " +
+          "segments individually through getSpilledSegments instead", category = "SHUFFLE")
+    }
+    val segment = segments.head
+    if (segment.length > StreamingShuffleBlockResolver.MAX_SERVED_BYTES) {
+      // A committed segment holds one block, whose payload the protocol caps, so this bound is only
+      // ever reached by a corrupt or mis-attributed record. Refusing is far better than handing a
+      // consumer a length it will try to buffer.
+      throw SparkException.internalError(
+        s"streaming shuffle refuses to serve ${segment.length} bytes for block $blockId, because " +
+          s"one response may not exceed ${StreamingShuffleBlockResolver.MAX_SERVED_BYTES} bytes",
+        category = "SHUFFLE")
+    }
+    // The bytes are never copied through the heap: a leased file segment is handed out, and the
+    // lease is what stops an acknowledgement from unlinking the file before the consumer opens it.
+    val buffer = leasedSegment(producer, segment).getOrElse {
+      throw SparkException.internalError(
+        s"the spilled segment of block $blockId was retired before it could be served, which " +
+          "means its consumer has already acknowledged every record in it", category = "SHUFFLE")
     }
     if (debugEnabled) {
-      logDebug(log"Streaming shuffle served block ${MDC(BLOCK_ID, blockId)} from " +
-        log"${MDC(COUNT, segments.length)} spilled segment(s) totalling " +
-        log"${MDC(NUM_BYTES, buffer.size())} bytes")
+      logDebug(log"Streaming shuffle served block ${MDC(BLOCK_ID, blockId)} from one spilled " +
+        log"segment of ${MDC(NUM_BYTES, buffer.size())} bytes")
     }
     buffer
   }
 
   /**
-   * Reads several committed segments into one heap buffer, preserving their bytes and their order
-   * exactly.
+   * Wraps one committed spill segment as a leased buffer, without reading it.
    *
-   * The assembled size is bounded by construction: a single buffer cannot address more than
-   * `Int.MaxValue` bytes, so a request beyond that is refused with an actionable message rather
-   * than allowed to fail as an arithmetic overflow or an allocation error.
+   * The lease is taken before the buffer exists, which is the whole point: a file segment buffer
+   * opens its file lazily, so taking the lease inside the buffer would leave a window in which the
+   * file has been unlinked and the lazy open is the thing that discovers it.
+   *
+   * @return the leased buffer, or nothing when the file has already been retired or its producer
+   *         has closed, in which case the segment is no longer servable from disk
    */
-  private def concatenateSegments(blockId: BlockId, segments: Seq[SpilledBlock]): ByteBuffer = {
-    val totalBytes = segments.foldLeft(0L)((accumulated, segment) => accumulated + segment.length)
-    if (totalBytes > StreamingShuffleBlockResolver.MAX_ASSEMBLED_BYTES) {
-      throw SparkException.internalError(
-        s"streaming shuffle cannot assemble $totalBytes bytes of spilled data into a single " +
-          s"buffer for block $blockId, because one buffer cannot exceed " +
-          s"${StreamingShuffleBlockResolver.MAX_ASSEMBLED_BYTES} bytes; request the segments " +
-          "individually instead", category = "SHUFFLE")
+  private def leasedSegment(
+      producer: MemorySpillManager,
+      segment: SpilledBlock): Option[ManagedBuffer] = {
+    if (producer.acquireSpillFileLease(segment.file)) {
+      Some(new LeasedSegmentBuffer(
+        new FileSegmentManagedBuffer(transportConf, segment.file, segment.offset, segment.length),
+        producer,
+        segment.file))
+    } else {
+      if (debugEnabled) {
+        logDebug(log"Streaming shuffle cannot lease spill file " +
+          log"${MDC(FILE_NAME, segment.file.getName)}, so its segment is no longer servable")
+      }
+      None
     }
-    val assembled = ByteBuffer.allocate(totalBytes.toInt)
-    segments.foreach { segment =>
-      assembled.put(segmentBuffer(segment).nioByteBuffer())
-    }
-    assembled.flip()
-    assembled
-  }
-
-  /** Wraps one committed spill segment as a buffer, without reading it. */
-  private def segmentBuffer(segment: SpilledBlock): FileSegmentManagedBuffer = {
-    new FileSegmentManagedBuffer(transportConf, segment.file, segment.offset, segment.length)
   }
 
   /**
@@ -407,31 +670,77 @@ private[spark] class StreamingShuffleBlockResolver(
    * A file may still hold segments the consumer has already acknowledged, because a spill file is
    * only deleted once no retained record refers to it. Serving the whole file is nonetheless
    * byte-valid: every byte in it was committed by this subsystem, and the caller asked for the file
-   * rather than for a segment of it.
+   * rather than for a segment of it. The per-segment ceiling therefore does not apply, because this
+   * identity names one file rather than one block, and refusing it on that ceiling would refuse a
+   * legitimate one-to-one read.
+   *
+   * A far looser ceiling does apply, at [[StreamingShuffleBlockResolver.MAX_SERVED_FILE_BYTES]]. A
+   * whole-file read is answered with a zero-copy file segment, so the concern is not heap but the
+   * size of the transfer one small request can provoke -- and the name-based fallback below answers
+   * from local disk for a file this JVM has no producer for, where the producer's buffer budget
+   * bounds nothing at all. No spill file this subsystem writes comes near the ceiling, so reaching
+   * it means the name resolved to something this resolver has no business serving.
+   *
+   * The response is leased whenever the owning producer is known. When it is not -- a name-based
+   * lookup answered from local disk, which is how a host-local or External Shuffle Service read
+   * reaches a file this JVM has no producer for -- there is no lease authority to ask, and none is
+   * needed: no producer in this JVM holds a record naming that file, so nothing here will unlink
+   * it.
    */
   private def spillFileBuffer(
       blockId: TempShuffleBlockId,
       dirs: Option[Array[String]]): ManagedBuffer = {
-    val file = locateSpillFile(blockId, dirs)
+    val (owner, file) = locateSpillFile(blockId, dirs)
     val length = file.length()
+    if (length > StreamingShuffleBlockResolver.MAX_SERVED_FILE_BYTES) {
+      throw SparkException.internalError(
+        s"the spill file backing block $blockId is $length bytes, which exceeds the maximum of " +
+          s"${StreamingShuffleBlockResolver.MAX_SERVED_FILE_BYTES} bytes this resolver will " +
+          "serve as a single block; request the individual reduce partitions instead",
+        category = "SHUFFLE")
+    }
+    val fileSegment = new FileSegmentManagedBuffer(transportConf, file, 0L, length)
+    val buffer: ManagedBuffer = owner match {
+      case Some(producer) =>
+        if (producer.acquireSpillFileLease(file)) {
+          new LeasedSegmentBuffer(fileSegment, producer, file)
+        } else {
+          throw SparkException.internalError(
+            s"the spill file of block $blockId was retired before it could be served, which " +
+              "means every record it held has already been acknowledged", category = "SHUFFLE")
+        }
+      case None =>
+        fileSegment
+    }
     if (debugEnabled) {
       logDebug(log"Streaming shuffle served spill file ${MDC(FILE_NAME, file.getName)} for " +
         log"block ${MDC(BLOCK_ID, blockId)}, ${MDC(NUM_BYTES, length)} bytes")
     }
-    new FileSegmentManagedBuffer(transportConf, file, 0L, length)
+    buffer
   }
 
   /**
    * Finds the file backing a temporary shuffle block: first through the producers this resolver
-   * knows about, which is authoritative, and only then by name on local disk, which is how a
-   * caller that knows the block name but not this JVM's registry is answered.
+   * knows about, which is authoritative and also identifies the owner able to lease the file, and
+   * only then by name on local disk, which is how a caller that knows the block name but not this
+   * JVM's registry is answered.
+   *
+   * @return the owning producer when one is known, together with the file
    */
-  private def locateSpillFile(blockId: TempShuffleBlockId, dirs: Option[Array[String]]): File = {
+  private def locateSpillFile(
+      blockId: TempShuffleBlockId,
+      dirs: Option[Array[String]]): (Option[MemorySpillManager], File) = {
+    // One O(1) probe per producer, not a walk of every producer's every retained segment. The walk
+    // it replaces was linear in the total number of segments the executor had spilled and ran on
+    // every single-file lookup, so its cost grew with how much had been spilled while the request
+    // that paid for it stayed the same fixed size -- the same amplification the range bounds above
+    // exist to prevent, reached by a different route.
     val registered = allProducers.iterator
-      .flatMap(producer => producer.allSpilledBlocks.iterator)
-      .find(segment => segment.blockId == blockId)
-      .map(segment => segment.file)
-    registered.orElse(locateSpillFileByName(blockId, dirs)).filter(file => file.isFile).getOrElse {
+      .flatMap(producer => producer.spillFile(blockId).map(file => (Some(producer), file)))
+      .nextOption()
+    val located = registered
+      .orElse(locateSpillFileByName(blockId, dirs).map(file => (None, file)))
+    located.filter { case (_, file) => file.isFile }.getOrElse {
       throw SparkException.internalError(
         s"streaming shuffle has no spill file for block $blockId on this executor",
         category = "SHUFFLE")
@@ -442,9 +751,10 @@ private[spark] class StreamingShuffleBlockResolver(
    * Resolves a block name to a local file, honouring caller-supplied directories exactly as the
    * sort-based resolver does.
    *
-   * Never throws. Reaching the disk block manager needs a live environment, and a caller may be
-   * running somewhere that has none; that is not an error condition here, it simply means the file
-   * cannot be located this way and the caller is told there is no such block.
+   * A non-fatal failure answers `None` rather than propagating. Reaching the disk block manager
+   * needs a live environment, and a caller may be running somewhere that has none; that is not an
+   * error condition here, it simply means the file cannot be located this way and the caller is
+   * told there is no such block.
    */
   private def locateSpillFileByName(
       blockId: TempShuffleBlockId,
@@ -458,18 +768,28 @@ private[spark] class StreamingShuffleBlockResolver(
       Some(file)
     } catch {
       case NonFatal(e) =>
-        logDebug(log"Could not locate a streaming shuffle spill file named " +
-          log"${MDC(FILE_NAME, fileName)} for block ${MDC(BLOCK_ID, blockId)}", e)
+        if (debugEnabled) {
+          logDebug(log"Could not locate a streaming shuffle spill file named " +
+            log"${MDC(FILE_NAME, fileName)} for block ${MDC(BLOCK_ID, blockId)}", e)
+        }
         None
     }
   }
 
   /**
    * Every producer this resolver may consult, registered ones first and the constructor-supplied
-   * one last. De-duplicated by identity, because the same producer may be both.
+   * one last. De-duplicated by identity, because the same producer may be both, and empty once
+   * [[stop]] has run, for the same reason [[producerFor]] is.
    */
   private def allProducers: Seq[MemorySpillManager] = {
-    (producers.values().asScala.toSeq ++ rootProducer.toSeq).distinct
+    lifecycle.synchronized {
+      if (stopped) {
+        Seq.empty
+      } else {
+        val registered = producers.values().asScala.toSeq.map(entry => entry.producer)
+        (registered ++ rootProducer.toSeq).distinct
+      }
+    }
   }
 
   // ----------------------------------------------------------------------------------------------
@@ -479,19 +799,19 @@ private[spark] class StreamingShuffleBlockResolver(
   /**
    * Always fails, because streaming shuffle never produces merged output.
    *
-   * This is not a gap. A push-based merge is only ever started for a manager whose resolver is an
-   * `IndexShuffleBlockResolver`, and this resolver deliberately is not one, so nothing on the
-   * streaming path can create a merged block for this method to serve. Reaching it means a merged
-   * block was attributed to a streaming shuffle, which is a real programming error and is reported
-   * as one rather than disguised as an empty result.
+   * A push-based merge is only ever started for a manager whose resolver is an
+   * `IndexShuffleBlockResolver`, and this resolver is not one, so nothing on the streaming path can
+   * create a merged block for this method to serve. Reaching it means a merged block was attributed
+   * to a streaming shuffle, which is a programming error and is reported as one rather than
+   * disguised as an empty result.
    */
   override def getMergedBlockData(
       blockId: ShuffleMergedBlockId,
       dirs: Option[Array[String]]): Seq[ManagedBuffer] = {
     throw new UnsupportedOperationException(
       "Streaming shuffle does not participate in push-based shuffle merge, so it never produces " +
-        s"merged shuffle data and cannot serve $blockId. Set spark.shuffle.manager to sort, or " +
-        "set spark.shuffle.streaming.enabled to false, if push-based merge is required.")
+        s"merged shuffle data and cannot serve $blockId. Set ${SHUFFLE_MANAGER.key} to sort, or " +
+        s"set ${SHUFFLE_STREAMING_ENABLED.key} to false, if push-based merge is required.")
   }
 
   /**
@@ -506,8 +826,9 @@ private[spark] class StreamingShuffleBlockResolver(
       dirs: Option[Array[String]]): MergedBlockMeta = {
     throw new UnsupportedOperationException(
       "Streaming shuffle does not participate in push-based shuffle merge, so it never produces " +
-        s"merged shuffle metadata and cannot serve $blockId. Set spark.shuffle.manager to sort, " +
-        "or set spark.shuffle.streaming.enabled to false, if push-based merge is required.")
+        s"merged shuffle metadata and cannot serve $blockId. Set ${SHUFFLE_MANAGER.key} to " +
+        s"sort, or set ${SHUFFLE_STREAMING_ENABLED.key} to false, if push-based merge is " +
+        "required.")
   }
 
   // ----------------------------------------------------------------------------------------------
@@ -540,19 +861,30 @@ private[spark] class StreamingShuffleBlockResolver(
    * shutting down must never be derailed by a resolver that objects.
    *
    * Spill files are not deleted here. Ownership of them rests with the producer that wrote them,
-   * which deletes each file once no retained record still refers to it and which registers its own
-   * task-completion cleanup for the failure and cancellation cases. Deleting from here would race a
-   * producer that is still replaying its unacknowledged window.
+   * which deletes each file once no retained record still refers to it and no reader lease holds
+   * it, and which registers its own task-completion cleanup for the failure and cancellation cases.
+   * Deleting from here would race a producer that is still replaying its unacknowledged window.
+   *
+   * The stopped flag is raised and the registry cleared in the same critical section that every
+   * registration and every lookup contends for, which is what makes a stop final: no registration
+   * can slip in behind the clear, and no lookup afterwards can find anything -- not through the
+   * registry and not through the constructor-supplied fallback either.
    */
   override def stop(): Unit = {
-    if (stopped.compareAndSet(false, true)) {
-      Utils.tryLogNonFatalError {
-        val dropped = producers.size()
-        producers.clear()
-        if (dropped > 0) {
-          logDebug(log"Streaming shuffle block resolver stopped, dropping " +
-            log"${MDC(COUNT, dropped)} registered producer(s)")
+    Utils.tryLogNonFatalError {
+      val dropped = lifecycle.synchronized {
+        if (stopped) {
+          -1
+        } else {
+          stopped = true
+          val registered = producers.size()
+          producers.clear()
+          registered
         }
+      }
+      if (dropped > 0 && debugEnabled) {
+        logDebug(log"Streaming shuffle block resolver stopped, dropping " +
+          log"${MDC(COUNT, dropped)} registered producer(s)")
       }
     }
   }
@@ -578,11 +910,40 @@ private[spark] object StreamingShuffleBlockResolver {
   val TRANSPORT_MODULE: String = "shuffle-streaming"
 
   /**
-   * The largest number of bytes that may be assembled into a single buffer. This is not a tuning
-   * knob but a hard limit of the buffer abstraction itself, since an array-backed buffer is
-   * addressed by an `Int`.
+   * The largest response a reduce-partition or reduce-range request may be answered with.
+   *
+   * Deliberately small, and deliberately not derived from what a buffer can address. One response
+   * is one committed spill segment, which holds one block whose payload the protocol caps at
+   * `DataBlockMessage.MAX_BLOCK_SIZE_BYTES`; the headroom above that cap covers the serializer,
+   * compression and encryption framing a committed segment adds, and nothing legitimate reaches it.
+   * Its purpose is therefore to bound what a corrupt or mis-attributed record can ask a consumer to
+   * buffer, which a limit of `Int.MaxValue` would not do at all.
    */
-  val MAX_ASSEMBLED_BYTES: Long = Int.MaxValue.toLong
+  val MAX_SERVED_BYTES: Long = 8L * 1024 * 1024
+
+  /**
+   * The largest reduce range a single request may cover.
+   *
+   * A range request costs one lookup per partition it covers, each taking the producing manager's
+   * monitor, so the width of a range is the multiplier between the size of a request and the work
+   * it commissions. Left unbounded that multiplier reaches `Int.MaxValue`: a fixed-size request
+   * naming `[0, 2147483647)` would occupy the producer's monitor for over two billion iterations
+   * and starve every other reader of that map output while returning nothing. This bound is
+   * generous against real shuffles -- a batched fetch covers the partitions of one map output, and
+   * a range wider than this is a range worth splitting on the fetch side regardless -- and it makes
+   * the cost of a request proportional to the request.
+   */
+  val MAX_REDUCE_RANGE_WIDTH: Long = 4096L
+
+  /**
+   * The largest spill file this resolver will serve as one block.
+   *
+   * A whole-file read is answered with a zero-copy file segment, so the concern is not heap but the
+   * size of the transfer one small request can provoke. Bounding it keeps a temporary-block
+   * identity from being usable as a request for an arbitrarily large transfer, including for a file
+   * found by name on local disk that no producer in this JVM accounts for.
+   */
+  val MAX_SERVED_FILE_BYTES: Long = 1024L * 1024L * 1024L
 
   /**
    * Identifies the producer of one map output.
@@ -591,4 +952,88 @@ private[spark] object StreamingShuffleBlockResolver {
    * @param mapId the map output being produced
    */
   case class ProducerKey(shuffleId: Int, mapId: Long)
+
+  /**
+   * One registered producer together with the generation that registered it.
+   *
+   * The generation is the producing task's attempt id. Spark allocates attempt ids from a single
+   * monotonically increasing per-application counter, so comparing two of them is a total order
+   * over "which attempt is newer" without any further bookkeeping -- which is precisely what a
+   * registry shared by concurrent attempts at the same map output needs.
+   *
+   * @param taskAttemptId the generation that registered this producer
+   * @param producer the spill manager able to locate that map output's spilled blocks
+   */
+  case class RegisteredProducer(taskAttemptId: Long, producer: MemorySpillManager) {
+
+    /** Whether this registration is newer than, or a refresh of, an existing one. */
+    def supersedes(other: RegisteredProducer): Boolean = taskAttemptId >= other.taskAttemptId
+  }
+
+  /**
+   * A file segment buffer that holds a reader lease on the spill file behind it.
+   *
+   * Delegation rather than inheritance, because `FileSegmentManagedBuffer` is final -- and because
+   * delegation is the better shape anyway: every byte-level concern stays with the buffer that
+   * already implements it correctly, including its lazy open, its size threshold for memory mapping
+   * and its SSL variant, and this class adds nothing but ownership.
+   *
+   * The lease is taken by the resolver before this object is constructed, never by this object
+   * itself, so that no window exists in which the file is unlinked before the buffer holding it
+   * exists. `retain` takes a further lease and `release` drops exactly one, counted so that the
+   * count can never go negative: an over-release would unlink a file a second reader is still
+   * entitled to open, and a retain whose lease is refused must not later be released as though it
+   * had held one.
+   *
+   * @param delegate the file segment buffer that does the actual work
+   * @param producer the producer that owns the file and grants leases over it
+   * @param file the leased spill file, held so that leases can be released without reaching
+   *             into the delegate
+   */
+  class LeasedSegmentBuffer(
+      delegate: FileSegmentManagedBuffer,
+      producer: MemorySpillManager,
+      file: File)
+    extends ManagedBuffer {
+
+    /** Leases this buffer holds. Starts at the one the resolver took on its behalf. */
+    private val leases = new AtomicInteger(1)
+
+    override def size(): Long = delegate.size()
+
+    override def nioByteBuffer(): ByteBuffer = delegate.nioByteBuffer()
+
+    override def createInputStream(): InputStream = delegate.createInputStream()
+
+    override def convertToNetty(): Object = delegate.convertToNetty()
+
+    override def convertToNettyForSsl(): Object = delegate.convertToNettyForSsl()
+
+    override def retain(): ManagedBuffer = {
+      // A refused lease is not an error here: it means the file has been retired, and the caller
+      // already holds a lease that keeps it readable. Not counting the refusal is what keeps the
+      // matching release from dropping a lease this object never took.
+      if (producer.acquireSpillFileLease(file)) {
+        leases.incrementAndGet()
+      }
+      delegate.retain()
+      this
+    }
+
+    override def release(): ManagedBuffer = {
+      val held = leases.getAndUpdate(outstanding => math.max(0, outstanding - 1))
+      if (held > 0) {
+        producer.releaseSpillFileLease(file)
+      }
+      delegate.release()
+      this
+    }
+
+    /** Leases this buffer is currently accountable for. Intended for diagnostics and tests. */
+    def outstandingLeases: Int = leases.get()
+
+    override def toString: String = {
+      s"LeasedSegmentBuffer(file=${file.getName}, leases=${leases.get()}, delegate=$delegate)"
+    }
+  }
 }

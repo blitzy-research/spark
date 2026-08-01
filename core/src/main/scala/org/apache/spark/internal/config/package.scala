@@ -1761,8 +1761,8 @@ package object config {
 
   private[spark] val SHUFFLE_STREAMING_BUFFER_SIZE_PERCENT =
     ConfigBuilder("spark.shuffle.streaming.bufferSizePercent")
-      .doc("Percentage of executor memory used for streaming shuffle per-partition buffers. " +
-        "The per-partition allowance is (executorMemory * bufferSizePercent) / numPartitions.")
+      .doc("Percentage of executor memory reserved across all streaming shuffle buffers. The " +
+        "per-partition allowance is that aggregate budget divided by numPartitions.")
       .version("4.2.0")
       .intConf
       .checkValue(v => v >= 1 && v <= 50, "The buffer size percent must be in [1, 50].")
@@ -1779,9 +1779,13 @@ package object config {
 
   private[spark] val SHUFFLE_STREAMING_MAX_BANDWIDTH_MBPS =
     ConfigBuilder("spark.shuffle.streaming.maxBandwidthMBps")
-      .doc("Per-executor egress cap in MB/s for streaming shuffle traffic. When unset, egress " +
-        "is uncapped. The token bucket refill rate is this value divided by the number of " +
-        "concurrent shuffles.")
+      .doc("The administered network link capacity, in MB/s, against which streaming shuffle " +
+        "egress is paced on one executor. This declares the capacity of the link, not the rate " +
+        "streaming is permitted to reach: streaming holds itself to 80% of the declared " +
+        "capacity, and divides that allowance evenly across the shuffles the executor is " +
+        "serving, so each shuffle's token bucket refills at " +
+        "(0.8 * maxBandwidthMBps) / numConcurrentShuffles MB/s. When unset, egress is uncapped " +
+        "and no pacing is applied at all. Changing this value requires an executor restart.")
       .version("4.2.0")
       .intConf
       .checkValue(v => v > 0, "The maximum bandwidth should be positive.")

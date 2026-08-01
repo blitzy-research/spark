@@ -21,6 +21,8 @@ import java.util.Objects;
 
 import io.netty.buffer.ByteBuf;
 
+import org.apache.spark.annotation.Private;
+
 /**
  * The orderly end-of-stream signal of the streaming shuffle wire protocol.
  *
@@ -44,9 +46,11 @@ import io.netty.buffer.ByteBuf;
  * however many times the stream was throttled, spilled or partially retransmitted along the way.
  *
  * The header's {@code sequenceNumber} is the position this terminator itself occupies in the
- * stream, that is, one past the last data block, so the sequence space stays gap-free right up to
- * the end and a terminator can be detected as missing by the same reasoning that detects a missing
- * block.
+ * stream. Because the terminator is sent after every data block, that position is never smaller
+ * than {@link #totalBlocks}, and the constructor rejects a message claiming otherwise; it is
+ * strictly greater whenever the producer also spent positions on control messages. The sequence
+ * space therefore stays gap-free right up to the end, and a terminator can be detected as missing
+ * by the same reasoning that detects a missing block.
  *
  * Wire layout, {@value StreamingShuffleMessage#HEADER_ENCODED_LENGTH} header bytes then one long,
  * for 25 bytes in total; framed by {@link StreamingShuffleMessage#toByteBuffer()} it occupies 26.
@@ -60,9 +64,14 @@ import io.netty.buffer.ByteBuf;
  * </pre>
  *
  * Three of the sibling messages encode to the same 25 bytes, so length can never be used to tell
- * them apart. The one-byte discriminator that precedes the body does that on the wire, and
- * {@link #equals(Object)} does it in memory by requiring the concrete type to match before it looks
- * at a single field.
+ * them apart. The one-byte discriminator that precedes the body does that on the wire, and {@link
+ * #equals(Object)} does it in memory by requiring the concrete type to match before it looks at a
+ * single field.
+ *
+ * The inherited {@code shuffleId}, {@code partitionId} and {@code sequenceNumber} are all required
+ * to be non-negative, and {@link StreamingShuffleMessage} enforces that centrally on construction
+ * and on decode, so a terminator can no more name an impossible partition or stream position
+ * than it can claim a negative block count.
  *
  * This type is internal to Spark. It is pure data plus codec: it holds no reference to Spark core,
  * reads no configuration and no clock, and emits no log line, so that the decision of what an
@@ -73,7 +82,8 @@ import io.netty.buffer.ByteBuf;
  *
  * @since 4.2.0
  */
-public class StreamTerminationMessage extends StreamingShuffleMessage {
+@Private
+public final class StreamTerminationMessage extends StreamingShuffleMessage {
 
   /**
    * Total number of data blocks the producer emitted for this stream, counted over the whole life
@@ -83,8 +93,8 @@ public class StreamTerminationMessage extends StreamingShuffleMessage {
    * block at all and still terminates, so rejecting zero would make an empty shuffle partition
    * unrepresentable. The field is exposed directly, as every message in the surrounding shuffle
    * protocol exposes its own fields, and is additionally readable through {@link #totalBlocks()} so
-   * that a call site reading it beside the inherited {@link #shuffleId()},
-   * {@link #partitionId()} and {@link #sequenceNumber()} accessors can do so in one style.
+   * that a call site reading it beside the inherited {@link #shuffleId()}, {@link #partitionId()}
+   * and {@link #sequenceNumber()} accessors can do so in one style.
    */
   public final long totalBlocks;
 
@@ -99,11 +109,12 @@ public class StreamTerminationMessage extends StreamingShuffleMessage {
    * @param protocolVersion the wire revision this message was encoded with
    * @param shuffleId identifier of the shuffle this stream belongs to
    * @param partitionId identifier of the shuffle partition whose stream is ending
-   * @param sequenceNumber position of this terminator within the stream, one past the last data
-   *                       block
+   * @param sequenceNumber position of this terminator within the stream; must be at least
+   *                       {@code totalBlocks}
    * @param totalBlocks number of data blocks emitted for this stream; zero is legal, negative is
    *                    not
-   * @throws IllegalArgumentException if totalBlocks is negative
+   * @throws IllegalArgumentException if totalBlocks is negative, if it exceeds sequenceNumber, or
+   *                                  if any header field is negative
    */
   public StreamTerminationMessage(
       byte protocolVersion,
@@ -119,6 +130,19 @@ public class StreamTerminationMessage extends StreamingShuffleMessage {
       throw new IllegalArgumentException("Total number of blocks in a streaming shuffle stream " +
         "cannot be negative: " + totalBlocks);
     }
+    // The terminator is sent after every data block, so it sits later in the stream than any of
+    // them: with blocks numbered from zero, its own sequenceNumber is at least the number of blocks
+    // that preceded it, and is strictly greater when the producer also spent sequence numbers on
+    // heartbeats. A claim of more blocks than positions is therefore arithmetically impossible, and
+    // refusing it here matters because a consumer sizes its completion bookkeeping from this count:
+    // an inflated total makes a stream that has in fact ended look permanently incomplete, and the
+    // consumer waits for blocks that were never sent.
+    if (totalBlocks > sequenceNumber) {
+      throw new IllegalArgumentException("Stream termination claims " + totalBlocks +
+        " block(s) but sits at sequenceNumber " + sequenceNumber + " for shuffle " + shuffleId +
+        " partition " + partitionId + "; a stream cannot contain more blocks than the positions " +
+        "preceding its terminator");
+    }
     this.totalBlocks = totalBlocks;
   }
 
@@ -129,11 +153,12 @@ public class StreamTerminationMessage extends StreamingShuffleMessage {
    *
    * @param shuffleId identifier of the shuffle this stream belongs to
    * @param partitionId identifier of the shuffle partition whose stream is ending
-   * @param sequenceNumber position of this terminator within the stream, one past the last data
-   *                       block
+   * @param sequenceNumber position of this terminator within the stream; must be at least
+   *                       {@code totalBlocks}
    * @param totalBlocks number of data blocks emitted for this stream; zero is legal, negative is
    *                    not
-   * @throws IllegalArgumentException if totalBlocks is negative
+   * @throws IllegalArgumentException if totalBlocks is negative, if it exceeds sequenceNumber, or
+   *                                  if any header field is negative
    */
   public StreamTerminationMessage(
       int shuffleId,
@@ -144,16 +169,16 @@ public class StreamTerminationMessage extends StreamingShuffleMessage {
   }
 
   /**
-   * Creates a terminator from a header just read off the wire, which is the form
-   * {@link #decode(ByteBuf)} uses. Taking the header as one value rather than as four positional
-   * arguments removes any chance of transposing {@code shuffleId} and {@code partitionId} on the
-   * way in.
+   * Creates a terminator from a header just read off the wire, which is the form {@link
+   * #decode(ByteBuf)} uses. Taking the header as one value rather than as four positional arguments
+   * removes any chance of transposing {@code shuffleId} and {@code partitionId} on the way in.
    *
    * @param header the decoded header, which must not be null
    * @param totalBlocks number of data blocks emitted for this stream; zero is legal, negative is
    *                    not
    * @throws NullPointerException if header is null
-   * @throws IllegalArgumentException if totalBlocks is negative
+   * @throws IllegalArgumentException if totalBlocks is negative, if it exceeds sequenceNumber, or
+   *                                  if any header field is negative
    */
   public StreamTerminationMessage(Header header, long totalBlocks) {
     this(Objects.requireNonNull(header, "header").protocolVersion(), header.shuffleId(),
@@ -227,14 +252,16 @@ public class StreamTerminationMessage extends StreamingShuffleMessage {
    * @param buf the buffer to read from, positioned at the first header byte
    * @return the terminator just consumed from the buffer
    * @throws NullPointerException if buf is null
-   * @throws IllegalArgumentException if the buffer is truncated, or if it carries a negative block
-   *         count
+   * @throws IllegalArgumentException if the buffer is truncated, if it carries a negative block
+   *         count, or if its header carries a negative shuffle id, partition id or sequence number
    */
-  public static StreamTerminationMessage decode(ByteBuf buf) {
+  static StreamTerminationMessage decode(ByteBuf buf) {
     Header header = readHeader(buf);
-    if (buf.readableBytes() < Long.BYTES) {
-      throw new IllegalArgumentException("Truncated stream termination message: expected " +
-        Long.BYTES + " byte(s) for totalBlocks but only " + buf.readableBytes() + " remain");
+    // Exactly, not at least: a surplus is content the codec would never examine, and tolerating it
+    // would let a peer append bytes that survive the message boundary unparsed.
+    if (buf.readableBytes() != Long.BYTES) {
+      throw new IllegalArgumentException("Malformed stream termination message: expected exactly " +
+        Long.BYTES + " byte(s) for totalBlocks but " + buf.readableBytes() + " remain");
     }
     long totalBlocks = buf.readLong();
     return new StreamTerminationMessage(header, totalBlocks);

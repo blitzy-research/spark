@@ -17,11 +17,42 @@
 
 package org.apache.spark.shuffle.streaming
 
-import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.ConcurrentHashMap
 
 import com.codahale.metrics.{Counter, Gauge, MetricRegistry}
 
 import org.apache.spark.metrics.source.Source
+
+/**
+ * One live owner of streaming shuffle buffer memory, as seen by the buffer-utilisation gauge.
+ *
+ * An executor runs one buffer owner per concurrently streaming shuffle task, so utilisation is an
+ * executor-wide quantity that no single owner can compute on its own. Each owner therefore
+ * contributes only the two numbers it actually knows -- how many bytes it is holding, and the
+ * budget those bytes are measured against -- and the gauge sums the live contributions and derives
+ * the percentage itself. That division of labour is what makes the exported value describe the
+ * whole executor rather than whichever owner happened to publish last, and it is what lets an
+ * owner leave without disturbing the contribution of an owner that is still holding buffers.
+ *
+ * Both methods are read from the metrics reporting thread, so an implementation must answer
+ * without blocking: no lock that a producer can hold across I/O, no allocation proportional to the
+ * buffered data, and no dereference of state that may not exist yet. An implementation that cannot
+ * answer cheaply should register itself only once it can.
+ */
+private[spark] trait StreamingShuffleBufferUtilizationContributor {
+
+  /**
+   * Bytes this owner is currently holding in its streaming shuffle buffers. Must be non-negative;
+   * a negative answer is treated as zero rather than allowed to distort the executor-wide sum.
+   */
+  def contributedBufferedBytes: Long
+
+  /**
+   * The buffer budget this owner's bytes are measured against, in bytes. Must be non-negative; an
+   * owner reporting a zero budget contributes nothing to the denominator.
+   */
+  def contributedBudgetBytes: Long
+}
 
 /**
  * Dropwizard metric source for the streaming shuffle subsystem.
@@ -29,10 +60,13 @@ import org.apache.spark.metrics.source.Source
  * The streaming shuffle path publishes exactly four metrics, which together form its
  * operator-facing telemetry contract:
  *
- *  - `shuffle.streaming.bufferUtilizationPercent` (gauge) -- the utilisation of the streaming
- *    shuffle buffer budget, as a percentage. A gauge is the correct instrument here because
- *    utilisation is an instantaneous level rather than a cumulative total, and the value is
- *    computed on read so that the producer write path never pays for a metric computation.
+ *  - `shuffle.streaming.bufferUtilizationPercent` (gauge) -- executor-wide utilisation of the
+ *    streaming shuffle buffer budget, as a percentage. A gauge is the correct instrument here
+ *    because utilisation is an instantaneous level rather than a cumulative total, and the value
+ *    is genuinely computed when the gauge is read: the gauge sums the buffered bytes and the
+ *    budgets of every registered [[StreamingShuffleBufferUtilizationContributor]] and divides,
+ *    so the write path performs no metric work at all and concurrent shuffles on one executor are
+ *    aggregated rather than overwriting one another.
  *  - `shuffle.streaming.spillCount` (counter) -- the number of spill events performed to keep
  *    the buffer budget within its configured threshold.
  *  - `shuffle.streaming.backpressureEvents` (counter) -- the number of transitions into a
@@ -42,33 +76,63 @@ import org.apache.spark.metrics.source.Source
  *    per-producer partial-read invalidations performed after a producer failure.
  *
  * Name composition. This source declares its `sourceName` as "shuffle.streaming" and registers
- * the four metrics under their bare names. MetricsSystem prefixes a source with the application
- * and executor identifiers, and Dropwizard then appends the per-metric name, so the exported
- * names are `<application id>.<executor id>.shuffle.streaming.<metric name>`. The
- * "shuffle.streaming" prefix therefore lives in `sourceName` alone and must never be repeated
+ * the four metrics under their bare names. `MetricsSystem.buildRegistryName` prefixes a source
+ * with the application and executor identifiers only when both are available, so there are two
+ * exported forms and an operator may see either:
+ *
+ *  - `<spark.metrics.namespace or spark.app.id>.<spark.executor.id>.shuffle.streaming.<metric>`
+ *    for the driver and executor instances, which are the instances that set both identifiers; and
+ *  - the bare fallback `shuffle.streaming.<metric>` when the namespace or the executor id is
+ *    absent, which is the case for other instance types such as the standalone master and worker.
+ *
+ * Either way the "shuffle.streaming" prefix lives in `sourceName` alone and must never be repeated
  * in an individual metric name, which would export a doubled prefix such as
  * `shuffle.streaming.shuffle.streaming.spillCount`.
  *
- * Registration. This source is published through the static source list that MetricsSystem
- * registers when it starts, on the driver and on every executor alike. Because registration is
- * automatic, the sinks that are already configured -- notably the JMX sink -- export all four
- * metrics with no additional configuration, and the subsystem needs no bespoke metrics agent,
- * sink or UI surface of its own.
+ * Executor-wide aggregation of buffer utilisation. An executor runs as many streaming shuffle spill
+ * managers as it has concurrent streaming tasks, and every one of them has its own share of the
+ * buffer budget. A single scalar cell written by each of them in turn would therefore be a
+ * last-writer-wins race with an operator-facing consequence rather than a merely cosmetic one: a
+ * task holding almost nothing, or one publishing zero as it closes, would erase the reading of a
+ * sibling task sitting at the spill threshold, and the gauge would report calm during exactly the
+ * condition it exists to expose. Utilisation is therefore not published as a percentage at all.
+ * Each manager instead registers itself as a [[StreamingShuffleBufferUtilizationContributor]] and
+ * exposes the two quantities it actually knows -- the bytes it is holding and the share of the
+ * budget it was apportioned; the gauge sums both quantities over the live contributors and divides
+ * once. The reading is consequently the executor's true utilisation of its whole streaming buffer
+ * allowance, it is independent of the order in which managers happen to run, and a manager that
+ * finishes withdraws its contribution rather than overwriting everybody else's -- so a closing task
+ * can no longer drive the gauge to zero while another task is at 80 percent.
  *
- * Telemetry budget. Every update is lock-free and none of them is per-record. The counters are
- * backed by Dropwizard's striped adder and the gauge by a single atomic cell, so publishing a
- * value costs one uncontended add or one plain store. Counters are advanced on discrete events
- * only -- a spill occurring, a transition into a throttled state, an invalidation being
- * performed -- and never once per record or once per block, while the gauge is sampled by the
- * reporting sink rather than recomputed by the writer. That is how the sub-1% CPU telemetry
- * budget is met. This object holds no lock, performs no blocking call and never sleeps, so it
- * is equally safe to call from a task thread and from a network event-loop thread.
+ * Registration. This source is published through the static source list, which `MetricsSystem`
+ * registers when it starts -- on the driver and on every executor alike -- provided static sources
+ * are enabled. They are enabled by default, and `spark.metrics.staticSources.enabled=false` turns
+ * the whole static list off, this source along with the code-generation and Hive catalogue sources.
+ * Registering a source is not the same thing as exporting it: reaching an operator additionally
+ * requires a sink, and every sink is opt-in through `metrics.properties`. In particular the JMX
+ * sink, which is how these four metrics are intended to be read, ships commented out in
+ * `conf/metrics.properties.template` and has to be enabled there -- for example
+ * `*.sink.jmx.class=org.apache.spark.metrics.sink.JmxSink` -- before the metrics appear in an MBean
+ * browser. What this subsystem does guarantee is that it needs no metrics agent, sink or UI surface
+ * of its own: once a sink an operator already runs is configured, all four metrics travel over it.
+ *
+ * Telemetry budget. Every update is lock-free and none of them is per-record or per-block. The
+ * counters are backed by Dropwizard's striped adder, so advancing one costs a single uncontended
+ * add, and they are advanced on discrete events only -- a spill occurring, a transition into a
+ * throttled state, an invalidation being performed. The gauge costs the write path nothing at all:
+ * it is computed on the reporting thread by walking a registry that a buffer owner joins once and
+ * leaves once, so its cost is borne by the sink at whatever interval the sink samples. This object
+ * declares no lock, performs no blocking call and does not sleep, so it is equally safe to call
+ * from a task thread and from a network event-loop thread.
  *
  * As a JVM singleton this object accumulates values for the lifetime of the process. Callers
  * that need a clean baseline, such as tests asserting on absolute metric values, must first
  * call `reset()`.
  */
 private[spark] object StreamingShuffleMetricsSource extends Source {
+
+  /** Divisor and multiplier of the utilisation percentage. */
+  private val PERCENT_SCALE: Long = 100L
 
   /**
    * The metric namespace for the streaming shuffle subsystem. MetricsSystem places it after the
@@ -80,25 +144,25 @@ private[spark] object StreamingShuffleMetricsSource extends Source {
   override val metricRegistry: MetricRegistry = new MetricRegistry()
 
   /**
-   * Holder for the most recently published buffer utilisation percentage. An atomic cell keeps
-   * publication lock-free on the producer side and reduces the gauge itself to a plain read,
-   * which is what allows the gauge to be evaluated on the reporting thread rather than on the
-   * shuffle write path. Declared before the gauge below so that the initialisation order of
-   * this object is unambiguous.
+   * The buffer owners currently holding streaming shuffle memory on this executor.
+   *
+   * A set rather than a single cell, because an executor runs one owner per concurrently streaming
+   * task and the gauge has to describe all of them at once. Membership is what makes a
+   * contribution live: an owner adds itself when it starts holding bytes and removes itself when
+   * it releases them, so a departing owner subtracts exactly its own contribution and can never
+   * zero a peer's. The set is a concurrent one and is only ever added to, removed from and walked,
+   * so publication stays lock-free on the owner's side and the gauge never blocks a producer.
    */
-  private val bufferUtilization: AtomicLong = new AtomicLong(0L)
+  private val bufferUtilizationContributors =
+    ConcurrentHashMap.newKeySet[StreamingShuffleBufferUtilizationContributor]()
 
-  // Dropwizard gauge reporting the utilisation of the streaming shuffle buffer budget as a
-  // percentage. The value is computed on read: the gauge returns whatever the owning component
-  // last published through setBufferUtilizationPercent, so the write path does no metric work
-  // and the sampling interval is decided entirely by the reporting sink.
-  // Values are expected in the range [0, 100]. The published value is reported verbatim and is
-  // deliberately neither clamped nor coerced, so that a momentarily over-budget allocation
-  // stays visible to operators instead of being masked at 100, and so that a negative
-  // out-of-band sentinel remains available to the publisher.
+  // Dropwizard gauge reporting executor-wide utilisation of the streaming shuffle buffer budget as
+  // a percentage. The value is computed when the gauge is read, by aggregating the registered
+  // contributions, so the shuffle write path does no metric work and the sampling interval is
+  // decided entirely by the reporting sink.
   metricRegistry.register(MetricRegistry.name("bufferUtilizationPercent"),
     new Gauge[Long] {
-      override def getValue: Long = bufferUtilization.get()
+      override def getValue: Long = bufferUtilizationPercent
     })
 
   /**
@@ -124,18 +188,80 @@ private[spark] object StreamingShuffleMetricsSource extends Source {
     metricRegistry.counter(MetricRegistry.name("partialReadInvalidations"))
 
   /**
+   * Adds a buffer owner to the executor-wide utilisation aggregate. Idempotent: registering the
+   * same owner twice leaves it counted once, so a defensive second call cannot double count its
+   * bytes. A null owner is ignored rather than allowed to poison the registry.
+   *
+   * An owner should register only once its two contributed values can be answered cheaply and
+   * without dereferencing state that may not exist yet, because the gauge reads them from the
+   * metrics reporting thread.
+   *
+   * @param contributor the buffer owner to start counting
+   */
+  def registerBufferUtilizationContributor(
+      contributor: StreamingShuffleBufferUtilizationContributor): Unit = {
+    if (contributor != null) {
+      bufferUtilizationContributors.add(contributor)
+    }
+  }
+
+  /**
+   * Removes a buffer owner from the executor-wide utilisation aggregate, subtracting exactly that
+   * owner's contribution and leaving every other owner's intact. Idempotent, so it is safe on a
+   * cleanup path that may run more than once, and safe to call for an owner that never registered.
+   *
+   * @param contributor the buffer owner to stop counting
+   */
+  def unregisterBufferUtilizationContributor(
+      contributor: StreamingShuffleBufferUtilizationContributor): Unit = {
+    if (contributor != null) {
+      bufferUtilizationContributors.remove(contributor)
+    }
+  }
+
+  /** How many buffer owners are currently counted, for diagnostics and assertions. */
+  def bufferUtilizationContributorCount: Int = bufferUtilizationContributors.size()
+
+  /**
+   * Executor-wide buffer utilisation as a percentage of the aggregate budget, computed here rather
+   * than cached, which is exactly what the `bufferUtilizationPercent` gauge reports.
+   *
+   * The buffered bytes and the budgets of every registered owner are summed independently and the
+   * percentage is taken from the two totals, so a busy shuffle and an idle one on the same
+   * executor produce one honest executor-wide figure instead of two competing ones. Both sums
+   * saturate rather than wrap, a negative contribution is read as zero, and an empty registry or a
+   * zero total budget answers zero, so the gauge is total: there is no input for which it throws
+   * and no sentinel value it can return in place of a percentage.
+   *
+   * The value is not clamped at 100. A momentarily over-budget allocation stays visible to
+   * operators instead of being masked, which is the whole point of watching this gauge.
+   */
+  def bufferUtilizationPercent: Long = {
+    var bufferedBytes = 0L
+    var budgetBytes = 0L
+    val contributors = bufferUtilizationContributors.iterator()
+    while (contributors.hasNext) {
+      val contributor = contributors.next()
+      bufferedBytes = saturatingAdd(bufferedBytes, contributor.contributedBufferedBytes)
+      budgetBytes = saturatingAdd(budgetBytes, contributor.contributedBudgetBytes)
+    }
+    percentOf(bufferedBytes, budgetBytes)
+  }
+
+  /**
    * Resets the values of all metrics to zero. This is useful in tests.
    *
    * Each counter is driven back to zero by decrementing it by its own current count, which is
-   * the reset idiom already used by the static metric sources in this codebase. The buffer
-   * utilisation gauge is returned to its initial value as well, so that a caller sees the same
-   * state a freshly initialised process would report.
+   * the reset idiom already used by the static metric sources in this codebase. The utilisation
+   * registry is emptied as well, so that a caller sees the same state a freshly initialised
+   * process would report. Emptying it detaches any owner that is still holding buffers, which is
+   * harmless in the tests this method exists for and is the reason it is not called in service.
    */
   def reset(): Unit = {
     METRIC_SPILL_COUNT.dec(METRIC_SPILL_COUNT.getCount())
     METRIC_BACKPRESSURE_EVENTS.dec(METRIC_BACKPRESSURE_EVENTS.getCount())
     METRIC_PARTIAL_READ_INVALIDATIONS.dec(METRIC_PARTIAL_READ_INVALIDATIONS.getCount())
-    bufferUtilization.set(0L)
+    bufferUtilizationContributors.clear()
   }
 
   // The three increment helpers below ignore non-positive arguments. These are monotonic event
@@ -149,5 +275,36 @@ private[spark] object StreamingShuffleMetricsSource extends Source {
   def incrementBackpressureEvents(n: Long): Unit = if (n > 0L) METRIC_BACKPRESSURE_EVENTS.inc(n)
   def incrementPartialReadInvalidations(n: Long): Unit =
     if (n > 0L) METRIC_PARTIAL_READ_INVALIDATIONS.inc(n)
-  def setBufferUtilizationPercent(v: Long): Unit = bufferUtilization.set(v)
+
+  /**
+   * Adds two byte counts, treating a negative contribution as zero and saturating at
+   * `Long.MaxValue` instead of wrapping. Wrapping would turn an implausibly large total into a
+   * negative one and thence into a nonsense percentage, so it is ruled out arithmetically rather
+   * than assumed away.
+   */
+  private def saturatingAdd(runningTotal: Long, contribution: Long): Long = {
+    val sum = runningTotal + math.max(0L, contribution)
+    if (sum < 0L) Long.MaxValue else sum
+  }
+
+  /**
+   * Expresses `bufferedBytes` as a percentage of `budgetBytes`, without overflowing for any pair
+   * of non-negative inputs. The straightforward product is used whenever it is provably safe, and
+   * the divisor is scaled down instead for the extreme totals where it is not. The result is
+   * reported verbatim and is deliberately not clamped at 100, so that a momentarily over-budget
+   * executor stays visible to operators instead of being masked.
+   */
+  private def percentOf(bufferedBytes: Long, budgetBytes: Long): Long = {
+    if (bufferedBytes <= 0L || budgetBytes <= 0L) {
+      0L
+    } else if (bufferedBytes <= Long.MaxValue / PERCENT_SCALE) {
+      bufferedBytes * PERCENT_SCALE / budgetBytes
+    } else {
+      bufferedBytes / math.max(1L, budgetBytes / PERCENT_SCALE)
+    }
+  }
+
+  // There is deliberately no setter for the utilisation gauge. Buffer utilisation is aggregated
+  // exclusively from the registered contributors, because a single shared setter is what allowed
+  // one manager to overwrite the executor-wide reading with its own local view.
 }
