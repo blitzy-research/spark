@@ -100,29 +100,36 @@ import org.apache.spark.network.protocol.Encoders;
  * <b>Checksum scope.</b> The CRC32C covers the payload <em>and</em> the header fields that place it
  * in the stream -- shuffle id, partition id, sequence number and payload length -- computed by
  * {@link StreamingShuffleChecksum#computeBlock(int, long, int, long, byte[])}. Covering the payload
- * alone
- * would attest only that some bytes arrived intact and would say nothing about where they belong,
+ * alone would attest only that some bytes arrived intact and would say nothing about where they
+ * belong,
  * so a block whose header was rewritten in flight would verify cleanly and then be consumed as
  * though it were legitimately addressed. Binding the metadata in closes that gap at no extra cost,
  * since the same single pass produces the value.
  *
- * <b>Immutability and threading.</b> An instance is genuinely immutable once constructed, and that
- * is enforced rather than merely documented. The payload is a private array that no caller ever
- * holds a reference to: the public constructors copy the array handed to them, and the accessors
- * hand back either a read-only view ({@link #payloadBuffer()}) or a fresh copy ({@link
- * #copyPayload()}). Returning the live array, as an earlier revision of this class did, made the
- * block mutable by anyone who had ever touched it -- a caller reusing its own buffer would silently
- * rewrite the bytes of a block already queued for transmission, already checksummed, or already
- * retained for retransmission, and the checksum would then be a promise about content the block no
- * longer held. A block is checksummed once and may be replayed long afterwards, so nothing short of
- * exclusive ownership makes that promise keepable.
+ * <b>Immutability and threading.</b> Every value an instance reports is fixed at construction, and
+ * that is enforced rather than merely documented. The payload is a private array that no caller
+ * ever holds a reference to: the public constructors copy the array handed to them, and the
+ * accessors hand back either a read-only view ({@link #payloadBuffer()}) or a fresh copy ({@link
+ * #copyPayload()}). Returning the live array would make the block mutable by anyone who had ever
+ * touched it -- a caller reusing its own buffer would silently rewrite the bytes of a block already
+ * queued for transmission, already checksummed, or already retained for retransmission, and the
+ * checksum would then be a promise about content the block no longer held. A block is checksummed
+ * once and may be replayed long afterwards, so nothing short of exclusive ownership makes that
+ * promise keepable.
  *
  * Ownership can be transferred explicitly where a copy would be pure waste, through {@link
  * #withOwnedPayload}: the caller surrenders the array and must not touch it again. That is how
  * {@link #decode(ByteBuf)} avoids copying, since the array it passes was freshly allocated by the
  * decoder and is reachable from nowhere else. Because an instance is immutable, it is safe to hand
- * between Netty event-loop threads and task threads without further synchronisation. The class
- * carries no logging and no dependency on Spark core.
+ * between Netty event-loop threads and task threads without further synchronisation.
+ *
+ * One field is not final, and the contract holds anyway: {@link #verifyChecksum()} memoises a
+ * successful verification so the second, independent check on the task thread need not repeat the
+ * pass over every payload byte. That field is volatile, its write is idempotent and only ever from
+ * false to true, and it is derived entirely from state that cannot change -- so it alters no
+ * observable value, and every route by which an instance may be published is safe rather than only
+ * the queue the two verifying threads happen to share. The class carries no logging and no
+ * dependency on Spark core.
  *
  * @since 4.2.0
  */
@@ -177,7 +184,7 @@ public final class DataBlockMessage extends StreamingShuffleMessage {
    *
    * This is the one authoritative maximum <em>encoded frame</em> size of the streaming protocol, as
    * distinct from the maximum <em>payload</em> size {@link #MAX_BLOCK_SIZE_BYTES}. It is
-   * {@link #MAX_BLOCK_SIZE_BYTES} plus {@link #FRAMING_OVERHEAD_BYTES}, that is 2,097,182 bytes,
+   * {@link #MAX_BLOCK_SIZE_BYTES} plus {@link #FRAMING_OVERHEAD_BYTES}, that is 2,097,190 bytes,
    * and it is the figure any component sizing a network-facing resource must use: a rate limiter
    * whose burst allowance were only {@link #MAX_BLOCK_SIZE_BYTES} could not represent the largest
    * legal frame at all, and would either refuse it forever or let the surplus bytes go uncharged.
@@ -198,17 +205,26 @@ public final class DataBlockMessage extends StreamingShuffleMessage {
    * here and the second pass is skipped.
    *
    * Only success is remembered: a block that fails verification is never marked, so the repair path
-   * that asks for a replay behaves exactly as it did. The field is deliberately not volatile,
-   * because publication between the two threads happens through the receive queue, which already
-   * establishes the ordering; a reader that somehow saw the stale value would recompute the
-   * checksum and reach the same answer, so the worst case is the cost this exists to avoid rather
-   * than a wrong result.
+   * that asks for a replay behaves exactly as it did.
+   *
+   * <b>Why volatile.</b> The two threads that read and write this field do hand the block between
+   * them through the receive queue, whose own publication would order the write before the read, so
+   * a non-volatile field would in practice be read correctly. That is not good enough to state as a
+   * class contract: it makes the safety of sharing an instance depend on the route the caller
+   * happened to use, which this class cannot see and cannot enforce, and it is the one thing
+   * standing between the rest of the state being final and the whole instance being safely
+   * publishable by any means. Declaring it volatile makes the guarantee unconditional, and the cost
+   * is a single volatile write per verified block against the full CRC32C pass this memo avoids.
+   *
+   * The write is idempotent and one-directional -- only ever false to true, only ever on success --
+   * so there is no lost-update hazard to guard beyond visibility: two threads racing to verify the
+   * same block both compute the same answer and both store the same value.
    *
    * The one precondition is that the payload array is not mutated in place behind the block's back
    * after a successful verification. Every route into this class either copies the array it is
    * given or adopts an array allocated for the block and never touched again.
    */
-  private transient boolean checksumVerified;
+  private transient volatile boolean checksumVerified;
 
   /**
    * The one constructor that assigns the payload field, and therefore the single place where
@@ -522,7 +538,9 @@ public final class DataBlockMessage extends StreamingShuffleMessage {
 
   @Override
   public int encodedLength() {
-    // 17 (header) + 8 (checksum) + 4 (length prefix) + payload.length == 29 + payload.length
+    // 25 (header) + 8 (checksum) + 4 (length prefix) + payload.length == 37 + payload.length.
+    // The one-byte type discriminator is not counted here: the encoder writes it outside this
+    // length, which is why FRAMING_OVERHEAD_BYTES is 38 rather than 37.
     return HEADER_ENCODED_LENGTH + CHECKSUM_ENCODED_LENGTH +
         Encoders.ByteArrays.encodedLength(payload);
   }

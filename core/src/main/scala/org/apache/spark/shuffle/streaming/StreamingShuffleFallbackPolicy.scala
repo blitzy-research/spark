@@ -24,7 +24,7 @@ import java.util.concurrent.atomic.{AtomicLong, AtomicReference}
 import org.apache.spark.SparkConf
 import org.apache.spark.internal.{config, Logging, MessageWithContext}
 import org.apache.spark.internal.LogKeys.{CONFIG, COUNT, ELAPSED_TIME, MAX_SIZE, MEMORY_SIZE,
-  NUM_BYTES, PERCENT, PROTOCOL_VERSION, RATIO, REASON, SHUFFLE_ID, THRESHOLD, VALUE}
+  NUM_BYTES, PERCENT, PROTOCOL_VERSION, RATIO, REASON, SHUFFLE_ID, THRESHOLD, VALUE, VERSION_NUM}
 import org.apache.spark.network.shuffle.protocol.streaming.StreamingShuffleMessage
 import org.apache.spark.util.{Clock, SystemClock}
 
@@ -32,8 +32,8 @@ import org.apache.spark.util.{Clock, SystemClock}
  * Why the streaming shuffle stepped aside in favour of sort-based shuffle.
  *
  * The four members of this type are exactly the four conditions the streaming shuffle is specified
- * to degrade on, and they are modelled as values rather than as strings so that a caller can match
- * on them exhaustively and a test can assert on the precise one that fired. Nothing else about a
+ * to degrade on, and they are modelled as values rather than as strings so that every consumer
+ * matches on them exhaustively and names the precise one that fired. Nothing else about a
  * reason is behavioural: every one of them routes to the identical terminus, which is delegation to
  * the unmodified sort-based shuffle. A reason is therefore diagnostic information, never a
  * behavioural switch.
@@ -103,9 +103,9 @@ private[spark] object StreamingShuffleFallbackReason {
   }
 
   /**
-   * Every reason, in the order the specification enumerates them. Exposed so that a test can walk
-   * the closed set without restating it, and so that adding a member cannot silently escape
-   * coverage.
+   * Every reason, in the order the specification enumerates them. Exposed so that the closed set
+   * can be walked without restating it, and so that adding a member cannot silently escape a
+   * consumer that walks it.
    */
   val all: Seq[StreamingShuffleFallbackReason] =
     Seq(ConsumerTooSlow, MemoryPressure, NetworkSaturation, ProtocolVersionMismatch)
@@ -211,7 +211,7 @@ private[spark] object StreamingShuffleFallbackReason {
  *
  * ==Thread safety==
  *
- * Every method is safe to call concurrently. The decision surface is lock-free. The only monitor
+ * Every method is safe to call concurrently. The decision surface never blocks. The only monitor
  * taken is a per-shuffle one, held for the few field updates of a single throughput sample and
  * never across I/O, a callback or an allocation of consequence, so a producer thread, a consumer
  * thread and a Netty event-loop thread can all report into the same instance without contending on
@@ -219,7 +219,8 @@ private[spark] object StreamingShuffleFallbackReason {
  *
  * @param conf the executor's configuration, read once here and never consulted again
  * @param clock the time source for trip timestamps and for the sampling overloads that do not take
- *              an explicit instant; injected so that tests are deterministic without sleeping
+ *              an explicit instant; injected so every trip instant is a function of this clock
+ *              rather than of wall time, and so nothing in this class ever sleeps
  */
 private[spark] class StreamingShuffleFallbackPolicy(
     conf: SparkConf,
@@ -324,9 +325,7 @@ private[spark] class StreamingShuffleFallbackPolicy(
 
   logConstruction()
 
-  // ------------------------------------------------------------------------------------------
   // The decision surface. Hot path: lock-free, allocation-free, clock-free.
-  // ------------------------------------------------------------------------------------------
 
   /**
    * Whether a fallback condition has been observed and latched.
@@ -421,9 +420,7 @@ private[spark] class StreamingShuffleFallbackPolicy(
   /** How many shuffles currently have throughput state, bounded by [[MAX_TRACKED_SHUFFLES]]. */
   def trackedShuffleCount: Int = throughputWindows.size()
 
-  // ------------------------------------------------------------------------------------------
   // Trip 1: the consumer sustained at 2x slower than the producer for more than 60 seconds.
-  // ------------------------------------------------------------------------------------------
 
   /**
    * Records the rate at which a shuffle's producer is emitting bytes.
@@ -445,9 +442,9 @@ private[spark] class StreamingShuffleFallbackPolicy(
   /**
    * Records a producer rate sample taken now, as reported by the injected clock.
    *
-   * A convenience for production callers with no reason to name an instant. Tests should prefer
-   * the three-argument form with a clock they control, so that the sustained window can be walked
-   * exactly to its boundary.
+   * A convenience for a caller with no reason to name an instant. The three-argument form is the
+   * primitive: it takes the instant explicitly, which is the only way the sustained window can be
+   * walked exactly to its boundary rather than merely approached.
    */
   def recordProducerThroughput(shuffleId: Int, bytesPerSecond: Double): Unit = {
     recordThroughput(shuffleId, bytesPerSecond, clock.getTimeMillis(), fromProducer = true)
@@ -478,8 +475,8 @@ private[spark] class StreamingShuffleFallbackPolicy(
    * The instant at which a shuffle's consumer was first seen to be behind by the tolerated factor
    * and has been continuously since, or `None` when it is currently keeping up.
    *
-   * Exposed so that a test can assert the two halves of "sustained" independently: that the timer
-   * arms when the deficit appears, and that it clears the moment the consumer recovers.
+   * Exposed because the two halves of "sustained" are separately observable: the timer arms when
+   * the deficit appears, and it clears the moment the consumer recovers.
    */
   def slownessArmedSinceMs(shuffleId: Int): Option[Long] = {
     val window = throughputWindows.get(shuffleId)
@@ -575,9 +572,7 @@ private[spark] class StreamingShuffleFallbackPolicy(
     }
   }
 
-  // ------------------------------------------------------------------------------------------
   // Trip 2: memory pressure prevented a buffer allocation, so streaming risks exhausting memory.
-  // ------------------------------------------------------------------------------------------
 
   /**
    * Records the outcome of a streaming shuffle buffer reservation, and trips when the reservation
@@ -621,9 +616,7 @@ private[spark] class StreamingShuffleFallbackPolicy(
     }
   }
 
-  // ------------------------------------------------------------------------------------------
   // Trip 3: network utilisation above 90% of the administered link capacity.
-  // ------------------------------------------------------------------------------------------
 
   /**
    * Records observed egress against an explicit link capacity, and trips when utilisation is
@@ -680,9 +673,7 @@ private[spark] class StreamingShuffleFallbackPolicy(
   /** The administered link capacity in bytes per second, or `None` when no cap is administered. */
   def administeredLinkCapacityBytesPerSecond: Option[Long] = administeredCapacityBytesPerSecond
 
-  // ------------------------------------------------------------------------------------------
   // Trip 4: a producer/consumer protocol version mismatch, detected explicitly.
-  // ------------------------------------------------------------------------------------------
 
   /**
    * Checks a peer's announced streaming shuffle protocol version and trips when this build cannot
@@ -706,7 +697,7 @@ private[spark] class StreamingShuffleFallbackPolicy(
       trip(ProtocolVersionMismatch,
         log"a peer announced streaming shuffle protocol version " +
           log"${MDC(PROTOCOL_VERSION, peerVersion)} but this executor speaks version " +
-          log"${MDC(VALUE, StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION)}.")
+          log"${MDC(VERSION_NUM, StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION)}.")
     }
     compatible
   }
@@ -826,9 +817,7 @@ private[spark] class StreamingShuffleFallbackPolicy(
     state.reason.map(_.description).getOrElse(state.reasonName)
   }
 
-  // ------------------------------------------------------------------------------------------
   // Lifecycle.
-  // ------------------------------------------------------------------------------------------
 
   /**
    * Discards the throughput state for a shuffle that has finished or been unregistered.
@@ -863,8 +852,8 @@ private[spark] class StreamingShuffleFallbackPolicy(
    * sort-based shuffle both believe they own the same shuffle output. Nothing on the streaming hot
    * path calls this, and nothing should.
    *
-   * The cumulative diagnostic tallies are cleared too, so a test can assert absolute counts rather
-   * than differences.
+   * The cumulative diagnostic tallies are cleared too, so a count read after a reset is absolute
+   * rather than a difference against whatever came before it.
    */
   def reset(): Unit = {
     trippedReasonRef.set(None)
@@ -886,9 +875,7 @@ private[spark] class StreamingShuffleFallbackPolicy(
       s"trackedShuffles=${throughputWindows.size()})"
   }
 
-  // ------------------------------------------------------------------------------------------
   // The single terminus. Every trip condition, without exception, arrives here.
-  // ------------------------------------------------------------------------------------------
 
   /**
    * Latches the first fallback condition observed and reports it once.
@@ -928,9 +915,7 @@ private[spark] class StreamingShuffleFallbackPolicy(
   private def latchedDescription: String =
     trippedReasonRef.get().map(_.description).getOrElse("an earlier condition")
 
-  // ------------------------------------------------------------------------------------------
   // Private helpers and per-shuffle state.
-  // ------------------------------------------------------------------------------------------
 
   /**
    * Whether a sampled quantity can be reasoned about at all: a finite, non-negative number.
@@ -963,7 +948,7 @@ private[spark] class StreamingShuffleFallbackPolicy(
         log"${MDC(THRESHOLD, SUSTAINED_SLOWNESS_WINDOW_MS)} ms, on utilisation above " +
         log"${MDC(PERCENT, SATURATION_TRIP_PERCENT)}% of an administered link capacity of " +
         log"${MDC(MAX_SIZE, capacity)}, and on any protocol version other than " +
-        log"${MDC(PROTOCOL_VERSION, StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION)}")
+        log"${MDC(VERSION_NUM, StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION)}")
     }
   }
 

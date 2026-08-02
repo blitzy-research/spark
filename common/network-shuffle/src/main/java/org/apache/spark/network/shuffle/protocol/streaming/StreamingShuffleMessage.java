@@ -280,10 +280,15 @@ public abstract class StreamingShuffleMessage implements Encodable {
    *              non-negative
    * @param partitionId identifier of the shuffle partition this message belongs to; must be
    *                    non-negative
-   * @param sequenceNumber position of this message within its partition's stream, counted from
-   *                       zero and increasing by one per data block, which is what lets a consumer
-   *                       detect a gap or a reordering and lets a producer bound the window of
-   *                       blocks it must retain for retransmission; must be non-negative
+   * @param sequenceNumber a position within this partition's stream, counted from zero. Which
+   *                       position it is belongs to the concrete subtype and is documented there:
+   *                       for a data block it is the block's own index, advancing by one per block,
+   *                       which is what lets a consumer detect a gap or a reordering and lets a
+   *                       producer bound its retransmission window; for an acknowledgement it is
+   *                       the consumer's outbound control counter; for a retransmission request it
+   *                       is the inclusive lower bound of the requested run; and for a heartbeat or
+   *                       a termination it is the next data position expected or produced. Must be
+   *                       non-negative in every case
    * @throws IllegalArgumentException if the shuffle id, the map id, the partition id or the
    *                                 sequence number is negative
    */

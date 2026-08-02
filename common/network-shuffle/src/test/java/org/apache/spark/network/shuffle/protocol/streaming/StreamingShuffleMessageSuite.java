@@ -80,9 +80,7 @@ public class StreamingShuffleMessageSuite {
   /** A message type id no constant uses, used to exercise unknown-discriminator handling. */
   private static final byte UNKNOWN_TYPE_ID = (byte) 9;
 
-  // ===========================================================================================
   // Group 1: round-trip encode/decode for every message type, with exact-literal lengths.
-  // ===========================================================================================
 
   @Test
   public void testDataBlockMessageEncodeDecode() {
@@ -126,7 +124,8 @@ public class StreamingShuffleMessageSuite {
     HeartbeatMessage message =
         new HeartbeatMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, TIMESTAMP_MS);
     int len = message.encodedLength();
-    assertEquals(33, len);
+    // Twenty-five header, eight timestamp, four identity length, and no identity bytes.
+    assertEquals(37, len);
     ByteBuf buf = Unpooled.buffer(len);
     message.encode(buf);
     assertEquals(0, buf.writableBytes());
@@ -135,6 +134,83 @@ public class StreamingShuffleMessageSuite {
     assertEquals(message, decoded);
     assertEquals(TIMESTAMP_MS, decoded.timestampMs());
     assertEquals(TIMESTAMP_MS, decoded.timestampMs);
+    assertEquals(HeartbeatMessage.NO_CONSUMER_ID, decoded.consumerId());
+    assertFalse(decoded.declaresConsumerId());
+  }
+
+  @Test
+  public void testHeartbeatCarriesAStableConsumerIdentity() {
+    // The identity is what a producer keys its per-consumer cursor by, so it has to survive the
+    // wire exactly: a reconnection that announced a different identity would be served as a
+    // consumer that had never been seen.
+    String identity = "attempt-4096-partitions-7-11";
+    HeartbeatMessage message = new HeartbeatMessage(
+        SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, TIMESTAMP_MS, identity);
+    assertEquals(37 + identity.length(), message.encodedLength());
+    assertTrue(message.declaresConsumerId());
+
+    HeartbeatMessage decoded = (HeartbeatMessage) roundTrip(message);
+    assertEquals(message, decoded);
+    assertEquals(identity, decoded.consumerId());
+    assertEquals(identity, decoded.consumerId);
+    assertTrue(decoded.toString().contains(identity), decoded.toString());
+
+    // A multi-byte identity is measured in encoded bytes rather than in characters.
+    String wide = "consumer-\u00e9\u00e9"; // Two U+00E9, each two bytes once encoded.
+    HeartbeatMessage widened = new HeartbeatMessage(
+        SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, TIMESTAMP_MS, wide);
+    assertEquals(37 + wide.length() + 2, widened.encodedLength());
+    assertEquals(wide, ((HeartbeatMessage) roundTrip(widened)).consumerId());
+
+    // Identity takes part in equality, so two consumers of one stream are never one consumer.
+    assertNotEquals(message, new HeartbeatMessage(
+        SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, TIMESTAMP_MS, "attempt-4097"));
+    assertNotEquals(message, heartbeat());
+  }
+
+  @Test
+  public void testHeartbeatConsumerIdentityIsBounded() {
+    // The ceiling applies to a message built in memory as well as to one read off the wire, so no
+    // sender can construct a heartbeat a receiver would be obliged to refuse.
+    assertEquals(256, HeartbeatMessage.MAX_CONSUMER_ID_ENCODED_BYTES);
+    String longest = "x".repeat(HeartbeatMessage.MAX_CONSUMER_ID_ENCODED_BYTES);
+    assertDoesNotThrow(() -> new HeartbeatMessage(
+        SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, TIMESTAMP_MS, longest));
+    assertThrows(IllegalArgumentException.class, () -> new HeartbeatMessage(
+        SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, TIMESTAMP_MS, longest + "x"));
+    assertThrows(NullPointerException.class, () -> new HeartbeatMessage(
+        SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, TIMESTAMP_MS, null));
+    assertThrows(NullPointerException.class,
+        () -> new HeartbeatMessage(header(), TIMESTAMP_MS, null));
+  }
+
+  @Test
+  public void testHeartbeatConsumerIdentityLengthIsBoundedOnDecode() {
+    // A length prefix is the classic unbounded-allocation lever, so it is refused before it is
+    // used to allocate: negative, beyond the ceiling, and beyond the bytes the frame carries.
+    for (int declared : new int[] {-1, Integer.MIN_VALUE,
+        HeartbeatMessage.MAX_CONSUMER_ID_ENCODED_BYTES + 1, Integer.MAX_VALUE}) {
+      ByteBuf buf = Unpooled.buffer();
+      writeHeader(buf, SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER);
+      buf.writeLong(TIMESTAMP_MS);
+      buf.writeInt(declared);
+      assertThrows(IllegalArgumentException.class, () -> HeartbeatMessage.decode(buf));
+    }
+    // A length inside the ceiling but beyond the frame is a truncation, not an allocation.
+    ByteBuf truncated = Unpooled.buffer();
+    writeHeader(truncated, SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER);
+    truncated.writeLong(TIMESTAMP_MS);
+    truncated.writeInt(16);
+    truncated.writeBytes(new byte[8]);
+    assertThrows(IllegalArgumentException.class, () -> HeartbeatMessage.decode(truncated));
+
+    // And a surplus is refused, so a peer cannot append bytes that survive the message boundary.
+    ByteBuf surplus = Unpooled.buffer();
+    writeHeader(surplus, SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER);
+    surplus.writeLong(TIMESTAMP_MS);
+    surplus.writeInt(0);
+    surplus.writeByte(1);
+    assertThrows(IllegalArgumentException.class, () -> HeartbeatMessage.decode(surplus));
   }
 
   @Test
@@ -172,9 +248,7 @@ public class StreamingShuffleMessageSuite {
     assertEquals(40L, decoded.totalBlocks);
   }
 
-  // ===========================================================================================
   // Group 2: header integrity.
-  // ===========================================================================================
 
   @Test
   public void testHeaderLayoutConstants() {
@@ -254,9 +328,7 @@ public class StreamingShuffleMessageSuite {
         () -> StreamingShuffleMessage.Decoder.fromByteBuffer(ByteBuffer.wrap(framed)));
   }
 
-  // ===========================================================================================
   // Group 3: framed round trip through toByteBuffer and Decoder.fromByteBuffer.
-  // ===========================================================================================
 
   @Test
   public void testFramedRoundTripForEveryType() {
@@ -296,9 +368,7 @@ public class StreamingShuffleMessageSuite {
     assertInstanceOf(StreamTerminationMessage.class, roundTrip(termination(40L)));
   }
 
-  // ===========================================================================================
   // Group 4: the two-mebibyte size cap.
-  // ===========================================================================================
 
   @Test
   public void testMaxBlockSizeConstant() {
@@ -366,9 +436,7 @@ public class StreamingShuffleMessageSuite {
     assertThrows(IllegalArgumentException.class, () -> DataBlockMessage.decode(buf));
   }
 
-  // ===========================================================================================
   // Group 5: checksum behaviour.
-  // ===========================================================================================
 
   @Test
   public void testComputeMatchesTheJdkCrc32c() {
@@ -485,6 +553,17 @@ public class StreamingShuffleMessageSuite {
   }
 
   @Test
+  public void testBlockMetadataPreambleLengthMatchesTheFieldsItCovers() {
+    // The metadata preamble is what makes a block checksum attest to where the bytes belong as well
+    // as to the bytes themselves, and its length is stated in prose next to the constant. Pin the
+    // number so that adding a covered field cannot leave that prose describing the old layout.
+    assertEquals(28, StreamingShuffleChecksum.BLOCK_METADATA_PREAMBLE_LENGTH);
+    // shuffleId (int) + mapId (long) + partitionId (int) + sequenceNumber (long) + the payload
+    // length (int), which is covered so that a truncated payload cannot verify.
+    assertEquals(4 + 8 + 4 + 8 + 4, StreamingShuffleChecksum.BLOCK_METADATA_PREAMBLE_LENGTH);
+  }
+
+  @Test
   public void testComputeBlockSliceAgreesWithWholeArrayForm() {
     byte[] data = payload(512);
     assertEquals(
@@ -497,9 +576,7 @@ public class StreamingShuffleMessageSuite {
         SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, data, 8, 512));
   }
 
-  // ===========================================================================================
   // Group 6: unknown type and id handling.
-  // ===========================================================================================
 
   @Test
   public void testMessageTypeIdsAreFrozen() {
@@ -553,9 +630,7 @@ public class StreamingShuffleMessageSuite {
         () -> StreamingShuffleMessage.Decoder.fromByteBuffer(null));
   }
 
-  // ===========================================================================================
   // Group 7: equals and hashCode contract.
-  // ===========================================================================================
 
   @Test
   public void testDataBlockEqualityIsValueBasedOverThePayload() {
@@ -608,10 +683,11 @@ public class StreamingShuffleMessageSuite {
   }
 
   @Test
-  public void testTheFourFixedSizeMessagesAreNeverEqualToEachOther() {
-    // All four encode to exactly 25 bytes and carry a single long body, so length can never tell
-    // them apart. Given identical header and body values they must still be distinct, which is
-    // what confirms each equals implementation checks the concrete type.
+  public void testTheFourControlMessagesAreNeverEqualToEachOther() {
+    // Three of the four encode to exactly 33 bytes and carry a single long body, so length can
+    // never tell them apart, and a heartbeat's own body opens with the same long. Given identical
+    // header and body values they must still be distinct, which is what confirms each equals
+    // implementation checks the concrete type.
     StreamingShuffleMessage[] identical = {
         new AckMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, SEQUENCE_NUMBER),
         new HeartbeatMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, SEQUENCE_NUMBER),
@@ -621,7 +697,8 @@ public class StreamingShuffleMessageSuite {
             SEQUENCE_NUMBER),
     };
     for (int i = 0; i < identical.length; i++) {
-      assertEquals(33, identical[i].encodedLength());
+      int expectedLength = identical[i] instanceof HeartbeatMessage ? 37 : 33;
+      assertEquals(expectedLength, identical[i].encodedLength());
       for (int j = i + 1; j < identical.length; j++) {
         assertNotEquals(identical[i], identical[j]);
         assertNotEquals(identical[j], identical[i]);
@@ -652,9 +729,7 @@ public class StreamingShuffleMessageSuite {
     assertTrue(rendered.length() < 200, "toString is too long: " + rendered.length());
   }
 
-  // ===========================================================================================
   // Frame bounds and exact consumption.
-  // ===========================================================================================
 
   @Test
   public void testMaximumFrameLengthMatchesTheLargestLegitimateFrame() {
@@ -696,7 +771,7 @@ public class StreamingShuffleMessageSuite {
   @Test
   public void testEachFixedSizeDecoderRequiresAnExactBody() {
     // Directly against each concrete decoder, one byte short and one byte long.
-    for (StreamingShuffleMessage message : fixedSizeMessages()) {
+    for (StreamingShuffleMessage message : exactBodyMessages()) {
       byte[] body = encodedBody(message);
       ByteBuf shortBody = Unpooled.wrappedBuffer(Arrays.copyOf(body, body.length - 1));
       ByteBuf longBody = Unpooled.wrappedBuffer(Arrays.copyOf(body, body.length + 1));
@@ -705,9 +780,7 @@ public class StreamingShuffleMessageSuite {
     }
   }
 
-  // ===========================================================================================
   // Header identifier domains.
-  // ===========================================================================================
 
   @Test
   public void testNegativeHeaderIdentifiersAreRejectedOnDecode() {
@@ -764,9 +837,7 @@ public class StreamingShuffleMessageSuite {
     assertDoesNotThrow(() -> new AckMessage(0, MAP_ID, 0, 0L, AckMessage.NOTHING_CONSUMED));
   }
 
-  // ===========================================================================================
   // Body domains: acknowledgement position, retransmission window, termination count.
-  // ===========================================================================================
 
   @Test
   public void testAcknowledgementPositionDomain() {
@@ -898,9 +969,102 @@ public class StreamingShuffleMessageSuite {
         () -> StreamTerminationMessage.decode(undercount));
   }
 
-  // ===========================================================================================
+  // Shared acknowledgement predicates: the two number spaces, and the boundaries between them.
+  //
+  // acknowledgesWithin and supersedes are the protocol's own normative answers to "may this
+  // acknowledgement be applied", published here so that every producer decides it the same way
+  // rather than each open-coding a comparison. They read two different fields -- one the data
+  // position travelling towards the producer, the other the consumer's outbound control counter --
+  // and confusing the two is silent rather than loud, because both are non-negative longs that
+  // grow. These tests pin each predicate to its own field and to its own boundary.
+
+  @Test
+  public void testAcknowledgesWithinAtBelowAndAboveTheBound() {
+    // At the bound is legal: the consumer has consumed exactly what the producer has issued.
+    assertTrue(ackAt(4L, 10L).acknowledgesWithin(10L));
+    assertTrue(ackAt(4L, 9L).acknowledgesWithin(10L));
+    // One block past the bound is not an optimistic guess but a claim on a block that was never
+    // issued, and honouring it would drain the whole retained window.
+    assertFalse(ackAt(4L, 11L).acknowledgesWithin(10L));
+    // The extremes behave the same way, since the comparison never adds anything.
+    assertTrue(ackAt(4L, Long.MAX_VALUE).acknowledgesWithin(Long.MAX_VALUE));
+    assertFalse(ackAt(4L, Long.MAX_VALUE).acknowledgesWithin(Long.MAX_VALUE - 1L));
+  }
+
+  @Test
+  public void testAcknowledgesWithinTreatsNothingConsumedAsTheOnlySentinel() {
+    // NOTHING_CONSUMED acknowledges no block, so it can overreach no bound.
+    for (long bound : new long[] {AckMessage.NOTHING_CONSUMED, 0L, 7L, Long.MAX_VALUE}) {
+      assertTrue(ackAt(4L, AckMessage.NOTHING_CONSUMED).acknowledgesWithin(bound),
+          "the sentinel must pass against every bound, including " + bound);
+    }
+    // A producer that has issued nothing passes the sentinel as its bound, which must then admit
+    // only that same sentinel: no position can be acknowledged before a position exists.
+    assertFalse(ackAt(4L, 0L).acknowledgesWithin(AckMessage.NOTHING_CONSUMED));
+  }
+
+  @Test
+  public void testAcknowledgesWithinReadsThePositionAndNotTheControlSequence() {
+    // Same position, three different control sequence numbers: the answer may not move.
+    for (long control : new long[] {0L, 1L, Long.MAX_VALUE}) {
+      assertTrue(ackAt(control, 5L).acknowledgesWithin(5L));
+      assertFalse(ackAt(control, 6L).acknowledgesWithin(5L));
+    }
+    // And a message whose control number is far past the bound still passes on its position, which
+    // is the asymmetry that makes passing the wrong bound here undetectable by inspection.
+    assertTrue(ackAt(9_000L, 1L).acknowledgesWithin(2L));
+  }
+
+  @Test
+  public void testSupersedesIsStrictSoADuplicateIsRefused() {
+    AckMessage third = ackAt(3L, 100L);
+    assertTrue(third.supersedes(2L));
+    // Equal is refused, which is what makes applying an acknowledgement idempotent: a duplicate
+    // delivery must not be counted twice.
+    assertFalse(third.supersedes(3L));
+    // Older is refused, which is what makes it safe against reordering.
+    assertFalse(third.supersedes(4L));
+    assertFalse(third.supersedes(Long.MAX_VALUE));
+    // The extreme boundary, for the same reason as the position predicate.
+    assertTrue(ackAt(Long.MAX_VALUE, 0L).supersedes(Long.MAX_VALUE - 1L));
+    assertFalse(ackAt(Long.MAX_VALUE, 0L).supersedes(Long.MAX_VALUE));
+  }
+
+  @Test
+  public void testSupersedesAdmitsTheFirstMessageAgainstTheNothingAppliedSeed() {
+    // A producer seeds its cursor with NOTHING_CONSUMED, and the first control sequence number a
+    // consumer emits on a stream is zero. If that pair did not admit, the very first
+    // acknowledgement of every stream would be discarded as a repeat.
+    assertTrue(ackAt(0L, AckMessage.NOTHING_CONSUMED).supersedes(AckMessage.NOTHING_CONSUMED));
+    assertTrue(ackAt(0L, 0L).supersedes(AckMessage.NOTHING_CONSUMED));
+  }
+
+  @Test
+  public void testSupersedesIsMonotonicOverARunAndIgnoresThePosition() {
+    // Fold a strictly increasing run of control numbers exactly as a producer does. Every message
+    // must be admitted once, and replaying the same run must admit none of them.
+    long applied = AckMessage.NOTHING_CONSUMED;
+    long[] control = {0L, 1L, 2L, 3L};
+    // Positions advance far faster than control numbers, because one acknowledgement covers many
+    // blocks. That is the whole reason freshness is decided on the control sequence: a producer
+    // that tested supersedes against the position it had recorded would admit the first message and
+    // then refuse every later one, and would refuse all of them outright after a reconnect, where
+    // the consumer restarts its counter at zero while its position resumes mid-stream.
+    long[] positions = {40L, 90L, 140L, 190L};
+    for (int i = 0; i < control.length; i++) {
+      AckMessage message = ackAt(control[i], positions[i]);
+      assertTrue(message.supersedes(applied), "control " + control[i] + " must be admitted once");
+      applied = message.sequenceNumber();
+      assertFalse(message.supersedes(applied), "and must not be admitted a second time");
+      // The position is deliberately not consulted: against it, this message would be stale.
+      assertFalse(message.supersedes(positions[i]));
+    }
+    for (int i = 0; i < control.length; i++) {
+      assertFalse(ackAt(control[i], positions[i]).supersedes(applied), "a replayed run is refused");
+    }
+  }
+
   // Payload ownership.
-  // ===========================================================================================
 
   @Test
   public void testConstructorCopiesThePayloadSoLaterMutationCannotReachTheBlock() {
@@ -948,9 +1112,7 @@ public class StreamingShuffleMessageSuite {
     assertTrue(block.verifyChecksum());
   }
 
-  // ===========================================================================================
   // The map id, which is what lets one listener per executor serve every producer on it.
-  // ===========================================================================================
 
   @Test
   public void testMapIdSurvivesTheRoundTripOnEveryMessageType() {
@@ -1021,11 +1183,14 @@ public class StreamingShuffleMessageSuite {
       assertEquals(33, message.encodedLength(), message.getClass().getSimpleName());
       assertEquals(34, message.toByteBuffer().remaining());
     }
+    // A heartbeat carries the same header and the same long, plus the length-prefixed identity
+    // that makes a reconnecting consumer recognisable.
+    assertEquals(StreamingShuffleMessage.HEADER_ENCODED_LENGTH + 8 + 4,
+        heartbeat().encodedLength());
+    assertEquals(38, heartbeat().toByteBuffer().remaining());
   }
 
-  // ===========================================================================================
   // Stream-context binding.
-  // ===========================================================================================
 
   @Test
   public void testStreamContextBindingAcceptsTheMatchingStream() {
@@ -1056,9 +1221,7 @@ public class StreamingShuffleMessageSuite {
         () -> StreamingShuffleMessage.checkStreamContext(null, SHUFFLE_ID, MAP_ID, PARTITION_ID));
   }
 
-  // ===========================================================================================
   // Framing constants: the payload cap and the encoded-frame cap are two different resources.
-  // ===========================================================================================
 
   @Test
   public void testFramingConstantsFormOneConsistentContract() {
@@ -1109,9 +1272,7 @@ public class StreamingShuffleMessageSuite {
         StreamingShuffleMessage.framedLength(empty.encodedLength()));
   }
 
-  // ===========================================================================================
   // Exact wire layout: field order and offsets, asserted byte by byte.
-  // ===========================================================================================
 
   @Test
   public void testHeaderOccupiesFixedWireOffsetsInDeclaredOrder() {
@@ -1154,8 +1315,10 @@ public class StreamingShuffleMessageSuite {
 
   @Test
   public void testShuffleIdAndPartitionIdAreNeverTransposed() {
-    // Two same-typed adjacent fields are the classic transposition hazard, so assert they stay
-    // apart across a real round trip rather than trusting encoder and decoder to agree.
+    // Two int fields in one header are a transposition hazard whether or not they sit next to each
+    // other: the map id encoded between them means a decoder that reads the two in the wrong order
+    // also mis-reads the eight bytes separating them. Assert they survive a real round trip rather
+    // than trusting encoder and decoder to agree.
     AckMessage decoded = (AckMessage) roundTrip(new AckMessage(1, MAP_ID, 2, 3L, 4L));
     assertEquals(1, decoded.shuffleId());
     assertEquals(2, decoded.partitionId());
@@ -1166,29 +1329,30 @@ public class StreamingShuffleMessageSuite {
   }
 
   @Test
-  public void testHeaderRecordCarriesTheFourFieldsInOrder() {
+  public void testHeaderRecordCarriesTheFiveFieldsInOrder() {
     // The record exists so a decoder cannot transpose two same-typed fields; that guarantee is
-    // only worth anything if the constructor taking it preserves the mapping.
+    // only worth anything if the constructor taking it preserves the mapping. All five components
+    // are asserted, because a mapping that drops one is exactly as wrong as one that swaps two.
     StreamingShuffleMessage.Header header = header();
     AckMessage fromHeader = new AckMessage(header, 55L);
 
     assertEquals(StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION, fromHeader.protocolVersion());
     assertEquals(SHUFFLE_ID, fromHeader.shuffleId());
+    assertEquals(MAP_ID, fromHeader.mapId());
     assertEquals(PARTITION_ID, fromHeader.partitionId());
     assertEquals(SEQUENCE_NUMBER, fromHeader.sequenceNumber());
     assertEquals(55L, fromHeader.consumerPosition());
     assertEquals(new AckMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, 55L),
         fromHeader);
     // The same header drives every control message, so each must read it identically.
-    assertEquals(heartbeat(), new HeartbeatMessage(header, TIMESTAMP_MS));
+    assertEquals(heartbeat(),
+        new HeartbeatMessage(header, TIMESTAMP_MS, HeartbeatMessage.NO_CONSUMER_ID));
     assertEquals(retransmit(44L), new RetransmitRequestMessage(header, 44L));
     assertEquals(termination(SEQUENCE_NUMBER),
         new StreamTerminationMessage(header, SEQUENCE_NUMBER));
   }
 
-  // ===========================================================================================
   // Buffer position discipline: a receive buffer rarely starts at zero.
-  // ===========================================================================================
 
   @Test
   public void testPeekProtocolVersionHonoursANonZeroBufferPosition() {
@@ -1225,9 +1389,7 @@ public class StreamingShuffleMessageSuite {
     assertEquals(3, buffer.position(), "decoding must not advance the caller's buffer");
   }
 
-  // ===========================================================================================
   // Version diagnostics and the order in which a frame's fields are checked.
-  // ===========================================================================================
 
   @Test
   public void testCheckProtocolVersionNamesBothRevisions() {
@@ -1260,9 +1422,7 @@ public class StreamingShuffleMessageSuite {
     assertTrue(error.getMessage().contains("Incompatible"), error.getMessage());
   }
 
-  // ===========================================================================================
   // Null rejection at every construction and decode entry point.
-  // ===========================================================================================
 
   @Test
   public void testNullPayloadIsRejectedByEveryConstructionRoute() {
@@ -1283,7 +1443,8 @@ public class StreamingShuffleMessageSuite {
   @Test
   public void testNullHeaderIsRejectedByEveryConstructionRoute() {
     assertThrows(NullPointerException.class, () -> new AckMessage(null, 0L));
-    assertThrows(NullPointerException.class, () -> new HeartbeatMessage(null, TIMESTAMP_MS));
+    assertThrows(NullPointerException.class,
+        () -> new HeartbeatMessage(null, TIMESTAMP_MS, HeartbeatMessage.NO_CONSUMER_ID));
     assertThrows(NullPointerException.class, () -> new RetransmitRequestMessage(null, 0L));
     assertThrows(NullPointerException.class, () -> new StreamTerminationMessage(null, 0L));
     assertThrows(NullPointerException.class, () -> new DataBlockMessage(null, 0L, payload(4)));
@@ -1305,9 +1466,7 @@ public class StreamingShuffleMessageSuite {
     assertThrows(NullPointerException.class, () -> StreamTerminationMessage.decode(null));
   }
 
-  // ===========================================================================================
   // Data block body truncation, distinguished by where the frame runs out.
-  // ===========================================================================================
 
   @Test
   public void testDataBlockDecodeRejectsATruncatedChecksum() {
@@ -1362,9 +1521,7 @@ public class StreamingShuffleMessageSuite {
     assertTrue(error.getMessage().contains("16"), error.getMessage());
   }
 
-  // ===========================================================================================
   // Legality boundaries at the low end of every domain.
-  // ===========================================================================================
 
   @Test
   public void testZeroIsAValidHeaderIdentity() {
@@ -1413,9 +1570,7 @@ public class StreamingShuffleMessageSuite {
     assertEquals(Long.MAX_VALUE, ((HeartbeatMessage) roundTrip(beat)).timestampMs());
   }
 
-  // ===========================================================================================
   // Rendering: every message names its own body field and stays bounded.
-  // ===========================================================================================
 
   @Test
   public void testControlMessagesRenderTheirOwnBodyFieldAndStayBounded() {
@@ -1436,9 +1591,7 @@ public class StreamingShuffleMessageSuite {
     }
   }
 
-  // ===========================================================================================
   // The ownership-transferring factory, which is the one route that does not copy.
-  // ===========================================================================================
 
   @Test
   public void testWithOwnedPayloadAdoptsTheArrayItIsGiven() {
@@ -1462,9 +1615,7 @@ public class StreamingShuffleMessageSuite {
     assertEquals(adopted, roundTrip(adopted));
   }
 
-  // ===========================================================================================
   // The shape of the protocol surface itself: internal, final, and not instantiable by mistake.
-  // ===========================================================================================
 
   @Test
   public void testEveryProtocolTypeIsMarkedPrivateApi() {
@@ -1511,17 +1662,16 @@ public class StreamingShuffleMessageSuite {
   }
 
   @Test
-  public void testOnlyTheFramingByteDistinguishesTheFourFixedSizeMessagesOnTheWire() {
-    // The four control messages encode to byte-identical bodies when their single body field
-    // happens to match, so the framing byte is the only thing that tells the decoder which one it
-    // is holding. If routing ever fell back on anything else it would silently mis-decode here.
-    // The one value legal in all four body domains at once: at or above the sequence number for a
+  public void testOnlyTheFramingByteDistinguishesTheFixedSizeMessagesOnTheWire() {
+    // Three control messages encode to byte-identical bodies when their single body field happens
+    // to match, so the framing byte is the only thing that tells the decoder which one it is
+    // holding. If routing ever fell back on anything else it would silently mis-decode here.
+    // The one value legal in all three body domains at once: at or above the sequence number for a
     // retransmission window's upper bound, equal to it for a termination's block count, and
-    // non-negative for an acknowledgement position and a timestamp.
+    // non-negative for an acknowledgement position.
     long sharedBodyValue = SEQUENCE_NUMBER;
     StreamingShuffleMessage[] messages = {
         ack(sharedBodyValue),
-        new HeartbeatMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, sharedBodyValue),
         new RetransmitRequestMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER,
             sharedBodyValue),
         termination(sharedBodyValue),
@@ -1538,6 +1688,14 @@ public class StreamingShuffleMessageSuite {
       assertSame(message.getClass(), decoded.getClass());
       assertEquals(message, decoded);
     }
+    // A heartbeat opens its body with the same long and is nevertheless not one of them: its
+    // identity field makes the body longer, so routing on length alone would mis-decode it too.
+    HeartbeatMessage beat =
+        new HeartbeatMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, sharedBodyValue);
+    byte[] beatBody = encodedBody(beat);
+    assertEquals(reference.length + 4, beatBody.length);
+    assertArrayEquals(reference, Arrays.copyOfRange(beatBody, 0, reference.length));
+    assertSame(HeartbeatMessage.class, roundTrip(beat).getClass());
   }
 
   @Test
@@ -1603,9 +1761,7 @@ public class StreamingShuffleMessageSuite {
     }
   }
 
-  // ===========================================================================================
   // Helpers.
-  // ===========================================================================================
 
   /**
    * Framed round trip asserting equals, hashCode and toString, mirroring the helper that
@@ -1631,8 +1787,18 @@ public class StreamingShuffleMessageSuite {
     };
   }
 
-  /** The four messages whose encoded form is exactly 33 bytes. */
+  /** The three messages whose encoded form is exactly 33 bytes. */
   private StreamingShuffleMessage[] fixedSizeMessages() {
+    return new StreamingShuffleMessage[] {
+        ack(40L), retransmit(44L), termination(SEQUENCE_NUMBER)};
+  }
+
+  /**
+   * Every message whose decoder demands an exact body: the three fixed-size ones and a heartbeat,
+   * whose body is variable in the identity it carries but exact once that identity's length has
+   * been read.
+   */
+  private StreamingShuffleMessage[] exactBodyMessages() {
     return new StreamingShuffleMessage[] {
         ack(40L), heartbeat(), retransmit(44L), termination(SEQUENCE_NUMBER)};
   }
@@ -1650,6 +1816,15 @@ public class StreamingShuffleMessageSuite {
 
   private AckMessage ack(long consumerPosition) {
     return new AckMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, consumerPosition);
+  }
+
+  /**
+   * An acknowledgement whose control sequence number and consumed position are chosen separately,
+   * because the predicates that read them are only meaningfully tested when the two differ.
+   */
+  private AckMessage ackAt(long controlSequenceNumber, long consumerPosition) {
+    return new AckMessage(
+        SHUFFLE_ID, MAP_ID, PARTITION_ID, controlSequenceNumber, consumerPosition);
   }
 
   private HeartbeatMessage heartbeat() {

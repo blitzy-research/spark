@@ -47,10 +47,19 @@ import org.apache.spark.util.{Clock, SystemClock, ThreadUtils, Utils}
  *
  * The streaming shuffle path holds already-framed blocks in memory between the moment they are
  * produced and the moment the consumer acknowledges them, because an acknowledged block is the
- * only block whose bytes may be discarded. That window is what makes retransmission possible, and
- * it is also what makes a hard memory bound mandatory. This class is that bound: it admits blocks
- * against an explicit budget, evicts to local disk when utilisation crosses the configured
+ * only block whose *memory* may be discarded. That window is what makes retransmission possible,
+ * and it is also what makes a hard memory bound mandatory. This class is that bound: it admits
+ * blocks against an explicit budget, evicts to local disk when utilisation crosses the configured
  * threshold, and releases memory the instant an acknowledgement arrives.
+ *
+ * Two lifetimes meet here, and keeping them apart is the class's other job. Buffered bytes belong
+ * to the producing task: they are acquired from its memory manager and have to be returned when it
+ * ends. Spilled segments belong to the shuffle: they are ordinary files in the local directories,
+ * and the reduce side reads them after the map stage has finished, because that is the only time
+ * the scheduler lets it read at all. So an acknowledgement releases memory and never a segment, and
+ * a successful producer hands its files to the executor-scoped block resolver -- which unlinks them
+ * at generation withdrawal, at shuffle unregistration or at its own shutdown -- rather than
+ * deleting output that a later attempt of a reduce task is entitled to read again.
  *
  * Extension by subclassing only. This class extends [[MemoryConsumer]] and overrides its abstract
  * `spill(long, MemoryConsumer)` callback. That single decision is what buys the streaming path
@@ -72,7 +81,8 @@ import org.apache.spark.util.{Clock, SystemClock, ThreadUtils, Utils}
  * Budget derivation, and why it is executor scoped. The aggregate allowance is
  * `onHeapUnifiedMemory * bufferSizePercent / 100` and the per-partition allowance is that aggregate
  * divided by the reduce partition count, which is exactly the contracted
- * `(executorMemory * bufferPercent) / numPartitions`. The on-heap unified region is recovered from
+ * `(executorMemory * bufferPercent) / numPartitions` with `bufferPercent` read as the percentage it
+ * is named for. The on-heap unified region is recovered from
  * the callable public surface of `MemoryManager` as
  * `maxOnHeapStorageMemory + onHeapExecutionMemoryUsed`, because `UnifiedMemoryManager` defines
  * `maxOnHeapStorageMemory` as `maxHeapMemory - onHeapExecutionMemoryUsed`; the two therefore sum
@@ -169,15 +179,17 @@ import org.apache.spark.util.{Clock, SystemClock, ThreadUtils, Utils}
  * which is why an empty partition's bookkeeping is retained rather than discarded -- the number of
  * entries is bounded by the reduce partition count either way.
  *
- * Cleanup. Release is registered on `TaskContext.addTaskCompletionListener`, so buffers are freed
- * and spill files deleted on success, on failure and on cancellation alike. This is the mechanism
- * by which the zero-leak requirement is met, and it is machine checked: the test JVM runs with
+ * Cleanup. Release is registered on `TaskContext.addTaskCompletionListener`, so buffered memory is
+ * freed on success, on failure and on cancellation alike. This is the mechanism by which the
+ * zero-leak requirement is met, and it is machine checked: the test JVM runs with
  * `spark.unsafe.exceptionOnMemoryLeak` enabled, so a retained reservation fails the build rather
- * than passing silently. Spill files are reference counted rather than deleted the instant their
- * last record is retired, because a block resolver hands out lazily opened file segments: a reader
- * takes a lease with [[acquireSpillFileLease]] and drops it with [[releaseSpillFileLease]], and the
- * file is unlinked only once it is retired and unleased. [[close]] is the bounded backstop and
- * unlinks unconditionally, because no reader may outlive the task that produced the bytes.
+ * than passing silently. What becomes of the spill files at that moment depends on whether this
+ * instance still owns them: a producer that succeeded hands them to the executor-scoped block
+ * resolver first and [[close]] then leaves every one in place, while a producer that failed still
+ * owns them and [[close]] unlinks them all. Files are reference counted either way rather than
+ * unlinked the instant their owner is done with them, because a block resolver hands out lazily
+ * opened file segments: a reader takes a lease with [[acquireSpillFileLease]] and drops it with
+ * [[releaseSpillFileLease]], and an unlink waits on the last lease.
  *
  * Configuration is read once here and held immutably, which is what makes "configuration changes
  * require an executor restart" true by construction rather than by documentation.
@@ -220,11 +232,9 @@ private[spark] class MemorySpillManager(
 
   import MemorySpillManager._
 
-  // ----------------------------------------------------------------------------------------------
   // Configuration. Read once, held immutably. The two percentage keys are range validated by their
   // own ConfigEntry definitions, so an out-of-range value is rejected here at read time with
   // INVALID_CONF_VALUE.REQUIREMENT and never reaches the arithmetic below.
-  // ----------------------------------------------------------------------------------------------
 
   // Held for diagnostics only. The percentages that actually size the budget are read once by the
   // executor-scoped quota, because the budget is shared and must be derived once per executor
@@ -237,11 +247,9 @@ private[spark] class MemorySpillManager(
   // files are buffered identically to every other spill file this executor produces.
   private val fileBufferSizeBytes: Int = conf.get(SHUFFLE_FILE_BUFFER_SIZE).toInt * 1024
 
-  // ----------------------------------------------------------------------------------------------
   // Deferred environment access. See the class comment: none of these may be dereferenced during
   // construction, because the shuffle manager that owns this component is built before the memory
   // manager exists on the driver.
-  // ----------------------------------------------------------------------------------------------
 
   private lazy val blockManager: BlockManager = SparkEnv.get.blockManager
 
@@ -292,10 +300,8 @@ private[spark] class MemorySpillManager(
   private lazy val quota: ExecutorBufferQuota =
     quotaOverride.getOrElse(MemorySpillManager.executorQuota(conf))
 
-  // ----------------------------------------------------------------------------------------------
   // Mutable state. Everything in this block is guarded by `lock` except the atomics, which are
   // deliberately lock free so that a diagnostic read never contends with a producer.
-  // ----------------------------------------------------------------------------------------------
 
   private val lock = new Object()
 
@@ -338,14 +344,18 @@ private[spark] class MemorySpillManager(
 
   // Retained spill records across every partition. Guarded by `lock`. Evicting a block returns its
   // whole charge -- payload and per-block overhead alike -- to the quota while its record stays on
-  // the heap, so the record count is the one thing the byte budget stops bounding. Tracked as a
+  // the heap, and an acknowledgement does not remove it either, since the segment it names stays
+  // readable for the shuffle's lifetime. So the record count is the one thing the byte budget stops
+  // bounding, and `MAX_RETAINED_SPILL_RECORDS_TOTAL` is what bounds it instead. Tracked as a
   // running total rather than derived, because admission consults it on the hot path.
   private var spilledRecordCount = 0
 
   // Acknowledged position per registered consumer, per partition. Guarded by `lock`, because a
-  // position and the retirement it authorises must be decided in the same indivisible step. Only a
-  // consumer present here may acknowledge anything, and retirement never advances past the slowest
-  // entry, so a fast consumer cannot discard bytes a slower sibling has yet to receive.
+  // position and the memory retirement it authorises must be decided in the same indivisible step.
+  // Only a consumer present here may acknowledge anything, and retirement never advances past the
+  // slowest entry, so a fast consumer cannot free memory holding a block a slower sibling has yet
+  // to receive. Positions outlive an owning task whose files were handed on, because the
+  // acknowledgement that retires the last of them can arrive after the task has ended.
   private val consumerPositions = new mutable.HashMap[String, mutable.HashMap[Int, Long]]()
 
   private var lastPollTimeMs = -1L
@@ -431,11 +441,15 @@ private[spark] class MemorySpillManager(
 
   /**
    * Per-partition buffer state: the in-memory blocks still awaiting acknowledgement, the blocks an
-   * eviction has detached and is currently writing, the blocks already on disk and still awaiting
-   * acknowledgement, the three byte tallies, the sequence watermarks and the last-access stamp that
-   * breaks eviction ties. Every queue is kept in ascending sequence-number order, and every spilled
-   * block precedes every in-memory block for the same partition, so a monotonically advancing
-   * consumer position always retires a prefix.
+   * eviction has detached and is currently writing, the durable records of the blocks already on
+   * disk, the three byte tallies, the sequence watermarks and the last-access stamp that breaks
+   * eviction ties. Every queue is kept in ascending sequence-number order, and every spilled block
+   * precedes every in-memory block for the same partition, so a monotonically advancing consumer
+   * position always retires a prefix of the memory.
+   *
+   * `spilledBlockRecords` outlives acknowledgement, unlike the other two queues: the segments it
+   * names are this map task's output on local disk, and they stay readable until their owner
+   * unlinks them.
    *
    * `spillingBlocks` is owned exclusively by the eviction in progress. Their payloads are still on
    * the heap and still charged, so they are still counted; an acknowledgement covering them only
@@ -479,9 +493,7 @@ private[spark] class MemorySpillManager(
     def isEmpty: Boolean = retainedBlockCount == 0 && pendingBytes == 0L
   }
 
-  // ----------------------------------------------------------------------------------------------
   // Budget and registration
-  // ----------------------------------------------------------------------------------------------
 
   /**
    * Records the reduce partition count of the shuffle this consumer serves, which is the divisor
@@ -566,7 +578,9 @@ private[spark] class MemorySpillManager(
 
   /**
    * The per-partition allowance for an arbitrary partition count, implementing the contracted
-   * `(executorMemory * bufferPercent) / numPartitions` without requiring a registration first.
+   * `(executorMemory * bufferPercent) / numPartitions` -- with `bufferPercent` read as a
+   * percentage, so the aggregate is divided by a hundred first -- without requiring a registration
+   * first.
    *
    * @param partitions the partition count to divide the aggregate allowance by; must be positive
    */
@@ -595,10 +609,8 @@ private[spark] class MemorySpillManager(
     math.max(0L, math.min(MAX_BLOCK_PAYLOAD_BYTES.toLong, allowance))
   }
 
-  // ----------------------------------------------------------------------------------------------
   // Inspection. Every accessor below is a pure read; none of them disturbs the eviction order, so
   // a test or a diagnostic may call them freely without perturbing what it is measuring.
-  // ----------------------------------------------------------------------------------------------
 
   /** Total bytes currently held in memory across all partitions, awaiting acknowledgement. */
   def bufferedBytes: Long = lock.synchronized(bufferedMemoryBytes)
@@ -687,6 +699,24 @@ private[spark] class MemorySpillManager(
 
   /** Whether this consumer has been closed and will refuse any further admission. */
   def isClosed: Boolean = closed.get()
+
+  /**
+   * Whether this store can still serve the output it retained, which is a different question from
+   * whether it can still accept a block.
+   *
+   * The two lifetimes this class straddles are why the questions differ. Memory belongs to the
+   * producing task: it is acquired from that task's memory manager and has to be returned when the
+   * task ends. Spilled segments belong to the shuffle: they are ordinary files in the local
+   * directories, and the reduce side reads them after the map stage has finished, which is the only
+   * time the scheduler lets it read at all. So a closed store whose files have been handed to the
+   * block resolver goes on answering lookups, registrations and acknowledgements over those files,
+   * whereas a closed store that still owned its files has already unlinked them and can answer
+   * nothing.
+   */
+  def servesRetainedOutput: Boolean = lock.synchronized(servesRetainedOutputLocked)
+
+  /** [[servesRetainedOutput]] for a caller already holding `lock`. */
+  private def servesRetainedOutputLocked: Boolean = !closed.get() || spillFilesDetached
 
   /**
    * The exact order in which eviction will consider partitions: largest evictable footprint first,
@@ -805,6 +835,36 @@ private[spark] class MemorySpillManager(
       buffer.memoryBlocks.exists(_.sequenceNumber == sequenceNumber) ||
         buffer.spillingBlocks.exists(_.sequenceNumber == sequenceNumber) ||
         buffer.spilledBlockRecords.exists(_.sequenceNumber == sequenceNumber)
+    }
+  }
+
+  /**
+   * The payload size of one retained block, without materialising it.
+   *
+   * A producer pacing a replay needs each block's size in order to charge it against a credit
+   * window and a rate limiter, and it needs that number *before* deciding whether to queue the
+   * block at all. Obtaining it from [[retainedPayload]] would read the segment off disk and
+   * decompress it -- a disk round trip and an allocation of up to the protocol's block cap, per
+   * block, discarded immediately -- so a bounded replay of a long window would spend more work
+   * measuring blocks than sending them. Both halves of the retained window already know the
+   * answer: a buffered block carries its bytes, and a spilled record carries the payload length
+   * recorded when it was written.
+   *
+   * Like [[retainsBlock]], and unlike [[bufferedBlock]], this does not count as a use of the
+   * partition: asking how large a block is must not reorder which partition is evicted next.
+   *
+   * @param partitionId the reduce partition the block belongs to
+   * @param sequenceNumber the sequence number of the block to measure
+   * @return the payload length in bytes, or `None` if the block is no longer retained
+   */
+  def retainedPayloadLength(partitionId: Int, sequenceNumber: Long): Option[Int] = {
+    lock.synchronized {
+      partitionBuffers.get(partitionId).flatMap { buffer =>
+        buffer.memoryBlocks.find(_.sequenceNumber == sequenceNumber).map(_.length)
+          .orElse(buffer.spillingBlocks.find(_.sequenceNumber == sequenceNumber).map(_.length))
+          .orElse(buffer.spilledBlockRecords.find(_.sequenceNumber == sequenceNumber)
+            .map(_.payloadLength))
+      }
     }
   }
 
@@ -963,9 +1023,7 @@ private[spark] class MemorySpillManager(
       s"diskBytesSpilled=$diskBytesSpilled, closed=$isClosed)"
   }
 
-  // ----------------------------------------------------------------------------------------------
   // Admission
-  // ----------------------------------------------------------------------------------------------
 
   /**
    * Admits one already-framed block into the producer buffer, reserving its bytes from the task
@@ -1134,8 +1192,9 @@ private[spark] class MemorySpillManager(
         s"[0, $partitionDomainBound)")
     } else if (spilledRecordCount >= MAX_RETAINED_SPILL_RECORDS_TOTAL) {
       // Every retained spill record is heap this instance no longer charges for, because eviction
-      // returned the whole charge to the quota. Bounding their number across partitions is
-      // therefore the only thing standing between a consumer that stopped acknowledging and
+      // returned the whole charge to the quota, and a record outlives acknowledgement because the
+      // segment it names is map output rather than a retransmission buffer. Bounding their number
+      // across partitions is therefore the only thing standing between a large map output and
       // unbounded metadata; reaching it raises pressure and routes the shuffle to fallback.
       AdmissionRefused(s"this consumer already retains $spilledRecordCount spilled block records " +
         s"across all partitions, the maximum of $MAX_RETAINED_SPILL_RECORDS_TOTAL")
@@ -1151,7 +1210,8 @@ private[spark] class MemorySpillManager(
         s"of $partitionCeiling bytes; frame to at most $maxAdmissiblePayloadBytes payload bytes")
     } else if (retained >= MAX_RETAINED_BLOCKS_PER_PARTITION) {
       // The per-block charge bounds how much payload one partition can hold, but a spilled block's
-      // retained record is heap this class does not charge for, so the block count is bounded too.
+      // retained record is heap this class does not charge for and holds for the shuffle's lifetime
+      // rather than until acknowledgement, so the block count is bounded too.
       AdmissionRefused(s"partition $partitionId already retains $retained blocks in memory " +
         s"and on disk, the maximum of $MAX_RETAINED_BLOCKS_PER_PARTITION")
     } else if (partitionBytes + required > partitionCeiling) {
@@ -1229,9 +1289,7 @@ private[spark] class MemorySpillManager(
     }
   }
 
-  // ----------------------------------------------------------------------------------------------
   // Threshold polling and eviction
-  // ----------------------------------------------------------------------------------------------
 
   /**
    * Performs one cadence-gated utilisation check, evicting if the threshold is met.
@@ -1239,8 +1297,8 @@ private[spark] class MemorySpillManager(
    * Driven on the contracted 100 ms cadence by the executor's shared ticker whenever this instance
    * was constructed with `autoPoll` enabled, and callable by the owner from its own thread as often
    * as it likes besides. The 100 ms gate, measured with the injected clock, suppresses the check in
-   * between either way, so a test that withholds the instance from the ticker can advance a manual
-   * clock and observe exactly which calls do work.
+   * between either way, so which calls do work is a function of the injected clock rather than of
+   * how often the caller happens to ask.
    *
    * @return true when this call evicted at least one partition
    */
@@ -1585,12 +1643,13 @@ private[spark] class MemorySpillManager(
    * Re-attaches or retires every block a planned eviction detached, and reports exactly what left
    * memory. Must be called while holding `lock`.
    *
-   * Three outcomes are handled. A partition that was written out has its durable records published,
-   * minus any the consumer acknowledged while the write was in flight; a partition that could not
-   * be written has its blocks returned to the head of its queue, still servable, so a failing disk
-   * costs the shuffle its fast path and never its data; and a partition belonging to an instance
-   * that was closed mid-write releases nothing at all, because closure has already released those
-   * bytes and a second release would drive the memory manager's balance negative.
+   * Three outcomes are handled. A partition that was written out has every durable record
+   * published, whether or not a consumer acknowledged it while the write was in flight, because a
+   * segment on disk is map output rather than a retransmission buffer; a partition that could not
+   * be written has its unacknowledged blocks returned to the head of its queue, still servable, so
+   * a failing disk costs the shuffle its fast path and never its data; and a partition belonging to
+   * an instance closed mid-write releases nothing at all, because closure has already released
+   * those bytes and a second release would drive the memory manager's balance negative.
    */
   private def publishEvictionLocked(
       written: Seq[(Int, List[BufferedBlock], Option[Seq[SpilledBlock]])]): EvictionResult = {
@@ -1613,20 +1672,22 @@ private[spark] class MemorySpillManager(
           val watermark = buffer.acknowledgedThroughSequence
           outcome match {
             case Some(records) =>
-              // An acknowledgement that landed while the write was in flight only advanced the
-              // watermark; dropping the records it covers is what retires them here, and a file
-              // covering nothing that survives is unlinked immediately rather than leaked.
-              val survivors = records.filter(_.sequenceNumber > watermark)
-              buffer.spilledBlockRecords ++= survivors
-              spilledRecordCount += survivors.size
-              survivors.foreach { record =>
+              // Every written record is published, including one an acknowledgement covered while
+              // the write was in flight. A durable segment is map output rather than a
+              // retransmission buffer: acknowledgement releases the memory a block occupied, never
+              // the copy on disk that a later reduce attempt has to be able to read.
+              buffer.spilledBlockRecords ++= records
+              spilledRecordCount += records.size
+              records.foreach { record =>
                 spillFilesByBlockId.update(record.blockId, record.file)
                 spillFileBlockIds.update(record.file, record.blockId)
               }
               buffer.lastAccessTimeMs = now
               committedDiskBytes += records.foldLeft(0L)((acc, record) => acc + record.length)
               evictedPartitions += 1
-              if (survivors.isEmpty) {
+              if (records.isEmpty) {
+                // No record names the file, so nothing could ever locate it again; unlinking it
+                // here is what keeps an unnameable file from being left on local disk.
                 spilledFiles.foreach { file =>
                   if (retireSpillFileLocked(file)) {
                     filesToDelete += file
@@ -1718,7 +1779,7 @@ private[spark] class MemorySpillManager(
         writer.recordWritten()
         val segment = writer.commitAndGet()
         records += SpilledBlock(partitionId, block.sequenceNumber, blockId, tempFile,
-          segment.offset, segment.length)
+          segment.offset, segment.length, block.data.length)
       }
       writer.close()
       succeeded = true
@@ -1767,9 +1828,7 @@ private[spark] class MemorySpillManager(
     }
   }
 
-  // ----------------------------------------------------------------------------------------------
   // Acknowledgement-driven reclamation
-  // ----------------------------------------------------------------------------------------------
 
   /**
    * Admits a consumer to the acknowledgement protocol for this producer.
@@ -1788,13 +1847,24 @@ private[spark] class MemorySpillManager(
    * Idempotent: re-registering a consumer already present keeps the position it has reached, so a
    * reconnecting consumer does not rewind the window it has already advanced.
    *
+   * A consumer may be admitted after the producing task has finished, and normally is: the
+   * scheduler starts no reduce task before its map stage completes, so almost every consumer
+   * subscribes to a store that has already released its memory and handed its files to the block
+   * resolver. Registration is therefore governed by whether this store still serves its output --
+   * [[servesRetainedOutput]] -- rather than by whether the producing task is still running. A store
+   * that owns its files and has been closed serves nothing, because those files are gone.
+   *
    * @param consumerId identity of the consumer, as the producer knows it; must be non-empty
+   * @return true when the consumer is now registered, false when this store no longer serves
    */
-  def registerConsumer(consumerId: String): Unit = {
+  def registerConsumer(consumerId: String): Boolean = {
     require(consumerId != null && consumerId.nonEmpty, "consumerId must be non-empty")
     lock.synchronized {
-      if (!closed.get()) {
+      if (servesRetainedOutputLocked) {
         consumerPositions.getOrElseUpdate(consumerId, new mutable.HashMap[Int, Long]())
+        true
+      } else {
+        false
       }
     }
   }
@@ -1847,9 +1917,9 @@ private[spark] class MemorySpillManager(
 
   /**
    * Records that a consumer has received everything in a partition up to and including
-   * `throughSequenceNumber`, and retires whatever that makes retirable -- which is what a consumer
-   * acknowledgement means: those bytes have been received and need no longer be retained for
-   * retransmission.
+   * `throughSequenceNumber`, and releases the buffer memory that makes releasable -- which is what
+   * a consumer acknowledgement means: those bytes reached their consumer, so the producer need not
+   * hold them in memory against a retransmission request.
    *
    * Three checks stand between an acknowledgement and the buffers it would retire, and all three
    * are evaluated under the same monitor that performs the retirement:
@@ -1862,14 +1932,17 @@ private[spark] class MemorySpillManager(
    *    for the partition, so a position of `Long.MaxValue` -- or any other value plucked from the
    *    air -- retires exactly the blocks that were really sent and not one more.
    *
-   * Retirement then advances to the *minimum* position across every registered consumer, so a block
-   * is released only once every consumer entitled to it has confirmed receipt. In-memory blocks
-   * give their bytes straight back to the memory manager. Blocks that had already been evicted gave
-   * theirs back at eviction time, so all that remains for them is to delete the backing file, and
-   * that happens only once no retained record still refers to it and no reader holds a lease on it.
-   * Because a partition's spilled blocks always precede its in-memory blocks, and both queues are
-   * ordered by sequence number, a monotonically advancing retirement position always retires a
-   * prefix.
+   * Retirement then advances to the *minimum* position across every registered consumer, so memory
+   * is released only once every consumer entitled to it has confirmed receipt. Because a
+   * partition's spilled blocks always precede its in-memory blocks, and both queues are ordered
+   * by sequence number, a monotonically advancing retirement position always retires a prefix.
+   *
+   * What an acknowledgement releases is *memory*, and only memory. A block that had already been
+   * evicted gave its bytes back at eviction time and leaves nothing here to release: its segment on
+   * disk is map output, not a retransmission buffer, and stays readable until the block resolver
+   * unlinks it at generation withdrawal, at shuffle unregistration or at its own shutdown.
+   * Unlinking it on acknowledgement would destroy output a later attempt of the same reduce task is
+   * entitled to read, which is the re-readability Spark's recovery model assumes of map output.
    *
    * The whole operation is synchronous and does no work proportional to anything but the retired
    * prefix, which is what keeps it inside the 100 ms reclamation target. The target is measured
@@ -1885,18 +1958,21 @@ private[spark] class MemorySpillManager(
   def acknowledge(consumerId: String, partitionId: Int, throughSequenceNumber: Long): Long = {
     require(consumerId != null && consumerId.nonEmpty, "consumerId must be non-empty")
     require(partitionId >= 0, s"partitionId must be non-negative, but was $partitionId")
-    if (closed.get()) {
+    val accepted = lock.synchronized {
+      // A store that has handed its files to the resolver still accepts acknowledgements, and must:
+      // its consumers do almost all of their acknowledging after the producing task has ended, and
+      // refusing them there would leave every cursor frozen at the position it held when the task
+      // finished -- so a reconnecting consumer would be replayed output it had already consumed.
+      // Such an acknowledgement releases no memory, because there is none left to release; what it
+      // advances is the cursor that bounds replay.
+      servesRetainedOutputLocked &&
+        recordAcknowledgementLocked(consumerId, partitionId, throughSequenceNumber)
+    }
+    if (!accepted) {
+      rejectedAcknowledgements.incrementAndGet()
       0L
     } else {
-      val accepted = lock.synchronized {
-        recordAcknowledgementLocked(consumerId, partitionId, throughSequenceNumber)
-      }
-      if (!accepted) {
-        rejectedAcknowledgements.incrementAndGet()
-        0L
-      } else {
-        reclaim(partitionId)
-      }
+      reclaim(partitionId)
     }
   }
 
@@ -1955,10 +2031,27 @@ private[spark] class MemorySpillManager(
     }
   }
 
+  /**
+   * Releases the acknowledged prefix of one partition's *memory*, and only its memory.
+   *
+   * The asymmetry between the two things this class retains is the whole of this method. In-memory
+   * blocks are task-managed execution memory: they must be handed back as soon as every consumer
+   * entitled to them has confirmed receipt, which is what the hundred-millisecond reclamation bound
+   * is about. Spilled segments are not memory at all -- they are the map output, on local disk,
+   * whose lifetime is the shuffle's rather than any one reduce attempt's. Unlinking them because a
+   * consumer acknowledged them would destroy output a *later* attempt of that same reduce task is
+   * entitled to read, and Spark's recovery model depends on map output being re-readable until the
+   * shuffle is unregistered. So an acknowledgement never unlinks a segment: a segment is unlinked
+   * either by an owning [[close]] -- the producing task failed, so its output is going away anyway
+   * -- or by the block resolver once [[releaseSpillFileOwnership]] has made the resolver the owner,
+   * at generation withdrawal, at shuffle unregistration or at resolver shutdown.
+   *
+   * The watermark still advances on every acknowledgement, because it is what an eviction in flight
+   * consults to avoid re-publishing memory this method has already released.
+   */
   private def reclaim(partitionId: Int): Long = {
     val startTimeMs = clock.getTimeMillis()
     var memoryFreed = 0L
-    val filesToDelete = new mutable.ArrayBuffer[File]()
     lock.synchronized {
       // The retirement position is the minimum across every registered consumer, recomputed here
       // rather than passed in, so that a departing consumer and an advancing one reach the same
@@ -1981,34 +2074,16 @@ private[spark] class MemorySpillManager(
           bufferedMemoryBytes -= bytes
           memoryFreed += bytes
         }
-        val releasedFiles = new mutable.ArrayBuffer[File]()
-        while (buffer.spilledBlockRecords.nonEmpty &&
-            buffer.spilledBlockRecords.head.sequenceNumber <= position) {
-          releasedFiles += buffer.spilledBlockRecords.removeHead().file
-          spilledRecordCount -= 1
-        }
-        if (releasedFiles.nonEmpty) {
-          // A file is retired once no retained record still refers to it, and unlinked only once it
-          // is also unleased: a block resolver may be holding a lazily opened segment on it, and
-          // unlinking underneath that reader is precisely the race the lease exists to close.
-          val stillReferenced = buffer.spilledBlockRecords.map(_.file).toSet
-          releasedFiles.distinct.filterNot(stillReferenced.contains).foreach { file =>
-            if (retireSpillFileLocked(file)) {
-              filesToDelete += file
-            }
-          }
-        }
         buffer.lastAccessTimeMs = clock.getTimeMillis()
-        // The partition's bookkeeping is deliberately retained even when it holds nothing. It
-        // carries the sequence watermark that keeps the stream gap-free, and discarding it would
-        // let a partition that drained completely re-admit a sequence number it had already
-        // accepted. The number of entries is bounded by the reduce partition count either way.
+        // The partition's bookkeeping is deliberately retained even when it holds no memory. It
+        // carries the sequence watermark that keeps the stream gap-free, and the durable segment
+        // records through which a later consumer -- or a later attempt of the same one -- is
+        // served. The number of entries is bounded by the reduce partition count either way.
       }
     }
     if (memoryFreed > 0L) {
       releaseReclaimedBytes(memoryFreed)
     }
-    filesToDelete.foreach(deleteSpillFile)
     val elapsedMs = clock.getTimeMillis() - startTimeMs
     lastReclamationMs.set(elapsedMs)
     if (elapsedMs > RECLAMATION_DEADLINE_MS) {
@@ -2034,9 +2109,7 @@ private[spark] class MemorySpillManager(
     memoryFreed
   }
 
-  // ----------------------------------------------------------------------------------------------
   // Lifecycle
-  // ----------------------------------------------------------------------------------------------
 
   /**
    * Registers release on task completion, so buffers are freed and spill files removed whether the
@@ -2131,9 +2204,14 @@ private[spark] class MemorySpillManager(
           spillFilesByBlockId.clear()
           spillFileBlockIds.clear()
         }
-        // The consumer registry is this instance's heap too, and once closed no acknowledgement can
-        // retire anything, so keeping positions alive would serve nothing but the leak detector.
-        consumerPositions.clear()
+        // The consumer registry survives a detached close and goes with an owning one. Each
+        // consumer's position is where its replay would resume from, so discarding it at task
+        // completion would make every reconnecting consumer look like one that had never been
+        // served -- and it is precisely after task completion that consumers do their reading. An
+        // owning close has nothing left to replay, so its registry is only heap.
+        if (ownsFiles) {
+          consumerPositions.clear()
+        }
         true
       } else {
         false
@@ -2172,7 +2250,6 @@ private[spark] class MemorySpillManager(
     }
   }
 
-  // ----------------------------------------------------------------------------------------------
   // Spill file leases. A block resolver serves a spilled block by handing out a lazily opened file
   // segment, so the file must outlive the record that named it: a consumer acknowledgement can
   // retire the last record referring to a file at any moment, and unlinking it underneath a reader
@@ -2180,7 +2257,6 @@ private[spark] class MemorySpillManager(
   // spill file rather than as anything diagnosable. Reference counting closes it: a reader leases
   // the file for as long as it may open it, and the file is unlinked only once it is both retired
   // and unleased.
-  // ----------------------------------------------------------------------------------------------
 
   /**
    * Hands the spill files this instance produced to the executor-scoped block resolver.
@@ -2228,9 +2304,8 @@ private[spark] class MemorySpillManager(
       // A closed instance grants no lease while it still owns its files, because it has already
       // unlinked them. Once ownership has been handed to the block resolver the files are still
       // there and serving them is the entire purpose of the hand-off, so a detached close keeps
-      // granting. A retired file is refused in either case: every record in it was acknowledged.
-      val servable = !closed.get() || spillFilesDetached
-      if (!servable || retiredSpillFiles.contains(file)) {
+      // granting. A retired file is refused in either case: nothing retained names it any more.
+      if (!servesRetainedOutputLocked || retiredSpillFiles.contains(file)) {
         false
       } else {
         spillFileLeases.update(file, spillFileLeases.getOrElse(file, 0) + 1)
@@ -2344,9 +2419,7 @@ private[spark] class MemorySpillManager(
     }
   }
 
-  // ----------------------------------------------------------------------------------------------
   // Telemetry and disk helpers
-  // ----------------------------------------------------------------------------------------------
 
   /** Advances the peak-reservation high-water mark without taking a lock. */
   private def recordPeakMemory(): Unit = {
@@ -2548,8 +2621,8 @@ private[spark] object MemorySpillManager extends Logging {
    * number of occurrences it stands in for, so the aggregate record loses volume information about
    * nothing: only per-event granularity, which the streaming debug key restores.
    *
-   * Lock-free and driven by the owner's clock, so it is safe to consult from any thread and its
-   * bound is exactly reproducible in a test that advances a manual clock.
+   * Non-blocking and driven by the owner's clock, so it is safe to consult from any thread and its
+   * bound advances with that clock rather than with wall time.
    *
    * @param windowMs width of the reporting window in milliseconds
    */
@@ -2637,12 +2710,10 @@ private[spark] object MemorySpillManager extends Logging {
    */
   val MAX_ENCODED_FRAME_BYTES: Int = DataBlockMessage.MAX_ENCODED_FRAME_BYTES
 
-  // -----------------------------------------------------------------------------------------------
   // Executor-scoped shared budget. One instance per JVM, and therefore per executor, because the
   // contracted bound is a fraction of *executor* memory: an executor runs many tasks at once, so a
   // budget derived per instance would let `n` concurrent producers hold `n * bufferSizePercent` of
   // the heap between them and the bound would be a per-task bound wearing an executor-wide name.
-  // -----------------------------------------------------------------------------------------------
 
   /**
    * The streaming buffer allowance every [[MemorySpillManager]] on one executor reserves from.
@@ -2657,8 +2728,8 @@ private[spark] object MemorySpillManager extends Logging {
    * @param bufferSizePercent percentage of the on-heap unified region the allowance occupies
    * @param spillThresholdPercent percentage of the allowance at which eviction is triggered
    * @param unifiedMemoryProvider supplies the size of the on-heap unified memory region; injected
-   *                              so that a test can exercise admission against a budget of its own
-   *                              choosing without depending on the host JVM's heap
+   *                              so the allowance is a function of this argument rather than of
+   *                              whatever heap the host JVM happens to have been given
    */
   class ExecutorBufferQuota(
       bufferSizePercent: Int,
@@ -2754,9 +2825,9 @@ private[spark] object MemorySpillManager extends Logging {
     }
   }
 
-  // Guarded by this object's monitor. Held as `var` rather than as a lazy val because a test must
-  // be able to discard them, and because the configuration they are derived from is only available
-  // once an instance is constructed.
+  // Guarded by this object's monitor. Held as `var` rather than as a lazy val because they must be
+  // discardable -- see [[resetExecutorState]] -- and because the configuration they are derived
+  // from is only available once an instance is constructed.
   private var sharedQuota: ExecutorBufferQuota = null
 
   private var poller: ScheduledExecutorService = null
@@ -2856,9 +2927,10 @@ private[spark] object MemorySpillManager extends Logging {
   }
 
   /**
-   * Discards the executor-scoped allowance and empties the ticker's registry, so that a test can
-   * exercise a fresh budget. Only a test calls this: on an executor the allowance is meant to
-   * outlive every individual task.
+   * Discards the executor-scoped allowance and empties the ticker's registry, so the next instance
+   * derives a fresh budget. Nothing on an executor calls this: there the allowance is meant to
+   * outlive every individual task, and discarding it under a live producer would unaccount memory
+   * that is still held.
    */
   private[streaming] def resetSharedStateForTesting(): Unit = synchronized {
     if (sharedQuota != null) {
@@ -2868,11 +2940,9 @@ private[spark] object MemorySpillManager extends Logging {
     pollTargets.clear()
   }
 
-  // -----------------------------------------------------------------------------------------------
   // Internal admission and eviction outcomes. Modelled as types rather than as booleans so that the
   // several distinguishable ways an admission can fail -- transiently, permanently, because the
   // instance closed, or because the caller broke the sequence contract -- cannot be conflated.
-  // -----------------------------------------------------------------------------------------------
 
   /** Outcome of one attempt to reserve room for a block. */
   private sealed trait AdmissionOutcome
@@ -2947,12 +3017,22 @@ private[spark] object MemorySpillManager extends Logging {
    * `SerializerManager` exactly as every other Spark spill file is, and a reader must unwrap them
    * the same way; each block was committed on its own, so each segment is independently decodable.
    *
+   * <b>Two lengths, and they are not the same number.</b> `length` measures the segment on disk,
+   * which with `spark.shuffle.compress` on -- its default -- is the compressed size and carries no
+   * usable relation to the payload. `payloadLength` is the size of the block as it goes on the
+   * wire, recorded from the block itself at the instant it was written rather than derived from
+   * the file afterwards. Keeping it is what lets a producer answer "how large is this block" while
+   * pacing a replay without reading and decompressing the segment to find out -- a read that would
+   * cost a whole disk round trip and a two mebibyte allocation per queued block, for a number it
+   * already knew when it spilled it.
+   *
    * @param partitionId the reduce partition the block belongs to
    * @param sequenceNumber the block's position in that partition's stream
    * @param blockId the temporary shuffle block that backs the file
    * @param file the file the segment lives in
    * @param offset the segment's start offset within that file
-   * @param length the segment's length in bytes, as committed
+   * @param length the segment's length in bytes, as committed to disk
+   * @param payloadLength the block's payload size in bytes, as it goes on the wire
    */
   case class SpilledBlock(
       partitionId: Int,
@@ -2960,5 +3040,6 @@ private[spark] object MemorySpillManager extends Logging {
       blockId: TempShuffleBlockId,
       file: File,
       offset: Long,
-      length: Long)
+      length: Long,
+      payloadLength: Int)
 }

@@ -167,9 +167,10 @@ public class StreamingShuffleChecksum {
    * closes that gap: the value now attests to the payload <em>and</em> to the four routing and
    * position fields
    * that place it in the stream, so any header rewrite is detected by exactly the check that
-   * already runs on every block. The cost is a fixed one -- a 20-byte preamble to allocate, fill
-   * and fold in -- rather than a second pass over the payload, which is what an independent header
-   * checksum would have required.
+   * already runs on every block. The cost is a fixed one -- a
+   * {@link #BLOCK_METADATA_PREAMBLE_LENGTH}-byte preamble, that is twenty-eight bytes, to allocate,
+   * fill and fold in -- rather than a second pass over the payload, which is what an independent
+   * header checksum would have required.
    *
    * The map id is one of those four fields, and it has to be. A single listener per executor serves
    * every producer running on it, so the map id is what decides which producer's stream a block

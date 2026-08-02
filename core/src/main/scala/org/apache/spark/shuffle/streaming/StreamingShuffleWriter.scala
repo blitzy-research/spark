@@ -25,9 +25,9 @@ import scala.util.control.NonFatal
 
 import org.apache.spark.{SparkConf, SparkEnv, SparkException, TaskContext}
 import org.apache.spark.internal.{config, Logging}
-import org.apache.spark.internal.LogKeys.{COUNT, DURATION, EPOCH, FILE_NAME, INDEX, MAP_ID,
-  MAX_ATTEMPTS, MAX_SIZE, MEMORY_SIZE, NUM_BLOCKS, NUM_BYTES, NUM_PARTITIONS, PARTITION_ID, REASON,
-  RECORDS, SHUFFLE_ID, TASK_ATTEMPT_ID, THRESHOLD, TIMEOUT, VALUE}
+import org.apache.spark.internal.LogKeys.{COUNT, DESCRIPTION, DURATION, EPOCH, FILE_NAME, INDEX,
+  MAP_ID, MAX_ATTEMPTS, MAX_SIZE, MEMORY_SIZE, NUM_BLOCKS, NUM_BYTES, NUM_PARTITIONS, PARTITION_ID,
+  REASON, RECORDS, SHUFFLE_ID, TASK_ATTEMPT_ID, THRESHOLD, TIMEOUT, VALUE}
 import org.apache.spark.network.shuffle.protocol.streaming.DataBlockMessage
 import org.apache.spark.scheduler.MapStatus
 import org.apache.spark.serializer.{SerializationStream, SerializerInstance, SerializerManager}
@@ -45,7 +45,7 @@ import org.apache.spark.util.{Clock, SystemClock}
  * constructors included -- at ten. Bundling is therefore not a stylistic preference but the
  * mechanism by which this writer stays inside a machine-enforced limit, and it buys two further
  * properties: the manager assembles the streaming subsystem once and hands the same shape to every
- * writer it creates, and a test can substitute one collaborator without restating the rest.
+ * writer it creates, and one collaborator can be substituted without restating the rest.
  *
  * Every member is supplied by [[StreamingShuffleManager]], which owns their lifetimes. The writer
  * borrows them for the duration of one map task and never constructs, replaces or closes anything
@@ -82,9 +82,9 @@ import org.apache.spark.util.{Clock, SystemClock}
  * `coordinatorGateway` rather than as an `RpcEndpointRef`. Only the writer observes that this map
  * output has been streamed in full, and only the writer observes a fallback trip while producing,
  * so only the writer can report either at the moment it becomes true. Taking them as an abstraction
- * rather than as a transport keeps this writer free of `RpcEnv`, which is what allows the whole of
- * the consumer-failure and graceful-degradation flow to be driven by a manual clock in a test with
- * no live Spark cluster at all.
+ * rather than as a transport keeps this writer free of `RpcEnv`, so the whole of the
+ * consumer-failure and graceful-degradation flow is driven by a clock and an interface rather than
+ * by a live cluster.
  *
  * @param backpressure executor-wide flow control: credit, liveness timers and arbitration
  * @param rateLimiter executor-wide egress pacing, consulted here only for its framing ceiling
@@ -116,9 +116,28 @@ private[spark] case class StreamingShuffleWriterComponents(
  * This is the producer half of the streaming shuffle. Where
  * [[org.apache.spark.shuffle.sort.SortShuffleWriter]] sorts a task's records, writes them to a
  * local data file and publishes an index so that reduce tasks may fetch them once the whole map
- * stage has finished, this writer frames records into small blocks and pushes them to the consumers
- * as they are produced. That is the entire point of the subsystem: it removes the materialisation
- * barrier, so reduce-side work overlaps map-side work rather than waiting for it.
+ * stage has finished, this writer frames records into small blocks and pushes each block to the
+ * consumers subscribed to its partition as soon as it is cut. Nothing waits for the task's last
+ * record, and nothing reaches disk on the path a subscribed consumer keeps up with.
+ *
+ * ==How much overlap this actually produces==
+ *
+ * Worth stating plainly, because the mechanism above is capable of more than the platform currently
+ * asks of it. Which consumers are subscribed at any moment is not this writer's decision and not
+ * this subsystem's: task submission belongs to the DAG scheduler, an absolute preservation zone for
+ * this feature, and the unmodified scheduler submits a stage only once every parent stage reports
+ * its output available.
+ *
+ * So for a shuffle whose map tasks each run once, the reduce tasks reading it are submitted after
+ * the map stage has finished, no consumer is subscribed while this writer runs, and the overlap it
+ * is capable of is simply not exercised: every block is retained, made durable at the stop, and
+ * served from the executor-scoped resolver afterwards. What the streaming path removes in that
+ * configuration is the index-and-fetch round trip and the reduce side's whole-partition
+ * materialisation -- not the producer/consumer overlap. The overlap is exercised whenever a
+ * consumer is in fact attached, which happens when a reduce attempt reads while a superseded or
+ * speculative map attempt is still producing, and would happen for every shuffle under a scheduler
+ * that submitted consumers earlier. In that case this writer streams to it with no disk involved at
+ * all, and the durability step at the stop writes only what was not taken.
  *
  * ==Wire contract==
  *
@@ -135,11 +154,11 @@ private[spark] case class StreamingShuffleWriterComponents(
  *    violation rather than something to be tolerated.
  *  - No payload exceeds [[DataBlockMessage.MAX_BLOCK_SIZE_BYTES]]. The cap is what makes pipelining
  *    possible: a consumer may begin work on a block while later blocks are still in flight.
- *  - Payload bytes are '''not compressed and not encrypted by this writer'''. Compression would
- *    place a codec frame boundary in the middle of the byte range a block carries, which would
- *    defeat the incremental consumption the cap exists to enable; confidentiality on the wire
- *    belongs to the transport, which the streaming module configures under its own
- *    `spark.shuffle-streaming.io.*` namespace.
+ *  - Payload bytes are '''compressed and encrypted exactly once per partition''', by the single
+ *    `SerializerManager.wrapStream` this writer opens for that partition's `ShuffleBlockId`. A
+ *    codec frame therefore straddles block boundaries freely, which is legal precisely because no
+ *    block is decoded on its own: the consumer concatenates first and unwraps once. Wrapping per
+ *    block instead would be the thing that breaks, since a codec's framing spans blocks.
  *  - Every partition ends with an explicit end-of-stream signal, emitted even when the partition is
  *    empty. Without it a consumer could not tell a finished producer from a producer that has
  *    stopped responding, and would wait out the five-second producer timeout on every successful
@@ -190,9 +209,10 @@ private[spark] case class StreamingShuffleWriterComponents(
  * liveness window and the replay backoff -- read the injected [[Clock]] and never `Thread.sleep`.
  * The writer schedules work at deadlines instead of waiting for them, so a test drives the whole of
  * FR-9's consumer-failure flow with a manual clock and no sleeps, which is what makes that flow
- * deterministic rather than flaky. The one exception is `System.nanoTime`, used solely to measure
- * the writer's own service time for [[ShuffleWriteMetricsReporter.incWriteTime]], mirroring
- * `SortShuffleWriter`.
+ * deterministic rather than flaky. There is no exception to it, the service time reported to
+ * [[ShuffleWriteMetricsReporter.incWriteTime]] included: that is measured with the clock's own
+ * monotonic reading rather than by calling the JVM's nanosecond timer directly, so the figure an
+ * operator reads out of task metrics comes from the same source as every other timing here.
  *
  * @param handle the streaming registration produced by `registerShuffle`
  * @param mapId this map task's identifier, as the scheduler knows it
@@ -201,7 +221,8 @@ private[spark] case class StreamingShuffleWriterComponents(
  *                     which is this task's `shuffleWriteMetrics`
  * @param conf the executor's configuration, read once here and then held immutably
  * @param components the streaming collaborators, owned by [[StreamingShuffleManager]]
- * @param clock the time source for every elapsed-time decision
+ * @param clock the time source for every elapsed-time decision, the shuffle write time reported
+ *              to the metrics reporter included
  * @tparam K the shuffle key type
  * @tparam V the shuffle value type
  * @tparam C the combiner type of the underlying dependency, unused by a streaming producer because
@@ -232,9 +253,7 @@ private[spark] class StreamingShuffleWriter[K, V, C](
     BackpressureStreamKey.forProducer(
       shuffleId, mapId, context.taskAttemptId(), partitionId)
 
-  // ---------------------------------------------------------------------------------------------
   // Collaborators, unpacked once so that the hot path reads a field rather than a case class member
-  // ---------------------------------------------------------------------------------------------
 
   private val backpressure: BackpressureProtocol = components.backpressure
   private val rateLimiter: TokenBucketRateLimiter = components.rateLimiter
@@ -249,9 +268,7 @@ private[spark] class StreamingShuffleWriter[K, V, C](
   private val coordinatorGateway: StreamingShuffleCoordinatorGateway =
     components.coordinatorGateway
 
-  // ---------------------------------------------------------------------------------------------
   // Shuffle shape, taken from the handle
-  // ---------------------------------------------------------------------------------------------
 
   private val dep = handle.dependency
 
@@ -298,11 +315,9 @@ private[spark] class StreamingShuffleWriter[K, V, C](
    */
   private val partitionDivisor: Int = math.max(1, declaredPartitions)
 
-  // ---------------------------------------------------------------------------------------------
   // Configuration, read exactly once (G5). Holding these immutably is what makes "streaming shuffle
   // configuration changes require an executor restart" true by construction rather than by promise,
   // and is why no dynamic reconfiguration path exists or is needed.
-  // ---------------------------------------------------------------------------------------------
 
   private val debugEnabled: Boolean = conf.get(config.SHUFFLE_STREAMING_DEBUG)
 
@@ -310,9 +325,7 @@ private[spark] class StreamingShuffleWriter[K, V, C](
 
   private val spillThresholdPercent: Int = conf.get(config.SHUFFLE_STREAMING_SPILL_THRESHOLD)
 
-  // ---------------------------------------------------------------------------------------------
   // Task attributes
-  // ---------------------------------------------------------------------------------------------
 
   /**
    * The flush ordering this task's blocks are queued under.
@@ -366,14 +379,12 @@ private[spark] class StreamingShuffleWriter[K, V, C](
    */
   private val serializerManager: SerializerManager = SparkEnv.get.serializerManager
 
-  // -------------------------------------------------------------------------------------------
   // Memory budget (FR-2, FR-5)
-  // -------------------------------------------------------------------------------------------
 
   /**
    * The largest block payload this writer will ever frame, in bytes.
    *
-   * Three ceilings apply and the smallest wins, because a block that exceeds any one of them can
+   * Four ceilings apply and the smallest wins, because a block that exceeds any one of them can
    * never be sent:
    *
    *  - the protocol's own cap, [[DataBlockMessage.MAX_BLOCK_SIZE_BYTES]], which is what makes
@@ -425,9 +436,12 @@ private[spark] class StreamingShuffleWriter[K, V, C](
     val paceCeiling = rateLimiter.maxAcquirableBytes - DataBlockMessage.FRAMING_OVERHEAD_BYTES
     val resolved = math.min(protocolCeiling, math.min(budgetCeiling, paceCeiling))
     if (resolved <= 0L) {
-      // Trip condition 2: the reservation this shuffle needs can never be satisfied, so streaming
-      // is stood down for the executor and the retry of this task lands on the sort-based path.
-      fallbackPolicy.recordAllocationGrant(
+      // Trip condition 2: the reservation this shuffle needs can never be satisfied. Routed through
+      // the same stand-down as every other refused reservation, so the message below -- that the
+      // retry lands on the sort-based path -- is a description of what has been arranged rather
+      // than an expectation. No stream exists to report against yet, which is why the protocol's
+      // own per-stream record is not written here.
+      standDownForMemoryPressure(
         protocolCeiling + DataBlockMessage.FRAMING_OVERHEAD_BYTES, math.max(0L, resolved))
       logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} cannot frame a block: " +
         log"the buffer budget of ${MDC(MEMORY_SIZE, spillManager.totalBudgetBytes)} bytes leaves " +
@@ -442,9 +456,7 @@ private[spark] class StreamingShuffleWriter[K, V, C](
     resolved.toInt
   }
 
-  // -------------------------------------------------------------------------------------------
   // Mutable state. Every field below is touched only from the task thread.
-  // -------------------------------------------------------------------------------------------
 
   /**
    * Per-partition egress state, indexed by reduce partition id, allocated lazily on first use.
@@ -472,10 +484,14 @@ private[spark] class StreamingShuffleWriter[K, V, C](
 
   private var finished: Boolean = false
 
-  // Are we in the process of stopping? Because map tasks can call stop() with success = true
-  // and then call stop() with success = false if they get an exception, we want to make sure
-  // we don't try deleting files, etc twice.
-  private var stopping = false
+  /**
+   * How far the stop protocol has progressed.
+   *
+   * A single "already stopping" flag cannot express the sequence [[stop]] has to survive, which is
+   * why this is a state; the protocol and the reason each state is distinguished are documented
+   * there rather than here.
+   */
+  private var stopState: StopState = StopState.NotEntered
 
   private var serializationReleased: Boolean = false
 
@@ -501,6 +517,8 @@ private[spark] class StreamingShuffleWriter[K, V, C](
 
   private var lastHeartbeatMillis: Long = 0L
 
+  private var lastCoordinatorHeartbeatMillis: Long = 0L
+
   private var throughputWindowOpenedMillis: Long = 0L
 
   private var throughputWindowBaseBytes: Long = 0L
@@ -524,9 +542,7 @@ private[spark] class StreamingShuffleWriter[K, V, C](
 
   private var publishedRecordsWritten: Long = 0L
 
-  // -------------------------------------------------------------------------------------------
   // ShuffleWriter contract
-  // -------------------------------------------------------------------------------------------
 
   /**
    * Streams this task's records to their consumers.
@@ -584,55 +600,107 @@ private[spark] class StreamingShuffleWriter[K, V, C](
    * without implying materialised output. It is produced by [[MapStatus.apply]] because `MapStatus`
    * is a sealed trait, so no new subtype could be declared here even if one were wanted.
    *
-   * A second call is a no-op that returns `None`. That is not defensive padding: the caller invokes
-   * `stop(success = true)` on the happy path and `stop(success = false)` from its catch block, so a
-   * writer without the guard would release its resources twice.
+   * <b>Why the guard is a state and not a flag.</b> The authoritative caller invokes
+   * `stop(success = true)` on the happy path and `stop(success = false)` from a catch block that
+   * covers everything after the writer was created -- which includes a failure raised *by* the
+   * successful stop and a failure raised *after* it returned. A single "already stopping" boolean
+   * answers all of those the same way, and that answer is wrong for two of them. A success stop
+   * that threw part way through would have the failure cleanup refused, leaving a generation
+   * published that no consumer can read to completion; and a task that failed after a successful
+   * stop would leave its output reachable although the attempt did not succeed. So the states are
+   * distinguished, and each combination has exactly one correct response:
+   *
+   *  - not entered: run the requested sequence.
+   *  - running: a re-entrant call. Unreachable through the shuffle write path, and answered as a
+   *    no-op rather than by recursing into a sequence that is already executing.
+   *  - succeeded, asked to succeed again: a no-op. The status has been produced and republishing it
+   *    would report the same bytes twice.
+   *  - succeeded, asked to fail: run the failure cleanup. The attempt is failing after all, so its
+   *    output must stop being reachable through every owner of it.
+   *  - failed: a no-op. Everything has been released and no further call can change anything.
+   *
+   * A success stop that raises performs the failure cleanup itself before propagating, so the
+   * guarantee does not depend on the caller making the second call at all.
    *
    * @param success whether the map task completed successfully
    * @return the map status on success, `None` otherwise
    */
   override def stop(success: Boolean): Option[MapStatus] = {
-    if (stopping) {
+    val recoveringFromSuccess = !success && stopState == StopState.Succeeded
+    if (stopState != StopState.NotEntered && !recoveringFromSuccess) {
       return None
     }
-    stopping = true
-    val startedAtNanos = System.nanoTime()
+    stopState = StopState.Running
+    val startedAtNanos = clock.nanoTime()
     try {
       if (success) {
-        // A bounded last pass rather than a single shot: egress is paced, so a block offered at
-        // the very end of this task may still be queued, and one attempt at pushing it would
-        // routinely leave it there.
-        val delivered = drainBeforeStopping()
-        // Whatever the drain could not deliver still has to be reachable, and this task's memory is
-        // about to stop existing, so the retained window is written to disk and its files are
-        // handed to the executor-scoped resolver. That transfer -- not the moment this task happens
-        // to finish -- is what bounds the lifetime of retained output.
-        val durable = secureRetainedOutput()
-        requireOutputRecoverable(delivered, durable)
-        // Every producer ledger is reported complete before the status is published, so a consumer
-        // that reads the completion set and then asks the ledger how many blocks it should expect
-        // gets an answer rather than an unterminated stream.
-        completeProducerStreams()
-        publishWriteMetrics()
-        mapStatus = MapStatus(blockManager.shuffleServerId, partitionLengths, mapId)
-        // Reported after the final drain and before the status is handed back, so that the
-        // coordinator's completion set never claims output this writer has not finished framing.
-        reportMapOutputComplete()
-        logStreamingSummary()
-        Option(mapStatus)
+        try {
+          val status = completeSuccessfully()
+          stopState = StopState.Succeeded
+          status
+        } catch {
+          case NonFatal(e) =>
+            // The sequence did not finish, so this generation's output is not reachable in the way
+            // a published map status would promise. Retiring it here rather than relying on the
+            // caller's own catch block is what makes the protocol self-contained: the caller is
+            // not obliged to make the second call, and the flag-based guard this replaces would
+            // have refused it in any case.
+            releaseAfterFailure("the producing map task could not complete its successful stop")
+            stopState = StopState.Failed
+            throw e
+        }
       } else {
-        // The task has failed, so nothing retained for retransmission can ever be asked for again.
-        // Withdraw the publication first, then release: a reader that resolved this generation
-        // between the two would otherwise be handed a store whose buffers are being freed under it.
-        withdrawRetainedOutput()
-        releaseEgressResources()
-        closeSpillState()
+        if (recoveringFromSuccess) {
+          logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} map " +
+            log"${MDC(TASK_ATTEMPT_ID, mapId)} reported success and is now failing; its streamed " +
+            log"output is withdrawn, because a consumer must not read the output of an attempt " +
+            log"that did not succeed")
+        }
+        releaseAfterFailure("the producing map task failed")
+        stopState = StopState.Failed
         None
       }
     } finally {
       closeSerializationResources()
-      writeMetrics.incWriteTime(System.nanoTime() - startedAtNanos)
+      writeMetrics.incWriteTime(clock.nanoTime() - startedAtNanos)
     }
+  }
+
+  /**
+   * Runs the successful stop sequence and produces the map status.
+   *
+   * Separate from [[stop]] so that the state protocol there reads as a protocol rather than as one
+   * interleaved with the sequence it governs. Each step is documented at its own definition; what
+   * this method owns is the order, and every adjacency in it is load bearing:
+   *
+   *  1. The final drain first, because it is the last chance for paced egress to release what is
+   *     still queued, and everything after it depends on knowing what is left.
+   *  2. Durability next, over exactly what the drain could not deliver. This task's memory is about
+   *     to stop existing, so the retained window is written to disk and its files handed to the
+   *     executor-scoped resolver; that transfer, not the moment this task happens to finish, is
+   *     what bounds the lifetime of retained output. A map output every consumer already
+   *     acknowledged has nothing retained, so this step writes nothing at all.
+   *  3. The reachability requirement immediately after, because it is the one condition under which
+   *     publishing a status would be a promise this producer cannot keep.
+   *  4. Stream completion before the status, so that a consumer which reads the completion set and
+   *     then asks the ledger how many blocks to expect gets an answer rather than an unterminated
+   *     stream.
+   *  5. The completion report after the drain and before the status is handed back, so the
+   *     coordinator's completion set never claims output this writer has not finished framing.
+   *
+   * @return the placeholder map status, always non-empty
+   */
+  private def completeSuccessfully(): Option[MapStatus] = {
+    val delivered = drainBeforeStopping()
+    val durable = secureRetainedOutput()
+    requireOutputRecoverable(delivered, durable)
+    requireNoLatchedFailure()
+    completeProducerStreams()
+    publishWriteMetrics()
+    mapStatus = MapStatus(blockManager.shuffleServerId, partitionLengths, mapId)
+    reportMapOutputComplete()
+    logStreamingSummary()
+    Option(mapStatus)
   }
 
   /**
@@ -644,9 +712,7 @@ private[spark] class StreamingShuffleWriter[K, V, C](
   override def getPartitionLengths(): Array[Long] = partitionLengths
 
 
-  // -------------------------------------------------------------------------------------------
   // Initialisation
-  // -------------------------------------------------------------------------------------------
 
   /**
    * Prepares the streaming path, exactly once per writer.
@@ -679,34 +745,86 @@ private[spark] class StreamingShuffleWriter[K, V, C](
    * Everything that can forbid streaming this shuffle at all is settled by
    * [[negotiateBeforeProducing]] before any of it, so that a refusal costs nothing and unwinds
    * nothing.
+   *
+   * <b>Transactional.</b> Steps 2 onwards each publish something an owner outside this writer can
+   * see, and any of the steps after them can still refuse: the publication can be declined, the
+   * budget derivation reaches through `SparkEnv`, and the quotient check is an assertion on a
+   * contract. A writer that left a partial initialisation behind would leave this generation
+   * published and routed while holding no buffers and streaming nothing -- a producer a consumer
+   * can resolve and open a channel to, and then wait on until its own detector fires. So the whole
+   * body either completes or is unwound: the failure path is the same single operation the
+   * unsuccessful stop uses, so exactly one piece of code knows how to retire a generation, and it
+   * retires every owner rather than the subset this method happened to reach.
+   *
+   * Two registrations are deliberately '''not''' unwound, and both are correct to keep:
+   *
+   *  - the two task-completion listeners, because `TaskContext` exposes no way to withdraw one and
+   *    neither needs withdrawing -- each is idempotent and each fires on a task that failed exactly
+   *    as it does on one that succeeded, releasing whatever is left;
+   *  - the shuffle's registration with the backpressure protocol, because that registration is
+   *    shuffle scoped rather than task scoped and is shared with every other map task of the same
+   *    shuffle running on this executor. Unwinding it here would strip the partition count and the
+   *    utilisation budget out from under those tasks. It is released when the shuffle is
+   *    unregistered, which is the boundary that owns it.
    */
   private def initializeStreaming(): Unit = {
     if (!initialized) {
       initialized = true
       negotiateBeforeProducing()
-      spillManager.registerPartitionCount(partitionDivisor)
-      blockResolver.registerProducer(shuffleId, mapId, context.taskAttemptId(), spillManager)
-      spillManager.registerCleanup(context)
-      context.addTaskCompletionListener[Unit](_ => releaseOnTaskCompletion())
-      backpressure.registerShuffle(shuffleId, partitionDivisor)
-      serverHandler.registerTaskAttempt(egressPriority)
-      val nowMillis = clock.getTimeMillis()
-      lastMaintenanceMillis = nowMillis
-      lastHeartbeatMillis = nowMillis
-      throughputWindowOpenedMillis = nowMillis
-      // Forces the derivation, so it either succeeds and is logged once, or refuses before a single
-      // record has been buffered and while there is still nothing to unwind.
-      val capacity = blockPayloadCapacity
-      verifyBudgetContract()
-      logInfo(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} map " +
-        log"${MDC(TASK_ATTEMPT_ID, mapId)} streams ${MDC(NUM_PARTITIONS, declaredPartitions)} " +
-        log"partitions with a buffer budget of " +
-        log"${MDC(MEMORY_SIZE, spillManager.totalBudgetBytes)} bytes " +
-        log"(${MDC(VALUE, bufferSizePercent)}% of executor memory), " +
-        log"${MDC(NUM_BYTES, spillManager.perPartitionBudgetBytes)} bytes per partition, " +
-        log"spilling at ${MDC(THRESHOLD, spillThresholdPercent)}% and framing blocks of at most " +
-        log"${MDC(COUNT, capacity)} bytes")
+      try {
+        publishStreamingProducer()
+      } catch {
+        case NonFatal(e) =>
+          releaseAfterFailure("its producer could not be initialised")
+          throw e
+      }
     }
+  }
+
+  /**
+   * The publishing half of [[initializeStreaming]], separated so that the unwind has one subject.
+   *
+   * Everything here either publishes this generation to an owner outside this writer or derives a
+   * value that binds memory to the task. Nothing here is idempotent by itself, and nothing here is
+   * retried: the caller unwinds the whole of it on any refusal.
+   */
+  private def publishStreamingProducer(): Unit = {
+    spillManager.registerPartitionCount(partitionDivisor)
+    // The verdict is acted upon rather than discarded. A declined publication means one of exactly
+    // two things, and neither permits this attempt to stream: a newer generation of this map output
+    // is registered, so this one is a superseded attempt whose partial output must never reach a
+    // consumer; or the executor has stopped its streaming subsystem, so no retained block of this
+    // attempt could ever be served. Discovering it here costs one refused task whose retry the
+    // manager serves correctly, whereas discovering it at the successful stop -- where the hand-off
+    // of retained files is refused -- would mean a whole map task's output had already been
+    // streamed to consumers that must not receive it.
+    if (!blockResolver.registerProducer(shuffleId, mapId, context.taskAttemptId(), spillManager)) {
+      throw new SparkException(s"Streaming shuffle $shuffleId could not publish the retained " +
+        s"output of map $mapId attempt ${context.taskAttemptId()}: either a newer generation of " +
+        "that map output is registered or this executor has stopped streaming, so this attempt " +
+        "must not stream and is failed so that its retry is served correctly.")
+    }
+    spillManager.registerCleanup(context)
+    context.addTaskCompletionListener[Unit](_ => releaseOnTaskCompletion())
+    backpressure.registerShuffle(shuffleId, partitionDivisor)
+    serverHandler.registerTaskAttempt(egressPriority)
+    val nowMillis = clock.getTimeMillis()
+    lastMaintenanceMillis = nowMillis
+    lastHeartbeatMillis = nowMillis
+    lastCoordinatorHeartbeatMillis = nowMillis
+    throughputWindowOpenedMillis = nowMillis
+    // Forces the derivation, so it either succeeds and is logged once, or refuses before a single
+    // record has been buffered.
+    val capacity = blockPayloadCapacity
+    verifyBudgetContract()
+    logInfo(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} map " +
+      log"${MDC(TASK_ATTEMPT_ID, mapId)} streams ${MDC(NUM_PARTITIONS, declaredPartitions)} " +
+      log"partitions with a buffer budget of " +
+      log"${MDC(MEMORY_SIZE, spillManager.totalBudgetBytes)} bytes " +
+      log"(${MDC(VALUE, bufferSizePercent)}% of executor memory), " +
+      log"${MDC(NUM_BYTES, spillManager.perPartitionBudgetBytes)} bytes per partition, " +
+      log"spilling at ${MDC(THRESHOLD, spillThresholdPercent)}% and framing blocks of at most " +
+      log"${MDC(COUNT, capacity)} bytes")
   }
 
   /**
@@ -767,9 +885,7 @@ private[spark] class StreamingShuffleWriter[K, V, C](
         s"$expected bytes, but $published bytes were published")
   }
 
-  // -------------------------------------------------------------------------------------------
   // Record path
-  // -------------------------------------------------------------------------------------------
 
   /**
    * Appends one record to its partition's stream, emitting blocks as boundaries are crossed.
@@ -833,8 +949,9 @@ private[spark] class StreamingShuffleWriter[K, V, C](
    * partition is producing, and leaving it uncharged would mean the configured buffer percentage
    * bounded only the blocks cut out of these arrays and not the arrays themselves -- so the
    * executor could hold substantially more than the operator asked it to. A refusal is treated
-   * exactly as a refused block admission is: memory pressure is recorded, the fallback policy is
-   * told, and the task fails so that it is retried on the sort-based path.
+   * exactly as a refused block admission is: the shuffle stands down for every participant through
+   * [[standDownForMemoryPressure]], and the task then fails so that it is retried on the sort-based
+   * path.
    *
    * The serialization stream is built over `SerializerManager.wrapStream`, not over the raw
    * accumulator, so that the bytes this partition streams are compressed and encrypted exactly as
@@ -847,8 +964,8 @@ private[spark] class StreamingShuffleWriter[K, V, C](
     } else {
       val scratchBytes = accumulatorFootprintBytes
       if (!spillManager.reserveScratch(scratchBytes)) {
-        fallbackPolicy.recordAllocationGrant(scratchBytes, 0L)
         backpressure.reportBufferAllocationFailure(producerKey(partitionId))
+        standDownForMemoryPressure(scratchBytes, 0L)
         logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} could not reserve " +
           log"${MDC(MEMORY_SIZE, scratchBytes)} bytes of framing scratch for partition " +
           log"${MDC(PARTITION_ID, partitionId)}, holding " +
@@ -903,6 +1020,15 @@ private[spark] class StreamingShuffleWriter[K, V, C](
    * reader reassembles on that assumption, so a divergence is a genuine protocol violation -- the
    * signature of a server handler shared between two concurrent producers of the same shuffle --
    * and is reported as one instead of silently corrupting a stream.
+   *
+   * <b>This side's numbering is committed only by a successful hand-off.</b>
+   * `state.nextSequenceNumber` advances after both the admission and the egress offer have returned
+   * and the assertion has passed, so a refused block leaves this partition's numbering where it was
+   * and the retry of the task starts from a consistent position. The admission is deliberately not
+   * rolled back when the egress offer refuses: the only way it refuses is a protocol violation,
+   * which fails this task, and a failing task withdraws the whole generation -- routing, retained
+   * output, spill files and sessions together -- so there is nothing left for a rollback of one
+   * block to protect.
    */
   private def emitBlock(state: PartitionEgressState, length: Int): Unit = {
     val sequenceNumber = state.nextSequenceNumber
@@ -912,12 +1038,12 @@ private[spark] class StreamingShuffleWriter[K, V, C](
     // write time around its commit rather than around each record's serialization, and
     // `SortShuffleWriter` charges it around its sorter's teardown. The maintenance and telemetry
     // hooks below are deliberately outside the timed region, because they are neither.
-    val startedAtNanos = System.nanoTime()
+    val startedAtNanos = clock.nanoTime()
     val assigned = try {
       admitBlock(state, sequenceNumber, state.accumulator.take(length))
       serverHandler.enqueueBlock(state.partitionId, length)
     } finally {
-      writeMetrics.incWriteTime(System.nanoTime() - startedAtNanos)
+      writeMetrics.incWriteTime(clock.nanoTime() - startedAtNanos)
     }
     if (assigned != sequenceNumber) {
       throw StreamingShuffleErrors.invalidSequenceNumber(
@@ -947,8 +1073,8 @@ private[spark] class StreamingShuffleWriter[K, V, C](
    * A refusal from [[MemorySpillManager.bufferBlock]] already means eviction was attempted and
    * could not free enough, so the recovery here does the only three things that can change that
    * verdict without waiting: push queued bytes towards the wire, apply whatever the consumer has
-   * acknowledged since, and force an eviction pass. None of them sleeps, which is why the whole
-   * path is deterministic under a manual clock.
+   * acknowledged since, and force an eviction pass. None of them sleeps, so the whole path advances
+   * with the injected clock rather than with wall time.
    *
    * Why the loop is driven by observed progress rather than by a fixed round count. A refusal is
    * raised against the *per-partition* allowance, but eviction chooses its victim executor-wide, in
@@ -1036,12 +1162,11 @@ private[spark] class StreamingShuffleWriter[K, V, C](
           // nothing about whether the budget is exhausted. Wait for that write to land instead of
           // failing a task that is about to have room.
           deferrals += 1
-          // Hand the CPU to whichever thread is doing the reclaiming. Spinning without yielding
-          // starves the very eviction being waited for, which is not a theoretical concern: an
-          // unyielded run of these rounds was measured completing in about 5 ms while the eviction
-          // it was waiting for landed 17 ms later, so the wait expired before the work it existed
-          // to wait for could possibly finish. This is a yield and not a sleep, so the loop stays
-          // free of wall-clock timing and remains deterministic under an injected clock.
+          // Hand the CPU to whichever thread is doing the reclaiming. A run of these rounds that
+          // does not yield can burn its whole allowance faster than a spill write completes, and so
+          // declare the budget exhausted while it is actively being freed; yielding makes the wait
+          // outlast the work it is waiting for. This is a yield and not a sleep, so the loop stays
+          // free of wall-clock timing and advances with the injected clock.
           Thread.`yield`()
         } else {
           barrenRounds += 1
@@ -1050,13 +1175,8 @@ private[spark] class StreamingShuffleWriter[K, V, C](
     }
     if (!admitted) {
       val requested = payload.length.toLong + MemorySpillManager.PER_BLOCK_OVERHEAD_BYTES
-      fallbackPolicy.recordAllocationGrant(requested, 0L)
-      // The policy above owns the decision to stand streaming down; the protocol owns the record of
-      // *why*. Both have to be told: without this call the protocol's degradation reasons would
-      // show no memory-pressure entry for a shuffle that stood down precisely because a buffer
-      // could not be allocated, and the second of the four specified fallback conditions would be
-      // undetectable in the very telemetry an operator consults to understand the fallback.
       backpressure.reportBufferAllocationFailure(producerKey(state.partitionId))
+      standDownForMemoryPressure(requested, 0L)
       logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} could not reserve " +
         log"${MDC(MEMORY_SIZE, requested)} bytes for partition " +
         log"${MDC(PARTITION_ID, state.partitionId)} after ${MDC(MAX_ATTEMPTS, round)} eviction " +
@@ -1081,9 +1201,7 @@ private[spark] class StreamingShuffleWriter[K, V, C](
   }
 
 
-  // -------------------------------------------------------------------------------------------
   // Maintenance: flow control, spill, liveness and the consumer-failure flow (FR-3, FR-5, FR-9)
-  // -------------------------------------------------------------------------------------------
 
   /**
    * Runs the periodic streaming duties, at most once per [[MAINTENANCE_INTERVAL_MS]].
@@ -1126,8 +1244,16 @@ private[spark] class StreamingShuffleWriter[K, V, C](
     if (nowMillis - lastMaintenanceMillis >= MAINTENANCE_INTERVAL_MS) {
       lastMaintenanceMillis = nowMillis
       drainAcknowledgements()
+      // Both figures are executor-wide, and they have to be. The budget is one allowance shared by
+      // every spill manager on the executor, so pairing it with this task's own buffered bytes
+      // would divide a task-local numerator by an executor-wide denominator and under-report
+      // utilisation by roughly the number of map tasks running concurrently -- exactly when the
+      // spill threshold matters most. Reporting the reservation against the shared quota also makes
+      // the report idempotent: every concurrent map task of every shuffle publishes the same pair,
+      // so a later report overwriting an earlier one changes nothing and the reading is
+      // executor-wide by construction rather than by whichever task reported last.
       backpressure.reportBufferUtilization(
-        shuffleId, spillManager.bufferedBytes, spillManager.totalBudgetBytes)
+        shuffleId, spillManager.executorReservedBytes, spillManager.totalBudgetBytes)
       pollSpill()
       sendHeartbeatsIfDue(nowMillis)
       handleConsumerStalls(nowMillis)
@@ -1136,6 +1262,91 @@ private[spark] class StreamingShuffleWriter[K, V, C](
       // makes an acknowledgement gap observable rather than merely inferable.
       backpressure.pollOnce()
       publishWriteMetrics()
+      // Last, because this is the one maintenance duty that can stand this producer down, and a
+      // stand-down raises. Nothing above it is skipped as a result.
+      standDownIfRetired(nowMillis)
+    }
+  }
+
+  /**
+   * Refreshes this generation's registration with the coordinator, on the refresh cadence.
+   *
+   * The refresh is an obligation rather than an optimisation. The coordinator reaps a producer it
+   * has not heard from inside its liveness window, so a map task that streams for longer than that
+   * window without refreshing would have its own address withdrawn from under the consumers that
+   * are reading it -- and they would then recompute a map stage that was working perfectly well.
+   *
+   * The same ask is also the only way a driver-side decision about this generation reaches this
+   * executor. A consumer that timed out invalidates the generation at the driver, a newer attempt
+   * supersedes it there, a shuffle-wide fallback retires it there, and this subsystem has no
+   * driver-to-executor channel through which any of that could be pushed. Asking is what makes
+   * those decisions actionable here, which is why the answer is returned rather than discarded.
+   *
+   * The refresh rides the maintenance pass, so its cadence is the maintenance cadence. That is
+   * sufficient rather than merely convenient: the interval is the connection timeout and the
+   * coordinator's window is twice it, so one missed pass is absorbed by construction.
+   *
+   * Gated on the cadence and on nothing else. In particular it is deliberately not gated on this
+   * writer having finished framing, because the final drain runs after framing has finished and is
+   * exactly the phase in which the registration most needs to stay alive: the drain's deadline is
+   * the same length as the coordinator's liveness window.
+   *
+   * @param nowMillis the caller's own clock reading, so the cadence is measured once per pass
+   * @return what the driver reported, or `None` when it was not asked on this pass or could not be
+   *         reached. `None` never means "not live"
+   */
+  private def refreshCoordinatorRegistration(
+      nowMillis: Long): Option[StreamingShuffleProducerLiveness] = {
+    val elapsedMillis = nowMillis - lastCoordinatorHeartbeatMillis
+    if (elapsedMillis < COORDINATOR_HEARTBEAT_INTERVAL_MS) {
+      None
+    } else {
+      lastCoordinatorHeartbeatMillis = nowMillis
+      val generation = StreamingShuffleProducerGeneration(context.partitionId(), mapId,
+        context.taskAttemptId())
+      coordinatorGateway.heartbeatProducer(shuffleId, generation)
+    }
+  }
+
+  /**
+   * Fails this task when the driver no longer holds its producer generation.
+   *
+   * A retired generation must not keep producing. Its output has either been superseded by a newer
+   * attempt or already declared invalid, its consumers have been told to recompute, and every byte
+   * it streams from here on is work whose result nothing will read. Failing is the recovery the
+   * platform already has: the unmodified scheduler retries the task, and the unsuccessful stop that
+   * follows retires this generation from every owner on this executor through the one withdrawal
+   * operation.
+   *
+   * An unreachable driver is deliberately not treated as retirement. Nothing is known in that case,
+   * and standing down on the strength of nothing would abandon a shuffle that is healthy everywhere
+   * else; a producer that has genuinely gone is handled by the coordinator's own liveness window.
+   *
+   * Reached from the maintenance pass alone, and never from the final drain. That drain runs inside
+   * a successful stop, where raising would abandon output that is about to be made durable and
+   * readable, so the drain refreshes the registration and ignores the answer. A generation retired
+   * during the drain is therefore not stood down, and it does not need to be: its completion report
+   * is refused by the driver, so no consumer is told its output is available; no consumer can be
+   * handed its address either, because the driver's registry no longer holds it; and its local
+   * owners are retired by the shuffle's own unregistration. Correctness is unaffected, because the
+   * consumer whose invalidation retired the generation has already raised the fetch failure that
+   * recomputes the stage.
+   */
+  private def standDownIfRetired(nowMillis: Long): Unit = {
+    if (!finished) {
+      refreshCoordinatorRegistration(nowMillis).foreach { liveness =>
+        if (!liveness.live) {
+          val failure = new SparkException(s"Streaming shuffle $shuffleId no longer holds the " +
+            s"producer generation of map index ${context.partitionId()} attempt " +
+            s"${context.taskAttemptId()} at epoch ${liveness.coordinatorEpoch}: it has been " +
+            "superseded, invalidated by a consumer, or retired by a shuffle-wide fallback. The " +
+            "task is failed so that the unmodified scheduler recomputes it.")
+          logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} failing map " +
+            log"${MDC(TASK_ATTEMPT_ID, mapId)} because the coordinator no longer holds its " +
+            log"producer generation at epoch ${MDC(EPOCH, liveness.coordinatorEpoch)}", failure)
+          throw failure
+        }
+      }
     }
   }
 
@@ -1198,11 +1409,22 @@ private[spark] class StreamingShuffleWriter[K, V, C](
    * shuffle registered on this executor: a task whose own buffers are comfortable must still yield
    * when the executor as a whole has crossed the threshold, which is precisely the cross-shuffle
    * monitoring the backpressure protocol exists to provide.
+   *
+   * <b>Only the second trigger is arbitrated.</b> The first is this subsystem's own contract -- the
+   * spill threshold is evaluated against the producer buffer budget and eviction at that point is
+   * unconditional -- so no arbitration may stand in front of it. The second exists to make one
+   * shuffle yield on account of another's demand, and that is exactly the question arbitration
+   * answers: `shouldYield` places the concurrent shuffles in order of how much of the executor's
+   * buffered egress each is responsible for and exempts the least demanding one, so a small shuffle
+   * sharing an executor with a very large one is never asked to yield on every pass and starved.
+   * Gating the first trigger on it instead would be strictly wrong: `shouldYield` is false when
+   * there is only one shuffle, by design, so a single-shuffle executor would stop spilling
+   * altogether at the very moment the threshold said it must.
    */
   private def pollSpill(): Unit = {
     if (spillManager.pollOnce()) {
       recordSpillObserved()
-    } else if (backpressure.isSpillRequired && spillManager.maybeSpill()) {
+    } else if (backpressure.shouldYield(shuffleId) && spillManager.maybeSpill()) {
       recordSpillObserved()
     }
   }
@@ -1413,6 +1635,48 @@ private[spark] class StreamingShuffleWriter[K, V, C](
   }
 
   /**
+   * Turns a buffer reservation this executor could not satisfy into a shuffle-wide stand-down.
+   *
+   * Reached from the three places a streaming producer can be refused the memory it trades for
+   * latency: a budget that cannot accommodate even one block for one partition, the framing scratch
+   * a partition needs before its first record, and the admission of a block after eviction has been
+   * attempted and could not free room. All three are the second of the four specified fallback
+   * conditions, and every caller raises immediately afterwards, because there is no correct way to
+   * continue streaming bytes that cannot be held.
+   *
+   * Two participants are told here, and each owns a different part of the outcome:
+   *
+   *  - [[StreamingShuffleFallbackPolicy]] owns the '''decision'''. Recording a reservation that was
+   *    short granted is what latches the memory-pressure trip on this executor.
+   *  - the coordinator owns the '''scope'''. This is the step the raise alone cannot supply, and
+   *    leaving it out is what made a refused allocation a local decision with global consequences:
+   *    a task that merely failed would have its retry served by the sort-based delegate here while
+   *    every other executor kept streaming the same shuffle, which is two producers of one output
+   *    and two incompatible reduce-side read paths. Declaring makes the transition shuffle-wide
+   *    before anything is delegated or retried, and the policy's own one-shot keeps the wire cost
+   *    at one ask per shuffle per executor however many tasks observe the condition.
+   *
+   * A third participant, [[BackpressureProtocol]], owns the '''record of why''' and is told by the
+   * two callers that have a partition to name rather than here: its record is per stream, and the
+   * budget derivation runs before any stream exists. Without that record the protocol's degradation
+   * reasons would show no memory-pressure entry for a shuffle that stood down precisely because a
+   * buffer could not be allocated, and the condition would be invisible in the very telemetry an
+   * operator consults to understand the fallback.
+   *
+   * The reason declared is whatever the policy latched, which is memory pressure for every path
+   * that reaches here; the explicit fallback covers the case where a different condition had
+   * already latched first, in which case that condition is the one the whole shuffle agrees on.
+   *
+   * @param requestedBytes the reservation that was asked for, in bytes
+   * @param grantedBytes what was actually granted, which is what makes the sample a short grant
+   */
+  private def standDownForMemoryPressure(requestedBytes: Long, grantedBytes: Long): Unit = {
+    fallbackPolicy.recordAllocationGrant(requestedBytes, grantedBytes)
+    declareShuffleFallback(fallbackPolicy.trippedReason
+      .orElse(Some(StreamingShuffleFallbackReason.MemoryPressure)))
+  }
+
+  /**
    * Stands down cleanly when graceful degradation has tripped.
    *
    * Every trip routes to the same terminus -- delegation to the unmodified sort-based shuffle --
@@ -1507,19 +1771,16 @@ private[spark] class StreamingShuffleWriter[K, V, C](
    * consumer concluding on its own that output it never received was complete.
    */
   private def reportMapOutputComplete(): Unit = {
-    val generation = StreamingShuffleProducerGeneration(mapId, context.taskAttemptId())
-    if (coordinatorGateway.completeProducer(shuffleId, generation, context.partitionId())
-        && debugEnabled) {
+    val generation = StreamingShuffleProducerGeneration(
+      context.partitionId(), mapId, context.taskAttemptId())
+    if (coordinatorGateway.completeProducer(shuffleId, generation) && debugEnabled) {
       logDebug(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} recorded map " +
         log"${MDC(MAP_ID, mapId)} index ${MDC(INDEX, context.partitionId())} as streamed to " +
         log"completion")
     }
   }
 
-
-  // ------------------------------------------------------------------------------------------- End
-  // of stream
-  // -------------------------------------------------------------------------------------------
+  // End of stream
 
   /**
    * Closes every partition's stream and signals end of stream on all of them.
@@ -1536,7 +1797,7 @@ private[spark] class StreamingShuffleWriter[K, V, C](
       finishPartition(partitionStates(activePartitions(index)))
       index += 1
     }
-    val startedAtNanos = System.nanoTime()
+    val startedAtNanos = clock.nanoTime()
     // Every declared partition is terminated in one pass: those this task produced records for,
     // whose blocks were emitted just above, and those it produced nothing for, whose terminator
     // legitimately reports zero blocks. One call rather than one per partition is what keeps
@@ -1545,7 +1806,7 @@ private[spark] class StreamingShuffleWriter[K, V, C](
     // a time would cost the square of the partition count in scans for identical wire output.
     serverHandler.terminateStreams(0 until declaredPartitions)
     serverHandler.flushPending()
-    writeMetrics.incWriteTime(System.nanoTime() - startedAtNanos)
+    writeMetrics.incWriteTime(clock.nanoTime() - startedAtNanos)
     drainAcknowledgements()
     publishWriteMetrics()
   }
@@ -1630,6 +1891,12 @@ private[spark] class StreamingShuffleWriter[K, V, C](
         val nowMillis = clock.getTimeMillis()
         drainAcknowledgements()
         sendHeartbeatsIfDue(nowMillis)
+        // The coordinator's liveness window is the same length as this drain's deadline, so a drain
+        // that runs to its deadline without refreshing would have this producer's address reaped at
+        // exactly the moment its last blocks were being delivered. The answer is deliberately
+        // ignored here: see [[standDownIfRetired]] for why a retirement must not raise inside a
+        // successful stop, and where it surfaces instead.
+        refreshCoordinatorRegistration(nowMillis)
         handleConsumerStalls(nowMillis)
         backpressure.pollOnce()
         errorNotifier.throwIfError()
@@ -1648,6 +1915,9 @@ private[spark] class StreamingShuffleWriter[K, V, C](
       }
     } catch {
       case NonFatal(e) =>
+        // Swallowed here and not lost: the drain is best-effort, so its own failure must not
+        // pre-empt the durability check that follows, and anything the notifier latched is raised
+        // by [[requireNoLatchedFailure]] before this attempt may report success.
         logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} could not complete its " +
           log"final egress pass for map ${MDC(TASK_ATTEMPT_ID, mapId)}; the blocks stay retained " +
           log"and consumers recover by asking for them or by failing their fetch", e)
@@ -1656,10 +1926,26 @@ private[spark] class StreamingShuffleWriter[K, V, C](
   }
 
   /**
-   * Makes this map output's retained window durable and hands its files to the block resolver.
+   * Makes whatever of this map output is still unacknowledged durable, and hands its files to the
+   * block resolver.
    *
-   * This is the step that gives retained output a lifetime longer than the task that produced it,
-   * and it exists because the platform does not permit the alternative. Buffered blocks live in
+   * '''How much this writes is decided by the consumers, not by this method.''' What it makes
+   * durable is the retained window, and a block leaves that window as soon as the consumer reading
+   * it acknowledges it. So this is not a materialisation of the map output: a partition whose
+   * consumer kept pace has nothing retained by the time the task stops, and this step writes zero
+   * bytes and registers zero files for it. It writes a whole partition only in the case where
+   * nothing consumed it while it was being produced -- which is the case the unmodified scheduler
+   * produces for a map stage that runs once, and the reason the honest description of streaming in
+   * that configuration is the removal of the index-and-fetch round trip rather than overlap.
+   *
+   * The step still runs unconditionally, and deliberately so even when it has nothing to write. The
+   * transfer of an empty file set is accepted on the same terms as a full one, which leaves the
+   * resolver holding a registration for this generation; a consumer that reconnects afterwards then
+   * receives a typed answer about a block that no longer exists instead of finding no producer at
+   * all, and recovers through a fetch failure and recomputation. Skipping the step to save a
+   * round trip would trade that for silence.
+   *
+   * What is durable rather than resident is not a design preference either. Buffered blocks live in
    * task-managed execution memory, which the executor reclaims at task completion and -- with
    * `spark.unsafe.exceptionOnMemoryLeak` enabled, as the test envelope sets it -- fails the task
    * over if anything still holds. So "keep it in memory until the consumer acknowledges it" is not
@@ -1668,9 +1954,9 @@ private[spark] class StreamingShuffleWriter[K, V, C](
    *
    * Three steps in this order, and the order is the guarantee:
    *
-   * 1. Force the whole retained window to disk. Only unacknowledged blocks are still retained, so
-   *    this writes exactly what a reconnecting consumer may ask for and nothing that has already
-   *    been retired.
+   * 1. Force whatever remains of the retained window to disk. Only unacknowledged blocks are still
+   *    retained, so this writes exactly what a reconnecting consumer may ask for, nothing that has
+   *    already been retired, and nothing at all when everything has been.
    * 2. Detach file ownership from this task's spill manager, so that its task-completion listener
    *    frees memory as it always did but unlinks none of the files.
    * 3. Register the files with the executor-scoped [[StreamingShuffleBlockResolver]], which unlinks
@@ -1770,9 +2056,10 @@ private[spark] class StreamingShuffleWriter[K, V, C](
    * generation is no longer the registered one, so its output must not be served at all. The drain
    * result is therefore reported in the diagnosis rather than used to excuse the failure.
    *
-   * The resources are released before throwing, because the caller's catch block calls
-   * `stop(success = false)` and that call returns immediately once stopping has begun, so this is
-   * the last point at which anything can be unwound.
+   * Nothing is released here. This raises from inside the successful stop sequence, and that
+   * sequence retires the generation and frees everything it holds on its way out -- see [[stop]]
+   * for why the protocol performs the failure cleanup itself rather than leaving it to the caller.
+   * Releasing here as well would duplicate an operation whose single owner is the point of it.
    *
    * @param delivered whether the final drain wrote everything that was queued, for the diagnosis
    * @param durable whether the retained window is reachable: on disk and owned by the resolver
@@ -1781,15 +2068,37 @@ private[spark] class StreamingShuffleWriter[K, V, C](
     if (!durable) {
       val queued = serverHandler.pendingBytes
       val buffered = spillManager.bufferedBytes
-      withdrawRetainedOutput()
-      releaseEgressResources()
-      closeSpillState()
       throw new SparkException(s"Streaming shuffle $shuffleId map $mapId could not complete: its " +
         s"retained output is not reachable by a consumer (final drain delivered everything " +
         s"queued: $delivered, $queued byte(s) still queued for egress, $buffered byte(s) still " +
         "buffered in task memory), so the attempt must be retried on a fresh generation.")
     }
   }
+
+  /**
+   * Raises whatever the error notifier latched, before this attempt is allowed to report success.
+   *
+   * '''Why one more check, after everything else has passed.''' Every failure the egress path
+   * observes arrives on a Netty thread, long after the call that issued the write returned, and the
+   * notifier exists precisely to carry it across to the task thread. The write loop consults it on
+   * every block and the final drain consults it on every pass -- but the drain's own pass is
+   * best-effort by design and swallows what it catches, so the last thing to fail is the one thing
+   * that could go unreported. Without this call a channel failure could be logged on an I/O thread
+   * and a successful map status published anyway, which is the single worst outcome available: the
+   * scheduler would record the attempt as done and would learn otherwise only when a reduce task
+   * failed its fetch, one stage later and with a diagnosis pointing at the wrong task.
+   *
+   * '''Why it is placed after the durability requirement rather than before it.''' Both refuse the
+   * same publication, so only their diagnoses differ, and [[requireOutputRecoverable]] gives the
+   * more actionable one: it names how many bytes are unreachable and why. A latched channel failure
+   * is frequently the *cause* of the unreachability it would otherwise mask, so letting the
+   * specific message win and keeping this as the backstop reads better in a log than the reverse.
+   *
+   * Nothing is released here, for the reason [[requireOutputRecoverable]] documents: raising from
+   * inside the successful stop sequence hands the work to that sequence's own catch, which retires
+   * the generation and frees everything it holds exactly once.
+   */
+  private def requireNoLatchedFailure(): Unit = errorNotifier.throwIfError()
 
   /**
    * Reports every producer stream of this map output complete on the local ledger.
@@ -1844,9 +2153,7 @@ private[spark] class StreamingShuffleWriter[K, V, C](
     }
   }
 
-  // -------------------------------------------------------------------------------------------
   // Telemetry (FR-7)
-  // -------------------------------------------------------------------------------------------
 
   /**
    * Publishes progress onto the task's standard shuffle-write metrics.
@@ -1894,12 +2201,81 @@ private[spark] class StreamingShuffleWriter[K, V, C](
       log"${MDC(COUNT, spillsObservedTotal)} spills, " +
       log"${MDC(VALUE, consumerStalls)} consumer stalls and " +
       log"${MDC(MAX_ATTEMPTS, replayAttemptsTotal)} replay attempts")
+    logEgressCeilings()
+    logProtocolAnomalies()
   }
 
-  // -------------------------------------------------------------------------------------------
+  /**
+   * Reports the egress ceilings this map task's consumers ran into, when any of them did.
+   *
+   * Conditional on purpose, and the condition is the whole design of the line: every figure it
+   * carries is zero for a shuffle whose consumers kept up, so emitting it unconditionally would add
+   * a line per map task saying nothing. A non-zero figure, by contrast, is the only way an operator
+   * learns that a bound engaged -- that a channel was refused, that a consumer identity went
+   * untracked, or that a queue ceiling deferred references onto an owed run -- and each of those is
+   * a bounded response to remotely induced pressure rather than a fault. What the numbers diagnose
+   * is the pressure, not the bound: deferrals climbing while output is not moving points at a
+   * consumer that has stopped acknowledging, and refused channels point at a peer opening
+   * connections it never uses.
+   */
+  private def logEgressCeilings(): Unit = {
+    val refusedSessions = serverHandler.refusedSessionCount
+    val untrackedConsumers = serverHandler.untrackedConsumerCount
+    val deferredBlocks = serverHandler.deferredBlockCount
+    val owedBlocks = serverHandler.owedBlockCount
+    if (refusedSessions > 0L || untrackedConsumers > 0L || deferredBlocks > 0L || owedBlocks > 0L) {
+      logInfo(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} map " +
+        log"${MDC(TASK_ATTEMPT_ID, mapId)} applied its egress ceilings: " +
+        log"${MDC(COUNT, refusedSessions)} channel(s) refused past the session ceiling, " +
+        log"${MDC(VALUE, untrackedConsumers)} consumer identity(ies) left untracked, " +
+        log"${MDC(NUM_BLOCKS, deferredBlocks)} block reference(s) deferred onto an owed run and " +
+        log"${MDC(MAX_SIZE, owedBlocks)} still owed at this point")
+    }
+  }
+
+  /**
+   * Reports the protocol anomalies this map task's egress observed, when it observed any.
+   *
+   * These counters are the producer's side of every consumer behaviour the protocol tolerates
+   * rather than trusts: an acknowledgement refused because it reached past what was sent, a
+   * retained block a consumer asked for that could no longer be served, a session resumed after a
+   * reconnect, a duplicate acknowledgement, a session or a consumer retired for silence, a session
+   * superseded by the same consumer reconnecting, a consumer identity that changed mid-session, a
+   * frame addressed to a stream this handler does not serve, and a block replayed on request.
+   * Individually each is a handled case; together, and counted, they are how an operator
+   * distinguishes a slow consumer from a broken one, and a reconnecting consumer from a peer
+   * probing the port.
+   *
+   * The anomalies are rendered as a list of only those that occurred rather than as a fixed set of
+   * figures, so the line says what happened instead of mostly saying that nothing did, and it is
+   * suppressed entirely when nothing did. The two consumer counts are carried as context whenever
+   * the line fires, because every figure above is per-consumer in origin and meaningless without
+   * knowing how many there were.
+   */
+  private def logProtocolAnomalies(): Unit = {
+    val anomalies = Seq(
+      ("acknowledgement(s) refused as out of range", serverHandler.refusedAckCount),
+      ("duplicate acknowledgement(s)", serverHandler.duplicateAckCount),
+      ("retained block(s) no longer servable", serverHandler.unservableBlockCount),
+      ("block(s) replayed on request", serverHandler.retransmittedBlockCount),
+      ("session(s) resumed after a reconnect", serverHandler.resumedSessionCount),
+      ("session(s) superseded by a reconnect", serverHandler.supersededSessionCount),
+      ("session(s) retired for silence", serverHandler.expiredSessionCount),
+      ("consumer(s) retired for silence", serverHandler.expiredConsumerCount),
+      ("consumer identity conflict(s)", serverHandler.identityConflictCount),
+      ("misaddressed frame(s)", serverHandler.misaddressedMessageCount))
+      .filter(_._2 > 0L)
+    if (anomalies.nonEmpty) {
+      val rendered = anomalies.map { case (label, count) => s"$count $label" }.mkString(", ")
+      logInfo(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} map " +
+        log"${MDC(TASK_ATTEMPT_ID, mapId)} egress observed ${MDC(DESCRIPTION, rendered)} across " +
+        log"${MDC(COUNT, serverHandler.liveConsumerCount)} connected and " +
+        log"${MDC(VALUE, serverHandler.trackedConsumerCount)} tracked consumer(s)")
+    }
+  }
+
   // Cleanup. Every release below is idempotent, because it may be reached from stop() and from task
   // completion, and because a map task may call stop() twice.
-  // -------------------------------------------------------------------------------------------
 
   /**
    * Releases everything this writer owns, on success, on failure and on cancellation alike.
@@ -2005,35 +2381,68 @@ private[spark] class StreamingShuffleWriter[K, V, C](
   }
 
   /**
-   * Withdraws this generation's retained output from the executor-scoped resolver.
+   * Retires this generation and frees everything it holds, for an attempt that will not succeed.
    *
-   * Reached only from the unsuccessful branch of [[stop]], and deliberately not from the successful
-   * one. A successful map output stays published for as long as its consumers may read it, which
-   * outlives this task: the publication is retired when the shuffle is unregistered or when a newer
-   * generation of the same map supersedes it, never when the producing task happens to finish.
+   * The two steps below are one unit and are always taken together, which is why they have a name
+   * rather than being written out at each call site: the withdrawal stops every owner -- the driver
+   * registry, this executor's routing table, the retained-output registry and the handler's own
+   * sessions -- from offering this generation, and the close returns the memory and the disk it
+   * holds. Both halves are idempotent, which is what lets the three callers reach it in any order:
+   * the unsuccessful stop, a success stop that could not finish, and a failed initialisation.
    *
-   * A failed attempt's output, by contrast, is not merely unneeded but wrong to serve -- it is
-   * partial by definition -- so the binding is removed before the buffers behind it are freed.
+   * @param reason operator-facing context, recorded with the withdrawal on the driver and locally
    */
-  private def withdrawRetainedOutput(): Unit = {
+  private def releaseAfterFailure(reason: String): Unit = {
+    withdrawGeneration(reason)
+    // The buffers are this task's execution memory, so releasing them is the one part of the
+    // withdrawal only the task thread may do.
+    closeSpillState()
+  }
+
+  /**
+   * Retires this generation from every owner of it on this executor.
+   *
+   * Reached only through [[releaseAfterFailure]], and so only for an attempt that will not succeed.
+   * A successful map output stays published and routed for as long as its consumers may read it,
+   * which outlives this task: it is retired when the shuffle is unregistered, when a newer
+   * generation of the same map supersedes it, or when this executor's manager stops -- never when
+   * the producing task happens to finish.
+   *
+   * A failed attempt's output, by contrast, is not merely unneeded but wrong to serve, because it
+   * is partial by definition. Delegating to the handler rather than unregistering the resolver here
+   * is what makes the retirement complete: this writer holds the retained-output owner but not the
+   * routing table, so unregistering only what it holds would leave a routing entry behind for the
+   * whole life of the executor.
+   *
+   * The driver is told first, and it has to be. It owns the address a consumer resolves and is the
+   * one owner this executor cannot retire for itself; withdrawing it before the local owners go
+   * means no consumer is handed an address that is about to refuse it. Waiting for the driver's own
+   * liveness window to reap the registration instead would leave that address on offer for the
+   * whole of that window.
+   *
+   * Contained rather than propagating, because this runs while a failure is already being handled.
+   */
+  private def withdrawGeneration(reason: String): Unit = {
     try {
-      blockResolver.unregisterProducer(shuffleId, mapId, context.taskAttemptId())
+      coordinatorGateway.invalidateProducer(shuffleId,
+        StreamingShuffleProducerGeneration(context.partitionId(), mapId, context.taskAttemptId()),
+        StreamingShuffleInvalidationReason.IncompleteStream, reason)
+      serverHandler.withdrawGeneration(reason)
     } catch {
       case NonFatal(e) =>
         logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} could not withdraw the " +
-          log"retained output of map ${MDC(TASK_ATTEMPT_ID, mapId)}", e)
+          log"producer generation of map ${MDC(TASK_ATTEMPT_ID, mapId)}", e)
     }
   }
 
   /**
-   * Frees every buffer and deletes every spill file, for a task that has already failed.
+   * Frees every buffer and deletes every spill file, for an attempt that will not succeed.
    *
-   * Reached only from the unsuccessful branch of [[stop]]. Nothing retained for retransmission can
-   * ever be asked for again once the task has failed, so waiting for task completion to release it
-   * would hold executor memory and disk for no purpose. On the successful branch this is
-   * deliberately not called: the spill manager's own completion listener releases it, which keeps
-   * the retention window alive for the short remainder of the task in case a consumer asks for a
-   * replay.
+   * Reached only through [[releaseAfterFailure]]. Nothing retained for retransmission can ever be
+   * asked for again once the attempt has failed, so waiting for task completion to release it would
+   * hold executor memory and disk for no purpose. On the successful path this is deliberately not
+   * called: the spill manager's own completion listener releases it, which keeps the retention
+   * window alive for the short remainder of the task in case a consumer asks for a replay.
    */
   private def closeSpillState(): Unit = {
     try {
@@ -2045,10 +2454,8 @@ private[spark] class StreamingShuffleWriter[K, V, C](
     }
   }
 
-  // -------------------------------------------------------------------------------------------
-  // Inspection. Pure reads, exposed so that a suite can assert on what this writer did without
-  // reaching into its internals or observing it through a live cluster.
-  // -------------------------------------------------------------------------------------------
+  // Inspection. Pure reads, exposed so that what this writer did is observable without reaching
+  // into its internals or standing up a live cluster to watch it.
 
   /** The largest block payload this writer will frame, in bytes. */
   def blockPayloadCapacityBytes: Int = blockPayloadCapacity
@@ -2105,15 +2512,13 @@ private[spark] class StreamingShuffleWriter[K, V, C](
     }
   }
 
-  /** Whether [[stop]] has already been entered. */
-  def isStopped: Boolean = stopping
+  /** Whether [[stop]] has already been entered, in any of its outcomes. */
+  def isStopped: Boolean = stopState != StopState.NotEntered
 
   /** The map status produced on success, or `None` before a successful stop. */
   def producedMapStatus: Option[MapStatus] = Option(mapStatus)
 
-  // -------------------------------------------------------------------------------------------
   // Internal state types
-  // -------------------------------------------------------------------------------------------
 
   /**
    * Everything this writer tracks for one reduce partition.
@@ -2298,11 +2703,36 @@ private[spark] class StreamingShuffleWriter[K, V, C](
  * Constants of the streaming shuffle producer.
  *
  * The timing figures are the feature's own, restated here as named values so that the write path
- * reads as prose and a test can assert against the same names the implementation uses. Where a
+ * reads as prose and every consumer of a figure names it rather than repeating its digits. Where a
  * figure is also a constant of a collaborator, it is taken from that collaborator rather than
  * repeated, so that the two can never drift apart.
  */
 private[spark] object StreamingShuffleWriter {
+
+  /**
+   * How far a writer's stop protocol has progressed.
+   *
+   * Sealed and enumerated rather than encoded in booleans because the responses the protocol owes
+   * are not a product of independent flags: see [[StreamingShuffleWriter.stop]] for the five
+   * (state, requested outcome) combinations and the single correct response to each.
+   */
+  sealed trait StopState
+
+  /** The states of a writer's stop protocol. */
+  object StopState {
+
+    /** No stop has begun, so the requested sequence runs. */
+    case object NotEntered extends StopState
+
+    /** A stop is executing; a nested call is a no-op rather than a recursion. */
+    case object Running extends StopState
+
+    /** A successful stop completed and produced a map status. */
+    case object Succeeded extends StopState
+
+    /** Everything the writer held has been released; no further stop can change anything. */
+    case object Failed extends StopState
+  }
 
   /** Cadence of the maintenance pass: flow control, spill polling, liveness and telemetry. */
   val MAINTENANCE_INTERVAL_MS: Long = 100L
@@ -2321,6 +2751,16 @@ private[spark] object StreamingShuffleWriter {
 
   /** Interval at which a producer heartbeat is sent on every active stream. */
   val HEARTBEAT_INTERVAL_MS: Long = StreamingShuffleServerHandler.PRODUCER_HEARTBEAT_INTERVAL_MS
+
+  /**
+   * Interval at which a producer refreshes its registration with the coordinator.
+   *
+   * Half the coordinator's liveness window by construction, because it is the connection timeout
+   * and the window is twice it. One missed refresh is therefore tolerated before the registration
+   * is reaped, which is what stops a single slow ask from withdrawing a healthy producer's address.
+   */
+  val COORDINATOR_HEARTBEAT_INTERVAL_MS: Long =
+    StreamingShuffleCoordinator.PRODUCER_CONNECTION_TIMEOUT_MS
 
   /** Acknowledgement gap after which a consumer is treated as unresponsive. */
   val CONSUMER_LIVENESS_TIMEOUT_MS: Long =
@@ -2379,11 +2819,12 @@ private[spark] object StreamingShuffleWriter {
    * it hands the verdict back to the barren-round tolerance, which fails the task and degrades to
    * sort-based shuffle exactly as specified.
    *
-   * Sized from measurement rather than taste. A spill write of a few kilobytes was observed landing
-   * roughly 17 ms after it began, while sixty-odd rounds that did not yield burned through their
-   * whole allowance in about 5 ms -- fast enough to declare the budget exhausted while it was
-   * actively being freed. A thousand yielding rounds spans that write with a wide margin on a busy
-   * executor and still terminates promptly when nothing is going to arrive.
+   * Sized so that the bound is a backstop rather than the thing that decides the outcome. Rounds
+   * that yield are paced by the scheduler and not by a spin, so a thousand of them outlast a spill
+   * write of ordinary size by a wide margin even on a busy executor, while still terminating
+   * promptly when nothing is going to arrive. A count small enough to be reached by a healthy
+   * evictor would turn a transient reclamation into a task failure, which is the failure mode this
+   * number exists to prevent.
    */
   val MAX_EVICTION_DEFERRALS: Int = 1024
 

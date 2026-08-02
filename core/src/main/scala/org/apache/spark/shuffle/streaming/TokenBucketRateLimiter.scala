@@ -61,11 +61,22 @@ import org.apache.spark.util.{Clock, SystemClock}
  *
  * All time is read through the injected clock, never through the system clock directly, so that a
  * test can freeze or advance time and observe exact token arithmetic instead of racing a real
- * clock. Accrual is measured in milliseconds: that keeps the elapsed-time multiplication far away
- * from Long overflow for every rate derivable from the operator's MB/s setting, and the bucket's
- * burst allowance is at least one second of tokens, which makes sub-millisecond accrual
- * irrelevant -- a refusal inside the same millisecond is simply the throttle signal the protocol
- * expects.
+ * clock. Accrual is measured against the clock's <em>monotonic</em> reading rather than its
+ * wall-clock one, and that is a correctness requirement rather than a preference: a wall clock can
+ * be stepped by an administrator or slewed by an NTP daemon, and either direction is harmful here.
+ * Stepped backwards it freezes accrual for the length of the step, so a producer is paced at zero
+ * while the operator's cap says otherwise; stepped forwards it mints a burst nobody earned, so the
+ * cap is exceeded by exactly the size of the jump. A monotonic source measures the interval that
+ * actually elapsed and is distorted by neither. The injected clock exposes both readings, and the
+ * manual clock used in tests derives its monotonic reading from the millisecond time a test sets,
+ * so advancing a manual clock still advances accrual exactly.
+ *
+ * Nanosecond arithmetic is kept overflow-safe by construction rather than by assuming intervals
+ * stay small: the elapsed interval is split into whole seconds and a sub-second remainder before it
+ * meets the token rate, each product saturates instead of wrapping, and the sum is immediately
+ * clamped to the bucket's remaining headroom. A bucket left idle for hours therefore fills, which
+ * is right, and never reports a wrapped or negative token count, which is what an unguarded
+ * multiplication would eventually do.
  *
  * An oversized request, one asking for more than the whole bucket can ever hold, is refused
  * outright and charged nothing. Admitting it against a full bucket and debiting only the capacity
@@ -77,18 +88,21 @@ import org.apache.spark.util.{Clock, SystemClock}
  *
  * Instances are cheap, and every method is safe to call concurrently from any number of threads.
  *
- * The rate this class enforces is derived, not declared. The operator declares an administered link
- * capacity through spark.shuffle.streaming.maxBandwidthMBps, and the factory in the companion
- * object turns that capacity into this limiter's token rate by dividing it across the shuffles the
- * executor is serving and then holding the result to 80 percent of the declared capacity. See
- * [[TokenBucketRateLimiter.apply]] for that arithmetic and for the single definition of the
- * configured value that both the configuration entry and this class speak in terms of.
+ * The rate this class enforces is derived, not declared, and it is not derived here. The operator
+ * declares an administered link capacity through spark.shuffle.streaming.maxBandwidthMBps, and
+ * [[TokenBucketRateLimiter.ExecutorEgressBudget]] turns that capacity into each limiter's token
+ * rate by dividing it across the shuffles the executor is producing for and then holding the result
+ * to 80 percent of the declared capacity. A limiter is therefore never built at a rate of its own
+ * choosing and never keeps a rate the divisor has moved past. See
+ * [[TokenBucketRateLimiter.executorBudget]] for that arithmetic and for the single definition of
+ * the configured value that both the configuration entry and this class speak in terms of.
  *
  * @param capacityBytes bucket size in bytes, that is the maximum burst; must be positive
  * @param refillBytesPerSecond token rate in bytes per second; must be positive.
  *                             [[TokenBucketRateLimiter.UNLIMITED_BYTES_PER_SECOND]] selects the
  *                             unlimited fast path, in which every request is admitted at no cost
- * @param clock time source for token accrual, injected so that tests are deterministic
+ * @param clock time source for token accrual, so accrual is a function of this clock alone and no
+ *              reading of wall time enters the rate
  * @param debugEnabled the value of spark.shuffle.streaming.debug, read once by the caller and held
  *                     immutably here. It is the sole authority over the one diagnostic this class
  *                     emits, so an operator who leaves that key at its default of false sees
@@ -130,7 +144,7 @@ private[spark] class TokenBucketRateLimiter(
    */
   private val state: AtomicReference[TokenBucketRateLimiter.BucketState] =
     new AtomicReference(
-      new TokenBucketRateLimiter.BucketState(initialCapacityBytes, clock.getTimeMillis(),
+      new TokenBucketRateLimiter.BucketState(initialCapacityBytes, clock.nanoTime(),
         initialCapacityBytes, initialRefillBytesPerSecond))
 
   /**
@@ -232,7 +246,7 @@ private[spark] class TokenBucketRateLimiter(
     if (unlimited) {
       Long.MaxValue
     } else {
-      refill(state.get(), clock.getTimeMillis()).tokens
+      refill(state.get(), clock.nanoTime()).tokens
     }
   }
 
@@ -261,7 +275,7 @@ private[spark] class TokenBucketRateLimiter(
     if (unlimited || bytes == 0L) {
       0L
     } else {
-      val observed = refill(state.get(), clock.getTimeMillis())
+      val observed = refill(state.get(), clock.nanoTime())
       if (bytes > observed.capacityBytes) {
         Long.MaxValue
       } else {
@@ -278,8 +292,9 @@ private[spark] class TokenBucketRateLimiter(
   }
 
   /**
-   * Whether this limiter admits everything at no cost. The fallback policy and the backpressure
-   * protocol use it to skip pacing bookkeeping entirely when egress is uncapped.
+   * Whether this limiter admits everything at no cost. Read by [[StreamingShuffleWriter]] to skip
+   * its pacing bookkeeping entirely -- the retry loop, the deferral accounting and the diagnostic
+   * -- when egress is uncapped, which is the default configuration.
    */
   def isUnlimited: Boolean = unlimited
 
@@ -295,7 +310,7 @@ private[spark] class TokenBucketRateLimiter(
     // Refills to the capacity currently in force rather than the one this limiter was constructed
     // with, so resetting after a redistribution does not silently reinstate an old rate.
     val observed = state.get()
-    state.set(new TokenBucketRateLimiter.BucketState(observed.capacityBytes, clock.getTimeMillis(),
+    state.set(new TokenBucketRateLimiter.BucketState(observed.capacityBytes, clock.nanoTime(),
       observed.capacityBytes, observed.refillBytesPerSecond))
   }
 
@@ -322,7 +337,7 @@ private[spark] class TokenBucketRateLimiter(
         recordOversizedRequest(bytes, observed.capacityBytes)
         attempting = false
       } else {
-        val refreshed = refill(observed, clock.getTimeMillis())
+        val refreshed = refill(observed, clock.nanoTime())
         if (refreshed.tokens < bytes) {
           // Over limit, and deliberately publishing nothing: accrual is derived from the elapsed
           // time since the recorded refill point, so the tokens minted above are not lost, and a
@@ -333,7 +348,7 @@ private[spark] class TokenBucketRateLimiter(
           // so the result cannot go negative and no clamping is needed -- and none is wanted, since
           // clamping is precisely how bytes escaped being charged for.
           val next = new TokenBucketRateLimiter.BucketState(refreshed.tokens - bytes,
-            refreshed.lastRefillMillis, refreshed.capacityBytes, refreshed.refillBytesPerSecond)
+            refreshed.lastRefillNanos, refreshed.capacityBytes, refreshed.refillBytesPerSecond)
           if (state.compareAndSet(observed, next)) {
             acquired = true
             attempting = false
@@ -404,9 +419,9 @@ private[spark] class TokenBucketRateLimiter(
           // for the limiters whose share did not move.
           attempting = false
         } else {
-          val refreshed = refill(observed, clock.getTimeMillis())
+          val refreshed = refill(observed, clock.nanoTime())
           val next = new TokenBucketRateLimiter.BucketState(
-            math.min(refreshed.tokens, newCapacity), refreshed.lastRefillMillis,
+            math.min(refreshed.tokens, newCapacity), refreshed.lastRefillNanos,
             newCapacity, newRefillBytesPerSecond)
           if (state.compareAndSet(observed, next)) {
             published = true
@@ -423,27 +438,29 @@ private[spark] class TokenBucketRateLimiter(
    * capacity.
    *
    * Pure: it returns a new snapshot, or `observed` itself when nothing changed, and never touches
-   * the shared state. Two guards keep it honest. Elapsed time that is zero or negative -- which a
-   * wall clock can report when it is adjusted backwards -- mints nothing and never rewinds the
-   * accrual point. Elapsed time too short to earn a whole token likewise leaves the accrual point
-   * alone, so the fraction is carried into the next call instead of being discarded over and over.
+   * the shared state. Two guards keep it honest. An elapsed interval that is zero or negative mints
+   * nothing and never rewinds the accrual point -- negative is not expected from a monotonic
+   * source, but the platform guarantee is "always increasing" rather than "provably monotonic", so
+   * the guard stays. An interval too short to earn a whole token likewise leaves the accrual point
+   * alone, so the fraction is carried into the next call instead of being discarded over and over;
+   * at nanosecond resolution that carry matters for every rate an operator can configure.
    *
    * @param observed the snapshot to advance
-   * @param nowMillis the current time in milliseconds, as reported by the injected clock
+   * @param nowNanos the current monotonic time in nanoseconds, as reported by the injected clock
    * @return the refilled snapshot, or `observed` when no whole token was earned
    */
   private def refill(
       observed: TokenBucketRateLimiter.BucketState,
-      nowMillis: Long): TokenBucketRateLimiter.BucketState = {
-    val elapsedMillis = nowMillis - observed.lastRefillMillis
-    if (elapsedMillis <= 0L) {
+      nowNanos: Long): TokenBucketRateLimiter.BucketState = {
+    val elapsedNanos = nowNanos - observed.lastRefillNanos
+    if (elapsedNanos <= 0L) {
       observed
     } else {
       // The rate and the capacity are taken from the snapshot being advanced, never from a field of
       // the limiter, so accrual is always measured against the parameters that snapshot was
       // published with even if a redistribution lands mid-computation.
-      val minted = TokenBucketRateLimiter.saturatingMultiply(
-        elapsedMillis, observed.refillBytesPerSecond) / TokenBucketRateLimiter.MILLIS_PER_SECOND
+      val minted = TokenBucketRateLimiter.tokensEarned(
+        elapsedNanos, observed.refillBytesPerSecond)
       if (minted <= 0L) {
         observed
       } else {
@@ -453,10 +470,10 @@ private[spark] class TokenBucketRateLimiter(
         // tokens arriving at a full bucket are thrown away.
         val headroom = observed.capacityBytes - observed.tokens
         if (minted >= headroom) {
-          new TokenBucketRateLimiter.BucketState(observed.capacityBytes, nowMillis,
+          new TokenBucketRateLimiter.BucketState(observed.capacityBytes, nowNanos,
             observed.capacityBytes, observed.refillBytesPerSecond)
         } else {
-          new TokenBucketRateLimiter.BucketState(observed.tokens + minted, nowMillis,
+          new TokenBucketRateLimiter.BucketState(observed.tokens + minted, nowNanos,
             observed.capacityBytes, observed.refillBytesPerSecond)
         }
       }
@@ -552,51 +569,66 @@ private[spark] object TokenBucketRateLimiter extends Logging {
   val MILLIS_PER_SECOND: Long = 1000L
 
   /**
-   * Builds the limiter that paces one shuffle's egress on this executor.
+   * Nanoseconds in one second, the divisor that turns a monotonic interval into earned tokens.
    *
-   * The configured value is the administered link capacity, so the token rate this returns is
+   * Accrual is measured in nanoseconds because that is the unit the clock's monotonic reading comes
+   * in, and converting it down to milliseconds first would throw away every sub-millisecond
+   * interval -- which, on a path consulted once per outbound block, is most of them.
+   */
+  val NANOS_PER_SECOND: Long = 1000000000L
+
+  /**
+   * Builds the executor's egress budget, out of which each shuffle's limiter is handed.
+   *
+   * The configured value is the administered link capacity, so the token rate each of this budget's
+   * limiters paces at is
    * `(BANDWIDTH_CEILING_PERCENT / 100) * maxBandwidthMBps * 1 MiB / numConcurrentShuffles` bytes
    * per second -- the composition of [[perShuffleBytesPerSecond]] and [[applyLinkCapacityCeiling]],
    * in that order. An operator who declares a 1000 MB/s link and is running two shuffles should
    * therefore expect each to refill at 400 MB/s and the pair to occupy 800 MB/s, which is the 80
    * percent ceiling holding across the executor rather than per stream.
    *
-   * The link capacity is an optional configuration entry, and its absence is the unlimited state:
-   * absence is deliberately not encoded as zero or as a negative sentinel, so it is matched
-   * explicitly here and routed to [[unlimited]].
+   * A budget rather than a limiter is what this returns, and that is the whole point: the divisor
+   * is a property of the executor, so no single limiter can own it. [[ExecutorEgressBudget]] hands
+   * out one limiter per shuffle and republishes every live limiter's share whenever the divisor
+   * moves, which is what makes the aggregate obey the cap instead of each limiter obeying it alone.
    *
-   * @param conf the executor's configuration, read once and never consulted again
-   * @param numConcurrentShuffles active shuffles on this executor, as reported by the streaming
-   *                              shuffle coordinator; a value of zero or less is treated as one
-   * @param clock time source handed to the limiter, injected so that tests are deterministic
-   * @return a bounded limiter when a link capacity is declared, an unlimited one when it is not
+   * The link capacity is an optional configuration entry, and its absence is the unlimited state:
+   * absence is deliberately not encoded as zero or as a negative sentinel, so it is carried as an
+   * absent option into the budget, which routes it to [[unlimited]].
+   *
+   * @param conf the executor's configuration; the cap and the debug gate are read once here and
+   *             never consulted again, which is what makes an executor restart the only way to
+   *             change either
+   * @param clock time source handed to every limiter the budget creates, so accrual across the
+   *              whole budget advances from one reading rather than from wall time
+   * @param concurrencySource asks the coordinator how many streaming shuffles this executor is
+   *                          producing for, answering `None` when the question cannot be put
+   * @return a budget that paces to the declared capacity, or one that paces nothing when no
+   *         capacity is declared
    */
-  def apply(
+  def executorBudget(
       conf: SparkConf,
-      numConcurrentShuffles: Int,
-      clock: Clock = new SystemClock): TokenBucketRateLimiter = {
+      clock: Clock = new SystemClock,
+      concurrencySource: () => Option[Int] = () => None): ExecutorEgressBudget = {
     val debug = conf.get(config.SHUFFLE_STREAMING_DEBUG)
-    conf.get(config.SHUFFLE_STREAMING_MAX_BANDWIDTH_MBPS) match {
-      case Some(maxBandwidthMBps) =>
-        val share = perShuffleBytesPerSecond(maxBandwidthMBps, numConcurrentShuffles)
-        val paced = applyLinkCapacityCeiling(share)
-        val burst = burstCapacityBytes(paced)
-        if (debug) {
-          logInfo(log"Streaming shuffle egress limiter derived from the link capacity " +
+    val cap = conf.get(config.SHUFFLE_STREAMING_MAX_BANDWIDTH_MBPS)
+    if (debug) {
+      cap match {
+        case Some(maxBandwidthMBps) =>
+          val firstShare = applyLinkCapacityCeiling(perShuffleBytesPerSecond(maxBandwidthMBps, 1))
+          logInfo(log"Streaming shuffle egress budget derived from the link capacity " +
             log"${MDC(CONFIG, config.SHUFFLE_STREAMING_MAX_BANDWIDTH_MBPS.key)}=" +
-            log"${MDC(VALUE, maxBandwidthMBps)} MB/s, shared across " +
-            log"${MDC(COUNT, numConcurrentShuffles)} concurrent shuffles and held to " +
-            log"${MDC(NUM_BYTES, BANDWIDTH_CEILING_PERCENT)}% of it: refill " +
-            log"${MDC(NUM_BYTES, paced)} bytes/s, burst ${MDC(MAX_SIZE, burst)} bytes")
-        }
-        new TokenBucketRateLimiter(burst, paced, clock, debug)
-      case None =>
-        if (debug) {
+            log"${MDC(VALUE, maxBandwidthMBps)} MB/s, held to " +
+            log"${MDC(NUM_BYTES, BANDWIDTH_CEILING_PERCENT)}% of it and divided among the " +
+            log"shuffles this executor produces for: while it produces for one, that one paces " +
+            log"at ${MDC(MAX_SIZE, firstShare)} bytes/s")
+        case None =>
           logInfo(log"Streaming shuffle egress is uncapped because " +
             log"${MDC(CONFIG, config.SHUFFLE_STREAMING_MAX_BANDWIDTH_MBPS.key)} is unset")
-        }
-        unlimited(clock, debug)
+      }
     }
+    new ExecutorEgressBudget(cap, clock, debug, concurrencySource)
   }
 
   /**
@@ -695,6 +727,50 @@ private[spark] object TokenBucketRateLimiter extends Logging {
   }
 
   /**
+   * Whole tokens earned by `elapsedNanos` of accrual at `bytesPerSecond`.
+   *
+   * The interval is split into whole seconds and a sub-second remainder before either meets the
+   * rate, which is what keeps the arithmetic exact over the entire range a caller can present. The
+   * naive form -- multiply the whole nanosecond interval by the rate and then divide -- overflows a
+   * `Long` after roughly ninety seconds at a hundred megabytes per second, and a bucket that has
+   * simply been idle while its shuffle waited on a slow consumer can easily be idle for longer than
+   * that. Split, the remainder term is bounded by one second of nanoseconds and the seconds term is
+   * a small number, so both stay in range for every rate derivable from the operator's MB/s
+   * setting.
+   *
+   * Both products saturate rather than wrap, so an interval or rate beyond even that range yields
+   * `Long.MaxValue` -- which the caller immediately clamps to the bucket's headroom, meaning the
+   * extreme case fills the bucket. That is the correct answer for a long idle period, and it is
+   * reached without the caller having to reason about overflow at all.
+   *
+   * @param elapsedNanos monotonic interval to credit; a non-positive value earns nothing
+   * @param bytesPerSecond the token rate to credit it at; a non-positive rate earns nothing
+   * @return tokens earned, never negative
+   */
+  def tokensEarned(elapsedNanos: Long, bytesPerSecond: Long): Long = {
+    if (elapsedNanos <= 0L || bytesPerSecond <= 0L) {
+      0L
+    } else {
+      val wholeSeconds = elapsedNanos / NANOS_PER_SECOND
+      val remainderNanos = elapsedNanos - wholeSeconds * NANOS_PER_SECOND
+      saturatingAdd(
+        saturatingMultiply(wholeSeconds, bytesPerSecond),
+        saturatingMultiply(remainderNanos, bytesPerSecond) / NANOS_PER_SECOND)
+    }
+  }
+
+  /**
+   * `a + b` for non-negative operands, saturating at `Long.MaxValue` instead of wrapping.
+   *
+   * Used only where a wrapped sum would become a small or negative token count and therefore a
+   * silently wrong pacing decision; the saturated value is always clamped by the caller.
+   */
+  def saturatingAdd(a: Long, b: Long): Long = {
+    val sum = a + b
+    if (sum < 0L) Long.MaxValue else sum
+  }
+
+  /**
    * An immutable snapshot of a bucket: the tokens it holds, and the instant up to which accrual
    * has been credited.
    *
@@ -710,13 +786,16 @@ private[spark] object TokenBucketRateLimiter extends Logging {
    * mutable fields would make that impossible to guarantee without a lock on the hot path.
    *
    * @param tokens tokens currently held, always within [0, capacityBytes]
-   * @param lastRefillMillis clock reading, in milliseconds, up to which accrual is credited
+   * @param lastRefillNanos monotonic clock reading, in nanoseconds, up to which accrual is
+   *                        credited. Monotonic rather than wall-clock, because an interval is the
+   *                        only quantity accrual needs and it is the one quantity a clock
+   *                        adjustment must not be able to distort
    * @param capacityBytes bucket size this snapshot was measured against
    * @param refillBytesPerSecond token rate this snapshot accrues at
    */
   private[streaming] class BucketState(
       val tokens: Long,
-      val lastRefillMillis: Long,
+      val lastRefillNanos: Long,
       val capacityBytes: Long,
       val refillBytesPerSecond: Long)
 
@@ -755,11 +834,17 @@ private[spark] object TokenBucketRateLimiter extends Logging {
    * @param maxBandwidthMBps the operator's declared egress cap in MB/s, or None for unlimited.
    *                         Absence means unlimited, never zero
    * @param clock time source handed to every limiter this budget creates, injected for determinism
+   * @param concurrencySource asks the coordinator how many streaming shuffles this executor is
+   *                          currently producing for, answering `None` when the question cannot be
+   *                          put. Supplied as a function rather than as an endpoint reference so
+   *                          that no transport type reaches this class, and so the question can be
+   *                          answered without one
    */
   class ExecutorEgressBudget(
       maxBandwidthMBps: Option[Int],
       clock: Clock = new SystemClock,
-      debugEnabled: Boolean = false)
+      debugEnabled: Boolean = false,
+      concurrencySource: () => Option[Int] = () => None)
     extends Logging {
 
     /** Guards the registry and the redistribution pass. Never held across a blocking call. */
@@ -796,12 +881,47 @@ private[spark] object TokenBucketRateLimiter extends Logging {
      * @param shuffleId shuffle whose limiter should be retired
      * @return true if a limiter was present and retired
      */
-    def release(shuffleId: Int): Boolean = lock.synchronized {
-      val removed = limiters.remove(shuffleId).isDefined
+    def release(shuffleId: Int): Boolean = {
+      val removed = lock.synchronized {
+        val present = limiters.remove(shuffleId).isDefined
+        if (present) {
+          redistribute()
+        }
+        present
+      }
       if (removed) {
-        redistribute()
+        // Outside the lock, because the question may cross the network. The removal's verdict is
+        // what this method reports; whether the refresh moved the divisor is the refresh's
+        // business.
+        refreshConcurrency()
       }
       removed
+    }
+
+    /**
+     * Re-reads the coordinator's view of this executor's concurrency and republishes the shares if
+     * it moved the divisor.
+     *
+     * <b>Why a release is the moment that needs this and an admission is not.</b> The divisor is
+     * the larger of the local limiter count and the count the coordinator last reported, so a
+     * reported value can only ever be too high, never too low -- and a value that is too high paces
+     * every live limiter below its true share for as long as it is believed. An admission already
+     * carries a fresh count: the reply to a producer registration reports it, and the caller feeds
+     * it straight in through [[observeConcurrency]], so asking again there would spend a round trip
+     * on a number the executor already has. A release carries nothing. Dropping the third of three
+     * limiters leaves the local count at two and the reported count at three, and nothing else
+     * would ever correct it until the executor happened to register another producer.
+     *
+     * The question is put outside the redistribution lock, because it may cross the network and
+     * this class documents that its lock is never held across a blocking call. Nothing is lost by
+     * answering late: the divisor stays conservatively high until the answer arrives.
+     *
+     * @return true if the divisor moved and limiters were republished
+     */
+    def refreshConcurrency(): Boolean = {
+      // Read outside the lock. A failure to reach the coordinator is answered with None by the
+      // source itself, and None leaves the divisor exactly as it was.
+      concurrencySource().exists(observeConcurrency)
     }
 
     /**
@@ -825,9 +945,6 @@ private[spark] object TokenBucketRateLimiter extends Logging {
       }
     }
 
-    /** Number of shuffles this executor currently holds a limiter for. */
-    def activeLimiterCount: Int = lock.synchronized(limiters.size)
-
     /**
      * The divisor currently applied to the operator's cap: the larger of the local limiter count
      * and the concurrency the coordinator last reported, never less than one.
@@ -836,7 +953,7 @@ private[spark] object TokenBucketRateLimiter extends Logging {
 
     /**
      * The token rate every live limiter is currently pacing at, or None when egress is uncapped.
-     * The aggregate of all live limiters is this multiplied by [[activeLimiterCount]], which is
+     * The aggregate of all live limiters is this multiplied by the number of them, which is
      * what a test asserts against the operator's cap.
      */
     def currentShareBytesPerSecond: Option[Long] = lock.synchronized {
@@ -845,7 +962,11 @@ private[spark] object TokenBucketRateLimiter extends Logging {
 
     /**
      * Drops every limiter and forgets the reported concurrency, returning the budget to the state a
-     * freshly constructed one would report. Useful in tests, which reuse a budget across cases.
+     * freshly constructed one would report.
+     *
+     * Called at executor shutdown, once both transports are closed, so that nothing is retired
+     * while a live channel could still be charging against it. Also what lets a suite reuse one
+     * budget across cases.
      */
     def reset(): Unit = lock.synchronized {
       limiters.clear()

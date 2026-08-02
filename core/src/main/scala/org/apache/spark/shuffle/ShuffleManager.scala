@@ -109,20 +109,11 @@ private[spark] object ShuffleManager {
   }
 
   def getShuffleManagerClassName(conf: SparkConf): String = {
-    // Streaming shuffle coexists with sort-based shuffle rather than replacing it, and this map is
-    // the entire selection mechanism: `create` above instantiates whatever class name is resolved
-    // here, so adding one entry is all that is needed to make the streaming manager reachable. The
-    // two sort entries and the default are deliberately untouched -- `sort` remains the default, so
-    // an application that does not name "streaming" never loads a line of the streaming subsystem.
-    // Selecting the streaming manager is only the first of two tiers: it delegates every
-    // service-provider call to an internally held, unmodified SortShuffleManager while
-    // spark.shuffle.streaming.enabled is false (its default) or while any documented degradation
-    // condition holds, which is what makes sort-based shuffle both the default and the fallback.
     val shortShuffleMgrNames = Map(
       "sort" -> classOf[org.apache.spark.shuffle.sort.SortShuffleManager].getName,
       "tungsten-sort" -> classOf[org.apache.spark.shuffle.sort.SortShuffleManager].getName,
-      // The key is taken from the streaming manager's own constant so that the selector an operator
-      // writes and the class it selects cannot drift apart.
+      // Streaming shuffle coexists with sort-based shuffle; sort remains the default. The key comes
+      // from the streaming manager's own constant so selector and class cannot drift apart.
       org.apache.spark.shuffle.streaming.StreamingShuffleManager.SHORT_NAME ->
         classOf[org.apache.spark.shuffle.streaming.StreamingShuffleManager].getName)
 

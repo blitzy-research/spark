@@ -25,8 +25,8 @@ import scala.jdk.CollectionConverters._
 
 import org.apache.spark.SparkConf
 import org.apache.spark.internal.{config, Logging}
-import org.apache.spark.internal.LogKeys.{COUNT, MAX_ATTEMPTS, MAX_SIZE, NUM_BYTES, NUM_SKIPPED,
-  PARTITION_ID, PERCENT, REASON, SHUFFLE_ID, THRESHOLD}
+import org.apache.spark.internal.LogKeys.{COUNT, MAX_ATTEMPTS, MAX_SIZE, NUM_BYTES, NUM_EVENTS,
+  NUM_SKIPPED, PARTITION_ID, PERCENT, PROTOCOL_VERSION, REASON, SHUFFLE_ID, THRESHOLD, VERSION_NUM}
 import org.apache.spark.network.shuffle.protocol.streaming.{AckMessage, DataBlockMessage,
   HeartbeatMessage, RetransmitRequestMessage, StreamingShuffleMessage,
   StreamingShuffleMessageType, StreamTerminationMessage}
@@ -281,9 +281,9 @@ private[spark] case class BackpressureShuffleDemand(
  *
  * Determinism. Every time this class reads is read through the injected [[Clock]]. There is no
  * `Thread.sleep`, no direct `System.currentTimeMillis()` and no direct `System.nanoTime()` anywhere
- * in this file, and no method waits on anything, so a suite can freeze the clock, advance it by
- * exactly five or ten seconds and observe the timers trip to the millisecond instead of racing wall
- * time. The heartbeats this class builds are stamped from the same injected clock, which is why
+ * in this file, and no method waits on anything, so every timer here is a pure function of the
+ * clock it was given and trips at exactly its bound rather than somewhere near it. The heartbeats
+ * this class builds are stamped from that same clock, which is why
  * [[HeartbeatMessage]] takes its timestamp from the caller rather than reading a clock of its own.
  *
  * Liveness and clock skew. A stream's liveness is judged from the local instant at which this
@@ -317,19 +317,23 @@ private[spark] case class BackpressureShuffleDemand(
  *                    shuffles and the concurrency count that the egress budget is divided by. May
  *                    be null on a host that holds only a remote reference to the driver's endpoint,
  *                    in which case arbitration falls back to the shuffles registered locally
- * @param rateLimiter the pacing layer this protocol consults; must not be null
- * @param clock time source for every liveness and rate decision, injected so that tests are
- *              deterministic
+ * @param egressBudget the executor's whole egress allowance, from which this protocol resolves the
+ *                     one limiter that paces each registered shuffle. Not a single shared limiter:
+ *                     the contract divides the administered cap by the number of shuffles the
+ *                     executor is producing for, so the divisor belongs to the executor and each
+ *                     shuffle's share belongs to the shuffle. Must not be null
+ * @param clock time source for every liveness and rate decision, so each timer trips at exactly
+ *              its bound rather than at whatever wall time happens to be
  */
 private[spark] class BackpressureProtocol(
     conf: SparkConf,
     coordinator: StreamingShuffleCoordinator,
-    rateLimiter: TokenBucketRateLimiter,
+    egressBudget: TokenBucketRateLimiter.ExecutorEgressBudget,
     clock: Clock = new SystemClock)
-  extends StreamingShuffleBufferUtilizationContributor with Logging {
+  extends Logging {
 
   require(conf != null, "The Spark configuration must not be null.")
-  require(rateLimiter != null, "The streaming shuffle rate limiter must not be null.")
+  require(egressBudget != null, "The streaming shuffle egress budget must not be null.")
   require(clock != null, "The streaming shuffle clock must not be null.")
 
   // Read once at construction and held immutably. The streaming shuffle has no dynamic
@@ -364,6 +368,21 @@ private[spark] class BackpressureProtocol(
   private val shuffleBufferedBytes = new ConcurrentHashMap[Int, java.lang.Long]()
 
   private val shuffleBudgetBytes = new ConcurrentHashMap[Int, java.lang.Long]()
+
+  // The limiter pacing each registered shuffle's egress, cached here so the admission path never
+  // touches the budget's lock.
+  //
+  // Resolving a limiter from the budget takes the budget's lock and republishes every live
+  // limiter's share, because admitting a shuffle moves the divisor. That is correct once per
+  // shuffle and unacceptable once per block, and admission is a per-block question asked from a
+  // network event-loop thread. The resolution therefore happens at registration and the result is
+  // held in a concurrent map that admission only ever reads.
+  //
+  // A cache miss on the admission path is answered by resolving through the budget rather than by
+  // refusing: an unregistered shuffle must not be paced at the whole cap, and it must not be
+  // stalled either. The resolution is idempotent, so two threads racing to fill the same entry
+  // both receive the one limiter the budget holds for that shuffle.
+  private val shuffleLimiters = new ConcurrentHashMap[Int, TokenBucketRateLimiter]()
 
   /**
    * The one consumer-side receive budget of this executor, in bytes.
@@ -429,6 +448,13 @@ private[spark] class BackpressureProtocol(
   private val throttleLogGate =
     new MemorySpillManager.LogAggregationGate(MemorySpillManager.LOG_AGGREGATION_WINDOW_MS)
 
+  // Rate gate for the impossible-acknowledgement record. A consumer whose position accounting has
+  // diverged names an impossible position on every acknowledgement it sends, so the condition
+  // recurs per frame rather than per stream and is reported as a bounded aggregate for the same
+  // reason throttling is. The counter beside it supplies the total the aggregate reports.
+  private val impossibleAckLogGate =
+    new MemorySpillManager.LogAggregationGate(MemorySpillManager.LOG_AGGREGATION_WINDOW_MS)
+
   // Acknowledgement-driven reclamations that were not confirmed inside the 100 ms bound. Counted
   // rather than logged per occurrence, because the bound is per acknowledgement and a log line per
   // breach would be a per-acknowledgement line by another name.
@@ -490,10 +516,15 @@ private[spark] class BackpressureProtocol(
    * Registers a shuffle with the protocol, recording the reduce partition count that arbitration
    * and the aggregate utilisation reading are computed from.
    *
+   * Also claims the shuffle's share of the executor's egress allowance, which is what makes the
+   * contract's `maxBandwidthMBps / numConcurrentShuffles` divisor real: a shuffle counts towards
+   * the divisor from the moment it is registered rather than from the moment it first sends.
+   *
    * Idempotent in the sense that registering the same shuffle again simply refreshes the partition
    * count, which is what a second map task of the same shuffle on the same executor does. The
    * buffered and budget readings of an already-registered shuffle are left untouched, so a
-   * re-registration cannot silently zero a live utilisation contribution.
+   * re-registration cannot silently zero a live utilisation contribution, and the share is resolved
+   * rather than re-allocated, so the second map task paces against the limiter the first is using.
    *
    * @param shuffleId the shuffle to register; must be non-negative
    * @param numPartitions its reduce partition count; must be positive
@@ -505,6 +536,10 @@ private[spark] class BackpressureProtocol(
     shufflePartitionCounts.put(shuffleId, Integer.valueOf(numPartitions))
     shuffleBufferedBytes.putIfAbsent(shuffleId, java.lang.Long.valueOf(0L))
     shuffleBudgetBytes.putIfAbsent(shuffleId, java.lang.Long.valueOf(0L))
+    // Claims this shuffle's share of the executor's egress allowance, which republishes every
+    // other live shuffle's share because the divisor has just moved. Done here, off the hot path,
+    // so that the first block of the shuffle finds its limiter already paced correctly.
+    resolveLimiter(shuffleId)
     if (debugEnabled) {
       logDebug(log"Registered shuffle ${MDC(SHUFFLE_ID, shuffleId)} with the streaming shuffle " +
         log"backpressure protocol across ${MDC(COUNT, numPartitions)} partitions")
@@ -518,7 +553,9 @@ private[spark] class BackpressureProtocol(
    * cancellation alike.
    *
    * Dropping the utilisation contribution along with the shuffle is what stops a finished shuffle
-   * from inflating the executor's reading forever.
+   * from inflating the executor's reading forever, and returning its share of the egress allowance
+   * is the same statement in the other currency: a shuffle that has ended while still holding a
+   * limiter keeps the divisor too high and paces every shuffle outliving it below its true share.
    *
    * @param shuffleId the shuffle to drop
    * @return how many streams were dropped with it
@@ -527,6 +564,11 @@ private[spark] class BackpressureProtocol(
     shufflePartitionCounts.remove(shuffleId)
     shuffleBufferedBytes.remove(shuffleId)
     shuffleBudgetBytes.remove(shuffleId)
+    // Returns this shuffle's share to the shuffles that remain. The local cache entry goes first,
+    // so no admission can resolve a limiter the budget has already retired; the budget's own
+    // release is idempotent, so a shuffle that never held a limiter costs nothing here.
+    shuffleLimiters.remove(shuffleId)
+    egressBudget.release(shuffleId)
     var dropped = 0
     val entries = streams.keySet().iterator()
     while (entries.hasNext) {
@@ -543,6 +585,58 @@ private[spark] class BackpressureProtocol(
         log"${MDC(COUNT, dropped)} stream(s) of shuffle ${MDC(SHUFFLE_ID, shuffleId)}")
     }
     dropped
+  }
+
+  /**
+   * How many streams of one shuffle are registered here; zero for a shuffle this protocol has never
+   * seen and zero for one whose streams have all left.
+   *
+   * The question a caller asks before returning a shuffle's executor-scoped state: a shuffle with a
+   * live stream is still occupying credit and still occupying the link, whatever decision has been
+   * taken about it elsewhere.
+   */
+  def streamCount(shuffleId: Int): Int = {
+    var count = 0
+    val keys = streams.keySet().iterator()
+    while (keys.hasNext) {
+      if (keys.next().shuffleId == shuffleId) {
+        count += 1
+      }
+    }
+    count
+  }
+
+  /**
+   * The limiter pacing one shuffle's egress, resolved from the cache without taking any lock.
+   *
+   * Read on the admission path from a network event-loop thread, so it must not block, and a
+   * concurrent map read is the whole cost. A miss falls through to [[resolveLimiter]] rather than
+   * being refused or waved through: pacing a stream at the executor's whole cap and stalling it
+   * outright are both wrong, and only resolving the share is right.
+   *
+   * @param shuffleId shuffle whose pacing is being charged
+   * @return that shuffle's limiter, never null and never shared with another shuffle
+   */
+  private def limiterFor(shuffleId: Int): TokenBucketRateLimiter = {
+    val cached = shuffleLimiters.get(shuffleId)
+    if (cached != null) cached else resolveLimiter(shuffleId)
+  }
+
+  /**
+   * Claims a shuffle's share of the executor's egress allowance and caches the limiter pacing it.
+   *
+   * Takes the budget's lock, which is why this belongs to registration and not to admission.
+   * Idempotent in both layers: the budget answers with the one limiter it holds for the shuffle,
+   * and the cache is filled with `putIfAbsent`, so two threads racing here converge on the same
+   * instance rather than one of them pacing against a limiter the other has replaced.
+   *
+   * @param shuffleId shuffle to allocate a share to
+   * @return the limiter that now paces it
+   */
+  private def resolveLimiter(shuffleId: Int): TokenBucketRateLimiter = {
+    val limiter = egressBudget.limiterFor(shuffleId)
+    val existing = shuffleLimiters.putIfAbsent(shuffleId, limiter)
+    if (existing != null) existing else limiter
   }
 
   /** Ids of every shuffle registered here, ascending, so a reading is always deterministic. */
@@ -735,7 +829,7 @@ private[spark] class BackpressureProtocol(
     } else if (!ledger.hasCreditFor(bytes)) {
       enterThrottled(ledger, BackpressureProtocol.THROTTLE_CAUSE_CREDIT)
       false
-    } else if (!rateLimiter.tryAcquire(bytes)) {
+    } else if (!limiterFor(key.shuffleId).tryAcquire(bytes)) {
       enterThrottled(ledger, BackpressureProtocol.THROTTLE_CAUSE_RATE)
       false
     } else {
@@ -883,12 +977,24 @@ private[spark] class BackpressureProtocol(
       val nowMillis = clock.getTimeMillis()
       ledger.applyAck(consumerPosition, nowMillis) match {
         case None =>
-          impossibleAckPositions.incrementAndGet()
-          logWarning(log"Refusing a streaming shuffle acknowledgement for shuffle " +
-            log"${MDC(SHUFFLE_ID, key.shuffleId)} partition " +
-            log"${MDC(PARTITION_ID, key.partitionId)} that named position " +
-            log"${MDC(COUNT, consumerPosition)} beyond the highest position charged, " +
-            log"${MDC(MAX_SIZE, ledger.highestChargedSequenceNumber)}")
+          val refusals = impossibleAckPositions.incrementAndGet()
+          impossibleAckLogGate.admit(nowMillis) match {
+            case Some(unreported) =>
+              logWarning(log"Refusing a streaming shuffle acknowledgement for shuffle " +
+                log"${MDC(SHUFFLE_ID, key.shuffleId)} partition " +
+                log"${MDC(PARTITION_ID, key.partitionId)} that named position " +
+                log"${MDC(COUNT, consumerPosition)} beyond the highest position charged, " +
+                log"${MDC(MAX_SIZE, ledger.highestChargedSequenceNumber)} " +
+                log"(${MDC(NUM_EVENTS, refusals)} refusal(s) on this executor, " +
+                log"${MDC(NUM_SKIPPED, unreported)} not reported individually)")
+            case None =>
+              if (debugEnabled) {
+                logDebug(log"Refusing a streaming shuffle acknowledgement for shuffle " +
+                  log"${MDC(SHUFFLE_ID, key.shuffleId)} partition " +
+                  log"${MDC(PARTITION_ID, key.partitionId)} that named position " +
+                  log"${MDC(COUNT, consumerPosition)}")
+              }
+          }
           None
         case Some(released) =>
           if (released > 0L || ledger.hasCredit) {
@@ -955,7 +1061,15 @@ private[spark] class BackpressureProtocol(
   }
 
   /**
-   * Whether a frame's shuffle and partition match the stream it was delivered as.
+   * Whether a frame's stream identity -- shuffle, producer map, and reduce partition -- matches the
+   * stream it was delivered as.
+   *
+   * The map id is part of the comparison and has to be. Two generations of one map index carry the
+   * same shuffle id and the same partition id, and every frame of a superseded attempt is therefore
+   * indistinguishable from a frame of the attempt that replaced it on those two fields alone. A
+   * comparison that omitted the map would let a zombie attempt's acknowledgement release output its
+   * successor had sent, and would let its terminator declare a stream finished that the successor
+   * had barely begun.
    *
    * A mismatch means the frame was routed to the wrong ledger, which must never be applied and must
    * never be acknowledged. It is reported rather than thrown, because the caller is on a network
@@ -963,7 +1077,7 @@ private[spark] class BackpressureProtocol(
    */
   private def addresses(key: BackpressureStreamKey, message: StreamingShuffleMessage): Boolean = {
     val matches = key != null && message.shuffleId() == key.shuffleId &&
-      message.partitionId() == key.partitionId
+      message.mapId() == key.mapId && message.partitionId() == key.partitionId
     if (!matches) {
       misaddressedFrames.incrementAndGet()
     }
@@ -1061,6 +1175,15 @@ private[spark] class BackpressureProtocol(
    * splicing a partial replay into its input would reorder the partition; the reader escalates such
    * a request to a fetch failure and the upstream stage is recomputed.
    *
+   * "Every block" is decided by counting the blocks the window actually retains inside the
+   * requested range and requiring that count to equal the range's full width, which is the only
+   * form of the test that says what it means. Checking the two endpoints and comparing the
+   * request's width against the window's total size would agree with this on every state the
+   * protocol can reach today, because a cumulative acknowledgement retires a prefix and therefore
+   * leaves a contiguous suffix -- but it would agree by accident, resting on an invariant
+   * maintained in a different method, and it would keep agreeing right up until an interior block
+   * was released for some other reason.
+   *
    * A pure predicate: it records nothing and changes no state, so it can be consulted as often as a
    * caller likes.
    *
@@ -1074,9 +1197,8 @@ private[spark] class BackpressureProtocol(
     } else {
       val ledger = streams.get(key)
       ledger != null &&
-        ledger.containsUnacknowledged(request.firstSequenceNumber()) &&
-        ledger.containsUnacknowledged(request.lastSequenceNumber()) &&
-        request.blockCount() <= ledger.unacknowledgedBlockCount.toLong
+        ledger.retainedCountWithin(
+          request.firstSequenceNumber(), request.lastSequenceNumber()) == request.blockCount()
     }
   }
 
@@ -1191,7 +1313,7 @@ private[spark] class BackpressureProtocol(
       true
     } else if (bytes <= 0L) {
       true
-    } else if (!rateLimiter.tryAcquire(bytes)) {
+    } else if (!limiterFor(key.shuffleId).tryAcquire(bytes)) {
       enterThrottled(ledger, BackpressureProtocol.THROTTLE_CAUSE_RATE)
       false
     } else {
@@ -1232,6 +1354,33 @@ private[spark] class BackpressureProtocol(
     }
     // Recorded whether or not a ledger exists, because the link carried these bytes regardless of
     // whether this protocol had been told about the stream that carried them.
+    recordIngress(bytes)
+  }
+
+  /**
+   * Records the arrival of a block the receiver is going to discard.
+   *
+   * Two of the three things [[onDataReceived]] does still have to happen for a discarded block, and
+   * one must not. The producer is alive -- the frame itself proves it -- so the stream's inbound
+   * instant advances; and the link really did carry the bytes, so they count towards the measured
+   * ingress the network-saturation fallback condition is evaluated from.
+   *
+   * What must not happen is charging the block to the unacknowledged window. A duplicate names a
+   * position the consumer has already acknowledged, so charging it puts back an entry that the
+   * acknowledgement had removed, and that entry holds credit only an acknowledgement naming the
+   * same position could release -- which never arrives, because acknowledgement positions only
+   * advance. The stream's received total is left alone for a related reason: counting one block
+   * twice inflates the consumer's measured rate, and that rate is exactly the quantity the
+   * sustained-slowness fallback compares against the producer's.
+   *
+   * @param key identity of the stream the frame arrived for
+   * @param bytes encoded size of the block being discarded
+   */
+  def onDiscardedData(key: BackpressureStreamKey, bytes: Long): Unit = {
+    val ledger = streams.get(key)
+    if (ledger != null) {
+      ledger.recordInbound(clock.getTimeMillis())
+    }
     recordIngress(bytes)
   }
 
@@ -1289,26 +1438,50 @@ private[spark] class BackpressureProtocol(
 
   /**
    * Builds the heartbeat to send for a stream, stamped from the injected clock and positioned at
-   * the highest sequence number the stream has reached.
+   * the <b>next</b> block position this side of the stream will use.
+   *
+   * The position is supplied by the caller rather than derived from the ledger, and that parameter
+   * is the whole point. One reading of the field has to hold in both directions -- a producer
+   * announces the next position it will produce, a consumer the next position it expects -- because
+   * the producer's resume handshake takes the number a consumer sent as the position to serve from.
+   * The ledger cannot supply that number for a consumer: it records the highest position charged,
+   * and after a gap the highest charged position is above the next expected one, so a heartbeat
+   * built from it would have the producer resume past blocks that are still missing and the
+   * consumer would never be sent them again. The handler that owns the channel knows the true next
+   * position; this method owns the interval and the stamping, and takes the position on trust.
    *
    * The heartbeat message type takes its timestamp from the caller and reads no clock of its own,
    * which is exactly what allows this protocol's notion of time to be the single one in play and to
    * be frozen by a test. Emitting is recorded here, so [[shouldSendHeartbeat]] answers false again
    * until the interval has elapsed once more.
    *
+   * A consumer's heartbeat declares that consumer's stable identity, taken from the key rather than
+   * from the channel, because it is what the producer keys its per-consumer acknowledgement cursor
+   * by: an identity derived from the connection would change on the very reconnection the resume
+   * handshake exists to serve. A producer's own heartbeat declares none, because a producer holds
+   * no cursor on its peer.
+   *
+   * @param nextPosition next block position this side of the stream will use; clamped at zero,
+   *                     because the message type refuses a negative sequence number and a side
+   *                     that has not started announces zero, which the resume handshake reads as
+   *                     "serve me from the beginning"
    * @return the heartbeat to send, or `None` for a stream with no ledger
    */
-  def heartbeatFor(key: BackpressureStreamKey): Option[HeartbeatMessage] = {
+  def heartbeatFor(key: BackpressureStreamKey, nextPosition: Long): Option[HeartbeatMessage] = {
     val ledger = streams.get(key)
     if (ledger == null) {
       None
     } else {
       val nowMillis = clock.getTimeMillis()
       ledger.recordHeartbeatSent(nowMillis)
+      val declaredIdentity = key.role match {
+        case BackpressureStreamRole.Consumer => key.consumerId
+        case _ => HeartbeatMessage.NO_CONSUMER_ID
+      }
       // The clock is the caller's contract with the message type, and a wall clock adjusted
       // backwards past the epoch would otherwise construct a heartbeat the type itself rejects.
       Some(new HeartbeatMessage(key.shuffleId, key.mapId, key.partitionId,
-        ledger.heartbeatSequenceNumber, math.max(0L, nowMillis)))
+        math.max(0L, nextPosition), math.max(0L, nowMillis), declaredIdentity))
     }
   }
 
@@ -1446,8 +1619,12 @@ private[spark] class BackpressureProtocol(
 
   /**
    * Every stream whose producer has fallen silent past the five-second bound, in a deterministic
-   * order. One reading of the whole ledger set, so a caller acting on several failed producers sees
-   * a single consistent snapshot rather than a different answer per stream.
+   * order. One traversal of the ledger set against one reading of the clock, so a caller acting on
+   * several failed producers judges them all against the same instant rather than against a
+   * different one per stream. The traversal is weakly consistent, as `ConcurrentHashMap`'s iterator
+   * is: a stream registered or removed while it runs may or may not appear, which is immaterial
+   * because a stream that appears is timed out and one that does not will be caught on the next
+   * pass.
    */
   def timedOutProducerStreams: Seq[BackpressureStreamKey] = {
     val nowMillis = clock.getTimeMillis()
@@ -1485,19 +1662,32 @@ private[spark] class BackpressureProtocol(
   }
 
   /**
-   * Publishes how many bytes one shuffle is holding in its streaming buffers, and the budget those
-   * bytes are measured against.
+   * Publishes the buffered bytes and the budget one participating shuffle sees, so that utilisation
+   * can be read without this class reaching into any shuffle's memory accounting.
    *
-   * Utilisation is executor-wide and no single shuffle can compute it, so each publishes only the
-   * two numbers it knows and this class sums them. Reporting a shuffle that is not registered is
-   * ignored rather than allowed to create a contribution with no partition count behind it, which
-   * would distort arbitration; a negative reading is clamped to zero for the same reason the gauge
-   * clamps it, namely that it can only be an accounting slip and must not be able to reduce the
-   * total.
+   * <b>What a reporter must publish.</b> Both numbers must be drawn from the same scope, and in
+   * production that scope is the executor: the streaming buffer allowance is a single quota shared
+   * by every spill manager on the executor, so a reporter pairs the reservation against that quota
+   * with the quota itself. Publishing a task-local numerator against that shared denominator would
+   * under-report utilisation by roughly the number of concurrent map tasks, which is precisely when
+   * the spill threshold needs to be believed. Because every reporter therefore publishes the same
+   * pair, a later report overwriting an earlier one for the same shuffle changes nothing -- the
+   * per-shuffle entry is a record of participation, not a race between peers.
+   *
+   * The sum across participating shuffles is taken rather than the maximum, and it is right in both
+   * arrangements: reporters sharing one quota contribute proportionally to both totals and so leave
+   * the ratio exact, while reporters with genuinely separate allowances contribute a true
+   * aggregate. Only the ratio is published, so the multiplied absolute totals in the shared-quota
+   * case are not observable anywhere.
+   *
+   * Reporting a shuffle that is not registered is ignored rather than allowed to create a
+   * contribution with no partition count behind it, which would distort arbitration; a negative
+   * reading is clamped to zero for the same reason the gauge clamps it, namely that it can only be
+   * an accounting slip and must not be able to reduce the total.
    *
    * @param shuffleId the shuffle reporting
-   * @param bufferedBytes bytes it currently holds
-   * @param budgetBytes the budget those bytes are measured against
+   * @param bufferedBytes bytes currently held against the allowance the reporter measures against
+   * @param budgetBytes that allowance
    */
   def reportBufferUtilization(shuffleId: Int, bufferedBytes: Long, budgetBytes: Long): Unit = {
     if (shufflePartitionCounts.containsKey(shuffleId)) {
@@ -1506,21 +1696,17 @@ private[spark] class BackpressureProtocol(
     }
   }
 
-  /** Bytes one shuffle last reported holding; zero for a shuffle that has reported nothing. */
-  def reportedBufferedBytes(shuffleId: Int): Long = readLongEntry(shuffleBufferedBytes, shuffleId)
-
-  /** The budget one shuffle last reported; zero for a shuffle that has reported nothing. */
-  def reportedBudgetBytes(shuffleId: Int): Long = readLongEntry(shuffleBudgetBytes, shuffleId)
-
   /**
    * Executor-wide buffer utilisation across the concurrent shuffles, as a percentage of their
    * aggregate budget.
    *
    * The buffered bytes and the budgets are summed independently and the percentage is taken from
    * the two totals, so one busy shuffle and one idle shuffle on the same executor produce a single
-   * honest figure rather than two competing ones. Both sums saturate rather than wrap, and an empty
-   * set or a zero total budget answers zero, so this reading is total: there is no input for which
-   * it throws and no sentinel it can return instead of a percentage.
+   * honest figure rather than two competing ones. See [[reportBufferUtilization]] for why summing
+   * is exact whether reporters share one executor allowance or hold separate ones. Both sums
+   * saturate rather than wrap, and an empty set or a zero total budget answers zero, so this
+   * reading is total: there is no input for which it throws and no sentinel it can return instead
+   * of a percentage.
    *
    * The value is deliberately not clamped at 100. A momentarily over-budget executor stays visible
    * rather than being masked, which is the entire reason a spill threshold is watched.
@@ -1543,9 +1729,13 @@ private[spark] class BackpressureProtocol(
   def spillThresholdPercent: Int = spillThreshold
 
   /**
-   * Whether aggregate utilisation has reached the configured spill threshold, which is the signal
-   * the spill manager acts on. Detected here, because utilisation spans the shuffles this protocol
-   * arbitrates between; acted on there, because eviction is the spill manager's responsibility.
+   * Whether aggregate utilisation has reached the configured spill threshold.
+   *
+   * Detected here, because utilisation spans the shuffles this protocol arbitrates between; acted
+   * on by the spill manager, because eviction is its responsibility. It reaches the spill manager
+   * through [[shouldYield]] rather than directly, so that a shuffle asked to evict on account of
+   * the executor's aggregate is one arbitration has actually selected -- this reading on its own
+   * says that somebody must yield, not which shuffle.
    */
   def isSpillRequired: Boolean = aggregateBufferUtilizationPercent >= spillThreshold.toLong
 
@@ -1557,7 +1747,7 @@ private[spark] class BackpressureProtocol(
    * the two quantities it names: pending volume first, because bytes held are what the spill
    * threshold actually measures, then reduce partition count, because a wide shuffle has the larger
    * footprint when two hold equal volume, and finally the shuffle id, so that the order is total
-   * and a suite can assert on it without tolerating ties. Every key is carried on the result rather
+   * and no two shuffles ever compare equal. Every key is carried on the result rather
    * than folded into a score, so it is visible why one shuffle was placed ahead of another.
    */
   def arbitrationOrder: Seq[BackpressureShuffleDemand] = {
@@ -1592,20 +1782,24 @@ private[spark] class BackpressureProtocol(
   def yieldOrder: Seq[Int] = arbitrationOrder.map(_.shuffleId)
 
   /**
-   * The shuffle that is guaranteed to keep making progress while the executor is over its spill
+   * The one shuffle this arbitration never asks to yield while the executor is over its spill
    * threshold, namely the least demanding of the concurrent shuffles.
    *
-   * Exempting exactly one shuffle from yielding is what turns "the largest yields first" into a
-   * genuine anti-starvation guarantee: without it, a small shuffle sharing an executor with a very
-   * large one could be asked to yield on every arbitration pass and never finish.
+   * Exempting exactly one shuffle is what turns "the largest yields first" into an anti-starvation
+   * rule rather than a permanent tax on the smallest: without it, a small shuffle sharing an
+   * executor with a very large one could be asked to yield on every arbitration pass and never
+   * finish. The exemption is from this decision only. Credit, pacing, link saturation and a stalled
+   * consumer can each still stop the exempt shuffle, so this is not a progress guarantee and must
+   * not be read as one.
    */
   def guaranteedShuffleId: Option[Int] = yieldOrder.lastOption
 
   /**
    * Whether one shuffle should yield buffer space on this pass.
    *
-   * Only asked when the executor is actually over its threshold, and never true for the guaranteed
-   * shuffle, so a shuffle with few partitions and little pending data always makes progress.
+   * Only asked when the executor is actually over its threshold, and never true for the exempt
+   * shuffle, so a shuffle with few partitions and little pending data is never the one asked to
+   * give way.
    */
   def shouldYield(shuffleId: Int): Boolean = {
     isSpillRequired && guaranteedShuffleId.exists(_ != shuffleId) &&
@@ -1675,30 +1869,22 @@ private[spark] class BackpressureProtocol(
     }
   }
 
-  // ==========================================================================================
   // The executor-wide consumer receive quota.
-  // ==========================================================================================
 
   /** The whole consumer-side receive budget of this executor, in bytes. */
   def receiveQuotaBytes: Long = receiveQuotaTotalBytes
 
   /**
-   * Bytes the consumer side of this executor is holding, for the buffer-utilisation gauge.
+   * Bytes of that budget currently held by consumers anywhere on this executor.
    *
-   * This class is the consumer side's single contributor, exactly as the spill manager's shared
-   * quota is the producer side's. That is a correctness property of the gauge and not a
-   * convenience: the gauge sums its contributors, so a reader registering itself would have N
-   * concurrent reduce tasks report the one executor-wide budget N times and divide by a denominator
-   * nobody configured. Registering this instance instead is idempotent -- the registry is a set,
-   * and every reader on the executor holds the same protocol -- so the consumer side is counted
-   * once however many tasks are reading.
+   * Deliberately not published to `shuffle.streaming.bufferUtilizationPercent`. That gauge reports
+   * the producer buffer budget the spill threshold is evaluated against, and the receive quota is a
+   * different budget entirely: summing the two would put unrelated bytes in the numerator and
+   * unrelated capacity in the denominator, so a producer genuinely at its eighty percent spill
+   * point would read as roughly forty the moment one idle reader appeared on the same executor.
+   * The spill manager's executor-shared quota is that gauge's sole contributor. What the consumer
+   * side holds is observable in its own right, here and through the backpressure-event counter.
    */
-  override def contributedBufferedBytes: Long = reservedReceiveQuotaBytes
-
-  /** The consumer-side budget those bytes are measured against. */
-  override def contributedBudgetBytes: Long = receiveQuotaTotalBytes
-
-  /** Bytes of that budget currently held by consumers anywhere on this executor. */
   def reservedReceiveQuotaBytes: Long = math.max(0L, reservedReceiveBytes.get())
 
   /** How many reservations have been refused because the executor-wide budget was exhausted. */
@@ -1874,12 +2060,12 @@ private[spark] class BackpressureProtocol(
       if (versionMismatchReported.compareAndSet(false, true)) {
         logWarning(log"Streaming shuffle message for shuffle ${MDC(SHUFFLE_ID, key.shuffleId)} " +
           log"partition ${MDC(PARTITION_ID, key.partitionId)} was refused because the peer " +
-          log"speaks wire revision ${MDC(COUNT, version)} and this executor speaks " +
-          log"${MDC(THRESHOLD, StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION)}")
+          log"speaks wire revision ${MDC(PROTOCOL_VERSION, version)} and this executor speaks " +
+          log"${MDC(VERSION_NUM, StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION)}")
       } else if (debugEnabled) {
         logDebug(log"Streaming shuffle message for shuffle ${MDC(SHUFFLE_ID, key.shuffleId)} " +
           log"partition ${MDC(PARTITION_ID, key.partitionId)} was refused at wire revision " +
-          log"${MDC(COUNT, version)}")
+          log"${MDC(PROTOCOL_VERSION, version)}")
       }
       false
     }
@@ -1970,8 +2156,10 @@ private[spark] class BackpressureProtocol(
    * Re-evaluates every stream and reports how many changed state, which is what a caller driving
    * the protocol on a timer at the hundred-millisecond cadence calls.
    *
-   * A poll performs no I/O, takes no lock and reads the clock exactly once, so it costs one pass
-   * over the ledger set. It exists because two of this class's judgements are time-derived rather
+   * A poll transfers nothing over the network and touches no disk, takes no lock and reads the
+   * clock exactly once, so it costs one pass over the ledger set. It can emit at most one log
+   * record, and that one is windowed. It exists because two of this class's judgements are
+   * time-derived rather
    * than event-derived -- the sustained-slowness latch and the reclamation deadline -- and a
    * subsystem with no data flowing would otherwise never notice either.
    *
@@ -2567,19 +2755,39 @@ private[spark] object BackpressureProtocol {
     def highestChargedSequenceNumber: Long =
       math.max(highestSent.get(), highestReceived.get())
 
-    /**
-     * The position a heartbeat for this stream should carry: how far this side has got, whether it
-     * is producing or consuming. Never negative, so the heartbeat message type can never reject it.
-     */
-    def heartbeatSequenceNumber: Long =
-      math.max(0L, math.max(highestSent.get(), highestReceived.get()))
-
     /** Blocks still in the window. */
     def unacknowledgedBlockCount: Int = unacknowledged.size()
 
     /** Whether one block is still in the window and can therefore still be replayed. */
     def containsUnacknowledged(sequenceNumber: Long): Boolean =
       unacknowledged.containsKey(java.lang.Long.valueOf(sequenceNumber))
+
+    /**
+     * How many blocks the window still retains within the inclusive range `[first, last]`.
+     *
+     * Answered from the sorted window's own sub-map rather than inferred from its endpoints and its
+     * total size. Inferring would be sound only while retirement stays strictly prefix-shaped --
+     * which it is today, since a cumulative acknowledgement drains from the lowest key upwards --
+     * but that makes the sufficiency of a replay decision depend on an invariant enforced somewhere
+     * else entirely, and a future eviction that removed an interior block would turn a correct
+     * refusal into a partial replay that reorders the consumer's partition. Counting what is
+     * actually there needs no such invariant.
+     *
+     * The cost is bounded by the protocol, not by the window: a retransmission request may span at
+     * most [[RetransmitRequestMessage.MAX_REQUESTED_BLOCKS]] blocks, so the walk is over at most
+     * that many entries and is paid once per request rather than once per block.
+     *
+     * @param first inclusive lower bound
+     * @param last inclusive upper bound; a value below `first` yields zero
+     */
+    def retainedCountWithin(first: Long, last: Long): Int = {
+      if (last < first) {
+        0
+      } else {
+        unacknowledged.subMap(
+          java.lang.Long.valueOf(first), true, java.lang.Long.valueOf(last), true).size()
+      }
+    }
 
     /** Inclusive bounds of the window, or `None` when nothing is outstanding. */
     def unacknowledgedWindow: Option[(Long, Long)] = {

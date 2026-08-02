@@ -31,7 +31,7 @@ import io.netty.channel.{Channel, EventLoopGroup}
 
 import org.apache.spark.{Aggregator, InterruptibleIterator, SparkConf, SparkEnv, TaskContext}
 import org.apache.spark.internal.{config, Logging}
-import org.apache.spark.internal.LogKeys.{BLOCK_ID, CHECKSUM, COUNT, EPOCH, ERROR, EXECUTOR_ID, HOST_PORT, MAP_ID, MAX_ATTEMPTS, NUM_BLOCKS, NUM_BYTES, NUM_PARTITIONS, NUM_TASKS, PARTITION_ID, PROTOCOL_VERSION, REASON, SHUFFLE_ID, STATUS, THRESHOLD, TIMEOUT, VALUE}
+import org.apache.spark.internal.LogKeys.{BLOCK_ID, CHECKSUM, COUNT, EPOCH, ERROR, EXECUTOR_ID, HOST_PORT, MAP_ID, MAX_ATTEMPTS, NUM_BLOCKS, NUM_BYTES, NUM_PARTITIONS, NUM_SKIPPED, NUM_TASKS, PARTITION_ID, PROTOCOL_VERSION, REASON, SHUFFLE_ID, STATUS, THRESHOLD, TIMEOUT, VALUE, VERSION_NUM}
 import org.apache.spark.network.TransportContext
 import org.apache.spark.network.client.{RpcResponseCallback, TransportClient, TransportClientBootstrap, TransportClientFactory}
 import org.apache.spark.network.server.{OneForOneStreamManager, RpcHandler, StreamManager}
@@ -47,8 +47,20 @@ import org.apache.spark.util.collection.ExternalSorter
 
 /**
  * The consumer half of a streaming shuffle: a [[ShuffleReader]] that consumes a reduce partition
- * from producer executors while the map stage is still producing it, instead of waiting for the map
- * output to be materialised on disk and then fetching it.
+ * directly from the executors producing it, block by block as blocks arrive, instead of waiting for
+ * the map output to be materialised on disk and then fetching whole partitions of it.
+ *
+ * <b>Producers need not have finished, and the log says whether they had.</b> This reader
+ * rendezvouses on <i>registered</i> producers rather than on completed ones -- a producer registers
+ * when it starts producing, not when it stops -- so a partition whose map tasks are still running
+ * is read as it is produced, and no step of `read()` waits for the map stage to complete. Whether
+ * that capability is exercised is decided elsewhere and deliberately not here: task submission
+ * belongs to the DAG scheduler, which this feature may not modify, and the unmodified scheduler
+ * submits a reduce stage only once its map stage reports available output. For a map stage whose
+ * tasks all run once, this reader therefore consumes retained output from producers that have
+ * already finished, and what it saves is the index-and-fetch round trip and the whole-partition
+ * buffering rather than the overlap. Because the rendezvous reply carries the completion set, which
+ * of the two actually happened is recorded rather than left to be assumed.
  *
  * <b>What this reader replaces, and what it deliberately does not.</b> The classic path -- see
  * `BlockStoreShuffleReader` -- learns block locations from `MapOutputTracker` and pulls finished
@@ -111,8 +123,9 @@ import org.apache.spark.util.collection.ExternalSorter
  * recomputation. Either way no corrupt record is ever handed to user code.
  *
  * <b>Determinism.</b> All timing goes through the injected [[Clock]] and through bounded numbers of
- * poll windows. There is no `Thread.sleep` and no direct `System.currentTimeMillis`, so the
- * behaviour of every timer in this class is reproducible under a manual clock.
+ * poll windows. Nothing sleeps and nothing reads the JVM's own clock directly, anywhere in this
+ * file -- the transport connector below takes a clock for the same reason -- so the behaviour of
+ * every timer on the consumer side is reproducible under a manual clock.
  *
  * @param handle registration state for the shuffle being read, produced by `registerShuffle`
  * @param startMapIndex first map index to read, inclusive. Streaming serves whole map ranges only
@@ -127,7 +140,8 @@ import org.apache.spark.util.collection.ExternalSorter
  *                    and the REST API with no user-interface change whatsoever
  * @param conf the executor's configuration, read once here and held immutably
  * @param streamingContext the collaborators this reader shares with the rest of the subsystem
- * @param clock the clock every timer in this class reads, injected so tests need no sleeps
+ * @param clock the clock every timer in this class reads, so each one advances with that clock
+ *              rather than with wall time and nothing here sleeps
  */
 private[spark] class StreamingShuffleReader[K, C](
     handle: StreamingShuffleHandle[K, _, C],
@@ -276,16 +290,24 @@ private[spark] class StreamingShuffleReader[K, C](
   private val registeredStreams = new mutable.HashSet[BackpressureStreamKey]
 
   /**
-   * This reader's consumer session identity.
+   * This reader's consumer session identity, announced to every producer it streams from.
    *
    * The task attempt id is allocated from one monotonically increasing per-application counter, so
    * it names this attempt uniquely across the whole application; the partition range distinguishes
    * two readers of the same attempt. A reduce task that fails and is retried is therefore a new
-   * session with a new receive window, which is what stops it inheriting the credit accounting of
-   * the session it replaced.
+   * session with a new receive window, which is what stops it inheriting the credit accounting --
+   * or the retained-output cursor -- of the session it replaced. Inheriting that cursor is what
+   * would lose data, because it would have the new attempt resume past blocks it never read.
+   *
+   * Within one attempt the value is fixed, and it travels on every heartbeat this reader's handlers
+   * send. That is what makes it the identity a producer keys its retained-output cursor and its
+   * per-consumer credit ledger by, and therefore what lets a reconnected channel resume where the
+   * previous one stopped rather than start again from the first block. A socket-derived identity
+   * could do neither, because it changes with the socket.
    */
   private val consumerId: String =
     s"attempt-${context.taskAttemptId()}-partitions-$startPartition-$endPartition"
+
   private val cleanedUp = new AtomicBoolean(false)
 
   /**
@@ -296,9 +318,13 @@ private[spark] class StreamingShuffleReader[K, C](
   private val quiesce = new CountDownLatch(1)
 
   /**
-   * Bytes this reader is holding in decoded-but-unconsumed blocks. Kept in an atomic rather than
-   * under `streamsLock` because the metrics reporting thread reads it through
-   * [[contributedBufferedBytes]] and must never block behind the task thread to do so.
+   * Bytes this reader is holding in decoded-but-unconsumed blocks.
+   *
+   * An atomic rather than a field under `streamsLock` because the two sides of the count are on
+   * different threads: a network event-loop thread adds as it stashes a decoded block, and the task
+   * thread subtracts as it consumes one. Neither may wait on the other -- parking an event-loop
+   * thread stalls every channel sharing it -- so the counter has to be lock-free rather than merely
+   * convenient.
    */
   private val stashedBytes = new AtomicLong(0L)
 
@@ -308,6 +334,30 @@ private[spark] class StreamingShuffleReader[K, C](
   /** Blocks accepted and bytes accepted, for the throughput samples the fallback policy needs. */
   private var acceptedBlocks: Long = 0L
   private var acceptedBytes: Long = 0L
+
+  /**
+   * Cumulative repair activity on this reduce task, and the two windows that bound its reporting.
+   *
+   * Both conditions recur per block rather than per task, and the retry budget is per block too, so
+   * a stream that is corrupt rather than merely unlucky produces one report per block and up to
+   * [[BackpressureProtocol.MAX_RETRY_ATTEMPTS]] more for its replays. That is the log volume of the
+   * shuffle itself, which is the one thing a diagnostic must never be. Each condition therefore
+   * reports the first occurrence immediately and then at most one aggregate per window, and each
+   * aggregate carries both the running total and the number of occurrences it stands in for, so the
+   * volume is stated even when the individual events are not. Per-block identity remains available
+   * behind the streaming debug key, and the terminal escalation -- a block that could not be
+   * repaired at all -- is never gated, because there is exactly one of those per task.
+   *
+   * The gates are per reader, not per executor, matching where the condition is observed and who
+   * owns the recovery. That bounds an executor at one report per window per concurrently running
+   * reduce task, which is bounded by its core count rather than by the size of the shuffle.
+   */
+  private var checksumFailures: Long = 0L
+  private var replayRequests: Long = 0L
+  private val checksumFailureLogGate =
+    new MemorySpillManager.LogAggregationGate(MemorySpillManager.LOG_AGGREGATION_WINDOW_MS)
+  private val replayRequestLogGate =
+    new MemorySpillManager.LogAggregationGate(MemorySpillManager.LOG_AGGREGATION_WINDOW_MS)
 
   // Tier two of the two-tier activation model. Tier one -- spark.shuffle.manager=streaming --
   // decides which manager class exists at all; this gate decides whether that manager streams or
@@ -374,7 +424,9 @@ private[spark] class StreamingShuffleReader[K, C](
     // consumer side holds is observable in its own right through the protocol's receive-quota
     // accessors and through the backpressure-event counter.
 
-    val locations = rendezvous()
+    // Deduplicated before anything is claimed or opened, so that the credit split, the streams
+    // and the reduce input all describe the same set of producers.
+    val locations = acceptedGenerations(rendezvous())
     // Claimed only once the producing generations are known, because a generation is part of a
     // stream's identity and therefore of the allowance being claimed.
     registerStreams(locations)
@@ -398,6 +450,10 @@ private[spark] class StreamingShuffleReader[K, C](
 
     val resultIter: Iterator[Product2[K, C]] = combineAndSort(interruptibleIter)
 
+    // Streams are open by now, so a producer lost while this read was being assembled is converted
+    // before the notifier is consulted -- otherwise the transport error latched alongside the loss
+    // would be raised here, one step before the iterator's own conversion could run.
+    convertSignalledProducerLossEverywhere()
     errorNotifier.throwIfError()
 
     resultIter match {
@@ -449,6 +505,47 @@ private[spark] class StreamingShuffleReader[K, C](
     } else {
       records.asInstanceOf[Iterator[(K, C)]]
     }
+  }
+
+  /**
+   * The one producer generation per map index that this consumer may read.
+   *
+   * A logical map output has exactly one accepted generation. A map index can be produced more than
+   * once -- speculative execution and task retries both do it -- and every attempt streams the
+   * whole of that index's output rather than a share of it, so reading two attempts of one index
+   * would concatenate the same records into the reduce input twice. That is a wrong answer returned
+   * silently, not a failure, which makes it the most expensive thing this reader could get wrong.
+   * The generation to read is the newest attempt offered: the coordinator lets a higher task
+   * attempt id supersede a lower one for the same map index, and a superseded attempt is precisely
+   * the one whose output the scheduler has abandoned.
+   *
+   * On any consistent reply this is the identity function, because the coordinator holds at most
+   * one producer per map index. It is applied regardless, because the two costs are not comparable:
+   * the check is one grouping of a list as long as the map count, while being wrong duplicates rows
+   * in a result no assertion downstream would question. A coordinator that ever offered two
+   * generations of one index -- through a defect, or through a reply a consumer of a different
+   * vintage reads -- must not be able to turn that into duplicated output here.
+   *
+   * Applied before allowances are claimed and before any stream is opened, so the credit split, the
+   * open channels and the records read all describe the same set of producers.
+   *
+   * @param offered producer locations as the coordinator ordered them, newest attempts included
+   * @return one location per map index, the newest attempt of each, in map-index order
+   */
+  private def acceptedGenerations(
+      offered: Seq[StreamingShuffleProducerLocation]): Seq[StreamingShuffleProducerLocation] = {
+    // Re-sorted explicitly: grouping loses the coordinator's map-index ordering, and that ordering
+    // is what makes a streaming read's record order match the sort-based baseline's.
+    val accepted = offered.groupBy(_.mapIndex).values.map(_.maxBy(_.taskAttemptId)).toSeq
+      .sortBy(_.mapIndex)
+    val superseded = offered.size - accepted.size
+    if (superseded > 0) {
+      logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} was offered " +
+        log"${MDC(COUNT, superseded)} producer generation(s) of map indexes it was also offered " +
+        log"a newer attempt of; reading only the newest attempt of each map index so that no map " +
+        log"output is concatenated into this reduce input twice")
+    }
+    accepted
   }
 
   /**
@@ -543,11 +640,19 @@ private[spark] class StreamingShuffleReader[K, C](
       case Some(reply) =>
         validateRendezvous(reply)
         if (debugEnabled) {
+          // The completion count is reported alongside the producer count because together they are
+          // the only honest answer to "did this read overlap its map stage": a reply in which every
+          // declared map index has already streamed to completion is a read of retained output,
+          // while any shortfall is a read that genuinely overlaps production.
           logDebug(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} resolved " +
             log"${MDC(COUNT, reply.locations.size)} live producer(s) of " +
             log"${MDC(NUM_TASKS, reply.numMaps)} declared map task(s) for partitions " +
             log"[${MDC(PARTITION_ID, startPartition)}, ${MDC(VALUE, endPartition)}) after " +
-            log"${MDC(MAX_ATTEMPTS, attempts + 1)} lookup attempt(s)")
+            log"${MDC(MAX_ATTEMPTS, attempts + 1)} lookup attempt(s); the map stage had " +
+            log"${MDC(STATUS, if (reply.mapStageComplete) "finished" else "not finished")} " +
+            log"producing, so this is a read of " +
+            log"${MDC(REASON, if (reply.mapStageComplete) "retained output" else "output in " +
+              "progress")}")
         }
         reply.locations
       case None =>
@@ -611,6 +716,21 @@ private[spark] class StreamingShuffleReader[K, C](
   }
 
   /**
+   * Runs [[ProducerStream.convertSignalledProducerLoss]] on every producer this read has opened.
+   *
+   * For the two places that consult the notifier without awaiting any one partition. Cheap when
+   * nothing has failed -- one volatile read per open producer and no allocation beyond the snapshot
+   * -- and it is the snapshot that makes taking the lock necessary: the release listener may clear
+   * the buffer from the task-completion thread while this walks it.
+   */
+  private def convertSignalledProducerLossEverywhere(): Unit = {
+    if (errorNotifier.hasError) {
+      streamsLock.synchronized(producerStreams.toSeq)
+        .foreach(stream => stream.convertSignalledProducerLoss())
+    }
+  }
+
+  /**
    * Declares a shuffle-wide fallback on the coordinator and caches the verdict it latched.
    *
    * Two things make this safe to call from a failure path. The ask is bounded by the same explicit
@@ -657,23 +777,29 @@ private[spark] class StreamingShuffleReader[K, C](
   }
 
   /**
-   * Whether a lookup reply accounts for every map output this consumer is entitled to read.
+   * Whether a lookup reply names a producer this consumer can open a stream to for every map output
+   * it is entitled to read.
    *
-   * A map output is accounted for when a live producer of it is named, so that this consumer can
-   * open a stream to it, or when the coordinator records it as streamed to completion by a producer
-   * that is still registered. Anything else -- a declared map task with neither -- means output is
-   * still to come, and a consumer that stopped there would return a partial result.
+   * Readiness is defined by what this consumer can actually read, which is a producer it holds an
+   * address for -- not by what the coordinator happens to know. A completion record is deliberately
+   * not accepted in place of an address: a completion says only that some producer finished
+   * streaming that map index, and a consumer that treated it as sufficient would stop polling for
+   * an index it can reach nobody for and hand back an iterator missing that index's records.
+   * That is silent data loss, whereas continuing to poll costs at worst one more lookup and then a
+   * bounded fetch failure, which the unmodified scheduler resolves by recomputing the upstream
+   * stage.
+   *
+   * Requiring the address costs nothing on the happy path, because the coordinator holds one
+   * producer per map index, exempts a producer from reaping once it has reported completion, and
+   * withdraws a completion whenever the producer that earned it goes -- so a completion never
+   * outlives the location that backs it.
    *
    * A stage that declared no map tasks is accounted for by definition, which is precisely the
    * legitimately-empty case, and a stage that has stood streaming down never reaches here because
    * [[checkShuffleFallback]] has already failed the fetch.
    */
   private def rendezvousSatisfied(reply: StreamingShuffleProducerLocations): Boolean = {
-    // The union rather than either set alone: a producer may be named without having completed, and
-    // a completion may outlive a replacement of the attempt that earned it, so neither set on its
-    // own is a complete account of the map indexes that have been served.
-    val accountedFor = reply.locations.map(_.mapIndex).toSet ++ reply.completedMapIndexes
-    accountedFor.size >= reply.numMaps
+    reply.locations.map(_.mapIndex).toSet.size >= reply.numMaps
   }
 
   /**
@@ -722,9 +848,19 @@ private[spark] class StreamingShuffleReader[K, C](
     val spanMs = attempts * COORDINATOR_LOOKUP_INTERVAL_MS
     val observed = lastReply match {
       case Some(reply) =>
-        val accountedFor = reply.locations.map(_.mapIndex).toSet ++ reply.completedMapIndexes
-        s"the coordinator last accounted for ${accountedFor.size} of " +
-          s"${reply.numMaps} declared map task(s) at epoch ${reply.coordinatorEpoch}"
+        val located = reply.locations.map(_.mapIndex).toSet.size
+        // Whether more output was still expected is what separates the two diagnoses that share
+        // this message: a rendezvous that ran out of attempts while producers were still arriving
+        // is a pacing problem, whereas one that ran out after the stage had finished or stood down
+        // is a liveness or registration problem, and no further waiting would have helped.
+        val outlook = if (reply.mapOutputsPending) {
+          "map output was still expected at that point"
+        } else {
+          "no further map output was expected at that point"
+        }
+        s"the coordinator last named a live producer for $located of ${reply.numMaps} declared " +
+          s"map task(s), ${reply.completedMapIndexes.size} of which had streamed to completion, " +
+          s"at epoch ${reply.coordinatorEpoch}, and $outlook"
       case None => "the shuffle had no registration at all"
     }
     val recovery = if (declared.fallenBack) {
@@ -811,8 +947,8 @@ private[spark] class StreamingShuffleReader[K, C](
       fallbackPolicy.checkProtocolVersion(reply.protocolVersion)
       logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} producers announced " +
         log"protocol version ${MDC(PROTOCOL_VERSION, reply.protocolVersion)} but this build " +
-        log"speaks " +
-        log"${MDC(VALUE, StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION)}; falling back to the " +
+        log"speaks ${MDC(VERSION_NUM, StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION)}; " +
+        log"falling back to the " +
         log"sort-based shuffle and recomputing the upstream stage")
       // Declared as well as tripped locally, for the same reason exhaustion is: the fetch failure
       // recovers this reduce attempt, and only the withdrawal of the streamed map output makes the
@@ -861,11 +997,8 @@ private[spark] class StreamingShuffleReader[K, C](
   }
 
   /**
-   * Opens one channel to one producer and attaches a consumer handler to it.
-   *
-   * The handler is per producer, because it owns that producer's sequence expectation, its
-   * acknowledgement position and its receive window. The channel is created through the injected
-   * connector so that a test can exercise every path in this class without a socket.
+   * Opens one channel to one producer, retrying a refused connection a bounded number of times
+   * before the producer is declared lost.
    *
    * <b>A producer whose task has finished is the ordinary case, not a failure.</b> Every consumer
    * of a map output connects after that output's task has ended, because the DAG scheduler submits
@@ -873,19 +1006,104 @@ private[spark] class StreamingShuffleReader[K, C](
    * the serving endpoint is [[StreamingShuffleListener]], which is scoped to the executor rather
    * than to a task and outlives every map task that registers with it, and the bytes it serves are
    * the retained files [[StreamingShuffleBlockResolver]] owns, which outlive their task by the same
-   * design. A completed producer is therefore connectable and streamable, and the connect below is
-   * expected to succeed on the happy path.
+   * design. A completed producer is therefore connectable and streamable, and a connect is expected
+   * to succeed on the happy path.
    *
-   * A failure to connect consequently means what it says -- the peer is unreachable -- and is
-   * bounded rather than a loop. It tells the coordinator to invalidate that producer generation,
-   * which withdraws the generation's completion record along with it, and it names the producer's
-   * own `MapStatus` address and map index, so the tracker removes that one dead map output and the
-   * scheduler recomputes that one map task. If the recomputed producer can be streamed from, the
-   * retry streams; if no producer of the shuffle can be resolved at all, the rendezvous exhausts
-   * and declares a shuffle-wide fallback, and the retry after that runs on the sort-based path.
-   * Every branch terminates in a completed job.
+   * <b>Why a refusal is retried rather than escalated at once.</b> The retained output this
+   * consumer needs is served by an executor that is doing other work: its transport can be
+   * momentarily out of accept capacity, its host briefly unreachable, or its serving handler
+   * part-way through registration. Escalating the first refusal would recompute a map task whose
+   * output is intact and seconds away from being servable, so the attempt is repeated on the
+   * schedule every streaming retry uses -- [[BackpressureProtocol.MAX_RETRY_ATTEMPTS]] attempts
+   * paced by [[BackpressureProtocol.retryBackoffMillis]], one second doubling to sixteen. The pause
+   * is [[awaitQuietly]], so it calls no `Thread.sleep` and a completing task cuts it short rather
+   * than sitting out the remainder of an interval.
+   *
+   * <b>Resumption belongs to the identity, not to this method.</b> The consumer identity announced
+   * on every heartbeat is stable for the life of this task attempt, so a producer that has already
+   * retained blocks for it answers a reconnected channel from the cursor that identity holds
+   * instead of from the beginning. Nothing is replayed here because a refused connect delivered
+   * nothing to replay; what a reconnection resumes is decided where the cursor lives.
+   *
+   * Once the attempts are spent, a failure to connect means what it says: the peer is unreachable.
+   * It tells the coordinator to invalidate that producer generation, which withdraws the
+   * generation's completion record along with it, and it names the producer's own `MapStatus`
+   * address and map index, so the tracker removes that one dead map output and the scheduler
+   * recomputes that one map task. If the recomputed producer can be streamed from, the retry
+   * streams; if no producer of the shuffle can be resolved at all, the rendezvous exhausts and
+   * declares a shuffle-wide fallback, and the retry after that runs on the sort-based path. Every
+   * branch terminates in a completed job.
    */
   private def openProducerStream(location: StreamingShuffleProducerLocation): ProducerStream = {
+    var attempt = 1
+    var opened: Option[ProducerStream] = None
+    // Time spent pausing between attempts is time the reduce task waited on its input, so it is
+    // accumulated and reported to the standard fetch-wait metric in one call, the way the
+    // rendezvous reports its own polling. Only the pauses are counted: a connect that succeeds
+    // first time adds nothing, so the happy path's accounting is exactly what it was.
+    var backoffWaitMillis = 0L
+    while (opened.isEmpty && !cleanedUp.get() &&
+        attempt <= BackpressureProtocol.MAX_RETRY_ATTEMPTS) {
+      // A failure already latched on an I/O thread outranks a further attempt: spending the rest of
+      // the budget on a read that has failed only delays the fetch failure it has already earned.
+      errorNotifier.throwIfError()
+      opened = connectOnce(location)
+      if (opened.isEmpty && attempt < BackpressureProtocol.MAX_RETRY_ATTEMPTS) {
+        val backoffMillis = BackpressureProtocol.retryBackoffMillis(attempt)
+        logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} could not open a channel " +
+          log"to producer ${MDC(EXECUTOR_ID, location.executorId)} at " +
+          log"${MDC(HOST_PORT, location.hostPort)} for map ${MDC(MAP_ID, location.mapId)} " +
+          log"(attempt ${MDC(MAX_ATTEMPTS, attempt)} of " +
+          log"${MDC(COUNT, BackpressureProtocol.MAX_RETRY_ATTEMPTS)}); retrying in " +
+          log"${MDC(TIMEOUT, backoffMillis)} ms")
+        val pauseStartMillis = clock.getTimeMillis()
+        awaitQuietly(backoffMillis)
+        backoffWaitMillis += math.max(0L, clock.getTimeMillis() - pauseStartMillis)
+      }
+      attempt += 1
+    }
+    if (backoffWaitMillis > 0L) {
+      readMetrics.incFetchWaitTime(backoffWaitMillis)
+    }
+    opened match {
+      case Some(stream) =>
+        stream
+      case None if cleanedUp.get() =>
+        // This consumer withdrew, which is not evidence against the producer. Invalidating the
+        // generation here would withdraw an intact map output and recompute a task for nothing, so
+        // the generation is left alone and only this read fails.
+        raiseFetchFailure(location, startPartition,
+          s"The streaming shuffle consumer of shuffle $shuffleId partitions " +
+            s"[$startPartition, $endPartition) was released while opening a channel to " +
+            s"${location.hostPort}.")
+      case None =>
+        invalidateProducer(location, StreamingShuffleInvalidationReason.ConnectionTimeout,
+          "the consumer could not open a streaming channel")
+        raiseFetchFailure(location, startPartition,
+          s"Could not open a streaming shuffle channel to ${location.hostPort} for shuffle " +
+            s"$shuffleId map ${location.mapId} in " +
+            s"${BackpressureProtocol.MAX_RETRY_ATTEMPTS} attempt(s), each bounded at " +
+            s"${StreamingShuffleClientHandler.PRODUCER_CONNECTION_TIMEOUT_MS} ms.")
+    }
+  }
+
+  /**
+   * One connection attempt: builds this producer's handler, offers it to the connector, and either
+   * registers the resulting stream or releases the handler again.
+   *
+   * The handler is per producer, because it owns that producer's sequence expectation, its
+   * acknowledgement position and its receive window, and a fresh one is built per attempt. A
+   * refused handler is closed at once, which returns whatever receive quota it charged to the
+   * executor's shared budget; reusing a closed one would leave that quota accounted to a channel
+   * that no longer exists. There is nothing to carry over, because a refusal delivered no bytes.
+   *
+   * The channel is created through the injected connector, so every path in this class is reachable
+   * without depending on a particular transport being available.
+   *
+   * @param location the producer to reach
+   * @return the registered stream, or `None` if no channel could be established
+   */
+  private def connectOnce(location: StreamingShuffleProducerLocation): Option[ProducerStream] = {
     // The partition range is handed to the handler because it is the *authenticated* request: a
     // frame naming a partition outside it allocates nothing and is dropped, so the state a remote
     // producer can provoke on this consumer is bounded by what this task asked for rather than by
@@ -893,8 +1111,7 @@ private[spark] class StreamingShuffleReader[K, C](
     val handler = new StreamingShuffleClientHandler(conf, shuffleId, location.mapId,
       location.taskAttemptId, consumerId, startPartition, endPartition, backpressure, errorNotifier,
       clock)
-    val connected = connector.connect(location, handler)
-    connected match {
+    connector.connect(location, handler) match {
       case Some(client) =>
         val stream = new ProducerStream(location, handler, client)
         streamsLock.synchronized {
@@ -905,26 +1122,28 @@ private[spark] class StreamingShuffleReader[K, C](
             log"producer ${MDC(EXECUTOR_ID, location.executorId)} at " +
             log"${MDC(HOST_PORT, location.hostPort)} for map ${MDC(MAP_ID, location.mapId)}")
         }
-        stream
+        Some(stream)
       case None =>
         handler.close()
-        invalidateProducer(location, StreamingShuffleInvalidationReason.ConnectionTimeout,
-          "the consumer could not open a streaming channel")
-        raiseFetchFailure(location, startPartition,
-          s"Could not open a streaming shuffle channel to ${location.hostPort} for shuffle " +
-            s"$shuffleId map ${location.mapId} within " +
-            s"${StreamingShuffleClientHandler.PRODUCER_CONNECTION_TIMEOUT_MS} ms.")
+        None
     }
   }
 
   /**
    * Issues the in-progress block request for every partition on every producer.
    *
-   * This is what makes the feature a streaming one: the request is sent while the map stage is
-   * still producing, so reduce-side work overlaps map-side work instead of waiting behind a
-   * materialisation barrier. The protocol's heartbeat carries it, which means one message type
-   * serves both purposes -- it names the partition this consumer wants and it proves the consumer
-   * is alive -- and the producer needs no extra request type to learn either.
+   * "In progress" is a statement about what the request does not require, and that is what makes
+   * the feature a streaming one: it is issued without waiting for the map stage to report complete
+   * output, and a producer answers it with whatever it has cut so far rather than only with a
+   * finished partition. Whether any producer really is still producing when it arrives is decided
+   * by the scheduler that submitted this task and not here; when one is, reduce-side work overlaps
+   * map-side work, and when none is, the same request reads retained output without the index
+   * lookup and whole-partition buffering the classic path needs. The request is not conditioned on
+   * which case holds, because both are served by the same exchange.
+   *
+   * The protocol's heartbeat carries it, which means one message type serves both purposes -- it
+   * names the partition this consumer wants and it proves the consumer is alive -- and the producer
+   * needs no extra request type to learn either.
    */
   private def requestInProgressBlocks(streams: Seq[ProducerStream]): Unit = {
     streams.foreach { stream =>
@@ -952,11 +1171,18 @@ private[spark] class StreamingShuffleReader[K, C](
    *
    * The reader does not decide to fall back -- [[StreamingShuffleFallbackPolicy]] does -- so this
    * method reports and does not judge: producer and consumer throughput for the "consumer sustained
-   * two times slower for more than sixty seconds" condition, observed link usage for the
-   * "saturation above ninety percent" condition, and the consumer's own buffered bytes so the
-   * executor-wide utilisation gauge and the spill decision see the whole picture rather than the
-   * producer's half. When no bandwidth cap is administered the policy treats the utilisation sample
-   * as unevaluable, which is exactly right: absence of a cap means unlimited, never zero.
+   * two times slower for more than sixty seconds" condition, and observed link usage for the
+   * "saturation above ninety percent" condition. When no bandwidth cap is administered the policy
+   * treats the utilisation sample as unevaluable, which is exactly right: absence of a cap means
+   * unlimited, never zero.
+   *
+   * Buffer utilisation is deliberately not among the things reported. That reading is per shuffle
+   * and last-writer-wins, its numerator is the producer buffer budget the spill threshold is
+   * evaluated against, and this side holds a different budget entirely -- so a reader reporting its
+   * own stash would not add to the picture, it would replace the producer's half of it, and a
+   * producer genuinely at its eighty percent spill point would read as whatever the reader happened
+   * to be holding. The invariant is stated once where this reader registers the shuffle, and this
+   * is the method that would otherwise break it.
    */
   private def sampleFlowControl(): Unit = {
     if (backpressure.isPollDue) {
@@ -976,7 +1202,6 @@ private[spark] class StreamingShuffleReader[K, C](
       // shuffle on this executor. The protocol measures what actually arrived, executor-wide, over
       // a stable interval, and that is the only honest numerator for a saturation ratio.
       fallbackPolicy.recordLinkUtilization(backpressure.ingressBytesPerSecond.toDouble)
-      backpressure.reportBufferUtilization(shuffleId, stashedBytes.get(), bufferBudgetBytes)
 
       val sustainedSlow = sampled.exists(backpressure.isConsumerSustainedSlow)
       if ((sustainedSlow || backpressure.isLinkSaturated) && !slownessReported) {
@@ -1004,6 +1229,14 @@ private[spark] class StreamingShuffleReader[K, C](
    * Best effort on purpose. The read is failing regardless, and a coordinator that cannot be
    * reached must not replace the fetch failure about to be raised -- which the scheduler knows how
    * to recover from -- with an RPC error it does not.
+   *
+   * The coordinator is told rather than the producer, and that is not a shortcut: the generation's
+   * other owners are on the producer's executor, this consumer has no channel to any of them, and
+   * inventing one would let any peer retire another executor's output. Telling the one authority
+   * both ends already talk to is what makes the invalidation reach them -- the producer refreshes
+   * its registration on the connection-timeout cadence, discovers on its next refresh that the
+   * driver no longer holds its generation, and retires its routing entry, its retained output, its
+   * sessions and its spill files itself through the one withdrawal operation that owns all four.
    */
   private def invalidateProducer(
       location: StreamingShuffleProducerLocation,
@@ -1235,6 +1468,13 @@ private[spark] class StreamingShuffleReader[K, C](
     private val openStreams = new mutable.ArrayBuffer[DeserializationStream]
     private val closed = new AtomicBoolean(false)
 
+    /**
+     * Blocks this producer delivered for partitions this task does not read. Touched only by the
+     * task thread, so a plain counter is enough, and it exists so that a misrouting is a number an
+     * operator can see rather than a line per discarded block.
+     */
+    private var foreignBlocksDiscarded: Long = 0L
+
     /** The ledger identity of one partition arriving from *this* producer generation. */
     private[streaming] def ledgerKey(partitionId: Int): BackpressureStreamKey =
       consumerKey(location, partitionId)
@@ -1288,6 +1528,9 @@ private[spark] class StreamingShuffleReader[K, C](
       var result: Option[DataBlockMessage] = None
       var finished = false
       while (!finished) {
+        // Producer loss is converted into a fetch failure before the notifier is consulted, so a
+        // transport error latched alongside the loss can never be what this task raises.
+        convertSignalledProducerLoss(partitionId)
         errorNotifier.throwIfError()
         checkFallbackWhileReading(partitionId)
         if (inbox.blocks.nonEmpty) {
@@ -1362,11 +1605,11 @@ private[spark] class StreamingShuffleReader[K, C](
           enqueue(block)
         case Some(StreamCompleted(completedPartition, totalBlocks)) =>
           markTerminated(completedPartition, totalBlocks)
-        case Some(ProducerLost(lostPartition, reason)) =>
+        case Some(ProducerLost(lostPartition, reason, cause)) =>
           val attributedPartition =
             if (servesPartition(lostPartition)) lostPartition else awaitedPartition
           failProducer(attributedPartition, StreamingShuffleInvalidationReason.ConnectionTimeout,
-            reason)
+            reason, cause)
         case None =>
           checkProducerLiveness(awaitedPartition)
       }
@@ -1376,10 +1619,20 @@ private[spark] class StreamingShuffleReader[K, C](
     /**
      * Accepts one arrived block into its inbox, or discards it if it is not ours.
      *
-     * A block for a partition outside this task's range is acknowledged before being dropped, so
-     * the producer reclaims it rather than retaining it for a consumer that will never read it.
-     * That is a routing quirk, not a protocol violation, so it is never reported as an unexpected
-     * message type.
+     * <b>A block for a partition outside this task's range is dropped and never acknowledged.</b>
+     * Acknowledging it was both contradictory and wrong. Contradictory, because the handler refuses
+     * an acknowledgement for a partition this consumer never asked for, so the call could only ever
+     * return false. Wrong, because an acknowledgement is the one message that advances a producer's
+     * retained-window cursor and frees the buffers behind it, and the cursor it would advance
+     * belongs to the reduce task that really does read that partition -- so a reducer confirming
+     * another reducer's data is a reducer able to make that data unreadable. The producer loses
+     * nothing by the silence: it keeps the block for the consumer that is entitled to it and
+     * releases it on that consumer's own acknowledgement.
+     *
+     * Arriving at all is nevertheless an anomaly, since a producer sends a partition only to the
+     * consumers that subscribed to it, so the first one is reported at warning level and counted.
+     * The count is reported rather than the individual blocks, because a misrouting affects every
+     * block of a partition and one line per block would be one line per two megabytes.
      *
      * Byte and block counts are recorded here, on arrival, because that is when the bytes crossed
      * the network. Locality is decided from the producer's executor id, so a producer that happens
@@ -1389,10 +1642,17 @@ private[spark] class StreamingShuffleReader[K, C](
       val partitionId = block.partitionId()
       val payloadBytes = block.payloadLength().toLong
       if (!servesPartition(partitionId)) {
-        handler.acknowledge(partitionId, block.sequenceNumber())
-        if (debugEnabled) {
-          logDebug(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} discarded a block for " +
-            log"partition ${MDC(PARTITION_ID, partitionId)} outside the range this task reads")
+        foreignBlocksDiscarded += 1L
+        if (foreignBlocksDiscarded == 1L) {
+          logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} received a block for " +
+            log"partition ${MDC(PARTITION_ID, partitionId)} from " +
+            log"${MDC(HOST_PORT, location.hostPort)}, which this task does not read; it is " +
+            log"discarded and deliberately not acknowledged, because the producer must keep it " +
+            log"for the consumer entitled to it")
+        } else if (debugEnabled) {
+          logDebug(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} discarded block " +
+            log"${MDC(COUNT, foreignBlocksDiscarded)} for a partition outside the range this " +
+            log"task reads")
         }
       } else {
         val inbox = inboxOf(partitionId)
@@ -1451,9 +1711,13 @@ private[spark] class StreamingShuffleReader[K, C](
      * elapsed time since this reader started waiting is measured here, against the most recent
      * inbound activity anywhere on the channel so that a producer busy with another partition is
      * never mistaken for a dead one.
+     *
+     * The three readings are taken before the notifier is consulted. Reached only from an empty
+     * poll window, so the hand-off queue holds nothing at this point and a loss signalled on it has
+     * already been applied; what remains is to prefer the reading that names a lost producer over a
+     * throwable that merely accompanied one.
      */
     private def checkProducerLiveness(awaitedPartition: Int): Unit = {
-      errorNotifier.throwIfError()
       if (handler.isProducerLost) {
         failProducer(awaitedPartition, StreamingShuffleInvalidationReason.ConnectionTimeout,
           s"the producer channel became inactive " +
@@ -1479,6 +1743,9 @@ private[spark] class StreamingShuffleReader[K, C](
               s"${StreamingShuffleClientHandler.PRODUCER_CONNECTION_TIMEOUT_MS} ms connection " +
               "timeout")
         }
+        // Consulted last, so that a producer loss this poll window revealed is raised as the fetch
+        // failure it is rather than as whatever transport error accompanied it.
+        errorNotifier.throwIfError()
       }
     }
 
@@ -1614,11 +1881,23 @@ private[spark] class StreamingShuffleReader[K, C](
           val retainedByProducer = sequenceNumber > handler.acknowledgedPosition(inbox.partitionId)
           val withinLedgerWindow = backpressure.isWithinUnacknowledgedWindow(
             ledgerKey(inbox.partitionId), sequenceNumber)
-          logWarning(log"Streaming shuffle block ${MDC(BLOCK_ID, blockName)} failed CRC32C " +
-            log"verification: the producer sent ${MDC(CHECKSUM, candidate.checksum())} and this " +
-            log"consumer computed ${MDC(VALUE, computed)}. Retained by the producer: " +
-            log"${MDC(REASON, retainedByProducer)}, ledger window: " +
-            log"${MDC(THRESHOLD, withinLedgerWindow)}")
+          checksumFailures += 1L
+          checksumFailureLogGate.admit(clock.getTimeMillis()) match {
+            case Some(unreported) =>
+              logWarning(log"Streaming shuffle block ${MDC(BLOCK_ID, blockName)} failed CRC32C " +
+                log"verification: the producer sent " +
+                log"${MDC(CHECKSUM, candidate.checksum())} and this consumer computed " +
+                log"${MDC(VALUE, computed)}. Retained by the producer: " +
+                log"${MDC(REASON, retainedByProducer)}, ledger window: " +
+                log"${MDC(THRESHOLD, withinLedgerWindow)} " +
+                log"(${MDC(COUNT, checksumFailures)} failure(s) on this task, " +
+                log"${MDC(NUM_SKIPPED, unreported)} not reported individually)")
+            case None =>
+              if (debugEnabled) {
+                logDebug(log"Streaming shuffle block ${MDC(BLOCK_ID, blockName)} failed CRC32C " +
+                  log"verification; computed ${MDC(VALUE, computed)}")
+              }
+          }
           attempt += 1
           val repairable = retainedByProducer &&
             attempt <= BackpressureProtocol.MAX_RETRY_ATTEMPTS &&
@@ -1651,8 +1930,8 @@ private[spark] class StreamingShuffleReader[K, C](
      * The wait is a bounded number of poll windows whose count is derived from the protocol's own
      * backoff for the stream, falling back to the standard exponential schedule from one second
      * when the protocol has no opinion. Expressing the delay as a count of poll windows rather than
-     * as a clock deadline is what keeps the behaviour identical under a manual clock, which is what
-     * makes the reader suites deterministic without a single sleep.
+     * as a clock deadline is what keeps the behaviour identical whichever clock is supplied, and
+     * what keeps this path free of a sleep.
      *
      * The replay is looked for by sequence number rather than at the head of the inbox, because the
      * blocks that followed the corrupt one were not lost and are commonly queued ahead of it; see
@@ -1668,10 +1947,21 @@ private[spark] class StreamingShuffleReader[K, C](
         handler.requestRetransmission(inbox.partitionId, sequenceNumber, sequenceNumber)
       val backoffMillis = backpressure.nextRetryBackoffMillis(ledgerKey(inbox.partitionId))
         .getOrElse(BackpressureProtocol.retryBackoffMillis(attempt))
-      logWarning(log"Streaming shuffle requested a replay of block ${MDC(BLOCK_ID, blockName)} " +
-        log"(attempt ${MDC(MAX_ATTEMPTS, attempt)} of " +
-        log"${MDC(COUNT, BackpressureProtocol.MAX_RETRY_ATTEMPTS)}, accepted: " +
-        log"${MDC(REASON, requested)}, backoff ${MDC(TIMEOUT, backoffMillis)} ms)")
+      replayRequests += 1L
+      replayRequestLogGate.admit(clock.getTimeMillis()) match {
+        case Some(unreported) =>
+          logWarning(log"Streaming shuffle requested a replay of block " +
+            log"${MDC(BLOCK_ID, blockName)} (attempt ${MDC(MAX_ATTEMPTS, attempt)} of " +
+            log"${MDC(COUNT, BackpressureProtocol.MAX_RETRY_ATTEMPTS)}, accepted: " +
+            log"${MDC(REASON, requested)}, backoff ${MDC(TIMEOUT, backoffMillis)} ms; " +
+            log"${MDC(NUM_BLOCKS, replayRequests)} replay(s) asked for on this task, " +
+            log"${MDC(NUM_SKIPPED, unreported)} not reported individually)")
+        case None =>
+          if (debugEnabled) {
+            logDebug(log"Streaming shuffle requested a replay of block " +
+              log"${MDC(BLOCK_ID, blockName)} on attempt ${MDC(MAX_ATTEMPTS, attempt)}")
+          }
+      }
       var windows = math.max(1L, backoffMillis / POLL_WINDOW_MS)
       var replayed: Option[DataBlockMessage] = None
       while (replayed.isEmpty && windows > 0L && !cleanedUp.get()) {
@@ -1806,15 +2096,20 @@ private[spark] class StreamingShuffleReader[K, C](
      * input.
      *
      * The failure itself is raised through [[raiseFetchFailure]], which records it on the notifier
-     * before throwing so that first-error-wins decides what propagates and the scheduler-facing
-     * signal is asserted on this thread either way. An explicitly detected protocol version
-     * mismatch is preferred as the reported cause when one was seen, because a version
-     * disagreement must trip the fallback policy rather than be reported as a timeout.
+     * before throwing so that the scheduler-facing signal is asserted on this thread and is the
+     * signal that propagates. An explicitly detected protocol version mismatch is preferred as the
+     * reported cause when one was seen, because a version disagreement must trip the fallback
+     * policy rather than be reported as a timeout.
+     *
+     * @param cause the transport-level throwable that revealed the loss, when the handler carried
+     *              one on its marker. Attached to the fetch failure so the recomputation is
+     *              diagnosable without having to correlate two exceptions.
      */
     def failProducer(
         partitionId: Int,
         reason: StreamingShuffleInvalidationReason,
-        detail: String): Nothing = {
+        detail: String,
+        cause: Throwable = null): Nothing = {
       val versionCause = incompatibleVersion
       val released = discardAll()
       val attributedReason = if (versionCause.isDefined) {
@@ -1826,6 +2121,16 @@ private[spark] class StreamingShuffleReader[K, C](
       val message = versionCause match {
         case Some(version) =>
           fallbackPolicy.checkProtocolVersion(version)
+          // The same declaration the rendezvous makes when it reads an unspeakable version, for the
+          // same reason and with the same effect. Discovering the mismatch mid-stream rather than
+          // at registration changes when it is learned, not what it means: every producer of this
+          // shuffle speaks the version this one just announced, so a fetch failure alone would
+          // recompute the upstream stage into producers that announce it again. Latching the trip
+          // locally governs only this executor, and the log line below would otherwise be claiming
+          // a fallback that no other participant had been told about.
+          declareShuffleFallback(StreamingShuffleFallbackReason.ProtocolVersionMismatch,
+            s"a producer streamed protocol version $version but this build speaks " +
+              s"${StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION}")
           logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} saw protocol version " +
             log"${MDC(PROTOCOL_VERSION, version)} from ${MDC(HOST_PORT, location.hostPort)}, " +
             log"which this build cannot read; discarded ${MDC(NUM_BYTES, released)} byte(s) and " +
@@ -1841,7 +2146,58 @@ private[spark] class StreamingShuffleReader[K, C](
           s"Streaming shuffle producer ${location.hostPort} for shuffle $shuffleId map " +
             s"${location.mapId} was lost: $detail."
       }
-      raiseFetchFailure(location, partitionId, message)
+      raiseFetchFailure(location, partitionId, message, cause)
+    }
+
+    /**
+     * Converts a producer loss the I/O threads have already signalled into the typed failure the
+     * scheduler understands, before any raw transport error can be raised in its place.
+     *
+     * This is the ordering that makes producer loss recoverable. A channel failure is reported
+     * twice by design -- as a marker on the hand-off queue, and as a raw throwable on the notifier
+     * -- and only the first of those can be turned into an atomic per-producer invalidation plus a
+     * fetch failure, because only the task thread can see everything this read has taken.
+     * Consulting the notifier first therefore raised a transport error out of a situation the
+     * scheduler could have recovered from, and the reduce attempt failed without its upstream stage
+     * ever being recomputed.
+     *
+     * Nothing is done unless a failure has actually been observed, so the cost on the hot path is
+     * one volatile read. When one has, every event already queued is processed in arrival order,
+     * which is what keeps a producer that finished streaming and then dropped its channel from
+     * being treated as lost: its terminations are ahead of its marker on the queue and are applied
+     * first. The drain is bounded by the queue's capacity and never waits.
+     */
+    def convertSignalledProducerLoss(awaitedPartition: Int): Unit = {
+      if (errorNotifier.hasError || handler.isProducerLost) {
+        var remaining = StreamingShuffleClientHandler.INBOUND_QUEUE_CAPACITY
+        var draining = true
+        while (draining && remaining > 0) {
+          remaining -= 1
+          handler.poll() match {
+            case Some(BlockReceived(block)) => enqueue(block)
+            case Some(StreamCompleted(completed, totalBlocks)) =>
+              markTerminated(completed, totalBlocks)
+            case Some(ProducerLost(lost, reason, cause)) =>
+              val attributed = if (servesPartition(lost)) lost else awaitedPartition
+              failProducer(attributed, StreamingShuffleInvalidationReason.ConnectionTimeout,
+                reason, cause)
+            case None => draining = false
+          }
+        }
+      }
+    }
+
+    /**
+     * The same conversion for a caller that is not awaiting any particular partition.
+     *
+     * Attributed to the first partition this producer has not ended, because that is the partition
+     * whose input a fetch failure is actually about. When every partition has ended there is
+     * nothing left for this producer to lose and the call does nothing, which is what stops a
+     * channel that failed while closing from failing a read that had already received everything.
+     */
+    def convertSignalledProducerLoss(): Unit = {
+      partitionIds.find(partitionId => !inboxOf(partitionId).terminated)
+        .foreach(partitionId => convertSignalledProducerLoss(partitionId))
     }
 
     /**
@@ -1881,7 +2237,9 @@ private[spark] class StreamingShuffleReader[K, C](
    *
    * <b>Where the pipelining lives.</b> `read` pulls the next block only when the deserializer has
    * consumed the previous one, so the reduce task's own progress is what draws data across the
-   * network. That is the mechanism by which reduce-side work overlaps map-side work.
+   * network. Against a producer that is still producing, that is the mechanism by which reduce-side
+   * work overlaps map-side work; against retained output it is the mechanism by which a partition
+   * larger than the receive window is consumed without ever being held whole.
    *
    * <b>Where the acknowledgement lives.</b> A block is acknowledged the moment its last byte has
    * been handed over, never when it arrives. Acknowledging on consumption is what makes the flow
@@ -1999,12 +2357,14 @@ private[spark] class StreamingShuffleReader[K, C](
     private var delegate: Iterator[(Any, Any)] = Iterator.empty
 
     override def hasNext: Boolean = {
+      stream.convertSignalledProducerLoss(partitionId)
       errorNotifier.throwIfError()
       initialize()
       delegate.hasNext
     }
 
     override def next(): (Any, Any) = {
+      stream.convertSignalledProducerLoss(partitionId)
       errorNotifier.throwIfError()
       initialize()
       if (!delegate.hasNext) {
@@ -2038,10 +2398,12 @@ private[spark] class StreamingShuffleReader[K, C](
 /**
  * Constants and predicates shared by [[StreamingShuffleReader]] and its collaborators.
  *
- * Every wire-derived value here is computed from the protocol's own public constants rather than
- * written out as a number, so that a change upstream cannot leave a stale literal behind. The
- * arithmetic is checked at class initialisation against `FRAMING_OVERHEAD_BYTES`, which is the one
- * figure the protocol publishes that depends on all of the others.
+ * Nothing here is wire-derived. Frame sizes, header lengths and framing overheads belong to the
+ * protocol classes and are read from them at the point of use, never restated as a literal on this
+ * side; the reader's own constants are its timing and retry bounds, its sentinel sequence numbers
+ * and map identifiers, and one range predicate. The timings that must agree with the flow-control
+ * subsystem are taken from [[BackpressureProtocol]] rather than written out again, for the same
+ * reason: a change there must not leave a stale number here.
  */
 private[spark] object StreamingShuffleReader {
 
@@ -2154,8 +2516,8 @@ private[spark] object StreamingShuffleReader {
  *                     rate has a meaningful count of them to divide by
  * @param fallbackPolicy the executor-wide policy that decides when streaming yields to the
  *                       sort-based shuffle. Shared so a trip is remembered across tasks
- * @param connector opens channels to producers. Injected so that a test can drive every path in the
- *                  reader without a socket, and owned by the manager, which closes it in `stop()`
+ * @param connector opens channels to producers. Injected so no transport type reaches the reader's
+ *                  own logic, and owned by the manager, which closes it in `stop()`
  * @param serializerManager applies the same compression and encryption wrapping to a streamed
  *                          payload that the classic path applies to a fetched block
  */
@@ -2246,8 +2608,13 @@ private[spark] trait StreamingShuffleProducerConnector {
  * enforced at application level by the heartbeat.
  *
  * @param conf the executor configuration the streaming transport namespace is read from
+ * @param clock the time source the shutdown deadline is measured on, injected for the same reason
+ *              the reader's is: a suite that has to observe a straggling channel must be able to
+ *              reach the deadline by advancing a clock rather than by waiting out the full window
  */
-private[spark] class NettyStreamingShuffleProducerConnector(conf: SparkConf)
+private[spark] class NettyStreamingShuffleProducerConnector(
+    conf: SparkConf,
+    clock: Clock = new SystemClock)
   extends RpcHandler with StreamingShuffleProducerConnector with Logging {
 
   private val transportConf: TransportConf =
@@ -2451,10 +2818,10 @@ private[spark] class NettyStreamingShuffleProducerConnector(conf: SparkConf)
       }
     }
     val deadline =
-      System.currentTimeMillis() + StreamingShuffleReader.CONNECTOR_SHUTDOWN_TIMEOUT_MS
+      clock.getTimeMillis() + StreamingShuffleReader.CONNECTOR_SHUTDOWN_TIMEOUT_MS
     var straggling = 0
     channels.foreach { channel =>
-      val remaining = deadline - System.currentTimeMillis()
+      val remaining = deadline - clock.getTimeMillis()
       val confirmed = try {
         if (remaining <= 0L) {
           !channel.isOpen

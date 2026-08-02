@@ -182,6 +182,13 @@ private[spark] class StreamingShuffleErrorNotifier(
   private val firstFetchFailure = new AtomicReference[FetchFailedException](null)
 
   /**
+   * Guards the single attachment of the root cause onto a preferred fetch failure. Needed because
+   * [[throwIfError]] sits on the iterator's hot path and is called on every advance, so attaching
+   * without a guard would grow the fetch failure's suppressed array once per record.
+   */
+  private val rootCauseAttached = new AtomicBoolean(false)
+
+  /**
    * Total number of failures reported through [[setError]], including the first. Recorded so that
    * the true size of a cascade remains visible even though only a bounded prefix of it is retained.
    */
@@ -385,12 +392,23 @@ private[spark] class StreamingShuffleErrorNotifier(
    * recomputes the upstream stage -- whether the exception that finally propagates is the fetch
    * failure itself or something that merely accompanied it.
    *
-   * The original type is then preserved wherever re-throwing it unchanged is safe. A fetch failure
-   * is re-thrown exactly as recorded, never wrapped, so that every existing matcher on its type
-   * continues to recognise it. An unchecked exception is re-thrown as it stands so that downstream
-   * matchers still see its exact type, and an Error is re-thrown as it stands so that a fatal
-   * condition is never masked or downgraded. Only a remaining checked exception is wrapped in a
-   * SparkException naming the shuffle, with the original attached as the cause.
+   * <b>What propagates, and why the fetch failure is preferred.</b> A recorded fetch failure is
+   * what is thrown whenever one exists, even when it lost the first-error race to a consequence of
+   * the very producer loss it describes -- a channel-close `IOException` provoked by that loss
+   * being the ordinary case. Preferring it is not cosmetic: registering it on the task context
+   * makes the executor report a fetch failure, but every matcher that inspects the propagating
+   * exception's type instead -- and every log line and every test assertion that reads it -- would
+   * otherwise see a transport error where the shuffle path knows the cause was a lost producer. The
+   * root cause is not discarded when this happens; it is attached to the fetch failure as a
+   * suppressed exception, exactly once, so the transport-level detail survives into the same stack
+   * trace.
+   *
+   * Outside that case the original type is preserved wherever re-throwing it unchanged is safe. An
+   * `Error` is re-thrown as it stands and is never displaced by the fetch failure, because a fatal
+   * condition must not be masked or downgraded by a recoverable one. An unchecked exception is
+   * re-thrown as it stands so that downstream matchers still see its exact type. Only a remaining
+   * checked exception is wrapped in a SparkException naming the shuffle, with the original attached
+   * as the cause.
    */
   def throwIfError(): Unit = {
     val recorded = firstError.get()
@@ -405,15 +423,39 @@ private[spark] class StreamingShuffleErrorNotifier(
       }
       reportDroppedFailuresOnce()
       recorded match {
-        // Checked, so it must be matched ahead of the generic checked branch below; wrapping it
-        // there would erase the type the scheduler-facing path is built on.
-        case producerLoss: FetchFailedException => throw producerLoss
-        case unchecked: RuntimeException => throw unchecked
+        // Matched first, and ahead of the fetch-failure preference below: a fatal condition is
+        // never displaced by a recoverable one.
         case fatal: Error => throw fatal
+        case rootCause if fetchFailed != null =>
+          attachRootCauseOnce(fetchFailed, rootCause)
+          throw fetchFailed
+        case unchecked: RuntimeException => throw unchecked
         case checked =>
           throw new SparkException(
             s"Streaming shuffle $shuffleId failed while reading pipelined map output " +
               s"(${checked.getClass.getName})$droppedFailureSuffix", checked)
+      }
+    }
+  }
+
+  /**
+   * Attaches the root cause to a preferred fetch failure, once, and never fatally.
+   *
+   * Skipped when the two are the same object, which is the case whenever the fetch failure won the
+   * first-error race. Contained, because this runs while a failure is already propagating and a
+   * bookkeeping problem must not replace it; and guarded by a single compare-and-set, because the
+   * caller is on the iterator's hot path.
+   */
+  private def attachRootCauseOnce(fetchFailed: FetchFailedException, rootCause: Throwable): Unit = {
+    if ((rootCause ne fetchFailed) && rootCauseAttached.compareAndSet(false, true)) {
+      try {
+        fetchFailed.addSuppressed(rootCause)
+      } catch {
+        case NonFatal(bookkeepingFailure) =>
+          if (debugEnabled) {
+            logDebug(log"Could not attach the root cause to the fetch failure of streaming " +
+              log"shuffle ${MDC(SHUFFLE_ID, shuffleId)}: ${MDC(ERROR, bookkeepingFailure)}")
+          }
       }
     }
   }
@@ -468,6 +510,7 @@ private[spark] class StreamingShuffleErrorNotifier(
     suppressedDropped.set(0L)
     overflowMarked.set(false)
     droppedFailuresReported.set(false)
+    rootCauseAttached.set(false)
     firstError.set(null)
   }
 }

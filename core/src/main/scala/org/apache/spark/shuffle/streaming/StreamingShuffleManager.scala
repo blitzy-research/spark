@@ -23,20 +23,22 @@ import java.util.concurrent.atomic.AtomicBoolean
 import scala.concurrent.duration.DurationLong
 import scala.util.control.NonFatal
 
-import org.apache.spark.{ShuffleDependency, SparkConf, SparkEnv, TaskContext}
+import org.apache.spark.{ShuffleDependency, SparkConf, SparkEnv, SparkException, TaskContext}
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.LogKeys.{CLASS_NAME, CONFIG, COUNT, EXECUTOR_ID, HOST_PORT,
   MAP_ID, NUM_BYTES, NUM_PARTITIONS, NUM_TASKS, REASON, SHUFFLE_ID, TASK_ATTEMPT_ID, VALUE}
 import org.apache.spark.internal.config.{SHUFFLE_STREAMING_DEBUG, SHUFFLE_STREAMING_ENABLED}
 import org.apache.spark.network.TransportContext
 import org.apache.spark.network.buffer.ManagedBuffer
+import org.apache.spark.network.client.StreamCallbackWithID
 import org.apache.spark.network.server.TransportServer
 import org.apache.spark.network.shuffle.MergedBlockMeta
 import org.apache.spark.network.shuffle.protocol.streaming.StreamingShuffleMessage
 import org.apache.spark.rpc.{RpcEndpointRef, RpcTimeout}
 import org.apache.spark.serializer.SerializerManager
-import org.apache.spark.shuffle.{ShuffleBlockResolver, ShuffleHandle, ShuffleManager,
-  ShuffleReader, ShuffleReadMetricsReporter, ShuffleWriteMetricsReporter, ShuffleWriter}
+import org.apache.spark.shuffle.{MigratableResolver, ShuffleBlockInfo, ShuffleBlockResolver,
+  ShuffleHandle, ShuffleManager, ShuffleReader, ShuffleReadMetricsReporter,
+  ShuffleWriteMetricsReporter, ShuffleWriter}
 import org.apache.spark.shuffle.sort.SortShuffleManager
 import org.apache.spark.storage.{BlockId, ShuffleBlockBatchId, ShuffleBlockId,
   ShuffleMergedBlockId, TempShuffleBlockId}
@@ -70,6 +72,28 @@ import org.apache.spark.util.{Clock, SystemClock}
  * The consequence worth stating plainly is that <b>no configuration, failure or resource condition
  * leaves a job without a working shuffle</b>. Delegation is available because the delegate is
  * constructed unconditionally, in this constructor, before any streaming component exists.
+ *
+ * ==What activation buys, and what it cannot==
+ *
+ * An operator turning tier two on should know what the subsystem can and cannot deliver on this
+ * platform, so it is recorded here rather than implied.
+ *
+ * The streaming path removes the map side's materialisation of shuffle output and the reduce side's
+ * index-and-fetch round trip and whole-partition buffering. A block is framed, checksummed and
+ * pushed the moment it is cut, and a subscribed consumer turns it into records without any of it
+ * reaching disk.
+ *
+ * What activation does <i>not</i> do is change when consumers exist. Task submission belongs to the
+ * DAG scheduler and to the task scheduler, both of which this feature may not modify at all, and
+ * the unmodified scheduler submits a stage only once every parent stage reports its output
+ * available. For a map stage whose tasks each run once, its reduce tasks are therefore submitted
+ * after the last map task has finished, no consumer is subscribed while any of them produces, and
+ * what those reduce tasks read is retained output served by [[StreamingShuffleBlockResolver]]
+ * rather than a live stream. Producer/consumer overlap is exercised only where a consumer really is
+ * attached -- a reduce attempt reading while a superseded or speculative map attempt still produces
+ * -- and would be exercised throughout under a scheduler that submitted consumers earlier. Both
+ * halves of the subsystem are built for that case and take it whenever it arises; neither pretends
+ * to create it.
  *
  * ==What is consulted before streaming is used==
  *
@@ -152,17 +176,13 @@ private[spark] class StreamingShuffleManager(conf: SparkConf, isDriver: Boolean)
 
   import StreamingShuffleManager._
 
-  // ---------------------------------------------------------------------------------------------
   // Configuration, read exactly once.
-  // ---------------------------------------------------------------------------------------------
 
   private val streamingEnabled: Boolean = conf.get(SHUFFLE_STREAMING_ENABLED)
   private val debugEnabled: Boolean = conf.get(SHUFFLE_STREAMING_DEBUG)
 
-  // ---------------------------------------------------------------------------------------------
   // The delegate. Constructed unconditionally and first, so that delegation is available from the
   // moment this object exists -- including from the constructor of anything below it.
-  // ---------------------------------------------------------------------------------------------
 
   private val sortShuffleManager: SortShuffleManager = new SortShuffleManager(conf)
 
@@ -193,9 +213,7 @@ private[spark] class StreamingShuffleManager(conf: SparkConf, isDriver: Boolean)
    */
   private val capabilityTokens = new ConcurrentHashMap[Integer, String]()
 
-  // ---------------------------------------------------------------------------------------------
   // Executor-scoped and driver-scoped collaborators.
-  // ---------------------------------------------------------------------------------------------
 
   /**
    * The driver's coordinator instance, present only on the driver and only while streaming is
@@ -245,19 +263,40 @@ private[spark] class StreamingShuffleManager(conf: SparkConf, isDriver: Boolean)
   }
 
   /**
-   * The executor's single egress pacer. Its refill rate is re-derived whenever the coordinator
-   * reports a different number of concurrent shuffles, which is the divisor the rate is defined by.
+   * The executor's whole egress allowance, divided among the shuffles it is producing for.
+   *
+   * <b>One limiter per shuffle, not one limiter for the executor.</b> The contract fixes the
+   * per-shuffle token rate at `maxBandwidthMBps / numConcurrentShuffles`. A single shared limiter
+   * set to that share is the same arithmetic applied to the wrong subject: it caps the executor's
+   * entire egress at one shuffle's worth, so an executor producing for three shuffles admits a
+   * third of the cap in total rather than the whole of it, and every one of those shuffles is paced
+   * at a third of what it is owed. Holding a limiter per shuffle, and republishing every live
+   * limiter's share whenever the divisor moves, is what makes the division real in both directions
+   * -- the aggregate obeys the cap and no shuffle is throttled below its share.
+   *
+   * Lazy, and its concurrency source lazier still: the divisor's second input is read from the
+   * driver, and an executor must not reach the driver while its shuffle manager is being
+   * constructed. Nothing here asks anything until a share is actually being returned.
    */
-  private lazy val rateLimiter: TokenBucketRateLimiter =
-    TokenBucketRateLimiter(conf, INITIAL_CONCURRENT_SHUFFLES)
+  private lazy val egressBudget: TokenBucketRateLimiter.ExecutorEgressBudget =
+    TokenBucketRateLimiter.executorBudget(conf, clock, () => executorConcurrency())
+
+  @volatile private var backpressureBuilt: Boolean = false
 
   /**
    * The executor's single credit ledger, liveness timer set and consumer receive quota. The
    * coordinator instance is passed when this JVM hosts one and `null` otherwise, which the protocol
    * documents and handles: an executor arbitrates over the shuffles registered locally instead.
+   *
+   * The flag above is what lets the release paths know whether there is any flow-control state to
+   * return without forcing this value, since `unregisterShuffle` reaches every executor of a
+   * streaming-enabled application including those that never streamed a byte.
    */
-  private lazy val backpressure: BackpressureProtocol =
-    new BackpressureProtocol(conf, driverCoordinator.orNull, rateLimiter)
+  private lazy val backpressure: BackpressureProtocol = {
+    val protocol = new BackpressureProtocol(conf, driverCoordinator.orNull, egressBudget)
+    backpressureBuilt = true
+    protocol
+  }
 
   @volatile private var listenerBound: Boolean = false
 
@@ -323,9 +362,7 @@ private[spark] class StreamingShuffleManager(conf: SparkConf, isDriver: Boolean)
       log"${MDC(CONFIG, SHUFFLE_STREAMING_ENABLED.key)}=${MDC(VALUE, streamingEnabled)}")
   }
 
-  // ---------------------------------------------------------------------------------------------
   // ShuffleManager service-provider interface.
-  // ---------------------------------------------------------------------------------------------
 
   /**
    * The resolver the block manager serves local shuffle blocks from, and the one
@@ -399,7 +436,7 @@ private[spark] class StreamingShuffleManager(conf: SparkConf, isDriver: Boolean)
       metrics: ShuffleWriteMetricsReporter): ShuffleWriter[K, V] = {
     handle match {
       case streaming: StreamingShuffleHandle[K @unchecked, V @unchecked, _]
-          if streamingAvailableFor(streaming.shuffleId) =>
+          if streamingAvailableFor(streaming) =>
         newStreamingWriter(streaming, mapId, context, metrics)
       case _ =>
         sortShuffleManager.getWriter(handle, mapId, context, metrics)
@@ -423,7 +460,7 @@ private[spark] class StreamingShuffleManager(conf: SparkConf, isDriver: Boolean)
       metrics: ShuffleReadMetricsReporter): ShuffleReader[K, C] = {
     handle match {
       case streaming: StreamingShuffleHandle[K @unchecked, _, C @unchecked]
-          if streamingAvailableFor(streaming.shuffleId) =>
+          if streamingAvailableFor(streaming) =>
         if (StreamingShuffleReader.servesFullMapRange(startMapIndex, endMapIndex)) {
           new StreamingShuffleReader[K, C](streaming, startMapIndex, endMapIndex, startPartition,
             endPartition, context, metrics, conf, readerContext)
@@ -450,12 +487,21 @@ private[spark] class StreamingShuffleManager(conf: SparkConf, isDriver: Boolean)
   /**
    * Releases everything this JVM holds for one shuffle.
    *
-   * All three owners are told, unconditionally and in the order that keeps local disk honest. The
+   * Every owner is told, unconditionally and in the order that keeps local disk honest. The
    * resolver goes first, because it is the only thing that unlinks retained spill files and a
    * shuffle whose files are never unlinked is a permanent local-disk leak. The coordinator is told
    * next so that no consumer can resolve a producer of a shuffle that no longer exists. The
-   * delegate is told last and always, because a declined dependency of this shuffle id may have
-   * been written by the sort-based writer.
+   * executor's flow-control state is returned after that, and the order there is load bearing in
+   * its own right: returning the shuffle's share of the egress allowance re-reads the coordinator's
+   * count of this executor's shuffles, and doing it before the coordinator has forgotten this one
+   * would read a divisor that still included it. The delegate is told last and always, because a
+   * declined dependency of this shuffle id may have been written by the sort-based writer.
+   *
+   * This method reaches every JVM of the application, driver and executors alike, because the block
+   * manager's storage endpoint routes the cleaner's removal to each of them. That is what makes it
+   * the right place to return executor-scoped state, and it is why nothing here forces a lazy
+   * collaborator: an executor that never streamed must not build a flow-control protocol purely in
+   * order to release one.
    *
    * @return the delegate's verdict, since it is the only participant whose bookkeeping the caller
    *         can act upon
@@ -473,6 +519,11 @@ private[spark] class StreamingShuffleManager(conf: SparkConf, isDriver: Boolean)
         }
       }
     }
+    // Each routed generation has already withdrawn its own retained output, because withdrawing the
+    // routing entry is one step of the single operation that does both. This sweep is what reaches
+    // the generations that were never routed -- an announcement the driver declined, a hand-off
+    // that was refused -- so it is a completeness pass rather than the primary path, and it is
+    // expected to release nothing in the ordinary case.
     streamingBlockResolver.foreach { resolver =>
       guard(s"release retained output of shuffle $shuffleId") {
         val released = resolver.removeShuffle(shuffleId)
@@ -489,6 +540,9 @@ private[spark] class StreamingShuffleManager(conf: SparkConf, isDriver: Boolean)
         }
       }
     }
+    if (backpressureBuilt) {
+      releaseShuffleStreamingState(shuffleId, "the shuffle was unregistered")
+    }
     guard(s"forget the degradation state of shuffle $shuffleId") {
       fallbackPolicy.forgetShuffle(shuffleId)
     }
@@ -499,10 +553,10 @@ private[spark] class StreamingShuffleManager(conf: SparkConf, isDriver: Boolean)
    * Shuts the subsystem down exactly once, releasing only what was actually built.
    *
    * The order is the reverse of the dependency order, so nothing is released while something that
-   * uses it is still live: consumer channels, then retained producer output, then the rendezvous
-   * endpoint, then the delegate. Every step is contained, because a shutdown that abandoned the
-   * remaining steps on the first failure would leak precisely the resources this method exists to
-   * release.
+   * uses it is still live: consumer channels, then the serving listener, then the executor's
+   * flow-control state, then retained producer output, then the rendezvous endpoint, then the
+   * delegate. Every step is contained, because a shutdown that abandoned the remaining steps on the
+   * first failure would leak precisely the resources this method exists to release.
    */
   override def stop(): Unit = {
     if (stopped.compareAndSet(false, true)) {
@@ -520,6 +574,21 @@ private[spark] class StreamingShuffleManager(conf: SparkConf, isDriver: Boolean)
       // The listener goes before the retained output it serves, so no consumer can be mid-request
       // against a store that is being torn down.
       closeStreamingListener()
+      // After both transports, because a limiter that is being retired must not be one a live
+      // channel is still charging against. `stopped` is already set, so the releases below ask the
+      // driver nothing: a divisor that will never pace another byte is not worth a round trip, and
+      // a driver that has already gone is not worth a warning per shuffle.
+      if (backpressureBuilt) {
+        guard("return the executor's streaming flow-control state") {
+          val released = backpressure.registeredShuffleIds
+          released.foreach(backpressure.unregisterShuffle)
+          egressBudget.reset()
+          if (released.nonEmpty && debugEnabled) {
+            logDebug(log"Streaming shuffle returned the executor state of " +
+              log"${MDC(COUNT, released.size)} shuffle(s) at shutdown")
+          }
+        }
+      }
       // Through the exposed resolver rather than the streaming one directly, so that whichever
       // resolver this manager published is the one that gets stopped. Both are idempotent, and the
       // sort delegate's own stop below reaches its resolver again harmlessly.
@@ -533,9 +602,7 @@ private[spark] class StreamingShuffleManager(conf: SparkConf, isDriver: Boolean)
     }
   }
 
-  // ---------------------------------------------------------------------------------------------
   // Gating.
-  // ---------------------------------------------------------------------------------------------
 
   /**
    * Why this dependency cannot be streamed, or `None` when it can.
@@ -564,17 +631,38 @@ private[spark] class StreamingShuffleManager(conf: SparkConf, isDriver: Boolean)
   /**
    * Whether a shuffle already registered for streaming may still be streamed on this executor.
    *
-   * All three surfaces are consulted, cheapest first, and a verdict learned from the driver is
-   * cached locally so that the next task on this executor answers without an RPC.
+   * All surfaces are consulted cheapest first, and a verdict learned from the driver is cached
+   * locally so that the next task on this executor answers without an RPC.
+   *
+   * <b>A local trip is declared before it is acted upon.</b> That is the whole difference between
+   * this method answering correctly and answering locally. `hasTripped` is this executor's own
+   * observation of one of the four conditions, and no other participant need have seen it;
+   * answering `false` on the strength of it alone would have this executor's tasks written and read
+   * by the sort-based delegate while every other executor kept streaming the same shuffle, which is
+   * one shuffle with two producers of the same output and two incompatible reduce-side read paths.
+   * So the trip is turned into a shuffle-wide decision first, and the decision -- not the local
+   * observation -- is what withdraws streaming.
+   *
+   * The kill switch is the one condition that is not declared, because it is not an observation. It
+   * is an operator turning streaming off, the closed set of fallback conditions has no member for
+   * it, and it cannot split a shuffle in practice: `registerShuffle` runs on the driver, so a
+   * streaming handle exists only for an application whose configuration enabled streaming, and that
+   * configuration is the one every executor of it receives.
    */
-  private def streamingAvailableFor(shuffleId: Int): Boolean = {
-    if (fallbackPolicy.shouldDelegateToSortShuffle) {
+  private def streamingAvailableFor(handle: StreamingShuffleHandle[_, _, _]): Boolean = {
+    val shuffleId = handle.shuffleId
+    if (fallbackPolicy.shuffleHasFallenBack(shuffleId)) {
       false
-    } else if (fallbackPolicy.shuffleHasFallenBack(shuffleId)) {
+    } else if (fallbackPolicy.killSwitchEngaged) {
+      false
+    } else if (fallbackPolicy.hasTripped) {
+      declareFallbackFor(handle,
+        fallbackPolicy.trippedReason.getOrElse(StreamingShuffleFallbackReason.ConsumerTooSlow),
+        "the executor stood streaming down before it served this task")
       false
     } else {
       val declared = guardOption(s"read the fallback state of shuffle $shuffleId") {
-        gatewayFor(shuffleId).fallbackState(shuffleId)
+        gatewayFor(handle).fallbackState(shuffleId)
       }
       declared match {
         case Some(state) if state.fallenBack =>
@@ -611,36 +699,79 @@ private[spark] class StreamingShuffleManager(conf: SparkConf, isDriver: Boolean)
   /**
    * The driver-facing gateway for one shuffle, built per call because it holds nothing but that
    * shuffle's capability token, the endpoint reference and the ask deadline.
+   *
+   * The token is taken from the handle rather than from this manager's registration map. The map is
+   * populated by `registerShuffle`, which runs on the driver only, so an executor's copy of it is
+   * always empty; a gateway built from it would present no token and be refused by every check the
+   * coordinator applies. The handle is the trusted channel the token actually arrives on.
    */
-  private def gatewayFor(shuffleId: Int): StreamingShuffleCoordinatorGateway = {
-    new RpcStreamingShuffleCoordinatorGateway(coordinatorRef,
-      Option(capabilityTokens.get(shuffleId)).getOrElse(""), coordinatorTimeout)
+  private def gatewayFor(
+      handle: StreamingShuffleHandle[_, _, _]): StreamingShuffleCoordinatorGateway = {
+    new RpcStreamingShuffleCoordinatorGateway(coordinatorRef, handle.capabilityToken,
+      coordinatorTimeout)
   }
 
-  /** Stands one shuffle down for every participant, and caches the verdict locally. */
+  /**
+   * Stands one shuffle down for every participant, and caches the verdict the coordinator latched.
+   *
+   * A declaration already latched is not repeated: the cached verdict is the same answer the
+   * coordinator would give, so the wire cost of a fallback stays at one ask per shuffle per
+   * executor however many tasks observe the condition.
+   *
+   * Failure is absorbed rather than propagated, and the verdict is '''returned''' rather than
+   * assumed, because those are two halves of one contract. A caller is about to delegate to the
+   * sort based path, and it may only do so once the transition is shuffle-wide; an unreachable or
+   * refusing driver therefore has to be visible to it as a declaration that did not take effect,
+   * not as an exception and not as a silent success.
+   *
+   * @return the verdict in force after the declaration; `fallenBack` is false when it could not be
+   *         made, in which case the caller must not delegate
+   */
   private def declareFallbackFor(
       handle: StreamingShuffleHandle[_, _, _],
       reason: StreamingShuffleFallbackReason,
-      detail: String): Unit = {
-    val gateway = new RpcStreamingShuffleCoordinatorGateway(coordinatorRef, handle.capabilityToken,
-      coordinatorTimeout)
-    val state = gateway.declareFallback(handle.shuffleId, reason, detail)
-    fallbackPolicy.observeShuffleFallback(handle.shuffleId, state)
-    logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, handle.shuffleId)} stood down for " +
-      log"${MDC(REASON, detail)}; the sort-based shuffle serves it from here on")
+      detail: String): StreamingShuffleFallbackState = {
+    val shuffleId = handle.shuffleId
+    fallbackPolicy.knownShuffleFallback(shuffleId) match {
+      case Some(latched) => latched
+      case None =>
+        val state = guardOption(s"stand shuffle $shuffleId down for every participant") {
+          gatewayFor(handle).declareFallback(shuffleId, reason, detail)
+        }.getOrElse(StreamingShuffleFallbackState())
+        // Only the unconfirmed case is reported here; a confirmed one is reported by the policy as
+        // it records the verdict, and logging both would say the same thing twice per shuffle.
+        if (!fallbackPolicy.observeShuffleFallback(shuffleId, state) && !state.fallenBack) {
+          logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} could not be stood down " +
+            log"for every participant after ${MDC(REASON, detail)}; the shuffle keeps streaming " +
+            log"and the local participant fails so that it is retried rather than served by a " +
+            log"second implementation")
+        }
+        // A confirmed stand-down means no further participant of this shuffle will stream on this
+        // executor, so its share of the egress allowance goes back to the shuffles that are still
+        // using the link -- but only once no stream of it remains registered here. A producer
+        // draining its unacknowledged window is still occupying that link, and dropping its ledgers
+        // would leave those bytes unpaced and unaccounted for; a share held by a draining producer
+        // is returned by `unregisterShuffle` when the shuffle itself ends.
+        if (state.fallenBack && backpressureBuilt && backpressure.streamCount(shuffleId) == 0) {
+          releaseShuffleStreamingState(shuffleId, "the shuffle stood streaming down")
+        }
+        state
+    }
   }
 
-  // ---------------------------------------------------------------------------------------------
   // Task-scoped construction.
-  // ---------------------------------------------------------------------------------------------
 
   /**
    * Builds the producer half of one map task, falling back if the coordinator declines it.
    *
    * The resolver is matched rather than asserted upon. It is present exactly when streaming is
-   * enabled, which is also what `streamingAvailableFor` requires, so its absence is unreachable --
-   * but a writer without a resolver could not retain its output, and delegating is a strictly safer
-   * answer to an unreachable state than an assertion that fails a task.
+   * enabled, and [[streamingAvailableFor]] answers `true` only when the kill switch is disengaged
+   * -- that is, only when streaming is enabled -- so the absent case is unreachable. It is
+   * nonetheless written out, because a writer without a resolver could not retain its output at
+   * all, and delegating is a strictly safer answer to an unreachable state than an assertion that
+   * fails a task. No fallback is declared on that branch and none is needed: it cannot be reached,
+   * and the closed set of conditions has no member for "this executor holds no retained-output
+   * owner".
    */
   private def newStreamingWriter[K, V, C](
       handle: StreamingShuffleHandle[K, V, C],
@@ -653,7 +784,25 @@ private[spark] class StreamingShuffleManager(conf: SparkConf, isDriver: Boolean)
     }
   }
 
-  /** Builds the producer half against the executor's retained-output owner. */
+  /**
+   * Builds the producer half against the executor's retained-output owner, transactionally.
+   *
+   * Two registrations are published before the writer exists, and both are visible to owners
+   * outside this method: the routing entry the executor's listener holds, and the producer address
+   * the driver's coordinator publishes. Everything after them can still refuse -- the announcement
+   * can be declined, the buffer budget reaches through `SparkEnv`, and the writer's own
+   * construction derives sizes from it -- so either the writer is returned or every registration
+   * made on the way to it is unwound. A partial registration left behind is not inert: it is a
+   * producer a consumer can resolve, connect to and then wait on until its own detector fires.
+   *
+   * The unwind is driven through [[StreamingShuffleServerHandler.withdrawGeneration]] rather than
+   * by removing the routing entry here, so exactly one piece of code knows how to retire a
+   * generation and it retires every owner of it -- routing, retained output, spill files and
+   * sessions -- rather than the subset this method happened to create. The handler is asked
+   * directly rather than looked up by key, because withdrawing '''this''' handler is what is
+   * wanted: under `spark.shuffle.useOldFetchProtocol` a map id is the partition index instead of
+   * the task attempt id, so a lookup can find a different attempt's handler under the same key.
+   */
   private def streamingWriterOn[K, V, C](
       resolver: StreamingShuffleBlockResolver,
       handle: StreamingShuffleHandle[K, V, C],
@@ -663,37 +812,136 @@ private[spark] class StreamingShuffleManager(conf: SparkConf, isDriver: Boolean)
     val shuffleId = handle.shuffleId
     val taskAttemptId = context.taskAttemptId()
     val notifier = new StreamingShuffleErrorNotifier(shuffleId, conf)
-    val serverHandler = new StreamingShuffleServerHandler(conf, shuffleId, mapId, taskAttemptId,
-      resolver, backpressure, rateLimiter, notifier)
+    val gateway = gatewayFor(handle)
+    // Bound before the handler is built, because the handler takes the routing table as the one
+    // owner of a generation it cannot otherwise reach: its own withdrawal retires the routing
+    // entry, the retained output and its sessions together, in that order.
     val (listener, _, server) = streamingListener
+    // This shuffle's own share of the executor's egress allowance, never a limiter shared with
+    // another shuffle. Resolving it here does two things at once: it admits this shuffle to the
+    // divisor and it republishes every other live shuffle's share, so the first block this map task
+    // frames is already paced at a rate that accounts for it.
+    val limiter = egressBudget.limiterFor(shuffleId)
+    val serverHandler = new StreamingShuffleServerHandler(conf, shuffleId, mapId, taskAttemptId,
+      resolver, listener, backpressure, limiter, notifier)
     // Registered before the producer is announced, so the executor's listener can route a frame the
     // instant a consumer acts on the address. Deliberately NOT released on task completion: a
     // successful map task's output is precisely the output no consumer has read yet, and the
-    // listener is the only way to reach it. Release happens when the output does -- on generation
-    // withdrawal, on unregisterShuffle, or when this manager stops.
+    // listener is the only way to reach it. Release happens when the output does, and always
+    // through the one operation that retires every owner at once --
+    // [[StreamingShuffleServerHandler.withdrawGeneration]] -- whether it is reached from a failed
+    // task's stop, from a generation the driver retired, from unregisterShuffle or from this
+    // manager's own shutdown.
     listener.register(shuffleId, mapId, serverHandler)
-    announceProducer(handle, mapId, context, server) match {
+    val announcement = announceProducer(handle, mapId, context, server)
+    announcement.filter(_.accepted) match {
       case Some(registration) =>
-        applyConcurrency(registration.numConcurrentShuffles)
-        val components = StreamingShuffleWriterComponents(
-          backpressure = backpressure,
-          rateLimiter = rateLimiter,
-          spillManager = new MemorySpillManager(context.taskMemoryManager(), conf),
-          blockResolver = resolver,
-          serverHandler = serverHandler,
-          fallbackPolicy = fallbackPolicy,
-          errorNotifier = notifier,
-          coordinatorGateway = new RpcStreamingShuffleCoordinatorGateway(coordinatorRef,
-            handle.capabilityToken, coordinatorTimeout))
-        new StreamingShuffleWriter[K, V, C](handle, mapId, context, metrics, conf, components)
+        try {
+          applyConcurrency(registration.numConcurrentShuffles)
+          val components = StreamingShuffleWriterComponents(
+            backpressure = backpressure,
+            rateLimiter = limiter,
+            spillManager = new MemorySpillManager(context.taskMemoryManager(), conf),
+            blockResolver = resolver,
+            serverHandler = serverHandler,
+            fallbackPolicy = fallbackPolicy,
+            errorNotifier = notifier,
+            coordinatorGateway = gateway)
+          new StreamingShuffleWriter[K, V, C](handle, mapId, context, metrics, conf, components)
+        } catch {
+          case NonFatal(e) =>
+            withdrawAnnouncedProducer(gateway, serverHandler, handle, mapId, context,
+              "its producer half could not be constructed")
+            throw e
+        }
       case None =>
-        // Nothing else has been built, and in particular no memory has been bound to this task, so
-        // withdrawing the routing entry is the whole of the cleanup delegation needs.
-        listener.deregister(shuffleId, mapId)
-        logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} map " +
-          log"${MDC(MAP_ID, mapId)} could not publish its producer address; the sort-based " +
-          log"shuffle writes this map output")
-        sortShuffleManager.getWriter(handle, mapId, context, metrics)
+        declinedProducerWriter(announcement, serverHandler, handle, mapId, context, metrics)
+    }
+  }
+
+  /**
+   * Answers a producer announcement the coordinator would not publish.
+   *
+   * Nothing streamed and nothing was published on the driver, so only this executor's own routing
+   * entry has to be unwound; it is withdrawn through the single operation for the reason given on
+   * [[streamingWriterOn]].
+   *
+   * What is then owed is a shuffle that still works, and there are two ways to owe it depending on
+   * what the refusal meant:
+   *
+   *  - a '''stale generation''' -- superseded by a later attempt, or retired -- is one zombie task,
+   *    not an unavailable shuffle. The generation that owns the map index is streaming perfectly
+   *    well, so standing the shuffle down would abandon streaming everywhere because a superseded
+   *    attempt happened to still be running. This attempt therefore fails, and the live one carries
+   *    on.
+   *  - '''anything else''' says streaming is not available for this shuffle: it has already stood
+   *    down, its registration is gone, it is at its producer ceiling, or the announcement did not
+   *    reach the driver at all. Delegating this one map task before that is agreed is the split
+   *    this finding is about -- one map output written by the sort-based writer while its siblings
+   *    stream, which no reduce-side read path can reassemble -- so the transition is confirmed with
+   *    the coordinator first, and the delegate is returned only if the confirmation took effect. A
+   *    confirmation that could not be made leaves the shuffle exactly as it was and fails this
+   *    attempt, which is a retry rather than a contradiction.
+   */
+  private def declinedProducerWriter[K, V, C](
+      announcement: Option[StreamingShuffleProducerRegistration],
+      serverHandler: StreamingShuffleServerHandler,
+      handle: StreamingShuffleHandle[K, V, C],
+      mapId: Long,
+      context: TaskContext,
+      metrics: ShuffleWriteMetricsReporter): ShuffleWriter[K, V] = {
+    val shuffleId = handle.shuffleId
+    guard(s"retire the unpublished producer of shuffle $shuffleId map $mapId") {
+      serverHandler.withdrawGeneration("the producer address could not be published")
+    }
+    if (announcement.exists(_.generationStale)) {
+      throw new SparkException(s"Streaming shuffle $shuffleId will not publish map $mapId " +
+        s"attempt ${context.taskAttemptId()}, because that generation no longer owns its map " +
+        "index: it has been superseded or retired. The attempt that owns it continues to " +
+        "stream, so this one fails rather than standing the shuffle down.")
+    }
+    // The closed set of four conditions has no member for "the coordinator would not publish this
+    // producer", and adding a fifth is forbidden by design, so the generic condition carries the
+    // decision and the detail carries the truth -- which is the same convention the reader uses for
+    // a rendezvous it cannot resolve.
+    val latched = declareFallbackFor(handle, StreamingShuffleFallbackReason.ConsumerTooSlow,
+      s"the producer address of map $mapId could not be published")
+    if (!latched.fallenBack) {
+      throw new SparkException(s"Streaming shuffle $shuffleId could not publish the producer " +
+        s"address of map $mapId and could not stand the shuffle down for every participant, so " +
+        "this attempt fails and is retried rather than being written by a second shuffle " +
+        "implementation while the rest of the shuffle keeps streaming.")
+    }
+    logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} map " +
+      log"${MDC(MAP_ID, mapId)} could not publish its producer address; the shuffle has stood " +
+      log"streaming down for every participant and the sort-based shuffle writes this map output")
+    sortShuffleManager.getWriter(handle, mapId, context, metrics)
+  }
+
+  /**
+   * Unwinds a producer that was announced and then could not be built.
+   *
+   * The driver is told first, and in that order for the same reason a failing writer tells it
+   * first: it owns the address a consumer resolves and is the one owner this executor cannot retire
+   * for itself, so withdrawing it before the local owners go means no consumer is handed an address
+   * that is about to refuse it. Each step is contained, because this runs while a failure is
+   * already being propagated and must not replace it.
+   */
+  private def withdrawAnnouncedProducer(
+      gateway: StreamingShuffleCoordinatorGateway,
+      serverHandler: StreamingShuffleServerHandler,
+      handle: StreamingShuffleHandle[_, _, _],
+      mapId: Long,
+      context: TaskContext,
+      reason: String): Unit = {
+    val shuffleId = handle.shuffleId
+    guard(s"withdraw the announced producer of shuffle $shuffleId map $mapId") {
+      gateway.invalidateProducer(shuffleId,
+        StreamingShuffleProducerGeneration(context.partitionId(), mapId, context.taskAttemptId()),
+        StreamingShuffleInvalidationReason.IncompleteStream, reason)
+    }
+    guard(s"retire the local owners of shuffle $shuffleId map $mapId") {
+      serverHandler.withdrawGeneration(reason)
     }
   }
 
@@ -706,6 +954,13 @@ private[spark] class StreamingShuffleManager(conf: SparkConf, isDriver: Boolean)
    * carries, which is what `MapOutputTracker` matches when a fetch failure asks it to remove the
    * output; an identity synthesised from the streaming listener would match nothing and would
    * silently defeat every recomputation the subsystem depends upon.
+   *
+   * The reply is handed back whole rather than filtered on acceptance, because a refusal is not one
+   * outcome but two: the caller has to tell a superseded generation, which must fail, from a
+   * shuffle that cannot be streamed, which must stand down. `None` means the ask did not reach the
+   * driver, which the caller treats as the second of those.
+   *
+   * @return the coordinator's reply, or `None` when the driver could not be reached
    */
   private def announceProducer(
       handle: StreamingShuffleHandle[_, _, _],
@@ -728,35 +983,106 @@ private[spark] class StreamingShuffleManager(conf: SparkConf, isDriver: Boolean)
     val registration = guardOption(s"announce a producer of shuffle ${handle.shuffleId}") {
       coordinatorRef.askSync[StreamingShuffleProducerRegistration](request, coordinatorTimeout)
     }
-    registration.filter { reply =>
+    registration.foreach { reply =>
       if (reply.accepted && debugEnabled) {
         logDebug(log"Streaming shuffle ${MDC(SHUFFLE_ID, handle.shuffleId)} published producer " +
           log"${MDC(EXECUTOR_ID, env.executorId)} map ${MDC(MAP_ID, mapId)} attempt " +
           log"${MDC(TASK_ATTEMPT_ID, context.taskAttemptId())} at " +
           log"${MDC(HOST_PORT, location.hostPort)}")
       }
-      reply.accepted
+    }
+    registration
+  }
+
+  /**
+   * Feeds the coordinator's count of this executor's concurrent shuffles to the egress budget,
+   * which republishes every live limiter's share if the count moves the divisor.
+   *
+   * The per-shuffle rate is the administered link capacity divided by that count and held to 80% of
+   * it, so the count is the one input that must move every rate at once. Handing the number to the
+   * budget rather than computing a rate here is what keeps that arithmetic in one place: the budget
+   * owns the divisor, the ceiling and the redistribution, and this method owns only the
+   * observation.
+   *
+   * Called on a producer registration reply, which carries the count, so the ordinary path costs no
+   * extra round trip.
+   *
+   * @param numConcurrentShuffles the count the coordinator reported; a non-positive value is
+   *                              ignored by the budget rather than treated as a divisor
+   */
+  private def applyConcurrency(numConcurrentShuffles: Int): Unit = {
+    if (egressBudget.observeConcurrency(numConcurrentShuffles) && debugEnabled) {
+      val share = egressBudget.currentShareBytesPerSecond
+      logDebug(log"Streaming shuffle egress is divided " +
+        log"${MDC(COUNT, egressBudget.divisor)} way(s) at " +
+        log"${MDC(NUM_BYTES, share.map(_.toString).getOrElse("unlimited"))} byte(s)/s per " +
+        log"shuffle after the coordinator reported " +
+        log"${MDC(VALUE, numConcurrentShuffles)} concurrent shuffle(s) on this executor")
     }
   }
 
   /**
-   * Re-derives the egress refill rate from the number of shuffles this executor is now serving.
+   * How many streaming shuffles this executor is currently producing for, or `None` when the answer
+   * cannot be had.
    *
-   * The rate is defined as the administered link capacity divided by that count and held to 80% of
-   * it, so the count changing is the one thing that must move the rate. Doing it here, on the
-   * coordinator's own answer, is what keeps the divisor a measured value rather than a guess.
+   * Handed to the egress budget as a closure, so the budget never touches `RpcEnv` and the question
+   * can be answered without one. Two routes, because this class is both the driver's
+   * manager and every executor's: the driver reads its own coordinator instance, and an executor
+   * asks the endpoint. The request names no shuffle, so no shuffle's capability token authorises it
+   * and none is presented; the coordinator validates the executor id itself and answers the safe
+   * divisor of one for an id it cannot read.
+   *
+   * `None` leaves the divisor exactly as it was, which is the conservative outcome. The divisor is
+   * the larger of this answer and the executor's own limiter count, so a missing answer can only
+   * leave the pacing where the local count already puts it -- never above the cap.
    */
-  private def applyConcurrency(numConcurrentShuffles: Int): Unit = {
-    conf.get(org.apache.spark.internal.config.SHUFFLE_STREAMING_MAX_BANDWIDTH_MBPS).foreach {
-      maxBandwidthMBps =>
-        val share =
-          TokenBucketRateLimiter.perShuffleBytesPerSecond(maxBandwidthMBps, numConcurrentShuffles)
-        val paced = TokenBucketRateLimiter.applyLinkCapacityCeiling(share)
-        if (rateLimiter.updateRate(paced) && debugEnabled) {
-          logDebug(log"Streaming shuffle egress refill rate is now " +
-            log"${MDC(NUM_BYTES, paced)} byte(s)/s across " +
-            log"${MDC(COUNT, numConcurrentShuffles)} concurrent shuffle(s)")
+  private def executorConcurrency(): Option[Int] = {
+    if (stopped.get()) {
+      // A shutdown returns every share it holds, and asking once per release would spend a round
+      // trip -- and log a warning once the driver has gone -- on a divisor that will never pace
+      // another byte.
+      None
+    } else {
+      guardOption("read this executor's streaming shuffle concurrency") {
+        val executorId = SparkEnv.get.executorId
+        driverCoordinator match {
+          case Some(coordinator) => coordinator.numConcurrentShufflesFor(executorId)
+          case None =>
+            coordinatorRef.askSync[Int](GetStreamingShuffleConcurrency(executorId),
+              coordinatorTimeout)
         }
+      }
+    }
+  }
+
+  /**
+   * Returns the executor-scoped streaming state one shuffle holds: its credit ledgers, its
+   * contribution to the aggregate utilisation reading, and its share of the executor's egress
+   * allowance.
+   *
+   * The share is the half that is easy to overlook and the half that compounds. The per-shuffle
+   * token rate is the administered cap divided by the number of shuffles this executor is producing
+   * for, so a shuffle that has ended while still holding a limiter keeps that divisor too high and
+   * paces every shuffle outliving it below its true share -- permanently, because nothing else ever
+   * revisits the division. Ledgers left behind are the same defect in the other currency: they keep
+   * a finished shuffle in the arbitration order and in the utilisation numerator forever.
+   *
+   * Contained rather than propagated, because every caller is either finishing a shuffle or
+   * shutting down and neither has a recovery for a failed bookkeeping step that is better than
+   * proceeding.
+   *
+   * @param shuffleId shuffle whose executor-scoped state is being returned
+   * @param occasion what prompted the release, for the diagnostic
+   */
+  private def releaseShuffleStreamingState(shuffleId: Int, occasion: String): Unit = {
+    guard(s"return the executor's streaming state for shuffle $shuffleId") {
+      val dropped = backpressure.unregisterShuffle(shuffleId)
+      if (debugEnabled) {
+        logDebug(log"Streaming shuffle returned the executor state of shuffle " +
+          log"${MDC(SHUFFLE_ID, shuffleId)} because ${MDC(REASON, occasion)}, dropping " +
+          log"${MDC(COUNT, dropped)} stream ledger(s); egress is now divided " +
+          log"${MDC(VALUE, egressBudget.divisor)} way(s)")
+      }
     }
   }
 
@@ -776,9 +1102,7 @@ private[spark] class StreamingShuffleManager(conf: SparkConf, isDriver: Boolean)
     }
   }
 
-  // ---------------------------------------------------------------------------------------------
   // Failure containment.
-  // ---------------------------------------------------------------------------------------------
 
   /**
    * Runs one shutdown or bookkeeping step, logging any non-fatal failure instead of propagating it.
@@ -825,13 +1149,28 @@ private[spark] class StreamingShuffleManager(conf: SparkConf, isDriver: Boolean)
  * is touched. Temporary shuffle block identities are streaming's own -- they name spill files this
  * subsystem created -- so they are routed to the streaming resolver without a producer lookup.
  *
- * <b>What this deliberately is not.</b> Not an `IndexShuffleBlockResolver`, and not a
- * `MigratableResolver`. `ShuffleWriteProcessor` selects push-based merge by pattern matching on the
- * manager's resolver type, so a router that presented itself as an index resolver would switch
- * push-based merge back on for streamed writes -- exactly the behavioural surprise the streaming
- * resolver is documented to avoid. The price is that push-based merge declines for the whole
- * application while streaming is enabled -- the documented posture: streaming neither extends
- * nor interoperates with push-based merge, it declines to participate.
+ * <b>What it deliberately is not: an index resolver.</b> `ShuffleWriteProcessor` selects
+ * push-based merge by pattern matching on the manager's resolver type, so a router that presented
+ * itself as an `IndexShuffleBlockResolver` would switch push-based merge back on for streamed
+ * writes and then push a data file that streaming never materialises. Declining to be one is the
+ * specified posture -- streaming neither extends nor interoperates with push-based merge, it
+ * declines to participate -- and it is why the sort delegate's own resolver is not simply published
+ * in place of this router. Three unchanged behaviours are consequently unavailable to the
+ * <i>whole</i> application while streaming is enabled, and every one of them degrades rather than
+ * failing: push-based merge declines for every shuffle; `FallbackStorage` logs an
+ * unsupported-resolver warning and copies nothing to fallback storage; and checksum-based
+ * corruption <i>diagnosis</i> answers `UNKNOWN_ISSUE`, which the fetch side already handles because
+ * it treats diagnosis as best effort. Ordinary shuffle reads, ordinary shuffle writes and
+ * peer-to-peer block migration are all unaffected.
+ *
+ * <b>What it deliberately is: a migration resolver.</b> `BlockManager` reaches migration support by
+ * casting the manager's resolver to `MigratableResolver` without testing the type first, so a
+ * router that did not mix it in would turn every executor decommission and every shuffle-block
+ * stream upload into a `ClassCastException`. Every member is therefore forwarded to the sort
+ * delegate, which is where all migratable output lives. Streamed output is never migratable -- it
+ * is a live retransmission window bound to the executor that produced it, addressed by no index and
+ * no data file -- so it is correctly invisible to the migrator rather than being offered and then
+ * failing half way through a migration.
  *
  * @param streaming the streaming resolver, which owns retained streamed output
  * @param sorted the sort-based delegate's index resolver, which owns materialised sorted output
@@ -839,7 +1178,20 @@ private[spark] class StreamingShuffleManager(conf: SparkConf, isDriver: Boolean)
 private[spark] class StreamingShuffleBlockRouter(
     streaming: StreamingShuffleBlockResolver,
     sorted: ShuffleBlockResolver)
-  extends ShuffleBlockResolver with Logging {
+  extends ShuffleBlockResolver with MigratableResolver with Logging {
+
+  /**
+   * The delegate seen as a migration resolver, which is what every migration member forwards to.
+   *
+   * Derived by asking rather than by casting, so that a delegate which is not migratable degrades
+   * to "nothing here is migratable" instead of failing at the first decommission. With
+   * [[SortShuffleManager]] as the delegate the answer is always present, because its resolver is an
+   * `IndexShuffleBlockResolver` and that class is itself a `MigratableResolver`.
+   */
+  private val migratable: Option[MigratableResolver] = sorted match {
+    case resolver: MigratableResolver => Some(resolver)
+    case _ => None
+  }
 
   override def getBlockData(blockId: BlockId, dirs: Option[Array[String]]): ManagedBuffer = {
     resolverFor(blockId).getBlockData(blockId, dirs)
@@ -882,6 +1234,48 @@ private[spark] class StreamingShuffleBlockRouter(
     }
   }
 
+  // MigratableResolver. Every member forwards to the sort delegate, because streamed output is not
+  // migratable and must stay invisible to the migrator.
+
+  /**
+   * The shuffles stored locally in a form that can be migrated, which is exactly the sort-owned
+   * ones. A streamed shuffle contributes nothing, and that is the correct answer rather than an
+   * omission: its retained bytes are a retransmission window that only the producing executor can
+   * serve, so listing it would have the decommissioner attempt a migration that cannot succeed.
+   */
+  override def getStoredShuffles(): Seq[ShuffleBlockInfo] = {
+    migratable.map(resolver => resolver.getStoredShuffles()).getOrElse(Seq.empty)
+  }
+
+  /** Records that one shuffle must not be migrated, with the delegate that owns that decision. */
+  override def addShuffleToSkip(shuffleId: Int): Unit = {
+    migratable.foreach(resolver => resolver.addShuffleToSkip(shuffleId))
+  }
+
+  /**
+   * Accepts a migrated shuffle block as a stream. The identities that arrive here are sort-based
+   * artefacts -- an index or data block of a map output being moved off a decommissioning executor
+   * -- so the delegate is the only component that can place them. A delegate that cannot accept
+   * them is reported rather than papered over with a callback that would discard the bytes.
+   */
+  override def putShuffleBlockAsStream(
+      blockId: BlockId,
+      serializerManager: SerializerManager): StreamCallbackWithID = {
+    migratable
+      .map(resolver => resolver.putShuffleBlockAsStream(blockId, serializerManager))
+      .getOrElse(throw new UnsupportedOperationException(
+        s"Streaming shuffle cannot accept migrated block $blockId, because the sort-based " +
+          s"delegate resolver ${sorted.getClass.getName} does not support block migration."))
+  }
+
+  /** The buffers of one map output being migrated, from the delegate that materialised them. */
+  override def getMigrationBlocks(
+      shuffleBlockInfo: ShuffleBlockInfo): List[(BlockId, ManagedBuffer)] = {
+    migratable
+      .map(resolver => resolver.getMigrationBlocks(shuffleBlockInfo))
+      .getOrElse(List.empty)
+  }
+
   /**
    * The resolver that owns a block identity, decided by asking rather than by failing.
    *
@@ -920,16 +1314,6 @@ private[spark] object StreamingShuffleManager {
    * writes and the class it resolves to cannot drift apart.
    */
   val SHORT_NAME: String = "streaming"
-
-  /**
-   * The concurrency divisor assumed before any coordinator has reported one.
-   *
-   * One, because a JVM about to build its first limiter is by definition serving at most one
-   * shuffle, and because assuming fewer concurrent shuffles than there are yields a larger initial
-   * refill rate that the first coordinator answer corrects downward at once. Assuming more would
-   * throttle the first shuffle of every application for no reason.
-   */
-  val INITIAL_CONCURRENT_SHUFFLES: Int = 1
 
   /**
    * Floor on the coordinator ask deadline. A deadline shorter than a second would make an ordinary

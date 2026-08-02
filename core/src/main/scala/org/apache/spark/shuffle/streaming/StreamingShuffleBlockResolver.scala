@@ -17,7 +17,7 @@
 
 package org.apache.spark.shuffle.streaming
 
-import java.io.{File, InputStream}
+import java.io.{ByteArrayOutputStream, File, InputStream}
 import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
@@ -32,7 +32,8 @@ import org.apache.spark.internal.LogKeys.{BLOCK_ID, COUNT, FILE_NAME, MAP_ID, NU
   SHUFFLE_ID, TASK_ATTEMPT_ID}
 import org.apache.spark.internal.config.{SHUFFLE_MANAGER, SHUFFLE_STREAMING_DEBUG,
   SHUFFLE_STREAMING_ENABLED}
-import org.apache.spark.network.buffer.{FileSegmentManagedBuffer, ManagedBuffer}
+import org.apache.spark.network.buffer.{FileSegmentManagedBuffer, ManagedBuffer,
+  NioManagedBuffer}
 import org.apache.spark.network.netty.SparkTransportConf
 import org.apache.spark.network.shuffle.{ExecutorDiskUtils, MergedBlockMeta}
 import org.apache.spark.network.util.TransportConf
@@ -58,35 +59,54 @@ import org.apache.spark.util.Utils
  * evict to local disk when the producer's buffer budget ran short. Those are the only streaming
  * shuffle bytes that exist as durable, addressable storage, and they are addressed here through
  * the location fields of `MemorySpillManager.SpilledBlock`. Blocks still held in memory are
- * deliberately not served here: they are the protocol's retransmission window and are replayed
- * over the streaming channel instead, and their payload is raw framed bytes whereas a spilled
- * segment is a `SerializerManager`-wrapped unit, so the two are not interchangeable encodings and
- * must never be concatenated.
+ * deliberately not served here: they are task-managed execution memory owned by the producing task,
+ * and the protocol already replays them over the streaming channel, so a second reader reaching
+ * into them would duplicate that path without being able to outlive the task it read from.
  *
- * Why a response carries exactly one segment. Every spilled segment was committed on its own
- * through `DiskBlockObjectWriter`, so each one carries its own serializer, compression and
- * encryption framing and is decodable only on its own. Physically concatenating two of them yields
- * bytes that no consumer can decode, so a request resolving to more than one segment is refused
- * outright and the caller is directed at [[getSpilledSegments]], which hands back one independently
- * decodable buffer per segment. Nothing is ever assembled into a heap buffer here: what is served
- * is a file segment whose bytes are never copied, and the size one response may carry is capped.
+ * Why a response is one assembled logical block. A reduce partition is written as one continuous
+ * serialization stream, and its protocol blocks are consecutive byte ranges cut out of that stream,
+ * so the bytes a consumer must be given for a partition are its block payloads concatenated in
+ * ascending sequence order -- which is precisely what `SerializerManager.wrapStream` produced for
+ * that `ShuffleBlockId`, and therefore precisely the framing the resolver contract prescribes. Each
+ * payload is recovered from its own committed spill segment first, because `DiskBlockObjectWriter`
+ * wrapped every segment individually on the way out and only that same unwrapping yields the
+ * payload back. The two are consequently not interchangeable: the on-disk segments must never be
+ * concatenated, and the payloads recovered from them always must be. However many segments a
+ * partition happens to hold is an artefact of when its buffer budget ran short, so it is
+ * deliberately not something a caller has to know about; the assembled response is bounded by
+ * [[StreamingShuffleBlockResolver.MAX_SERVED_BYTES]], which is what keeps one fixed-size request
+ * from commissioning an unbounded allocation.
  *
- * Why every served buffer is leased. A file segment buffer opens its file lazily, when the consumer
- * first reads it, which is necessarily after this resolver has returned. A consumer acknowledgement
- * can retire the last record naming that file in the interval between. Every buffer handed out from
- * here therefore holds a reader lease on its file, taken before the buffer is constructed and
+ * What an assembled response is, and is not. It is the contiguous, still-durable byte range of one
+ * partition's stream, in the framing the contract prescribes. It is not necessarily that stream
+ * from its beginning: once a consumer has acknowledged a prefix, the retained range starts part way
+ * in, and deserialising it needs the bytes that came before exactly as the streaming consumer's own
+ * incremental decoding does. That is inherent to a shuffle which never materialises a complete map
+ * output, and it is why a request resolving to nothing on disk is refused rather than answered with
+ * an empty buffer -- an empty answer would read as "this partition has no records".
+ *
+ * Why a whole-file response is leased. A file segment buffer opens its file lazily, when the
+ * consumer first reads it, which is necessarily after this resolver has returned, and a consumer
+ * acknowledgement can retire the last record naming that file in the interval between. A whole-file
+ * response therefore holds a reader lease on its file, taken before the buffer is constructed and
  * dropped when the buffer is released, and the owning producer unlinks a file only once that file
- * is both retired and unleased.
+ * is both retired and unleased. An assembled response needs no lease: its bytes are read and copied
+ * before this resolver returns, each read taking and dropping its own lease, so no later moment
+ * exists at which the file still has to be there.
  *
  * Why it is deliberately not index based. This class is not an `IndexShuffleBlockResolver` and does
  * not mix in `MigratableResolver`. `ShuffleWriteProcessor` selects a push-based merge by pattern
  * matching on the manager's resolver type, and a resolver that is not an
- * `IndexShuffleBlockResolver` falls through its empty default branch, so streaming takes no part in
- * push-based merge or in block migration. Sort-based shuffle keeps its own
- * `IndexShuffleBlockResolver` and remains both the default and the fallback: with the streaming
- * kill switch off, `StreamingShuffleManager` exposes the sort delegate's resolver rather than
- * this one, so the push-merge branch fires and behaviour is indistinguishable from sort-based
- * shuffle.
+ * `IndexShuffleBlockResolver` falls through its empty default branch, so streamed writes take no
+ * part in push-based merge; and streamed output is not migratable in any case, being a
+ * retransmission window bound to the executor that produced it. Sort-based shuffle keeps its own
+ * `IndexShuffleBlockResolver` and remains both the default and the fallback: with
+ * `spark.shuffle.streaming.enabled` at its default of false, `StreamingShuffleManager` exposes the
+ * sort delegate's resolver rather than this one, so the push-merge branch fires and behaviour is
+ * indistinguishable from sort-based shuffle. With streaming enabled it exposes
+ * [[StreamingShuffleBlockRouter]], which serves sort-owned blocks from that delegate and forwards
+ * every block-migration member to it, so migration keeps working for the output that can be
+ * migrated.
  *
  * Lifecycle and thread safety. An instance is created once per driver or executor, from
  * `StreamingShuffleManager`'s constructor, and is then shared by every task on that JVM. One
@@ -126,9 +146,7 @@ private[spark] class StreamingShuffleBlockResolver(
    */
   def this(conf: SparkConf) = this(conf, null)
 
-  // ----------------------------------------------------------------------------------------------
   // Configuration, read exactly once.
-  // ----------------------------------------------------------------------------------------------
 
   /**
    * Whether the verbose per-block debug trail is emitted. Off by default, because a line per
@@ -136,10 +154,8 @@ private[spark] class StreamingShuffleBlockResolver(
    */
   private val debugEnabled: Boolean = conf.get(SHUFFLE_STREAMING_DEBUG)
 
-  // ----------------------------------------------------------------------------------------------
   // State. A producer here is one map task's MemorySpillManager, which owns that task's spill
   // files and is the only component that knows where their segments live.
-  // ----------------------------------------------------------------------------------------------
 
   /**
    * The one monitor that makes this object's lifecycle atomic.
@@ -165,7 +181,6 @@ private[spark] class StreamingShuffleBlockResolver(
   /** Whether [[stop]] has run. Read and written only while holding [[lifecycle]]. */
   private var stopped: Boolean = false
 
-  // ----------------------------------------------------------------------------------------------
   // Deferred environment access.
   //
   // None of these may be dereferenced while this object is being constructed. On the driver the
@@ -173,7 +188,6 @@ private[spark] class StreamingShuffleBlockResolver(
   // valid until its own initialize() has run, so an eager dereference here would be a guaranteed
   // NullPointerException during SparkContext startup. A lazy val is Spark's own sanctioned remedy
   // for exactly this hazard, and IndexShuffleBlockResolver defers its block manager the same way.
-  // ----------------------------------------------------------------------------------------------
 
   private lazy val blockManager: BlockManager = SparkEnv.get.blockManager
 
@@ -197,11 +211,9 @@ private[spark] class StreamingShuffleBlockResolver(
       sslOptions = Some(securityManager.getRpcSSLOptions()))
   }
 
-  // ----------------------------------------------------------------------------------------------
   // Producer registry. This is the seam the streaming writer uses: it registers itself when it
   // starts producing a map output and unregisters when the task completes, which is what lets a
   // resolver shared by the whole JVM find the one component that can locate a given spilled block.
-  // ----------------------------------------------------------------------------------------------
 
   /**
    * Registers the producer of one map output so that its spilled blocks become servable.
@@ -213,6 +225,16 @@ private[spark] class StreamingShuffleBlockResolver(
    * already been superseded and its files are the ones being abandoned. The whole decision,
    * including the check that this resolver has not been stopped, is taken under one monitor, so a
    * registration can never land in a registry that [[stop]] has already cleared.
+   *
+   * Which of those three outcomes is reachable depends on what `mapId` means, and that is a
+   * configuration question rather than a fixed one. In the default configuration the map id Spark
+   * hands the writer <em>is</em> the task attempt id, so two attempts at the same map output arrive
+   * under different keys and never meet: only the refresh outcome fires, and it fires for a writer
+   * re-registering itself. Under `spark.shuffle.useOldFetchProtocol` the map id is the map index
+   * instead, two attempts do share a key, and the ordering outcomes become the ones that decide
+   * whose spill files are servable. The comparison is therefore not redundant in the default
+   * configuration so much as unexercised by it, and removing it would silently make the other
+   * configuration resolve by arrival order.
    *
    * @param shuffleId the shuffle being produced
    * @param mapId the map output being produced
@@ -488,9 +510,7 @@ private[spark] class StreamingShuffleBlockResolver(
   /** Whether [[stop]] has already run. */
   def isStopped: Boolean = lifecycle.synchronized(stopped)
 
-  // ----------------------------------------------------------------------------------------------
   // ShuffleBlockResolver: block retrieval.
-  // ----------------------------------------------------------------------------------------------
 
   /**
    * Retrieves the data for one block of streaming shuffle output.
@@ -510,17 +530,15 @@ private[spark] class StreamingShuffleBlockResolver(
    *    because a spill file is allocated as a temporary shuffle block and so this identity names
    *    precisely one file.
    *
-   * A request that resolves to a single segment is answered with a leased, zero-copy file segment.
-   * One that resolves to several is refused, and refusal is the only correct answer: each segment
-   * was committed on its own and carries its own serializer, compression and encryption framing, so
-   * their concatenation is not a decodable stream, and handing it out as one buffer would give a
-   * consumer bytes it can only fail on -- silently, and as a deserialization error attributed to
-   * the wrong layer. A caller that wants those segments must ask for them individually through
-   * [[getSpilledSegments]], which hands back one independently decodable buffer per segment.
+   * A reduce-partition or reduce-range request is answered by recovering the payload of every
+   * retained segment and concatenating those payloads in ascending sequence order, which is the
+   * framing the resolver contract prescribes for a shuffle block. The one thing refused on size is
+   * an assembled response larger than [[StreamingShuffleBlockResolver.MAX_SERVED_BYTES]].
    *
-   * Every buffer returned from here holds a reader lease on the file behind it and must be released
-   * by the caller, exactly as the buffers the sort-based resolver returns must be. That release is
-   * what finally lets the producer unlink a spill file whose records have all been acknowledged.
+   * A whole-file response holds a reader lease on the file behind it and must be released by the
+   * caller, exactly as the buffers the sort-based resolver returns must be; that release is what
+   * finally lets the producer unlink a spill file whose records have all been acknowledged. An
+   * assembled response holds nothing, its bytes having been copied before this method returned.
    *
    * @param blockId the block being requested
    * @param dirs local directories to read from instead of this executor's own. Honoured for the
@@ -554,38 +572,6 @@ private[spark] class StreamingShuffleBlockResolver(
   }
 
   /**
-   * The spilled segments of one reduce partition, one buffer per segment, in ascending sequence
-   * order.
-   *
-   * This is the segment-granular counterpart of [[getBlockData]] and the form a caller wants when
-   * it intends to decode the bytes rather than merely forward them, because each segment is an
-   * independently decodable unit. An empty result means that partition has nothing on disk, which
-   * on the streaming happy path is the normal case rather than an error.
-   *
-   * Each returned buffer holds its own reader lease and must be released by the caller. A segment
-   * whose lease cannot be taken is omitted rather than returned, because the only way a lease is
-   * refused is that the file has already been retired -- which happens precisely when the consumer
-   * has acknowledged every record in it, so the bytes are no longer owed to anyone.
-   *
-   * @param shuffleId the shuffle the partition belongs to
-   * @param mapId the map output the partition belongs to
-   * @param reduceId the reduce partition to report on; must be non-negative and, once the producer
-   *                 has registered its reduce partition count, must be a partition that producer
-   *                 actually owns
-   */
-  def getSpilledSegments(shuffleId: Int, mapId: Long, reduceId: Int): Seq[ManagedBuffer] = {
-    require(reduceId >= 0, s"reduceId must be non-negative, but was $reduceId")
-    requireNotStopped(ShuffleBlockId(shuffleId, mapId, reduceId))
-    producerFor(shuffleId, mapId) match {
-      case Some(producer) =>
-        requireOwnedPartition(producer, shuffleId, mapId, reduceId)
-        producer.spilledBlocks(reduceId).flatMap(segment => leasedSegment(producer, segment))
-      case None =>
-        Seq.empty
-    }
-  }
-
-  /**
    * Refuses any retrieval once [[stop]] has run.
    *
    * A stopped resolver has released its serving authority, and the producers it could have
@@ -598,25 +584,6 @@ private[spark] class StreamingShuffleBlockResolver(
       throw SparkException.internalError(
         s"the streaming shuffle block resolver has been stopped and cannot serve $blockId",
         category = "SHUFFLE")
-    }
-  }
-
-  /**
-   * Refuses a reduce partition the given producer cannot own.
-   *
-   * Validated only once the producer has registered its reduce partition count, because until then
-   * there is no ownership to check against: a producer with no registered count has admitted no
-   * block and so has nothing spilled, and the empty result it yields is already the correct answer.
-   */
-  private def requireOwnedPartition(
-      producer: MemorySpillManager,
-      shuffleId: Int,
-      mapId: Long,
-      reduceId: Int): Unit = {
-    if (producer.partitionCountRegistered && reduceId >= producer.numPartitions) {
-      throw SparkException.internalError(
-        s"reduce partition $reduceId is not part of shuffle $shuffleId map $mapId, whose " +
-          s"producer owns ${producer.numPartitions} reduce partition(s)", category = "SHUFFLE")
     }
   }
 
@@ -686,6 +653,8 @@ private[spark] class StreamingShuffleBlockResolver(
           "partitions, but its producer has not registered a reduce partition count, so the " +
           "range cannot be validated and is refused rather than traversed", category = "SHUFFLE")
     }
+    // Partition-major, and ascending by sequence number within each partition, because that is the
+    // order spilledBlocks reports and the order the concatenation has to be in to be decodable.
     val segments = (startReduceId until endReduceId)
       .flatMap(reduceId => producer.spilledBlocks(reduceId))
     if (segments.isEmpty) {
@@ -694,68 +663,94 @@ private[spark] class StreamingShuffleBlockResolver(
           "buffered in memory are replayed by retransmission over the streaming channel and are " +
           "deliberately not served from here", category = "SHUFFLE")
     }
-    if (segments.length > 1) {
-      // Refusal rather than concatenation, and deliberately so. Each of these segments was
-      // committed on its own through DiskBlockObjectWriter, so each carries its own serializer,
-      // compression and encryption framing and is decodable only on its own. Their bytes laid end
-      // to end are not a stream any consumer can read, and presenting them as one ManagedBuffer
-      // would surface as a deserialization failure blamed on the serializer rather than on the
-      // composition. There is no heap assembly path here for the same reason there is no correct
-      // one.
-      throw SparkException.internalError(
-        s"block $blockId resolves to ${segments.length} independently committed spill segments, " +
-          "which cannot be served as one buffer because each segment carries its own serializer, " +
-          "compression and encryption framing and is decodable only on its own; request the " +
-          "segments individually through getSpilledSegments instead", category = "SHUFFLE")
-    }
-    val segment = segments.head
-    if (segment.length > StreamingShuffleBlockResolver.MAX_SERVED_BYTES) {
-      // A committed segment holds one block, whose payload the protocol caps, so this bound is only
-      // ever reached by a corrupt or mis-attributed record. Refusing is far better than handing a
-      // consumer a length it will try to buffer.
-      throw SparkException.internalError(
-        s"streaming shuffle refuses to serve ${segment.length} bytes for block $blockId, because " +
-          s"one response may not exceed ${StreamingShuffleBlockResolver.MAX_SERVED_BYTES} bytes",
-        category = "SHUFFLE")
-    }
-    // The bytes are never copied through the heap: a leased file segment is handed out, and the
-    // lease is what stops an acknowledgement from unlinking the file before the consumer opens it.
-    val buffer = leasedSegment(producer, segment).getOrElse {
-      throw SparkException.internalError(
-        s"the spilled segment of block $blockId was retired before it could be served, which " +
-          "means its consumer has already acknowledged every record in it", category = "SHUFFLE")
-    }
+    val buffer = assembleLogicalBlock(blockId, producer, segments)
     if (debugEnabled) {
-      logDebug(log"Streaming shuffle served block ${MDC(BLOCK_ID, blockId)} from one spilled " +
-        log"segment of ${MDC(NUM_BYTES, buffer.size())} bytes")
+      logDebug(log"Streaming shuffle served block ${MDC(BLOCK_ID, blockId)} as " +
+        log"${MDC(NUM_BYTES, buffer.size())} byte(s) assembled from " +
+        log"${MDC(COUNT, segments.length)} spilled segment(s)")
     }
     buffer
   }
 
   /**
-   * Wraps one committed spill segment as a leased buffer, without reading it.
+   * Assembles one logical block from the payloads of the spill segments that still hold it.
    *
-   * The lease is taken before the buffer exists, which is the whole point: a file segment buffer
-   * opens its file lazily, so taking the lease inside the buffer would leave a window in which the
-   * file has been unlinked and the lazy open is the thing that discovers it.
+   * Each payload is recovered through the producer, which is the only component that can do it: the
+   * segment on disk was wrapped by `DiskBlockObjectWriter` under its own temporary block identity,
+   * and only unwrapping it the same way yields the payload back. The payloads are then laid end to
+   * end, which is exactly the byte sequence `SerializerManager.wrapStream` produced for this
+   * logical block and therefore exactly what a caller of the resolver contract will unwrap.
    *
-   * @return the leased buffer, or nothing when the file has already been retired or its producer
-   *         has closed, in which case the segment is no longer servable from disk
+   * Assembling into the heap is deliberate, and the cap is what makes it safe. The alternative --
+   * a lazily composed buffer over the segments -- cannot satisfy `ManagedBuffer.size()`, because a
+   * segment's committed length is its compressed length on disk and the payload total is unknowable
+   * without decoding. This path is also out of band: the streaming consumer replays block by block
+   * over its own channel and never arrives here, so the cost is bounded both by the cap and by how
+   * rarely anything asks.
+   *
+   * A payload that cannot be recovered aborts the assembly rather than being skipped. Skipping it
+   * would splice two byte ranges that are not adjacent in the partition's stream, and the caller
+   * would meet that as a deserialization failure attributed to the serializer.
+   *
+   * @param blockId the identity being served, carried so that every diagnostic names it
+   * @param producer the producer that owns these segments and can unwrap them
+   * @param segments the retained segments, partition-major and ascending by sequence number
    */
-  private def leasedSegment(
+  private def assembleLogicalBlock(
+      blockId: BlockId,
       producer: MemorySpillManager,
-      segment: SpilledBlock): Option[ManagedBuffer] = {
-    if (producer.acquireSpillFileLease(segment.file)) {
-      Some(new LeasedSegmentBuffer(
-        new FileSegmentManagedBuffer(transportConf, segment.file, segment.offset, segment.length),
-        producer,
-        segment.file))
-    } else {
-      if (debugEnabled) {
-        logDebug(log"Streaming shuffle cannot lease spill file " +
-          log"${MDC(FILE_NAME, segment.file.getName)}, so its segment is no longer servable")
+      segments: Seq[SpilledBlock]): ManagedBuffer = {
+    requireDenseSegments(blockId, segments)
+    val cap = StreamingShuffleBlockResolver.MAX_SERVED_BYTES
+    // Sized from the committed lengths, which understate the payload total whenever shuffle
+    // compression is on, with a floor so that a run of small segments does not start from nothing.
+    val committedBytes = segments.iterator.map(segment => segment.length).sum
+    val assembled = new ByteArrayOutputStream(math.min(
+      cap, math.max(committedBytes, StreamingShuffleBlockResolver.INITIAL_ASSEMBLY_BYTES)).toInt)
+    segments.foreach { segment =>
+      val payload = producer
+        .retainedPayload(segment.partitionId, segment.sequenceNumber)
+        .getOrElse(throw SparkException.internalError(
+          s"streaming shuffle could not read block ${segment.sequenceNumber} of reduce partition " +
+            s"${segment.partitionId} while assembling $blockId, so the assembled range would " +
+            "have a hole in it; that block was either acknowledged and released or its spill " +
+            "file could not be read", category = "SHUFFLE"))
+      if (assembled.size().toLong + payload.length > cap) {
+        throw SparkException.internalError(
+          s"streaming shuffle refuses to assemble more than $cap bytes for block $blockId, which " +
+            s"resolves to ${segments.length} retained spill segment(s); fetch a narrower reduce " +
+            "range, or read the producer's spill files by their temporary block identity",
+          category = "SHUFFLE")
       }
-      None
+      assembled.write(payload, 0, payload.length)
+    }
+    new NioManagedBuffer(ByteBuffer.wrap(assembled.toByteArray))
+  }
+
+  /**
+   * Refuses a segment run that is not a dense ascending sequence within each partition.
+   *
+   * Retention makes this hold: admission is dense, retirement always retires a prefix, and an
+   * eviction moves a partition's whole in-memory run at once, so what is on disk for a partition is
+   * a contiguous run. Checking it rather than assuming it is what turns a future defect in any of
+   * those three into a named refusal instead of silently spliced bytes that fail somewhere else.
+   */
+  private def requireDenseSegments(blockId: BlockId, segments: Seq[SpilledBlock]): Unit = {
+    var previous: Option[SpilledBlock] = None
+    segments.foreach { segment =>
+      previous.foreach { earlier =>
+        val outOfOrder = segment.partitionId < earlier.partitionId
+        val gapped = segment.partitionId == earlier.partitionId &&
+          segment.sequenceNumber != earlier.sequenceNumber + 1L
+        if (outOfOrder || gapped) {
+          throw SparkException.internalError(
+            s"streaming shuffle cannot assemble block $blockId, because its retained spill " +
+              s"segments are not a dense ascending run: reduce partition ${segment.partitionId} " +
+              s"block ${segment.sequenceNumber} follows reduce partition ${earlier.partitionId} " +
+              s"block ${earlier.sequenceNumber}", category = "SHUFFLE")
+        }
+      }
+      previous = Some(segment)
     }
   }
 
@@ -888,9 +883,7 @@ private[spark] class StreamingShuffleBlockResolver(
     }
   }
 
-  // ----------------------------------------------------------------------------------------------
   // ShuffleBlockResolver: push-based merge. Streaming declines to participate, by design.
-  // ----------------------------------------------------------------------------------------------
 
   /**
    * Always fails, because streaming shuffle never produces merged output.
@@ -927,9 +920,7 @@ private[spark] class StreamingShuffleBlockResolver(
         "required.")
   }
 
-  // ----------------------------------------------------------------------------------------------
   // ShuffleBlockResolver: enumeration and lifecycle.
-  // ----------------------------------------------------------------------------------------------
 
   /**
    * The locally stored blocks of one map output, which for streaming shuffle means the spill files
@@ -1017,14 +1008,23 @@ private[spark] object StreamingShuffleBlockResolver {
   /**
    * The largest response a reduce-partition or reduce-range request may be answered with.
    *
-   * Deliberately small, and deliberately not derived from what a buffer can address. One response
-   * is one committed spill segment, which holds one block whose payload the protocol caps at
-   * `DataBlockMessage.MAX_BLOCK_SIZE_BYTES`; the headroom above that cap covers the serializer,
-   * compression and encryption framing a committed segment adds, and nothing legitimate reaches it.
-   * Its purpose is therefore to bound what a corrupt or mis-attributed record can ask a consumer to
-   * buffer, which a limit of `Int.MaxValue` would not do at all.
+   * One response is a partition's retained spilled window assembled into one contiguous logical
+   * block, so this bounds a heap allocation and not a file segment. Sixteen protocol blocks' worth
+   * -- the payload cap is `DataBlockMessage.MAX_BLOCK_SIZE_BYTES` -- is generous against a window
+   * that anything out of band would sensibly ask for, while still making the cost of one fixed-size
+   * request proportional to the request rather than to how far behind a consumer has fallen. A
+   * caller that needs more is told to narrow the reduce range or to read the producer's spill files
+   * by their temporary block identity, which is answered as a zero-copy file segment under the far
+   * looser [[MAX_SERVED_FILE_BYTES]].
    */
-  val MAX_SERVED_BYTES: Long = 8L * 1024 * 1024
+  val MAX_SERVED_BYTES: Long = 32L * 1024 * 1024
+
+  /**
+   * The floor on the initial capacity of an assembly buffer. A run of small committed segments
+   * would otherwise size the buffer from a compressed total that is always lower than the payload
+   * total it has to hold, and pay for the shortfall in repeated growth.
+   */
+  val INITIAL_ASSEMBLY_BYTES: Long = 64L * 1024
 
   /**
    * The largest reduce range a single request may cover.
@@ -1083,7 +1083,14 @@ private[spark] object StreamingShuffleBlockResolver {
       producer: MemorySpillManager,
       retainedFiles: Seq[File] = Seq.empty) {
 
-    /** Whether this registration is newer than, or a refresh of, an existing one. */
+    /**
+     * Whether this registration is newer than, or a refresh of, an existing one.
+     *
+     * Equality is admitted rather than refused because the common case is a writer re-registering
+     * itself, which must not be mistaken for a stale attempt. Two genuinely different attempts only
+     * ever reach this comparison when the registry key does not already separate them -- see
+     * [[StreamingShuffleBlockResolver.registerProducer]] for when that is.
+     */
     def supersedes(other: RegisteredProducer): Boolean = taskAttemptId >= other.taskAttemptId
   }
 

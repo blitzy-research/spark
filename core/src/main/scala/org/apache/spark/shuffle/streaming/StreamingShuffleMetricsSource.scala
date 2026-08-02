@@ -322,34 +322,8 @@ private[spark] object StreamingShuffleMetricsSource extends Source {
 
   // There is deliberately no setter for the utilisation gauge. Buffer utilisation is aggregated
   // exclusively from the registered contributors, because a single shared setter is what allowed
-  // one manager to overwrite the executor-wide reading with its own local view.
-
-  /**
-   * A contributor reporting two byte counts that never change.
-   *
-   * This is the supported way to drive [[bufferUtilizationPercent]] to a chosen value, for a caller
-   * that wants a known reading without reaching for a setter that does not exist.
-   *
-   * It is a plain class rather than a case class, and that is a correctness decision rather than a
-   * stylistic one. The contributor registry is a set keyed on the element itself, so equality
-   * decides membership: with value equality, registering two owners that happen to report the same
-   * two counts would keep only one of them and the aggregate would be quietly half of what the
-   * caller asked for. Reference identity makes "two registrations" mean two contributions, which is
-   * what a suite registering several owners relies on.
-   *
-   * Negative arguments are accepted rather than rejected, because the aggregate already defines a
-   * negative contribution as zero and rejecting one here would put a second, different rule in the
-   * same path.
-   *
-   * @param contributedBufferedBytes bytes this owner reports as held
-   * @param contributedBudgetBytes the budget this owner reports those bytes measured against
-   */
-  class FixedBufferUtilization(
-      override val contributedBufferedBytes: Long,
-      override val contributedBudgetBytes: Long)
-    extends StreamingShuffleBufferUtilizationContributor {
-
-    override def toString: String =
-      s"FixedBufferUtilization($contributedBufferedBytes/$contributedBudgetBytes)"
-  }
+  // one manager to overwrite the executor-wide reading with its own local view. A caller that needs
+  // the gauge to read a chosen value registers a contributor reporting that value; production has
+  // exactly one such contributor, and any stand-in belongs with the code that needs it rather than
+  // shipped here.
 }
