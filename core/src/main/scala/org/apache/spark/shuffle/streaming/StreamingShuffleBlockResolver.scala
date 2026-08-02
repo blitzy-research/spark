@@ -22,6 +22,7 @@ import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 
+import scala.collection.mutable
 import scala.jdk.CollectionConverters._
 import scala.util.control.NonFatal
 
@@ -291,6 +292,7 @@ private[spark] class StreamingShuffleBlockResolver(
   def unregisterProducer(shuffleId: Int, mapId: Long, taskAttemptId: Long): Boolean = {
     val key = ProducerKey(shuffleId, mapId)
     var dropped = false
+    var orphanedFiles: Seq[File] = Seq.empty
     lifecycle.synchronized {
       // compute() removes the mapping when the remapping function returns null, so the generation
       // comparison and the removal are one indivisible step against the current entry. A
@@ -299,12 +301,17 @@ private[spark] class StreamingShuffleBlockResolver(
       producers.compute(key, (_, existing) => {
         if (existing != null && existing.taskAttemptId == taskAttemptId) {
           dropped = true
+          orphanedFiles = existing.retainedFiles
           null
         } else {
           existing
         }
       })
     }
+    // Outside the monitor: unlinking a file performs I/O, and this registry's monitor is contended
+    // by every registration and every lookup in the JVM. Nothing can reach these files any longer
+    // -- the registration naming them has gone -- so there is nothing to serialise against.
+    deleteRetainedFiles(orphanedFiles)
     if (debugEnabled) {
       if (dropped) {
         logDebug(log"Unregistered streaming shuffle producer for shuffle " +
@@ -329,20 +336,109 @@ private[spark] class StreamingShuffleBlockResolver(
    */
   def removeShuffle(shuffleId: Int): Int = {
     var dropped = 0
+    val orphanedFiles = new mutable.ArrayBuffer[File]()
     lifecycle.synchronized {
-      val iterator = producers.keySet().iterator()
+      val iterator = producers.entrySet().iterator()
       while (iterator.hasNext) {
-        if (iterator.next().shuffleId == shuffleId) {
+        val entry = iterator.next()
+        if (entry.getKey.shuffleId == shuffleId) {
+          orphanedFiles ++= entry.getValue.retainedFiles
           iterator.remove()
           dropped += 1
         }
       }
     }
+    // Every retained file of every generation of this shuffle goes, which is one of the three
+    // boundaries at which retained output is specified to be released. A consumer that has not read
+    // by now cannot: the shuffle itself is being unregistered.
+    deleteRetainedFiles(orphanedFiles.toSeq)
     if (dropped > 0 && debugEnabled) {
       logDebug(log"Dropped ${MDC(COUNT, dropped)} streaming shuffle producer(s) of shuffle " +
         log"${MDC(SHUFFLE_ID, shuffleId)}")
     }
     dropped
+  }
+
+  /**
+   * Takes over ownership of one successful map output's spill files.
+   *
+   * This is the transfer that makes retained output outlive its producing task. A map task's
+   * buffered bytes cannot survive that task: they are task-managed execution memory, which the
+   * executor reclaims at completion and, with `spark.unsafe.exceptionOnMemoryLeak` enabled, fails
+   * the task over if anything still holds. Its spill files can, being ordinary files in the local
+   * directories. So a producer whose task succeeded makes its unacknowledged window durable, hands
+   * the files here, and this registry unlinks them at the boundary the feature actually specifies
+   * -- generation invalidation, shuffle unregistration, or resolver shutdown -- rather than at the
+   * arbitrary moment the producing task happened to finish.
+   *
+   * Conditioned on the generation for the same reason [[unregisterProducer]] is: a superseded
+   * attempt completing late must not be able to attach its files to the live replacement's
+   * registration, where they would be served in place of the valid ones.
+   *
+   * @param shuffleId the shuffle that was produced
+   * @param mapId the map output that was produced
+   * @param taskAttemptId the generation handing its files across
+   * @param files the spill files whose deletion this resolver now owns
+   * @return true when the transfer took effect against that exact generation
+   */
+  def retainProducerOutput(
+      shuffleId: Int,
+      mapId: Long,
+      taskAttemptId: Long,
+      files: Seq[File]): Boolean = {
+    require(files != null, "files must not be null")
+    val key = ProducerKey(shuffleId, mapId)
+    var transferred = false
+    lifecycle.synchronized {
+      if (!stopped) {
+        producers.compute(key, (_, existing) => {
+          if (existing != null && existing.taskAttemptId == taskAttemptId) {
+            transferred = true
+            // Accumulated rather than replaced, so a producer that transfers in more than one step
+            // -- an early spill followed by the final flush -- cannot orphan the first batch.
+            existing.copy(retainedFiles = (existing.retainedFiles ++ files).distinct)
+          } else {
+            existing
+          }
+        })
+      }
+    }
+    if (transferred) {
+      if (debugEnabled) {
+        logDebug(log"Took ownership of ${MDC(COUNT, files.size)} streaming shuffle spill file(s) " +
+          log"for shuffle ${MDC(SHUFFLE_ID, shuffleId)} map ${MDC(MAP_ID, mapId)} generation " +
+          log"${MDC(TASK_ATTEMPT_ID, taskAttemptId)}")
+      }
+    } else {
+      logWarning(log"Declined to take ownership of streaming shuffle spill files for shuffle " +
+        log"${MDC(SHUFFLE_ID, shuffleId)} map ${MDC(MAP_ID, mapId)} from generation " +
+        log"${MDC(TASK_ATTEMPT_ID, taskAttemptId)}: it is not the registered generation")
+    }
+    transferred
+  }
+
+  /**
+   * Unlinks the spill files of registrations this resolver has dropped.
+   *
+   * Only files transferred through [[retainProducerOutput]] are ever passed here, so a producer
+   * whose task is still running never has a file removed underneath it. Each deletion absorbs its
+   * own failure: a file that cannot be unlinked is a local-disk annoyance the shuffle service will
+   * clear with the application directory, and raising here would abort the registry operation that
+   * happened to trigger it.
+   */
+  private def deleteRetainedFiles(files: Seq[File]): Unit = {
+    files.foreach { file =>
+      try {
+        if (file.exists() && !file.delete()) {
+          logWarning(log"Could not delete retained streaming shuffle spill file " +
+            log"${MDC(FILE_NAME, file.getName)}")
+        }
+      } catch {
+        case NonFatal(e) =>
+          logWarning(log"Could not delete retained streaming shuffle spill file " +
+            log"${MDC(FILE_NAME, file.getName)}", e)
+      }
+    }
   }
 
   /**
@@ -860,10 +956,16 @@ private[spark] class StreamingShuffleBlockResolver(
    * `stop`, exactly as the sort-based manager invokes its resolver's, and a manager that is
    * shutting down must never be derailed by a resolver that objects.
    *
-   * Spill files are not deleted here. Ownership of them rests with the producer that wrote them,
-   * which deletes each file once no retained record still refers to it and no reader lease holds
-   * it, and which registers its own task-completion cleanup for the failure and cancellation cases.
-   * Deleting from here would race a producer that is still replaying its unacknowledged window.
+   * Spill files still owned by their producer are not deleted here: that ownership rests with the
+   * producer that wrote them, which deletes each file once no retained record still refers to it
+   * and no reader lease holds it, and which registers its own task-completion cleanup for the
+   * failure and cancellation cases. Deleting those from here would race a producer that is still
+   * replaying its unacknowledged window.
+   *
+   * Files transferred through [[retainProducerOutput]] are a different matter and are deleted,
+   * because their producing task has already finished and this resolver is the only thing that
+   * still owns them. A stopping resolver is the last boundary at which they can be released, so not
+   * deleting them here would leak them onto local disk until the application directory is cleared.
    *
    * The stopped flag is raised and the registry cleared in the same critical section that every
    * registration and every lookup contends for, which is what makes a stop final: no registration
@@ -872,16 +974,19 @@ private[spark] class StreamingShuffleBlockResolver(
    */
   override def stop(): Unit = {
     Utils.tryLogNonFatalError {
+      val orphanedFiles = new mutable.ArrayBuffer[File]()
       val dropped = lifecycle.synchronized {
         if (stopped) {
           -1
         } else {
           stopped = true
           val registered = producers.size()
+          producers.values().asScala.foreach(orphanedFiles ++= _.retainedFiles)
           producers.clear()
           registered
         }
       }
+      deleteRetainedFiles(orphanedFiles.toSeq)
       if (dropped > 0 && debugEnabled) {
         logDebug(log"Streaming shuffle block resolver stopped, dropping " +
           log"${MDC(COUNT, dropped)} registered producer(s)")
@@ -961,10 +1066,22 @@ private[spark] object StreamingShuffleBlockResolver {
    * over "which attempt is newer" without any further bookkeeping -- which is precisely what a
    * registry shared by concurrent attempts at the same map output needs.
    *
+   * `retainedFiles` is empty while the producing task is still running and its own cleanup owns
+   * its spill files. It is populated by [[StreamingShuffleBlockResolver.retainProducerOutput]] when
+   * that task succeeds, at which point the files become this registry's to unlink -- and are
+   * unlinked when the generation is superseded, when the shuffle is unregistered, or when the
+   * resolver stops. That is what lets a successful map output be served after the task that
+   * produced it has gone, which task-managed buffer memory can never be.
+   *
    * @param taskAttemptId the generation that registered this producer
    * @param producer the spill manager able to locate that map output's spilled blocks
+   * @param retainedFiles spill files whose deletion this registry has taken over, empty until the
+   *                      producing task hands them across
    */
-  case class RegisteredProducer(taskAttemptId: Long, producer: MemorySpillManager) {
+  case class RegisteredProducer(
+      taskAttemptId: Long,
+      producer: MemorySpillManager,
+      retainedFiles: Seq[File] = Seq.empty) {
 
     /** Whether this registration is newer than, or a refresh of, an existing one. */
     def supersedes(other: RegisteredProducer): Boolean = taskAttemptId >= other.taskAttemptId

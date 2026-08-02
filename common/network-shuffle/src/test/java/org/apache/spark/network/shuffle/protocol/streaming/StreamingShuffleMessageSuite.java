@@ -60,6 +60,12 @@ public class StreamingShuffleMessageSuite {
    */
   private static final int SHUFFLE_ID = 7;
   private static final int PARTITION_ID = 3;
+  /**
+   * A map task identifier. Non-zero and distinct from every other constant here, so that a header
+   * field silently dropped from an encoder or a decoder shows up as a mismatch rather than
+   * coinciding with a neighbour's value.
+   */
+  private static final long MAP_ID = 11L;
   private static final long SEQUENCE_NUMBER = 42L;
 
   /**
@@ -84,9 +90,9 @@ public class StreamingShuffleMessageSuite {
     for (int payloadLength : new int[] {0, 1, 1024, 8192}) {
       byte[] payload = payload(payloadLength);
       DataBlockMessage message = DataBlockMessage.withComputedChecksum(
-          SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, payload);
+          SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, payload);
       int len = message.encodedLength();
-      assertEquals(29 + payloadLength, len);
+      assertEquals(37 + payloadLength, len);
       ByteBuf buf = Unpooled.buffer(len);
       message.encode(buf);
       // Encodable requires encode to write exactly encodedLength() bytes; with an exact-size buffer
@@ -102,9 +108,9 @@ public class StreamingShuffleMessageSuite {
 
   @Test
   public void testAckMessageEncodeDecode() {
-    AckMessage message = new AckMessage(SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, 40L);
+    AckMessage message = new AckMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, 40L);
     int len = message.encodedLength();
-    assertEquals(25, len);
+    assertEquals(33, len);
     ByteBuf buf = Unpooled.buffer(len);
     message.encode(buf);
     assertEquals(0, buf.writableBytes());
@@ -118,9 +124,9 @@ public class StreamingShuffleMessageSuite {
   @Test
   public void testHeartbeatMessageEncodeDecode() {
     HeartbeatMessage message =
-        new HeartbeatMessage(SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, TIMESTAMP_MS);
+        new HeartbeatMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, TIMESTAMP_MS);
     int len = message.encodedLength();
-    assertEquals(25, len);
+    assertEquals(33, len);
     ByteBuf buf = Unpooled.buffer(len);
     message.encode(buf);
     assertEquals(0, buf.writableBytes());
@@ -134,9 +140,9 @@ public class StreamingShuffleMessageSuite {
   @Test
   public void testRetransmitRequestMessageEncodeDecode() {
     RetransmitRequestMessage message =
-        new RetransmitRequestMessage(SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, 44L);
+        new RetransmitRequestMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, 44L);
     int len = message.encodedLength();
-    assertEquals(25, len);
+    assertEquals(33, len);
     ByteBuf buf = Unpooled.buffer(len);
     message.encode(buf);
     assertEquals(0, buf.writableBytes());
@@ -153,9 +159,9 @@ public class StreamingShuffleMessageSuite {
   @Test
   public void testStreamTerminationMessageEncodeDecode() {
     StreamTerminationMessage message =
-        new StreamTerminationMessage(SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, 40L);
+        new StreamTerminationMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, 40L, 40L);
     int len = message.encodedLength();
-    assertEquals(25, len);
+    assertEquals(33, len);
     ByteBuf buf = Unpooled.buffer(len);
     message.encode(buf);
     assertEquals(0, buf.writableBytes());
@@ -172,8 +178,8 @@ public class StreamingShuffleMessageSuite {
 
   @Test
   public void testHeaderLayoutConstants() {
-    assertEquals(17, StreamingShuffleMessage.HEADER_ENCODED_LENGTH);
-    assertEquals(1 + 4 + 4 + 8, StreamingShuffleMessage.HEADER_ENCODED_LENGTH);
+    assertEquals(25, StreamingShuffleMessage.HEADER_ENCODED_LENGTH);
+    assertEquals(1 + 4 + 8 + 4 + 8, StreamingShuffleMessage.HEADER_ENCODED_LENGTH);
     assertEquals(1, StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION);
   }
 
@@ -194,7 +200,7 @@ public class StreamingShuffleMessageSuite {
     // A message built with an explicit version must round-trip that version rather than silently
     // adopting this build's own, which is what allows a mismatch to be reported precisely.
     AckMessage message = new AckMessage(
-        StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION, SHUFFLE_ID, PARTITION_ID,
+        StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION, SHUFFLE_ID, MAP_ID, PARTITION_ID,
         SEQUENCE_NUMBER, 40L);
     assertEquals(StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION, message.protocolVersion());
     StreamingShuffleMessage decoded =
@@ -242,7 +248,7 @@ public class StreamingShuffleMessageSuite {
     // The version sits at a fixed offset of one byte into every framed message, so it can be
     // rewritten in place to simulate a peer built against a different revision.
     byte[] framed = toByteArray(new AckMessage(
-        SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, 40L).toByteBuffer());
+        SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, 40L).toByteBuffer());
     framed[1] = UNSUPPORTED_VERSION;
     assertThrows(IllegalArgumentException.class,
         () -> StreamingShuffleMessage.Decoder.fromByteBuffer(ByteBuffer.wrap(framed)));
@@ -267,8 +273,8 @@ public class StreamingShuffleMessageSuite {
     // And for the variable-length message at several payload sizes.
     for (int payloadLength : new int[] {0, 1, 1024}) {
       DataBlockMessage block = DataBlockMessage.withComputedChecksum(
-          SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, payload(payloadLength));
-      assertEquals(30 + payloadLength, block.toByteBuffer().remaining());
+          SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, payload(payloadLength));
+      assertEquals(38 + payloadLength, block.toByteBuffer().remaining());
     }
   }
 
@@ -305,9 +311,9 @@ public class StreamingShuffleMessageSuite {
     // The production comparison is strictly greater than the cap, so a full block is legal.
     byte[] payload = new byte[DataBlockMessage.MAX_BLOCK_SIZE_BYTES];
     DataBlockMessage block = DataBlockMessage.withComputedChecksum(
-        SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, payload);
+        SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, payload);
     assertEquals(DataBlockMessage.MAX_BLOCK_SIZE_BYTES, block.payloadLength());
-    assertEquals(29 + DataBlockMessage.MAX_BLOCK_SIZE_BYTES, block.encodedLength());
+    assertEquals(37 + DataBlockMessage.MAX_BLOCK_SIZE_BYTES, block.encodedLength());
     assertEquals(block, roundTrip(block));
     assertTrue(block.verifyChecksum());
   }
@@ -316,9 +322,10 @@ public class StreamingShuffleMessageSuite {
   public void testPayloadOneByteOverCapIsRejectedOnConstruction() {
     byte[] tooBig = new byte[DataBlockMessage.MAX_BLOCK_SIZE_BYTES + 1];
     assertThrows(IllegalArgumentException.class, () ->
-        new DataBlockMessage(SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, 0L, tooBig));
+        new DataBlockMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, 0L, tooBig));
     assertThrows(IllegalArgumentException.class, () ->
-        DataBlockMessage.withComputedChecksum(SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, tooBig));
+        DataBlockMessage.withComputedChecksum(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER,
+            tooBig));
   }
 
   @Test
@@ -440,10 +447,10 @@ public class StreamingShuffleMessageSuite {
     // byte survived. A payload-only checksum could not tell the difference.
     byte[] payload = payload(1024);
     DataBlockMessage block = DataBlockMessage.withComputedChecksum(
-        SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, payload);
+        SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, payload);
     assertTrue(block.verifyChecksum());
     assertEquals(StreamingShuffleChecksum.computeBlock(
-        SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, payload), block.checksum());
+        SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, payload), block.checksum());
 
     long checksum = block.checksum();
     // Same payload and same checksum, but re-addressed to a different partition, a different
@@ -457,20 +464,20 @@ public class StreamingShuffleMessageSuite {
   public void testBlockChecksumDetectsPayloadCorruption() {
     byte[] payload = payload(1024);
     DataBlockMessage block = DataBlockMessage.withComputedChecksum(
-        SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, payload);
+        SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, payload);
     byte[] corrupted = payload.clone();
     corrupted[500] ^= 0x01;
     assertFalse(reAddressed(PARTITION_ID, SEQUENCE_NUMBER, SHUFFLE_ID, corrupted,
         block.checksum()));
     assertFalse(StreamingShuffleChecksum.verifyBlock(
-        SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, corrupted, block.checksum()));
+        SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, corrupted, block.checksum()));
   }
 
   @Test
   public void testBlockChecksumSurvivesRoundTrip() {
     for (int payloadLength : new int[] {0, 1, 1024}) {
       DataBlockMessage block = DataBlockMessage.withComputedChecksum(
-          SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, payload(payloadLength));
+          SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, payload(payloadLength));
       DataBlockMessage decoded = (DataBlockMessage) roundTrip(block);
       assertEquals(block.checksum(), decoded.checksum());
       assertTrue(decoded.verifyChecksum());
@@ -481,12 +488,13 @@ public class StreamingShuffleMessageSuite {
   public void testComputeBlockSliceAgreesWithWholeArrayForm() {
     byte[] data = payload(512);
     assertEquals(
-        StreamingShuffleChecksum.computeBlock(SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER,
+        StreamingShuffleChecksum.computeBlock(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER,
             Arrays.copyOfRange(data, 8, 8 + 100)),
-        StreamingShuffleChecksum.computeBlock(SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, data, 8,
+        StreamingShuffleChecksum.computeBlock(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER,
+            data, 8,
             100));
     assertThrows(IllegalArgumentException.class, () -> StreamingShuffleChecksum.computeBlock(
-        SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, data, 8, 512));
+        SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, data, 8, 512));
   }
 
   // ===========================================================================================
@@ -557,9 +565,9 @@ public class StreamingShuffleMessageSuite {
     byte[] second = payload(64);
     assertNotSame(first, second);
     DataBlockMessage a = DataBlockMessage.withComputedChecksum(
-        SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, first);
+        SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, first);
     DataBlockMessage b = DataBlockMessage.withComputedChecksum(
-        SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, second);
+        SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, second);
     assertEquals(a, b);
     assertEquals(a.hashCode(), b.hashCode());
     assertEquals(a.toString(), b.toString());
@@ -579,21 +587,24 @@ public class StreamingShuffleMessageSuite {
   @Test
   public void testInequalityWhenAnySingleFieldDiffers() {
     AckMessage base = ack(40L);
-    assertNotEquals(base, new AckMessage(SHUFFLE_ID + 1, PARTITION_ID, SEQUENCE_NUMBER, 40L));
-    assertNotEquals(base, new AckMessage(SHUFFLE_ID, PARTITION_ID + 1, SEQUENCE_NUMBER, 40L));
-    assertNotEquals(base, new AckMessage(SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER + 1, 40L));
+    assertNotEquals(base, new AckMessage(SHUFFLE_ID + 1, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER,
+        40L));
+    assertNotEquals(base, new AckMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID + 1, SEQUENCE_NUMBER,
+        40L));
+    assertNotEquals(base, new AckMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER + 1,
+        40L));
     assertNotEquals(base, ack(41L));
 
     DataBlockMessage block = dataBlock(64);
     assertNotEquals(block, DataBlockMessage.withComputedChecksum(
-        SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, payload(65)));
+        SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, payload(65)));
     byte[] different = payload(64);
     different[0] ^= 0x01;
     assertNotEquals(block, DataBlockMessage.withComputedChecksum(
-        SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, different));
+        SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, different));
     // Same payload, different checksum field.
     assertNotEquals(block, new DataBlockMessage(
-        SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, block.checksum() + 1, payload(64)));
+        SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, block.checksum() + 1, payload(64)));
   }
 
   @Test
@@ -602,13 +613,15 @@ public class StreamingShuffleMessageSuite {
     // them apart. Given identical header and body values they must still be distinct, which is
     // what confirms each equals implementation checks the concrete type.
     StreamingShuffleMessage[] identical = {
-        new AckMessage(SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, 40L),
-        new HeartbeatMessage(SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, 40L),
-        new RetransmitRequestMessage(SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, 42L),
-        new StreamTerminationMessage(SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, 40L),
+        new AckMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, SEQUENCE_NUMBER),
+        new HeartbeatMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, SEQUENCE_NUMBER),
+        new RetransmitRequestMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER,
+            SEQUENCE_NUMBER),
+        new StreamTerminationMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER,
+            SEQUENCE_NUMBER),
     };
     for (int i = 0; i < identical.length; i++) {
-      assertEquals(25, identical[i].encodedLength());
+      assertEquals(33, identical[i].encodedLength());
       for (int j = i + 1; j < identical.length; j++) {
         assertNotEquals(identical[i], identical[j]);
         assertNotEquals(identical[j], identical[i]);
@@ -647,11 +660,12 @@ public class StreamingShuffleMessageSuite {
   public void testMaximumFrameLengthMatchesTheLargestLegitimateFrame() {
     // The bound is the framing byte plus a maximum-size data block, so a full block must frame to
     // exactly the maximum and nothing legitimate may exceed it.
-    DataBlockMessage fullBlock = DataBlockMessage.withComputedChecksum(SHUFFLE_ID, PARTITION_ID,
+    DataBlockMessage fullBlock = DataBlockMessage.withComputedChecksum(SHUFFLE_ID, MAP_ID,
+        PARTITION_ID,
         SEQUENCE_NUMBER, new byte[DataBlockMessage.MAX_BLOCK_SIZE_BYTES]);
     assertEquals(StreamingShuffleMessage.MAX_FRAME_LENGTH,
         fullBlock.toByteBuffer().remaining());
-    assertEquals(1 + 17 + 8 + 4 + DataBlockMessage.MAX_BLOCK_SIZE_BYTES,
+    assertEquals(1 + 25 + 8 + 4 + DataBlockMessage.MAX_BLOCK_SIZE_BYTES,
         StreamingShuffleMessage.MAX_FRAME_LENGTH);
   }
 
@@ -708,22 +722,46 @@ public class StreamingShuffleMessageSuite {
         () -> decodeAckWithHeader(Integer.MIN_VALUE, PARTITION_ID, 0L));
     assertThrows(IllegalArgumentException.class,
         () -> decodeAckWithHeader(SHUFFLE_ID, PARTITION_ID, Long.MIN_VALUE));
+    // The map id joined the header when one listener per executor became the serving model, so it
+    // is a routing identity like the others and is refused on the same terms.
+    assertThrows(IllegalArgumentException.class,
+        () -> decodeAckWithHeader(SHUFFLE_ID, -1L, PARTITION_ID, 0L));
+    assertThrows(IllegalArgumentException.class,
+        () -> decodeAckWithHeader(SHUFFLE_ID, Long.MIN_VALUE, PARTITION_ID, 0L));
   }
 
   @Test
   public void testNegativeHeaderIdentifiersAreRejectedOnConstruction() {
-    assertThrows(IllegalArgumentException.class, () -> new AckMessage(-1, PARTITION_ID, 0L, 0L));
-    assertThrows(IllegalArgumentException.class, () -> new AckMessage(SHUFFLE_ID, -1, 0L, 0L));
+    assertThrows(IllegalArgumentException.class, () -> new AckMessage(-1, MAP_ID, PARTITION_ID, 0L,
+        0L));
+    assertThrows(IllegalArgumentException.class, () -> new AckMessage(SHUFFLE_ID, MAP_ID, -1, 0L,
+        0L));
     assertThrows(IllegalArgumentException.class,
-        () -> new AckMessage(SHUFFLE_ID, PARTITION_ID, -1L, 0L));
+        () -> new AckMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, -1L, 0L));
     assertThrows(IllegalArgumentException.class,
-        () -> new HeartbeatMessage(-1, 0, 0L, TIMESTAMP_MS));
-    assertThrows(IllegalArgumentException.class, () -> new RetransmitRequestMessage(-1, 0, 0L, 0L));
-    assertThrows(IllegalArgumentException.class, () -> new StreamTerminationMessage(-1, 0, 0L, 0L));
+        () -> new HeartbeatMessage(-1, MAP_ID, 0, 0L, TIMESTAMP_MS));
+    assertThrows(IllegalArgumentException.class, () -> new RetransmitRequestMessage(-1, MAP_ID, 0,
+        0L, 0L));
+    assertThrows(IllegalArgumentException.class, () -> new StreamTerminationMessage(-1, MAP_ID, 0,
+        0L, 0L));
     assertThrows(IllegalArgumentException.class,
-        () -> DataBlockMessage.withComputedChecksum(-1, 0, 0L, payload(8)));
+        () -> DataBlockMessage.withComputedChecksum(-1, MAP_ID, 0, 0L, payload(8)));
+    // A negative map id is rejected wherever a message can be built, exactly as a negative shuffle
+    // or partition id is.
+    assertThrows(IllegalArgumentException.class,
+        () -> new AckMessage(SHUFFLE_ID, -1L, PARTITION_ID, 0L, 0L));
+    assertThrows(IllegalArgumentException.class,
+        () -> new HeartbeatMessage(SHUFFLE_ID, -1L, PARTITION_ID, 0L, TIMESTAMP_MS));
+    assertThrows(IllegalArgumentException.class,
+        () -> new RetransmitRequestMessage(SHUFFLE_ID, -1L, PARTITION_ID, 0L, 0L));
+    assertThrows(IllegalArgumentException.class,
+        () -> new StreamTerminationMessage(SHUFFLE_ID, -1L, PARTITION_ID, 0L, 0L));
+    assertThrows(IllegalArgumentException.class,
+        () -> DataBlockMessage.withComputedChecksum(SHUFFLE_ID, -1L, PARTITION_ID, 0L, payload(8)));
+    assertThrows(IllegalArgumentException.class, () -> new StreamingShuffleMessage.Header(
+        StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION, SHUFFLE_ID, -1L, PARTITION_ID, 0L));
     // Zero is the smallest legal value for all three and must be accepted.
-    assertDoesNotThrow(() -> new AckMessage(0, 0, 0L, AckMessage.NOTHING_CONSUMED));
+    assertDoesNotThrow(() -> new AckMessage(0, MAP_ID, 0, 0L, AckMessage.NOTHING_CONSUMED));
   }
 
   // ===========================================================================================
@@ -735,7 +773,8 @@ public class StreamingShuffleMessageSuite {
     assertEquals(-1L, AckMessage.NOTHING_CONSUMED);
     // The one legal negative, and it must survive a round trip.
     AckMessage nothingConsumed =
-        new AckMessage(SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, AckMessage.NOTHING_CONSUMED);
+        new AckMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER,
+            AckMessage.NOTHING_CONSUMED);
     assertEquals(AckMessage.NOTHING_CONSUMED, nothingConsumed.consumerPosition());
     assertEquals(nothingConsumed, roundTrip(nothingConsumed));
     // Non-negative positions are always legal.
@@ -761,12 +800,13 @@ public class StreamingShuffleMessageSuite {
   @Test
   public void testHeartbeatTimestampDomain() {
     assertDoesNotThrow(() -> heartbeat());
-    assertDoesNotThrow(() -> new HeartbeatMessage(SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, 0L));
+    assertDoesNotThrow(() -> new HeartbeatMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID,
+        SEQUENCE_NUMBER, 0L));
     // A negative timestamp is not clock skew; it makes the receiver's elapsed-time subtraction
     // enormous, or at Long.MIN_VALUE makes it overflow and change sign.
     for (long invalid : new long[] {-1L, Long.MIN_VALUE}) {
       assertThrows(IllegalArgumentException.class,
-          () -> new HeartbeatMessage(SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, invalid));
+          () -> new HeartbeatMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, invalid));
     }
   }
 
@@ -774,7 +814,7 @@ public class StreamingShuffleMessageSuite {
   public void testRetransmissionWindowBounds() {
     // A single-block window, where the bounds are equal, is legal.
     RetransmitRequestMessage single =
-        new RetransmitRequestMessage(SHUFFLE_ID, PARTITION_ID, 5L, 5L);
+        new RetransmitRequestMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, 5L, 5L);
     assertEquals(1L, single.blockCount());
     assertTrue(single.contains(5L));
     assertFalse(single.contains(4L));
@@ -783,22 +823,24 @@ public class StreamingShuffleMessageSuite {
 
     // An inverted window is refused.
     assertThrows(IllegalArgumentException.class,
-        () -> new RetransmitRequestMessage(SHUFFLE_ID, PARTITION_ID, 5L, 4L));
+        () -> new RetransmitRequestMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, 5L, 4L));
 
     // The width is bounded, so a peer cannot ask a producer to walk 2^63 positions.
     assertEquals(4096L, RetransmitRequestMessage.MAX_REQUESTED_BLOCKS);
-    RetransmitRequestMessage widest = new RetransmitRequestMessage(SHUFFLE_ID, PARTITION_ID, 0L,
+    RetransmitRequestMessage widest = new RetransmitRequestMessage(SHUFFLE_ID, MAP_ID,
+        PARTITION_ID, 0L,
         RetransmitRequestMessage.MAX_REQUESTED_BLOCKS - 1);
     assertEquals(RetransmitRequestMessage.MAX_REQUESTED_BLOCKS, widest.blockCount());
     assertThrows(IllegalArgumentException.class, () -> new RetransmitRequestMessage(
-        SHUFFLE_ID, PARTITION_ID, 0L, RetransmitRequestMessage.MAX_REQUESTED_BLOCKS));
+        SHUFFLE_ID, MAP_ID, PARTITION_ID, 0L, RetransmitRequestMessage.MAX_REQUESTED_BLOCKS));
     assertThrows(IllegalArgumentException.class,
-        () -> new RetransmitRequestMessage(SHUFFLE_ID, PARTITION_ID, 0L, Long.MAX_VALUE - 1L));
+        () -> new RetransmitRequestMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, 0L,
+            Long.MAX_VALUE - 1L));
     // The one pair for which counting the window rather than measuring its span overflows: an
     // upper bound at Long.MAX_VALUE against a lower bound of zero. A count would wrap to
     // Long.MIN_VALUE and read as small; the span is exact.
     assertThrows(IllegalArgumentException.class,
-        () -> new RetransmitRequestMessage(SHUFFLE_ID, PARTITION_ID, 0L, Long.MAX_VALUE));
+        () -> new RetransmitRequestMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, 0L, Long.MAX_VALUE));
   }
 
   @Test
@@ -818,27 +860,42 @@ public class StreamingShuffleMessageSuite {
   @Test
   public void testStreamTerminationBlockCountRelation() {
     // Zero blocks is legal: an empty partition legitimately terminates having sent nothing.
-    assertDoesNotThrow(() -> new StreamTerminationMessage(SHUFFLE_ID, PARTITION_ID, 0L, 0L));
-    // Equality is the normal case, where the terminator takes the sequence number after the last
-    // block, and fewer is legal too because heartbeats also spend sequence numbers.
-    assertDoesNotThrow(() -> new StreamTerminationMessage(SHUFFLE_ID, PARTITION_ID, 10L, 10L));
-    assertDoesNotThrow(() -> new StreamTerminationMessage(SHUFFLE_ID, PARTITION_ID, 10L, 4L));
+    assertDoesNotThrow(() -> new StreamTerminationMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, 0L,
+        0L));
+    // Only data blocks consume sequence numbers -- a heartbeat and the terminator both report the
+    // next unissued position without claiming it -- so the terminator's position equals the number
+    // of blocks that preceded it, and equality is the one legal relation.
+    assertDoesNotThrow(() -> new StreamTerminationMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, 10L,
+        10L));
+    // An undercount is the silent truncation case: a consumer that accepted ten blocks and is told
+    // the total was four reconciles the two, concludes the stream completed and hands a short
+    // result to the reduce task with every checksum intact. It must not be constructible.
+    assertThrows(IllegalArgumentException.class,
+        () -> new StreamTerminationMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, 10L, 4L));
     // Claiming more blocks than there are preceding positions is arithmetically impossible, and
     // would leave a consumer waiting for blocks that were never sent.
     assertThrows(IllegalArgumentException.class,
-        () -> new StreamTerminationMessage(SHUFFLE_ID, PARTITION_ID, 10L, 11L));
+        () -> new StreamTerminationMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, 10L, 11L));
     assertThrows(IllegalArgumentException.class,
-        () -> new StreamTerminationMessage(SHUFFLE_ID, PARTITION_ID, 10L, Long.MAX_VALUE));
+        () -> new StreamTerminationMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, 10L, Long.MAX_VALUE));
     assertThrows(IllegalArgumentException.class,
-        () -> new StreamTerminationMessage(SHUFFLE_ID, PARTITION_ID, 10L, -1L));
+        () -> new StreamTerminationMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, 10L, -1L));
   }
 
   @Test
   public void testStreamTerminationBlockCountRelationIsEnforcedOnDecode() {
-    ByteBuf buf = Unpooled.buffer();
-    writeHeader(buf, SHUFFLE_ID, PARTITION_ID, 10L);
-    buf.writeLong(11L);
-    assertThrows(IllegalArgumentException.class, () -> StreamTerminationMessage.decode(buf));
+    ByteBuf overcount = Unpooled.buffer();
+    writeHeader(overcount, SHUFFLE_ID, PARTITION_ID, 10L);
+    overcount.writeLong(11L);
+    assertThrows(IllegalArgumentException.class,
+        () -> StreamTerminationMessage.decode(overcount));
+    // A frame arriving from a peer is rejected for an undercount too, because decode funnels
+    // through the same construction path the local producer uses.
+    ByteBuf undercount = Unpooled.buffer();
+    writeHeader(undercount, SHUFFLE_ID, PARTITION_ID, 10L);
+    undercount.writeLong(4L);
+    assertThrows(IllegalArgumentException.class,
+        () -> StreamTerminationMessage.decode(undercount));
   }
 
   // ===========================================================================================
@@ -853,7 +910,8 @@ public class StreamingShuffleMessageSuite {
     // block no longer held.
     byte[] caller = {1, 2, 3, 4};
     DataBlockMessage block =
-        DataBlockMessage.withComputedChecksum(SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, caller);
+        DataBlockMessage.withComputedChecksum(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER,
+            caller);
     long checksumWhenBuilt = block.checksum();
 
     Arrays.fill(caller, (byte) 99);
@@ -891,6 +949,81 @@ public class StreamingShuffleMessageSuite {
   }
 
   // ===========================================================================================
+  // The map id, which is what lets one listener per executor serve every producer on it.
+  // ===========================================================================================
+
+  @Test
+  public void testMapIdSurvivesTheRoundTripOnEveryMessageType() {
+    // The map id is the field a router reads to decide which producer a frame concerns, so it has
+    // to come back off the wire exactly as it went on for every message in the family -- not only
+    // for data blocks.
+    for (StreamingShuffleMessage message : oneOfEachType()) {
+      assertEquals(MAP_ID, message.mapId(), message.getClass().getSimpleName());
+      StreamingShuffleMessage decoded =
+          StreamingShuffleMessage.Decoder.fromByteBuffer(message.toByteBuffer());
+      assertEquals(MAP_ID, decoded.mapId(), message.getClass().getSimpleName());
+      assertEquals(message, decoded);
+    }
+  }
+
+  @Test
+  public void testMapIdParticipatesInEqualityAndInStreamBinding() {
+    // Two blocks alike in every field but the map id are different blocks. Without this, output
+    // from two map tasks sharing a partition and a sequence number would be indistinguishable,
+    // which is precisely the collision the field was added to prevent.
+    AckMessage base = ack(40L);
+    assertNotEquals(base, new AckMessage(SHUFFLE_ID, MAP_ID + 1L, PARTITION_ID, SEQUENCE_NUMBER,
+        40L));
+    assertNotEquals(base.hashCode(), new AckMessage(SHUFFLE_ID, MAP_ID + 1L, PARTITION_ID,
+        SEQUENCE_NUMBER, 40L).hashCode());
+    assertTrue(base.toString().contains("mapId=" + MAP_ID));
+
+    // A frame that names another producer is refused at the binding boundary rather than being
+    // handed to a caller who has to remember to question it.
+    for (StreamingShuffleMessage message : oneOfEachType()) {
+      assertThrows(IllegalArgumentException.class, () -> StreamingShuffleMessage.Decoder
+          .fromByteBuffer(message.toByteBuffer(), SHUFFLE_ID, MAP_ID + 1L, PARTITION_ID));
+      assertThrows(IllegalArgumentException.class, () ->
+          StreamingShuffleMessage.checkStreamContext(message, SHUFFLE_ID, MAP_ID + 1L,
+              PARTITION_ID));
+    }
+  }
+
+  @Test
+  public void testChecksumBindsTheMapIdSoAReattributedBlockFailsVerification() {
+    // The checksum's whole purpose is to bind the payload to the identity it was sent under. Now
+    // that the map id decides whose output a block is, a block re-stamped with another map id must
+    // fail verification even though every payload byte survived -- otherwise a rewritten map id
+    // would silently reattribute intact bytes to the wrong producer's stream.
+    byte[] bytes = payload(256);
+    DataBlockMessage block =
+        DataBlockMessage.withComputedChecksum(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER,
+            bytes);
+    assertTrue(block.verifyChecksum());
+
+    assertNotEquals(
+        StreamingShuffleChecksum.computeBlock(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER,
+            bytes),
+        StreamingShuffleChecksum.computeBlock(SHUFFLE_ID, MAP_ID + 1L, PARTITION_ID,
+            SEQUENCE_NUMBER, bytes));
+    assertFalse(StreamingShuffleChecksum.verifyBlock(SHUFFLE_ID, MAP_ID + 1L, PARTITION_ID,
+        SEQUENCE_NUMBER, bytes, block.checksum()));
+    assertFalse(new DataBlockMessage(StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION, SHUFFLE_ID,
+        MAP_ID + 1L, PARTITION_ID, SEQUENCE_NUMBER, block.checksum(), bytes).verifyChecksum());
+  }
+
+  @Test
+  public void testMapIdWidensTheHeaderByEightBytes() {
+    // The map id is a long, so every framed message grew by eight bytes. Asserted against the
+    // constant rather than a literal total so that the encoder and this expectation cannot drift.
+    for (StreamingShuffleMessage message : fixedSizeMessages()) {
+      assertEquals(StreamingShuffleMessage.HEADER_ENCODED_LENGTH + 8, message.encodedLength());
+      assertEquals(33, message.encodedLength(), message.getClass().getSimpleName());
+      assertEquals(34, message.toByteBuffer().remaining());
+    }
+  }
+
+  // ===========================================================================================
   // Stream-context binding.
   // ===========================================================================================
 
@@ -898,9 +1031,9 @@ public class StreamingShuffleMessageSuite {
   public void testStreamContextBindingAcceptsTheMatchingStream() {
     for (StreamingShuffleMessage message : oneOfEachType()) {
       assertEquals(message, StreamingShuffleMessage.Decoder.fromByteBuffer(
-          message.toByteBuffer(), SHUFFLE_ID, PARTITION_ID));
+          message.toByteBuffer(), SHUFFLE_ID, MAP_ID, PARTITION_ID));
       assertDoesNotThrow(() ->
-          StreamingShuffleMessage.checkStreamContext(message, SHUFFLE_ID, PARTITION_ID));
+          StreamingShuffleMessage.checkStreamContext(message, SHUFFLE_ID, MAP_ID, PARTITION_ID));
     }
   }
 
@@ -911,15 +1044,16 @@ public class StreamingShuffleMessageSuite {
     for (StreamingShuffleMessage message : oneOfEachType()) {
       assertThrows(IllegalArgumentException.class,
           () -> StreamingShuffleMessage.Decoder.fromByteBuffer(
-              message.toByteBuffer(), SHUFFLE_ID, PARTITION_ID + 1));
+              message.toByteBuffer(), SHUFFLE_ID, MAP_ID, PARTITION_ID + 1));
       assertThrows(IllegalArgumentException.class,
           () -> StreamingShuffleMessage.Decoder.fromByteBuffer(
-              message.toByteBuffer(), SHUFFLE_ID + 1, PARTITION_ID));
+              message.toByteBuffer(), SHUFFLE_ID + 1, MAP_ID, PARTITION_ID));
       assertThrows(IllegalArgumentException.class, () ->
-          StreamingShuffleMessage.checkStreamContext(message, SHUFFLE_ID, PARTITION_ID + 1));
+          StreamingShuffleMessage.checkStreamContext(message, SHUFFLE_ID, MAP_ID,
+              PARTITION_ID + 1));
     }
     assertThrows(NullPointerException.class,
-        () -> StreamingShuffleMessage.checkStreamContext(null, SHUFFLE_ID, PARTITION_ID));
+        () -> StreamingShuffleMessage.checkStreamContext(null, SHUFFLE_ID, MAP_ID, PARTITION_ID));
   }
 
   // ===========================================================================================
@@ -929,11 +1063,11 @@ public class StreamingShuffleMessageSuite {
   @Test
   public void testFramingConstantsFormOneConsistentContract() {
     assertEquals(1, StreamingShuffleMessage.FRAME_TYPE_PREFIX_LENGTH);
-    // One framing prefix + seventeen header + eight checksum + four payload length prefix.
-    assertEquals(30, DataBlockMessage.FRAMING_OVERHEAD_BYTES);
+    // One framing prefix + twenty-five header + eight checksum + four payload length prefix.
+    assertEquals(38, DataBlockMessage.FRAMING_OVERHEAD_BYTES);
     assertEquals(1 + StreamingShuffleMessage.HEADER_ENCODED_LENGTH + 8 + 4,
         DataBlockMessage.FRAMING_OVERHEAD_BYTES);
-    assertEquals(2097182, DataBlockMessage.MAX_ENCODED_FRAME_BYTES);
+    assertEquals(2097190, DataBlockMessage.MAX_ENCODED_FRAME_BYTES);
     // The relation is asserted rather than assumed, because a component that budgets the payload
     // cap while transmitting the frame cap under-accounts for every block it sends.
     assertEquals(DataBlockMessage.MAX_BLOCK_SIZE_BYTES + DataBlockMessage.FRAMING_OVERHEAD_BYTES,
@@ -951,7 +1085,7 @@ public class StreamingShuffleMessageSuite {
     // precisely MAX_ENCODED_FRAME_BYTES, no more and no less.
     byte[] atCap = new byte[DataBlockMessage.MAX_BLOCK_SIZE_BYTES];
     DataBlockMessage block =
-        new DataBlockMessage(SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, 0L, atCap);
+        new DataBlockMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, 0L, atCap);
     assertEquals(DataBlockMessage.MAX_ENCODED_FRAME_BYTES,
         StreamingShuffleMessage.framedLength(block.encodedLength()));
 
@@ -981,12 +1115,15 @@ public class StreamingShuffleMessageSuite {
 
   @Test
   public void testHeaderOccupiesFixedWireOffsetsInDeclaredOrder() {
-    AckMessage message = new AckMessage(SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, 7L);
+    AckMessage message = new AckMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, 7L);
     ByteBuffer framed = ByteBuffer.wrap(toByteArray(message.toByteBuffer()));
 
     assertEquals(StreamingShuffleMessageType.ACK.id(), framed.get());
     assertEquals(StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION, framed.get());
     assertEquals(SHUFFLE_ID, framed.getInt());
+    // The map id is written between the shuffle id and the partition id, so that a router can read
+    // whose output a frame concerns from a fixed offset without decoding the body.
+    assertEquals(MAP_ID, framed.getLong());
     assertEquals(PARTITION_ID, framed.getInt());
     assertEquals(SEQUENCE_NUMBER, framed.getLong());
     assertEquals(7L, framed.getLong());
@@ -997,16 +1134,17 @@ public class StreamingShuffleMessageSuite {
   public void testDataBlockBodyIsChecksumThenLengthPrefixedPayload() {
     byte[] contents = payload(3);
     DataBlockMessage block = DataBlockMessage.withComputedChecksum(
-        SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, contents);
+        SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, contents);
     ByteBuffer framed = ByteBuffer.wrap(toByteArray(block.toByteBuffer()));
 
     assertEquals(StreamingShuffleMessageType.DATA_BLOCK.id(), framed.get());
     assertEquals(StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION, framed.get());
     assertEquals(SHUFFLE_ID, framed.getInt());
+    assertEquals(MAP_ID, framed.getLong());
     assertEquals(PARTITION_ID, framed.getInt());
     assertEquals(SEQUENCE_NUMBER, framed.getLong());
     assertEquals(StreamingShuffleChecksum.computeBlock(
-        SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, contents), framed.getLong());
+        SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, contents), framed.getLong());
     assertEquals(contents.length, framed.getInt());
     byte[] onTheWire = new byte[contents.length];
     framed.get(onTheWire);
@@ -1018,13 +1156,13 @@ public class StreamingShuffleMessageSuite {
   public void testShuffleIdAndPartitionIdAreNeverTransposed() {
     // Two same-typed adjacent fields are the classic transposition hazard, so assert they stay
     // apart across a real round trip rather than trusting encoder and decoder to agree.
-    AckMessage decoded = (AckMessage) roundTrip(new AckMessage(1, 2, 3L, 4L));
+    AckMessage decoded = (AckMessage) roundTrip(new AckMessage(1, MAP_ID, 2, 3L, 4L));
     assertEquals(1, decoded.shuffleId());
     assertEquals(2, decoded.partitionId());
     assertEquals(3L, decoded.sequenceNumber());
     assertEquals(4L, decoded.consumerPosition());
     // And the swapped identity is a different message, so a transposition could not go unnoticed.
-    assertNotEquals(decoded, new AckMessage(2, 1, 3L, 4L));
+    assertNotEquals(decoded, new AckMessage(2, MAP_ID, 1, 3L, 4L));
   }
 
   @Test
@@ -1039,11 +1177,13 @@ public class StreamingShuffleMessageSuite {
     assertEquals(PARTITION_ID, fromHeader.partitionId());
     assertEquals(SEQUENCE_NUMBER, fromHeader.sequenceNumber());
     assertEquals(55L, fromHeader.consumerPosition());
-    assertEquals(new AckMessage(SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, 55L), fromHeader);
+    assertEquals(new AckMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, 55L),
+        fromHeader);
     // The same header drives every control message, so each must read it identically.
     assertEquals(heartbeat(), new HeartbeatMessage(header, TIMESTAMP_MS));
     assertEquals(retransmit(44L), new RetransmitRequestMessage(header, 44L));
-    assertEquals(termination(40L), new StreamTerminationMessage(header, 40L));
+    assertEquals(termination(SEQUENCE_NUMBER),
+        new StreamTerminationMessage(header, SEQUENCE_NUMBER));
   }
 
   // ===========================================================================================
@@ -1068,7 +1208,7 @@ public class StreamingShuffleMessageSuite {
     // A receive buffer rarely starts at position zero, so the decoder has to honour position and
     // limit rather than assuming it owns the whole backing array.
     byte[] framed = toByteArray(new AckMessage(
-        SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, 9L).toByteBuffer());
+        SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, 9L).toByteBuffer());
     ByteBuffer buffer = ByteBuffer.allocate(framed.length + 6);
     buffer.position(3);
     buffer.put(framed);
@@ -1127,16 +1267,16 @@ public class StreamingShuffleMessageSuite {
   @Test
   public void testNullPayloadIsRejectedByEveryConstructionRoute() {
     assertThrows(NullPointerException.class, () -> DataBlockMessage.withComputedChecksum(
-        SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, null));
+        SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, null));
     assertThrows(NullPointerException.class,
-        () -> new DataBlockMessage(SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, 0L, null));
+        () -> new DataBlockMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, 0L, null));
     assertThrows(NullPointerException.class,
         () -> new DataBlockMessage(StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION,
-            SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, 0L, null));
+            SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, 0L, null));
     assertThrows(NullPointerException.class, () -> new DataBlockMessage(header(), 0L, null));
     assertThrows(NullPointerException.class,
         () -> DataBlockMessage.withOwnedPayload(StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION,
-            SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, 0L, null));
+            SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, 0L, null));
     assertThrows(NullPointerException.class, () -> StreamingShuffleChecksum.verify(null, 0L));
   }
 
@@ -1154,7 +1294,8 @@ public class StreamingShuffleMessageSuite {
     assertThrows(NullPointerException.class,
         () -> StreamingShuffleMessage.Decoder.fromByteBuffer(null));
     assertThrows(NullPointerException.class,
-        () -> StreamingShuffleMessage.Decoder.fromByteBuffer(null, SHUFFLE_ID, PARTITION_ID));
+        () -> StreamingShuffleMessage.Decoder.fromByteBuffer(null, SHUFFLE_ID, MAP_ID,
+            PARTITION_ID));
     assertThrows(NullPointerException.class,
         () -> StreamingShuffleMessage.peekProtocolVersion(null));
     assertThrows(NullPointerException.class, () -> DataBlockMessage.decode(null));
@@ -1201,7 +1342,7 @@ public class StreamingShuffleMessageSuite {
     ByteBuf minimal = Unpooled.buffer();
     writeHeader(minimal, SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER);
     minimal.writeLong(StreamingShuffleChecksum.computeBlock(
-        SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, new byte[0]));
+        SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, new byte[0]));
     minimal.writeInt(0);
     DataBlockMessage decoded = DataBlockMessage.decode(minimal);
     assertEquals(0, decoded.payloadLength());
@@ -1229,12 +1370,13 @@ public class StreamingShuffleMessageSuite {
   public void testZeroIsAValidHeaderIdentity() {
     // The bound is non-negative, not positive: shuffle 0, partition 0, sequence 0 is the first
     // block of the first partition of the first shuffle and must round trip.
-    AckMessage first = new AckMessage(0, 0, 0L, 0L);
+    AckMessage first = new AckMessage(0, MAP_ID, 0, 0L, 0L);
     assertEquals(first, roundTrip(first));
     assertEquals(0, first.shuffleId());
     assertEquals(0, first.partitionId());
     assertEquals(0L, first.sequenceNumber());
-    DataBlockMessage firstBlock = DataBlockMessage.withComputedChecksum(0, 0, 0L, payload(8));
+    DataBlockMessage firstBlock = DataBlockMessage.withComputedChecksum(0, MAP_ID, 0, 0L,
+        payload(8));
     assertEquals(firstBlock, roundTrip(firstBlock));
   }
 
@@ -1249,7 +1391,8 @@ public class StreamingShuffleMessageSuite {
     assertEquals(0, decoded.copyPayload().length);
     assertTrue(decoded.verifyChecksum());
     // The checksum of nothing travels the same path as the checksum of anything else.
-    assertEquals(StreamingShuffleChecksum.computeBlock(SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER,
+    assertEquals(StreamingShuffleChecksum.computeBlock(SHUFFLE_ID, MAP_ID, PARTITION_ID,
+        SEQUENCE_NUMBER,
         new byte[0]), decoded.checksum());
   }
 
@@ -1258,14 +1401,14 @@ public class StreamingShuffleMessageSuite {
     // The largest values each field admits are not rejected, so they must survive faithfully
     // rather than being silently normalised or wrapped.
     AckMessage extreme = new AckMessage(
-        Integer.MAX_VALUE, Integer.MAX_VALUE, Long.MAX_VALUE, Long.MAX_VALUE);
+        Integer.MAX_VALUE, MAP_ID, Integer.MAX_VALUE, Long.MAX_VALUE, Long.MAX_VALUE);
     AckMessage decoded = (AckMessage) roundTrip(extreme);
     assertEquals(Integer.MAX_VALUE, decoded.shuffleId());
     assertEquals(Integer.MAX_VALUE, decoded.partitionId());
     assertEquals(Long.MAX_VALUE, decoded.sequenceNumber());
     assertEquals(Long.MAX_VALUE, decoded.consumerPosition());
 
-    HeartbeatMessage beat = new HeartbeatMessage(0, 0, Long.MAX_VALUE, Long.MAX_VALUE);
+    HeartbeatMessage beat = new HeartbeatMessage(0, MAP_ID, 0, Long.MAX_VALUE, Long.MAX_VALUE);
     assertEquals(beat, roundTrip(beat));
     assertEquals(Long.MAX_VALUE, ((HeartbeatMessage) roundTrip(beat)).timestampMs());
   }
@@ -1304,9 +1447,9 @@ public class StreamingShuffleMessageSuite {
     // array, and that difference from the copying constructors is the whole reason it exists.
     byte[] surrendered = payload(64);
     DataBlockMessage adopted = DataBlockMessage.withOwnedPayload(
-        StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION, SHUFFLE_ID, PARTITION_ID,
+        StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION, SHUFFLE_ID, MAP_ID, PARTITION_ID,
         SEQUENCE_NUMBER, StreamingShuffleChecksum.computeBlock(
-            SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, surrendered), surrendered);
+            SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, surrendered), surrendered);
     assertTrue(adopted.verifyChecksum());
     assertEquals(64, adopted.payloadLength());
     surrendered[0] = (byte) ~surrendered[0];
@@ -1314,7 +1457,7 @@ public class StreamingShuffleMessageSuite {
 
     // The size cap and the round trip apply to the adopting route exactly as to any other.
     assertThrows(IllegalArgumentException.class, () -> DataBlockMessage.withOwnedPayload(
-        StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION, SHUFFLE_ID, PARTITION_ID,
+        StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION, SHUFFLE_ID, MAP_ID, PARTITION_ID,
         SEQUENCE_NUMBER, 0L, new byte[DataBlockMessage.MAX_BLOCK_SIZE_BYTES + 1]));
     assertEquals(adopted, roundTrip(adopted));
   }
@@ -1353,7 +1496,7 @@ public class StreamingShuffleMessageSuite {
     }
     assertTrue(Modifier.isAbstract(StreamingShuffleMessage.class.getModifiers()));
     // A record is implicitly final, and the header being immutable is what makes passing it
-    // around instead of four positional arguments safe.
+    // around instead of five positional arguments safe.
     assertTrue(StreamingShuffleMessage.Header.class.isRecord());
     assertTrue(Modifier.isFinal(StreamingShuffleMessage.Header.class.getModifiers()));
   }
@@ -1373,18 +1516,19 @@ public class StreamingShuffleMessageSuite {
     // happens to match, so the framing byte is the only thing that tells the decoder which one it
     // is holding. If routing ever fell back on anything else it would silently mis-decode here.
     // The one value legal in all four body domains at once: at or above the sequence number for a
-    // retransmission window's upper bound, at or below it for a termination's block count, and
+    // retransmission window's upper bound, equal to it for a termination's block count, and
     // non-negative for an acknowledgement position and a timestamp.
     long sharedBodyValue = SEQUENCE_NUMBER;
     StreamingShuffleMessage[] messages = {
         ack(sharedBodyValue),
-        new HeartbeatMessage(SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, sharedBodyValue),
-        new RetransmitRequestMessage(SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, sharedBodyValue),
+        new HeartbeatMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, sharedBodyValue),
+        new RetransmitRequestMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER,
+            sharedBodyValue),
         termination(sharedBodyValue),
     };
     byte[] reference = encodedBody(messages[0]);
     for (StreamingShuffleMessage message : messages) {
-      assertEquals(25, message.encodedLength());
+      assertEquals(33, message.encodedLength());
       assertArrayEquals(reference, encodedBody(message), message.toString());
       byte[] framed = toByteArray(message.toByteBuffer());
       // Identical bodies, distinct type bytes, and each still decodes back to its own class.
@@ -1413,7 +1557,7 @@ public class StreamingShuffleMessageSuite {
     // decoded message reports the revision its peer actually spoke. What must not happen is such
     // a message being accepted back off the wire as if it were current.
     AckMessage foreign =
-        new AckMessage(UNSUPPORTED_VERSION, SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, 40L);
+        new AckMessage(UNSUPPORTED_VERSION, SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, 40L);
     assertEquals(UNSUPPORTED_VERSION, foreign.protocolVersion());
     assertEquals(40L, foreign.consumerPosition());
     // The version participates in identity, so a foreign-version message is not the current one.
@@ -1483,42 +1627,45 @@ public class StreamingShuffleMessageSuite {
   /** One message of each of the five types, all sharing the same header values. */
   private StreamingShuffleMessage[] oneOfEachType() {
     return new StreamingShuffleMessage[] {
-        dataBlock(1024), ack(40L), heartbeat(), retransmit(44L), termination(40L),
+        dataBlock(1024), ack(40L), heartbeat(), retransmit(44L), termination(SEQUENCE_NUMBER),
     };
   }
 
-  /** The four messages whose encoded form is exactly 25 bytes. */
+  /** The four messages whose encoded form is exactly 33 bytes. */
   private StreamingShuffleMessage[] fixedSizeMessages() {
-    return new StreamingShuffleMessage[] {ack(40L), heartbeat(), retransmit(44L), termination(40L)};
+    return new StreamingShuffleMessage[] {
+        ack(40L), heartbeat(), retransmit(44L), termination(SEQUENCE_NUMBER)};
   }
 
   private DataBlockMessage dataBlock(int payloadLength) {
     return DataBlockMessage.withComputedChecksum(
-        SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, payload(payloadLength));
+        SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, payload(payloadLength));
   }
 
   /** A header carrying this suite's standard identity, for the header-taking constructors. */
   private StreamingShuffleMessage.Header header() {
     return new StreamingShuffleMessage.Header(StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION,
-        SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER);
+        SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER);
   }
 
   private AckMessage ack(long consumerPosition) {
-    return new AckMessage(SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, consumerPosition);
+    return new AckMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, consumerPosition);
   }
 
   private HeartbeatMessage heartbeat() {
-    return new HeartbeatMessage(SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, TIMESTAMP_MS);
+    return new HeartbeatMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, TIMESTAMP_MS);
   }
 
   private RetransmitRequestMessage retransmit(long lastSequenceNumber) {
     return new RetransmitRequestMessage(
-        SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, lastSequenceNumber);
+        SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, lastSequenceNumber);
   }
 
   private StreamTerminationMessage termination(long totalBlocks) {
+    // Only data blocks consume sequence numbers, so a terminator's own position is exactly the
+    // number of blocks that preceded it: the two values are one value here.
     return new StreamTerminationMessage(
-        SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER, totalBlocks);
+        SHUFFLE_ID, MAP_ID, PARTITION_ID, totalBlocks, totalBlocks);
   }
 
   /**
@@ -1549,8 +1696,19 @@ public class StreamingShuffleMessageSuite {
   }
 
   private static void writeHeader(ByteBuf buf, int shuffleId, int partitionId, long sequence) {
+    writeHeader(buf, shuffleId, MAP_ID, partitionId, sequence);
+  }
+
+  /**
+   * Writes a header by hand, in exactly the field order {@code encodeHeader} uses, so that a frame
+   * carrying a value the constructors would refuse can still be presented to a decoder. The map id
+   * is written between the shuffle id and the partition id, matching the wire layout.
+   */
+  private static void writeHeader(
+      ByteBuf buf, int shuffleId, long mapId, int partitionId, long sequence) {
     buf.writeByte(StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION);
     buf.writeInt(shuffleId);
+    buf.writeLong(mapId);
     buf.writeInt(partitionId);
     buf.writeLong(sequence);
   }
@@ -1570,8 +1728,14 @@ public class StreamingShuffleMessageSuite {
   }
 
   private static void decodeAckWithHeader(int shuffleId, int partitionId, long sequence) {
+    decodeAckWithHeader(shuffleId, MAP_ID, partitionId, sequence);
+  }
+
+  /** As {@link #decodeAckWithHeader(int, int, long)}, but with the map id chosen as well. */
+  private static void decodeAckWithHeader(
+      int shuffleId, long mapId, int partitionId, long sequence) {
     ByteBuf buf = Unpooled.buffer();
-    writeHeader(buf, shuffleId, partitionId, sequence);
+    writeHeader(buf, shuffleId, mapId, partitionId, sequence);
     buf.writeLong(0L);
     AckMessage.decode(buf);
   }
@@ -1614,6 +1778,6 @@ public class StreamingShuffleMessageSuite {
       byte[] payload,
       long checksum) {
     return new DataBlockMessage(StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION, shuffleId,
-        partitionId, sequenceNumber, checksum, payload).verifyChecksum();
+        MAP_ID, partitionId, sequenceNumber, checksum, payload).verifyChecksum();
   }
 }

@@ -47,15 +47,23 @@ import org.apache.spark.network.protocol.Encodable;
  * <pre>
  *   +--------+---------------------------------------------------------------+
  *   | type   | encoded body                                                  |
- *   | 1 byte | header (17 bytes) then the concrete message's own fields       |
+ *   | 1 byte | header (25 bytes) then the concrete message's own fields       |
  *   +--------+---------------------------------------------------------------+
  *
  *   the header, written by encodeHeader and read back by readHeader
- *   +-----------------+-----------+-------------+----------------+
- *   | protocolVersion | shuffleId | partitionId | sequenceNumber |
- *   | byte, 1 byte    | int, 4    | int, 4      | long, 8        |
- *   +-----------------+-----------+-------------+----------------+
+ *   +-----------------+-----------+-----------+-------------+----------------+
+ *   | protocolVersion | shuffleId | mapId     | partitionId | sequenceNumber |
+ *   | byte, 1 byte    | int, 4    | long, 8   | int, 4      | long, 8        |
+ *   +-----------------+-----------+-----------+-------------+----------------+
  * </pre>
+ *
+ * Why the map id is in the header. One executor hosts a single streaming listener for every map
+ * task it runs, because a listener owns Netty event loops and a per-task listener would multiply
+ * them by the number of tasks. A frame arriving there must therefore say which producer it concerns
+ * before anything can route it, and a data block must say which producer it came from before a
+ * consumer can attribute it: sequence numbers are counted per producer and per partition, so two
+ * maps writing the same partition use the very same numbers. The map id is the field that keeps
+ * those two streams apart, which is why it is part of the shared header rather than of one message.
  *
  * The header is {@value #HEADER_ENCODED_LENGTH} bytes, so a framed message always occupies {@code
  * encodedLength() + 1} bytes in total. The field order above is normative. It is written by {@link
@@ -124,9 +132,10 @@ import org.apache.spark.network.protocol.Encodable;
  *       size the protocol can legitimately produce, so a peer cannot induce work or allocation
  *       proportional to a length it invented. It is checked before dispatch.</li>
  *   <li><b>Semantic domains, at one choke point.</b> {@link #readHeader(ByteBuf)} validates the
- *       protocol version and rejects a negative shuffle id, partition id or sequence number. Every
- *       concrete decoder reads the header through that method before it reads a field of its own,
- *       so the domain check cannot be bypassed by reaching a concrete decoder directly.</li>
+ *       protocol version and rejects a negative shuffle id, map id, partition id or sequence
+ *       number. Every concrete decoder reads the header through that method before it reads a
+ *       field of its own, so the domain check cannot be bypassed by reaching a concrete decoder
+ *       directly.</li>
  *   <li><b>Exact frame consumption.</b> A decoder consumes its body exactly, and
  *       {@link Decoder#fromByteBuffer(ByteBuffer)} then requires the frame to be fully spent.
  *       Trailing bytes are a framing error and are rejected rather than ignored, which denies a
@@ -134,11 +143,11 @@ import org.apache.spark.network.protocol.Encodable;
  * </ul>
  *
  * Field values that are structurally valid may still be wrong <em>for the stream they arrived
- * on</em> -- a well-formed block addressed to another partition, for instance. That is a binding
- * question rather than a parsing one, so it is answered by {@link
- * #checkStreamContext(StreamingShuffleMessage, int, int)} and by the {@link
- * Decoder#fromByteBuffer(ByteBuffer, int, int)} overload, which a caller that knows which stream it
- * is reading should prefer.
+ * on</em> -- a well-formed block addressed to another partition, or to another map task's output,
+ * for instance. That is a binding question rather than a parsing one, so it is answered by {@link
+ * #checkStreamContext(StreamingShuffleMessage, int, long, int)} and by the {@link
+ * Decoder#fromByteBuffer(ByteBuffer, int, long, int)} overload, which a caller that knows which
+ * stream it is reading should prefer.
  *
  * This type is internal to Spark. It carries no logging and no dependency on Spark core, being pure
  * data plus codec: a peer that sends something unacceptable is rejected here with a plain {@link
@@ -165,15 +174,16 @@ public abstract class StreamingShuffleMessage implements Encodable {
 
   /**
    * Number of bytes the shared header occupies: one for {@code protocolVersion}, four for {@code
-   * shuffleId}, four for {@code partitionId} and eight for {@code sequenceNumber}.
+   * shuffleId}, eight for {@code mapId}, four for {@code partitionId} and eight for {@code
+   * sequenceNumber}.
    *
-   * The total is 17 bytes. Every subclass builds its own {@code encodedLength()} on top of this
+   * The total is 25 bytes. Every subclass builds its own {@code encodedLength()} on top of this
    * constant, so the four concrete messages that add a single {@code long} encode to {@code
-   * HEADER_ENCODED_LENGTH + 8}, that is 25 bytes, while a data block adds its checksum and its
+   * HEADER_ENCODED_LENGTH + 8}, that is 33 bytes, while a data block adds its checksum and its
    * length-prefixed payload on top of that. The value is written as the sum of its parts rather
    * than as a literal so that it cannot drift from the layout it describes.
    */
-  public static final int HEADER_ENCODED_LENGTH = 1 + 4 + 4 + 8;
+  public static final int HEADER_ENCODED_LENGTH = 1 + 4 + 8 + 4 + 8;
 
   /**
    * Bytes the framing prefix occupies, being the single type-discriminator byte that
@@ -201,6 +211,19 @@ public abstract class StreamingShuffleMessage implements Encodable {
    * cannot be routed to a decoder at all, so it is rejected outright rather than being handed on.
    */
   private static final int MIN_FRAME_LENGTH = PROTOCOL_VERSION_FRAME_OFFSET + 1;
+
+  /** Offset of the shuffle id within a framed message, counted from the type byte. */
+  private static final int SHUFFLE_ID_FRAME_OFFSET = PROTOCOL_VERSION_FRAME_OFFSET + 1;
+
+  /** Offset of the map id within a framed message, counted from the type byte. */
+  private static final int MAP_ID_FRAME_OFFSET = SHUFFLE_ID_FRAME_OFFSET + 4;
+
+  /**
+   * Bytes a framed message must carry before {@link #peekShuffleId(ByteBuffer)} and
+   * {@link #peekMapId(ByteBuffer)} can answer: the type byte, the version, the shuffle id and the
+   * map id.
+   */
+  private static final int MIN_ROUTABLE_FRAME_LENGTH = MAP_ID_FRAME_OFFSET + 8;
 
   /**
    * Most bytes a well-formed framed message can occupy, and therefore the point past which a frame
@@ -240,6 +263,7 @@ public abstract class StreamingShuffleMessage implements Encodable {
 
   private final byte protocolVersion;
   private final int shuffleId;
+  private final long mapId;
   private final int partitionId;
   private final long sequenceNumber;
 
@@ -252,29 +276,33 @@ public abstract class StreamingShuffleMessage implements Encodable {
    *
    * @param protocolVersion the wire revision this message was encoded with
    * @param shuffleId identifier of the shuffle this message belongs to; must be non-negative
+   * @param mapId identifier of the map task whose output this message concerns; must be
+   *              non-negative
    * @param partitionId identifier of the shuffle partition this message belongs to; must be
    *                    non-negative
    * @param sequenceNumber position of this message within its partition's stream, counted from
    *                       zero and increasing by one per data block, which is what lets a consumer
    *                       detect a gap or a reordering and lets a producer bound the window of
    *                       blocks it must retain for retransmission; must be non-negative
-   * @throws IllegalArgumentException if the shuffle id, the partition id or the sequence number is
-   *                                 negative
+   * @throws IllegalArgumentException if the shuffle id, the map id, the partition id or the
+   *                                 sequence number is negative
    */
   protected StreamingShuffleMessage(
       byte protocolVersion,
       int shuffleId,
+      long mapId,
       int partitionId,
       long sequenceNumber) {
     // Applied to a locally built message as well as to a decoded one, so that the domain rule is
     // the same in both directions. Without this a caller could construct a message that this codec
     // is then unable to decode -- it would encode without complaint and be rejected on arrival --
     // and an encode/decode asymmetry in a wire protocol is a bug waiting for a caller to find it.
-    // The cost is three comparisons per message, which is not measurable against the work of
+    // The cost is four comparisons per message, which is not measurable against the work of
     // encoding one.
-    checkHeaderDomains(shuffleId, partitionId, sequenceNumber);
+    checkHeaderDomains(shuffleId, mapId, partitionId, sequenceNumber);
     this.protocolVersion = protocolVersion;
     this.shuffleId = shuffleId;
+    this.mapId = mapId;
     this.partitionId = partitionId;
     this.sequenceNumber = sequenceNumber;
   }
@@ -285,29 +313,36 @@ public abstract class StreamingShuffleMessage implements Encodable {
    * construction site.
    *
    * @param shuffleId identifier of the shuffle this message belongs to; must be non-negative
+   * @param mapId identifier of the map task whose output this message concerns; must be
+   *              non-negative
    * @param partitionId identifier of the shuffle partition this message belongs to; must be
    *                    non-negative
    * @param sequenceNumber position of this message within its partition's stream; must be
    *                       non-negative
-   * @throws IllegalArgumentException if the shuffle id, the partition id or the sequence number is
-   *                                 negative
+   * @throws IllegalArgumentException if the shuffle id, the map id, the partition id or the
+   *                                 sequence number is negative
    */
-  protected StreamingShuffleMessage(int shuffleId, int partitionId, long sequenceNumber) {
-    this(CURRENT_PROTOCOL_VERSION, shuffleId, partitionId, sequenceNumber);
+  protected StreamingShuffleMessage(
+      int shuffleId,
+      long mapId,
+      int partitionId,
+      long sequenceNumber) {
+    this(CURRENT_PROTOCOL_VERSION, shuffleId, mapId, partitionId, sequenceNumber);
   }
 
   /**
    * Creates a message from a header that has just been read off the wire by {@link
    * #readHeader(ByteBuf)}. This is the constructor a concrete {@code decode(ByteBuf)} should use:
-   * passing the header as one value rather than as four positional arguments removes any chance of
-   * transposing {@code shuffleId} and {@code partitionId} on the way in.
+   * passing the header as one value rather than as five positional arguments removes any chance of
+   * transposing {@code shuffleId} and {@code partitionId}, or {@code mapId} and {@code
+   * sequenceNumber}, on the way in.
    *
    * @param header the decoded header, which must not be null
    * @throws NullPointerException if header is null
    */
   protected StreamingShuffleMessage(Header header) {
     this(Objects.requireNonNull(header, "header").protocolVersion(), header.shuffleId(),
-      header.partitionId(), header.sequenceNumber());
+      header.mapId(), header.partitionId(), header.sequenceNumber());
   }
 
   /**
@@ -330,6 +365,20 @@ public abstract class StreamingShuffleMessage implements Encodable {
    */
   public final int shuffleId() {
     return shuffleId;
+  }
+
+  /**
+   * Identifier of the map task whose output this message concerns.
+   *
+   * This is the field that makes one listener per executor possible. Every frame names the producer
+   * it belongs to, so an executor-scoped listener can route an inbound control frame to the right
+   * producer's handler, and a consumer receiving blocks from several maps of the same partition can
+   * attribute each one to the stream whose sequence space it was numbered in.
+   *
+   * @return the map id carried in this message's header
+   */
+  public final long mapId() {
+    return mapId;
   }
 
   /**
@@ -393,6 +442,7 @@ public abstract class StreamingShuffleMessage implements Encodable {
     Objects.requireNonNull(buf, "buf");
     buf.writeByte(protocolVersion);
     buf.writeInt(shuffleId);
+    buf.writeLong(mapId);
     buf.writeInt(partitionId);
     buf.writeLong(sequenceNumber);
   }
@@ -403,10 +453,10 @@ public abstract class StreamingShuffleMessage implements Encodable {
    * #encodeHeader(ByteBuf)}.
    *
    * The length is checked rather than asserted, because these bytes arrive from a remote peer and a
-   * truncated frame must be reported the same way in production as it is under test. The four
-   * fields are then handed to {@link Header}, whose constructor rejects a negative shuffle id,
-   * partition id or sequence number, so a malformed or hostile frame is refused here rather than
-   * being carried into the subsystem as an impossible routing identity or stream position.
+   * truncated frame must be reported the same way in production as it is under test. The five
+   * fields are then handed to {@link Header}, whose constructor rejects a negative shuffle id, map
+   * id, partition id or sequence number, so a malformed or hostile frame is refused here rather
+   * than being carried into the subsystem as an impossible routing identity or stream position.
    *
    * This method is the protocol's validation choke point, and that is a deliberate placement. Every
    * concrete decoder must read the header before it reads a field of its own, so validating here
@@ -423,11 +473,12 @@ public abstract class StreamingShuffleMessage implements Encodable {
    *       attached to the remaining fields, since their meaning is exactly what a version change is
    *       permitted to alter;</li>
    *   <li>the identifiers lie in their legitimate domains. {@code shuffleId} and
-   *       {@code partitionId} are indices and {@code sequenceNumber} is a position counted from
-   *       zero, so a negative value in any of them is not a small message that will be handled
-   *       downstream: it is a value that would be used to index a partition array, to key a
-   *       producer registry, or to compute a retransmission window, and it is refused here where it
-   *       enters rather than wherever it first happens to do damage.</li>
+   *       {@code partitionId} are indices, {@code mapId} is a monotonically assigned task
+   *       identifier and {@code sequenceNumber} is a position counted from zero, so a negative
+   *       value in any of them is not a small message that will be handled downstream: it is a
+   *       value that would be used to index a partition array, to key a producer registry, or to
+   *       compute a retransmission window, and it is refused here where it enters rather than
+   *       wherever it first happens to do damage.</li>
    * </ul>
    *
    * @param buf the buffer to read from, positioned at the first header byte
@@ -435,8 +486,8 @@ public abstract class StreamingShuffleMessage implements Encodable {
    * @throws NullPointerException if buf is null
    * @throws IllegalArgumentException if fewer than {@link #HEADER_ENCODED_LENGTH} bytes remain, if
    *                                 the protocol version is not one this build speaks, or if the
-   *                                 header carries a negative shuffle id, partition id or sequence
-   *                                 number
+   *                                 header carries a negative shuffle id, map id, partition id or
+   *                                 sequence number
    */
   protected static Header readHeader(ByteBuf buf) {
     Objects.requireNonNull(buf, "buf");
@@ -446,13 +497,14 @@ public abstract class StreamingShuffleMessage implements Encodable {
     }
     byte protocolVersion = buf.readByte();
     int shuffleId = buf.readInt();
+    long mapId = buf.readLong();
     int partitionId = buf.readInt();
     long sequenceNumber = buf.readLong();
     // Version first: the fields below only mean what this build thinks they mean if the peer is
     // speaking this build's revision of the protocol.
     checkProtocolVersion(protocolVersion);
-    checkHeaderDomains(shuffleId, partitionId, sequenceNumber);
-    return new Header(protocolVersion, shuffleId, partitionId, sequenceNumber);
+    checkHeaderDomains(shuffleId, mapId, partitionId, sequenceNumber);
+    return new Header(protocolVersion, shuffleId, mapId, partitionId, sequenceNumber);
   }
 
   /**
@@ -460,19 +512,28 @@ public abstract class StreamingShuffleMessage implements Encodable {
    *
    * Kept separate from {@link #readHeader(ByteBuf)} so that the same domain rule applies to a
    * header built in memory as to one read off the wire, and so that the rule is stated once. All
-   * three fields are non-negative by construction on the producing side -- two are array indices
-   * and the third is a position counted from zero -- so a negative value can only be a corrupt or
-   * forged frame.
+   * four fields are non-negative by construction on the producing side -- two are array indices,
+   * one is a monotonically assigned task identifier and the last is a position counted from zero --
+   * so a negative value can only be a corrupt or forged frame.
    *
    * @param shuffleId identifier of the shuffle the message belongs to
+   * @param mapId identifier of the map task whose output the message concerns
    * @param partitionId identifier of the shuffle partition the message belongs to
    * @param sequenceNumber position of the message within its partition's stream
    * @throws IllegalArgumentException if any argument is negative
    */
-  private static void checkHeaderDomains(int shuffleId, int partitionId, long sequenceNumber) {
+  private static void checkHeaderDomains(
+      int shuffleId,
+      long mapId,
+      int partitionId,
+      long sequenceNumber) {
     if (shuffleId < 0) {
       throw new IllegalArgumentException(
         "Streaming shuffle message carries a negative shuffleId: " + shuffleId);
+    }
+    if (mapId < 0) {
+      throw new IllegalArgumentException(
+        "Streaming shuffle message carries a negative mapId: " + mapId);
     }
     if (partitionId < 0) {
       throw new IllegalArgumentException(
@@ -497,25 +558,28 @@ public abstract class StreamingShuffleMessage implements Encodable {
    *
    * @param message a decoded message; must not be null
    * @param expectedShuffleId the shuffle the receiving stream belongs to
+   * @param expectedMapId the map task whose output the receiving stream carries
    * @param expectedPartitionId the partition the receiving stream belongs to
    * @throws NullPointerException if message is null
-   * @throws IllegalArgumentException if the message names a different shuffle or partition
+   * @throws IllegalArgumentException if the message names a different shuffle, map or partition
    */
   public static void checkStreamContext(
       StreamingShuffleMessage message,
       int expectedShuffleId,
+      long expectedMapId,
       int expectedPartitionId) {
     Objects.requireNonNull(message, "message");
-    if (message.shuffleId != expectedShuffleId || message.partitionId != expectedPartitionId) {
+    if (message.shuffleId != expectedShuffleId || message.mapId != expectedMapId
+        || message.partitionId != expectedPartitionId) {
       throw new IllegalArgumentException("Streaming shuffle message does not belong to this " +
-        "stream: message names shuffleId=" + message.shuffleId + ",partitionId=" +
-        message.partitionId + " but the stream serves shuffleId=" + expectedShuffleId +
-        ",partitionId=" + expectedPartitionId);
+        "stream: message names shuffleId=" + message.shuffleId + ",mapId=" + message.mapId +
+        ",partitionId=" + message.partitionId + " but the stream serves shuffleId=" +
+        expectedShuffleId + ",mapId=" + expectedMapId + ",partitionId=" + expectedPartitionId);
     }
   }
 
   /**
-   * Compares the four header fields of this message with those of another, for a subclass to fold
+   * Compares the five header fields of this message with those of another, for a subclass to fold
    * into its own {@code equals} alongside its own fields.
    *
    * @param other the message to compare against; null is never equal
@@ -525,19 +589,20 @@ public abstract class StreamingShuffleMessage implements Encodable {
     return other != null
       && protocolVersion == other.protocolVersion
       && shuffleId == other.shuffleId
+      && mapId == other.mapId
       && partitionId == other.partitionId
       && sequenceNumber == other.sequenceNumber;
   }
 
   /**
-   * Hash of the four header fields, for a subclass to combine with its own fields so that its
+   * Hash of the five header fields, for a subclass to combine with its own fields so that its
    * {@code hashCode} stays consistent with an {@code equals} built on {@link
    * #headerEquals(StreamingShuffleMessage)}.
    *
-   * @return a hash over protocolVersion, shuffleId, partitionId and sequenceNumber
+   * @return a hash over protocolVersion, shuffleId, mapId, partitionId and sequenceNumber
    */
   protected final int headerHashCode() {
-    return Objects.hash(protocolVersion, shuffleId, partitionId, sequenceNumber);
+    return Objects.hash(protocolVersion, shuffleId, mapId, partitionId, sequenceNumber);
   }
 
   /**
@@ -550,7 +615,7 @@ public abstract class StreamingShuffleMessage implements Encodable {
    */
   protected final String headerToString() {
     return "protocolVersion=" + protocolVersion + ",shuffleId=" + shuffleId +
-        ",partitionId=" + partitionId + ",sequenceNumber=" + sequenceNumber;
+        ",mapId=" + mapId + ",partitionId=" + partitionId + ",sequenceNumber=" + sequenceNumber;
   }
 
   /**
@@ -573,6 +638,61 @@ public abstract class StreamingShuffleMessage implements Encodable {
         "protocol version: " + msg.remaining() + " byte(s) remain");
     }
     return msg.get(msg.position() + PROTOCOL_VERSION_FRAME_OFFSET);
+  }
+
+  /**
+   * Reads the shuffle id out of a framed message without disturbing the buffer.
+   *
+   * This exists for one caller: the executor-scoped listener, which owns a single port shared by
+   * every producer on the executor and must decide which producer's handler a frame belongs to
+   * before anything decodes it. Reading two fields at fixed offsets is far cheaper than decoding a
+   * message only to discover it belongs to a different handler, and it keeps the offset arithmetic
+   * inside the type that defines the layout rather than spread across a router that would then have
+   * to be kept in step with it by hand.
+   *
+   * The read is absolute, at an explicit index, so the buffer's position is untouched and the
+   * caller can hand the very same buffer on to a decoder afterwards.
+   *
+   * @param msg a framed message, that is, the type byte followed by the encoded body
+   * @return the shuffle id the frame names
+   * @throws NullPointerException if msg is null
+   * @throws IllegalArgumentException if the frame is too short to carry a routing identity
+   */
+  public static int peekShuffleId(ByteBuffer msg) {
+    checkRoutable(msg);
+    return msg.getInt(msg.position() + SHUFFLE_ID_FRAME_OFFSET);
+  }
+
+  /**
+   * Reads the map id out of a framed message without disturbing the buffer.
+   *
+   * See {@link #peekShuffleId(ByteBuffer)} for why this is offered. Together the two identify the
+   * producer whose output a frame concerns, which is the whole of what a router needs to dispatch.
+   *
+   * @param msg a framed message, that is, the type byte followed by the encoded body
+   * @return the map id the frame names
+   * @throws NullPointerException if msg is null
+   * @throws IllegalArgumentException if the frame is too short to carry a routing identity
+   */
+  public static long peekMapId(ByteBuffer msg) {
+    checkRoutable(msg);
+    return msg.getLong(msg.position() + MAP_ID_FRAME_OFFSET);
+  }
+
+  /**
+   * Rejects a frame too short to carry the identity a router dispatches on.
+   *
+   * Checked before either peek reads, rather than relying on the buffer's own bounds check, so that
+   * a truncated frame is reported as the framing error it is instead of surfacing as an index
+   * failure from inside a buffer implementation.
+   */
+  private static void checkRoutable(ByteBuffer msg) {
+    Objects.requireNonNull(msg, "msg");
+    if (msg.remaining() < MIN_ROUTABLE_FRAME_LENGTH) {
+      throw new IllegalArgumentException("Streaming shuffle message is too short to carry a " +
+        "routing identity: " + msg.remaining() + " byte(s) remain but at least " +
+        MIN_ROUTABLE_FRAME_LENGTH + " are needed");
+    }
   }
 
   /**
@@ -609,7 +729,7 @@ public abstract class StreamingShuffleMessage implements Encodable {
   }
 
   /**
-   * The four header fields, decoded from the wire as one value.
+   * The five header fields, decoded from the wire as one value.
    *
    * Returning a single value from {@link StreamingShuffleMessage#readHeader(ByteBuf)} and accepting
    * one in {@link StreamingShuffleMessage#StreamingShuffleMessage(Header)} keeps the header out of
@@ -622,6 +742,7 @@ public abstract class StreamingShuffleMessage implements Encodable {
    *
    * @param protocolVersion the wire revision the sender stamped into the message
    * @param shuffleId identifier of the shuffle the message belongs to; must be non-negative
+   * @param mapId identifier of the map task whose output the message concerns; must be non-negative
    * @param partitionId identifier of the shuffle partition the message belongs to; must be
    *                    non-negative
    * @param sequenceNumber position of the message within its partition's stream; must be
@@ -631,40 +752,20 @@ public abstract class StreamingShuffleMessage implements Encodable {
   public record Header(
       byte protocolVersion,
       int shuffleId,
+      long mapId,
       int partitionId,
       long sequenceNumber) {
 
     /**
      * Rejects a header whose identities or stream position are outside the protocol's domains.
      *
-     * @throws IllegalArgumentException if the shuffle id, the partition id or the sequence number
-     *         is negative
+     * @throws IllegalArgumentException if the shuffle id, the map id, the partition id or the
+     *         sequence number is negative
      */
     public Header {
-      checkHeaderDomains(shuffleId, partitionId, sequenceNumber);
+      checkHeaderDomains(shuffleId, mapId, partitionId, sequenceNumber);
     }
   }
-
-  /**
-   * Rejects a negative shuffle id, partition id or sequence number, naming the offending field and
-   * its value.
-   *
-   * All three are counted from zero, so none of them has a meaningful negative value: a negative
-   * one is either a locally mis-derived identity or a malformed or hostile frame, and in both cases
-   * the honest response is to refuse the message rather than to route it, buffer it, or compare its
-   * position against a window. This is the single place the rule lives; the primary constructor and
-   * {@link Header} are its only two callers, and between them they cover every path by which a
-   * message can come into existence.
-   *
-   * The failure is an {@link IllegalArgumentException}, matching the rest of this message family,
-   * so that a caller which owns the surrounding context can turn it into a protocol-level failure
-   * and degrade to sort-based shuffle rather than have an error escape from an I/O thread.
-   *
-   * @param shuffleId identifier of the shuffle the message belongs to
-   * @param partitionId identifier of the shuffle partition the message belongs to
-   * @param sequenceNumber position of the message within its partition's stream
-   * @throws IllegalArgumentException if any of the three is negative
-   */
 
   // Decoding lives in its own nested type so that the single validated entry point is reachable
   // without an instance and cannot be confused with the per-subclass decoders it dispatches to.
@@ -748,25 +849,28 @@ public abstract class StreamingShuffleMessage implements Encodable {
      * overload a consumer serving a known shuffle and partition should use.
      *
      * Decoding alone cannot tell a block addressed to this partition from one addressed to another,
-     * because the codec has no idea which stream it is serving. Supplying that context here means a
-     * misaddressed frame is refused at the boundary instead of being handed to a caller that has to
-     * remember to question it.
+     * nor one carrying this map task's output from one carrying another's, because the codec has no
+     * idea which stream it is serving. Supplying that context here means a misaddressed frame is
+     * refused at the boundary instead of being handed to a caller that has to remember to question
+     * it.
      *
      * @param msg a framed message, that is, the type byte followed by the encoded body
      * @param expectedShuffleId the shuffle the receiving stream belongs to
+     * @param expectedMapId the map task whose output the receiving stream carries
      * @param expectedPartitionId the partition the receiving stream belongs to
-     * @return the decoded message, guaranteed to name the expected shuffle and partition
+     * @return the decoded message, guaranteed to name the expected shuffle, map and partition
      * @throws NullPointerException if msg is null
      * @throws IllegalArgumentException for any reason {@link #fromByteBuffer(ByteBuffer)} rejects a
-     *                                 frame, or if the message names a different shuffle or
+     *                                 frame, or if the message names a different shuffle, map or
      *                                 partition
      */
     public static StreamingShuffleMessage fromByteBuffer(
         ByteBuffer msg,
         int expectedShuffleId,
+        long expectedMapId,
         int expectedPartitionId) {
       StreamingShuffleMessage decoded = fromByteBuffer(msg);
-      checkStreamContext(decoded, expectedShuffleId, expectedPartitionId);
+      checkStreamContext(decoded, expectedShuffleId, expectedMapId, expectedPartitionId);
       return decoded;
     }
   }

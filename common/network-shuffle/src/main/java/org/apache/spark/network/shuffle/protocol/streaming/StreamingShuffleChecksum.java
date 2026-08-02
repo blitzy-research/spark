@@ -32,11 +32,14 @@ import org.apache.spark.annotation.Private;
  * {@link java.util.zip.CRC32C}, so this helper adds no dependency of any kind.
  *
  * Two families of entry point are offered, and the distinction matters. {@link #computeBlock(int,
- * int, long, byte[])} is the one the data-block protocol uses: it binds the payload to the shuffle,
- * partition and sequence number it was produced under, so a block whose header is rewritten in
- * flight fails verification even though its payload bytes are intact. {@link #compute(byte[])}
- * covers a byte range alone and is retained for callers that genuinely have no block identity to
- * bind -- checksumming a spill file segment, for instance.
+ * long, int, long, byte[])} is the one the data-block protocol uses: it binds the payload to the
+ * shuffle, map task, partition and sequence number it was produced under, so a block whose header
+ * is rewritten in flight fails verification even though its payload bytes are intact. The map task
+ * is part of that binding because one listener per executor serves every producer on it, which
+ * makes the map id the field that decides whose output a block is: a rewritten map id would
+ * otherwise reattribute an intact block to a different producer's stream undetected.
+ * {@link #compute(byte[])} covers a byte range alone and is retained for callers that genuinely
+ * have no block identity to bind -- checksumming a spill file segment, for instance.
  *
  * Both the expected and the computed value are reachable through this API, which is why {@link
  * #compute(byte[])} returns the raw value rather than the class exposing verification alone. A
@@ -147,10 +150,10 @@ public class StreamingShuffleChecksum {
 
   /**
    * Number of bytes in the canonical metadata preamble that {@link #computeBlock} folds into a
-   * block checksum ahead of the payload: shuffleId (4) + partitionId (4) + sequenceNumber (8) +
-   * payloadLength (4).
+   * block checksum ahead of the payload: shuffleId (4) + mapId (8) + partitionId (4) +
+   * sequenceNumber (8) + payloadLength (4).
    */
-  static final int BLOCK_METADATA_PREAMBLE_LENGTH = 4 + 4 + 8 + 4;
+  static final int BLOCK_METADATA_PREAMBLE_LENGTH = 4 + 8 + 4 + 8 + 4;
 
   /**
    * Computes the canonical checksum of a streaming shuffle data block, binding the payload to the
@@ -161,9 +164,18 @@ public class StreamingShuffleChecksum {
    * rewritten in flight -- moved to a different partition, replayed under a different sequence
    * number, or attributed to a different shuffle -- still verifies cleanly and is then consumed as
    * though it were legitimately addressed. Folding the identifying metadata into the same CRC32C
-   * closes that gap: the value now attests to the payload <em>and</em> to the four header fields
+   * closes that gap: the value now attests to the payload <em>and</em> to the four routing and
+   * position fields
    * that place it in the stream, so any header rewrite is detected by exactly the check that
-   * already runs on every block, at no additional cost.
+   * already runs on every block. The cost is a fixed one -- a 20-byte preamble to allocate, fill
+   * and fold in -- rather than a second pass over the payload, which is what an independent header
+   * checksum would have required.
+   *
+   * The map id is one of those four fields, and it has to be. A single listener per executor serves
+   * every producer running on it, so the map id is what decides which producer's stream a block
+   * belongs to; leaving it out would let an intact block be reattributed to a different map task's
+   * stream without the check noticing, which is precisely the class of error this binding exists to
+   * catch.
    *
    * The preamble is serialized in big-endian order, matching the wire encoding of the header
    * itself, so producer and consumer derive byte-identical input without a shared helper buffer.
@@ -171,6 +183,7 @@ public class StreamingShuffleChecksum {
    * without it, a differently split payload of the same total content could collide.
    *
    * @param shuffleId identifier of the shuffle the block belongs to
+   * @param mapId identifier of the map task whose output the block carries
    * @param partitionId identifier of the reduce partition the block belongs to
    * @param sequenceNumber position of the block within its partition stream
    * @param payload the block payload; must not be null
@@ -179,19 +192,21 @@ public class StreamingShuffleChecksum {
    */
   public static long computeBlock(
       int shuffleId,
+      long mapId,
       int partitionId,
       long sequenceNumber,
       byte[] payload) {
     Objects.requireNonNull(payload, "payload");
-    return computeBlock(shuffleId, partitionId, sequenceNumber, payload, 0, payload.length);
+    return computeBlock(shuffleId, mapId, partitionId, sequenceNumber, payload, 0, payload.length);
   }
 
   /**
    * Computes the canonical checksum of a streaming shuffle data block whose payload occupies a
    * slice of a larger buffer, so that the slice need not be copied out merely to be checksummed.
-   * See {@link #computeBlock(int, int, long, byte[])} for why the metadata is folded in.
+   * See {@link #computeBlock(int, long, int, long, byte[])} for why the metadata is folded in.
    *
    * @param shuffleId identifier of the shuffle the block belongs to
+   * @param mapId identifier of the map task whose output the block carries
    * @param partitionId identifier of the reduce partition the block belongs to
    * @param sequenceNumber position of the block within its partition stream
    * @param payload the array backing the block payload; must not be null
@@ -204,6 +219,7 @@ public class StreamingShuffleChecksum {
    */
   public static long computeBlock(
       int shuffleId,
+      long mapId,
       int partitionId,
       long sequenceNumber,
       byte[] payload,
@@ -218,9 +234,10 @@ public class StreamingShuffleChecksum {
     }
     byte[] preamble = new byte[BLOCK_METADATA_PREAMBLE_LENGTH];
     writeInt(preamble, 0, shuffleId);
-    writeInt(preamble, 4, partitionId);
-    writeLong(preamble, 8, sequenceNumber);
-    writeInt(preamble, 16, length);
+    writeLong(preamble, 4, mapId);
+    writeInt(preamble, 12, partitionId);
+    writeLong(preamble, 16, sequenceNumber);
+    writeInt(preamble, 24, length);
     // A fresh instance per call, for the same thread-safety reason as compute(...): the preamble
     // and the payload are folded into one accumulation so the result is a single CRC32C over the
     // concatenation, not a combination of two independent values.
@@ -236,6 +253,7 @@ public class StreamingShuffleChecksum {
    * flight fails this check even when its payload bytes are intact.
    *
    * @param shuffleId shuffleId read from the received header
+   * @param mapId mapId read from the received header
    * @param partitionId partitionId read from the received header
    * @param sequenceNumber sequenceNumber read from the received header
    * @param payload the received payload; must not be null
@@ -245,11 +263,12 @@ public class StreamingShuffleChecksum {
    */
   public static boolean verifyBlock(
       int shuffleId,
+      long mapId,
       int partitionId,
       long sequenceNumber,
       byte[] payload,
       long expectedChecksum) {
-    return computeBlock(shuffleId, partitionId, sequenceNumber, payload) == expectedChecksum;
+    return computeBlock(shuffleId, mapId, partitionId, sequenceNumber, payload) == expectedChecksum;
   }
 
   /**

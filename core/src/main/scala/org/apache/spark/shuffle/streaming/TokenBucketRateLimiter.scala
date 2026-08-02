@@ -237,6 +237,47 @@ private[spark] class TokenBucketRateLimiter(
   }
 
   /**
+   * How long until this bucket holds `bytes` tokens, in milliseconds, or zero if it already does.
+   *
+   * A caller that has been refused needs to know when to come back, and computing that here is the
+   * difference between resuming as soon as pacing permits and resuming whenever some unrelated
+   * event happens to provoke another attempt. The figure is derived from the shortfall and the
+   * refill rate, so it is exactly the wait the bucket's own arithmetic implies rather than a
+   * guessed interval, and it is rounded up so that the caller never wakes a fraction of a
+   * millisecond early and is refused a second time for it.
+   *
+   * A request larger than the bucket can ever hold reports [[Long.MaxValue]]: no amount of waiting
+   * would satisfy it, and reporting a finite wait would invite an endless retry. An unlimited
+   * limiter reports zero, because nothing is ever withheld.
+   *
+   * This is an observer: like [[availableTokens]] it computes the refill a [[tryAcquire]] would
+   * see and publishes nothing, so polling it can never perturb pacing.
+   *
+   * @param bytes the number of tokens the caller wants; must be non-negative
+   */
+  def millisUntilAvailable(bytes: Long): Long = {
+    require(bytes >= 0L,
+      s"The streaming shuffle token request must be non-negative but was $bytes.")
+    if (unlimited || bytes == 0L) {
+      0L
+    } else {
+      val observed = refill(state.get(), clock.getTimeMillis())
+      if (bytes > observed.capacityBytes) {
+        Long.MaxValue
+      } else {
+        val shortfall = bytes - observed.tokens
+        if (shortfall <= 0L) {
+          0L
+        } else {
+          val rate = observed.refillBytesPerSecond
+          math.max(1L,
+            (shortfall * TokenBucketRateLimiter.MILLIS_PER_SECOND + rate - 1L) / rate)
+        }
+      }
+    }
+  }
+
+  /**
    * Whether this limiter admits everything at no cost. The fallback policy and the backpressure
    * protocol use it to skip pacing bookkeeping entirely when egress is uncapped.
    */

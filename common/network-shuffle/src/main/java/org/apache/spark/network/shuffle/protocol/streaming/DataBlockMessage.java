@@ -44,7 +44,7 @@ import org.apache.spark.network.protocol.Encoders;
  * <pre>
  *   +--------+-----------+--------------+---------------+------------------+
  *   | type   | header    | checksum     | payload len   | payload          |
- *   | 1 byte | 17 bytes  | long, 8      | int, 4        | payload.length   |
+ *   | 1 byte | 25 bytes  | long, 8      | int, 4        | payload.length   |
  *   +--------+-----------+--------------+---------------+------------------+
  *      framing            the body encoded by encode(ByteBuf)
  * </pre>
@@ -78,7 +78,7 @@ import org.apache.spark.network.protocol.Encoders;
  * empty payload is also legal, which lets a zero-record partition be streamed and checksummed on
  * the same code path as any other.
  *
- * <b>Header domains.</b> The inherited {@code shuffleId}, {@code partitionId} and
+ * <b>Header domains.</b> The inherited {@code shuffleId}, {@code mapId}, {@code partitionId} and
  * {@code sequenceNumber} are all required to be non-negative, and {@link StreamingShuffleMessage}
  * enforces that centrally on construction and on decode, so a block can no more carry an impossible
  * routing identity or stream position than it can carry an over-size payload.
@@ -99,7 +99,8 @@ import org.apache.spark.network.protocol.Encoders;
  *
  * <b>Checksum scope.</b> The CRC32C covers the payload <em>and</em> the header fields that place it
  * in the stream -- shuffle id, partition id, sequence number and payload length -- computed by
- * {@link StreamingShuffleChecksum#computeBlock(int, int, long, byte[])}. Covering the payload alone
+ * {@link StreamingShuffleChecksum#computeBlock(int, long, int, long, byte[])}. Covering the payload
+ * alone
  * would attest only that some bytes arrived intact and would say nothing about where they belong,
  * so a block whose header was rewritten in flight would verify cleanly and then be consumed as
  * though it were legitimately addressed. Binding the metadata in closes that gap at no extra cost,
@@ -155,9 +156,10 @@ public final class DataBlockMessage extends StreamingShuffleMessage {
   /**
    * Bytes a data block occupies on the wire over and above its payload.
    *
-   * Thirty bytes: the one-byte framing prefix, the seventeen-byte header, the eight-byte CRC32C and
-   * the four-byte payload length prefix. This constant exists because payload bytes and framed
-   * bytes are two different resources and confusing them is a real defect: a producer that budgets
+   * Thirty-eight bytes: the one-byte framing prefix, the twenty-five-byte header, the eight-byte
+   * CRC32C and the four-byte payload length prefix. This constant exists because payload bytes and
+   * framed bytes are two different resources and confusing them is a real defect: a producer that
+   * budgets
    * {@link #MAX_BLOCK_SIZE_BYTES} for a block it then puts on the network as
    * {@link #MAX_ENCODED_FRAME_BYTES} bytes has under-accounted for every block it sends. Every
    * layer that has to reason about framed bytes -- the buffer accounting of the memory spill
@@ -186,6 +188,29 @@ public final class DataBlockMessage extends StreamingShuffleMessage {
   private final byte[] payload;
 
   /**
+   * Whether this block has already been shown to match the checksum it arrived with.
+   *
+   * A received block is verified on the channel thread, so that a corrupt one can be replaced by a
+   * replay before a task ever sees it, and the same block is verified again where its records are
+   * turned into values. Recomputing the checksum there covers the same immutable bytes and the same
+   * immutable header, so it can only ever reach the same answer -- at the cost of a second pass
+   * over every payload byte of the whole shuffle. A successful verification is therefore remembered
+   * here and the second pass is skipped.
+   *
+   * Only success is remembered: a block that fails verification is never marked, so the repair path
+   * that asks for a replay behaves exactly as it did. The field is deliberately not volatile,
+   * because publication between the two threads happens through the receive queue, which already
+   * establishes the ordering; a reader that somehow saw the stale value would recompute the
+   * checksum and reach the same answer, so the worst case is the cost this exists to avoid rather
+   * than a wrong result.
+   *
+   * The one precondition is that the payload array is not mutated in place behind the block's back
+   * after a successful verification. Every route into this class either copies the array it is
+   * given or adopts an array allocated for the block and never touched again.
+   */
+  private transient boolean checksumVerified;
+
+  /**
    * The one constructor that assigns the payload field, and therefore the single place where
    * ownership of the array is decided.
    *
@@ -197,6 +222,7 @@ public final class DataBlockMessage extends StreamingShuffleMessage {
    *
    * @param protocolVersion the wire revision this message was encoded with
    * @param shuffleId identifier of the shuffle this block belongs to
+   * @param mapId identifier of the map task whose output this block carries
    * @param partitionId identifier of the reduce partition this block belongs to
    * @param sequenceNumber position of this block within its partition's stream
    * @param checksum the CRC32C value covering this block
@@ -206,12 +232,13 @@ public final class DataBlockMessage extends StreamingShuffleMessage {
   private DataBlockMessage(
       byte protocolVersion,
       int shuffleId,
+      long mapId,
       int partitionId,
       long sequenceNumber,
       long checksum,
       byte[] payload,
       boolean ownsPayload) {
-    super(protocolVersion, shuffleId, partitionId, sequenceNumber);
+    super(protocolVersion, shuffleId, mapId, partitionId, sequenceNumber);
     this.checksum = checksum;
     // Validated here, in the one constructor every other route funnels through, so that neither a
     // producer nor the decoder can construct an over-size block.
@@ -225,6 +252,7 @@ public final class DataBlockMessage extends StreamingShuffleMessage {
    *
    * @param protocolVersion the wire revision this message was encoded with
    * @param shuffleId identifier of the shuffle this block belongs to
+   * @param mapId identifier of the map task whose output this block carries
    * @param partitionId identifier of the reduce partition this block belongs to
    * @param sequenceNumber position of this block within its partition's stream, counted from zero
    * @param checksum the CRC32C value covering this block
@@ -237,11 +265,12 @@ public final class DataBlockMessage extends StreamingShuffleMessage {
   public DataBlockMessage(
       byte protocolVersion,
       int shuffleId,
+      long mapId,
       int partitionId,
       long sequenceNumber,
       long checksum,
       byte[] payload) {
-    this(protocolVersion, shuffleId, partitionId, sequenceNumber, checksum, payload, false);
+    this(protocolVersion, shuffleId, mapId, partitionId, sequenceNumber, checksum, payload, false);
   }
 
   /**
@@ -249,6 +278,7 @@ public final class DataBlockMessage extends StreamingShuffleMessage {
    * producer uses when it already holds a checksum for the payload.
    *
    * @param shuffleId identifier of the shuffle this block belongs to
+   * @param mapId identifier of the map task whose output this block carries
    * @param partitionId identifier of the reduce partition this block belongs to
    * @param sequenceNumber position of this block within its partition's stream, counted from zero
    * @param checksum the CRC32C value covering this block
@@ -260,17 +290,18 @@ public final class DataBlockMessage extends StreamingShuffleMessage {
    */
   public DataBlockMessage(
       int shuffleId,
+      long mapId,
       int partitionId,
       long sequenceNumber,
       long checksum,
       byte[] payload) {
-    this(CURRENT_PROTOCOL_VERSION, shuffleId, partitionId, sequenceNumber, checksum, payload,
+    this(CURRENT_PROTOCOL_VERSION, shuffleId, mapId, partitionId, sequenceNumber, checksum, payload,
       false);
   }
 
   /**
    * Creates a data block from a header just read off the wire. Passing the header as a single value
-   * rather than as four positional arguments removes any chance of transposing {@code shuffleId}
+   * rather than as five positional arguments removes any chance of transposing {@code shuffleId}
    * and {@code partitionId} on the way in.
    *
    * @param header the decoded header; must not be null
@@ -285,7 +316,7 @@ public final class DataBlockMessage extends StreamingShuffleMessage {
     // The base constructor rejects a null header, so the cap check below is the only guard this
     // constructor has to add of its own.
     this(Objects.requireNonNull(header, "header").protocolVersion(), header.shuffleId(),
-      header.partitionId(), header.sequenceNumber(), checksum, payload, false);
+      header.mapId(), header.partitionId(), header.sequenceNumber(), checksum, payload, false);
   }
 
   /**
@@ -308,6 +339,7 @@ public final class DataBlockMessage extends StreamingShuffleMessage {
    *
    * @param protocolVersion the wire revision this message was encoded with
    * @param shuffleId identifier of the shuffle this block belongs to
+   * @param mapId identifier of the map task whose output this block carries
    * @param partitionId identifier of the reduce partition this block belongs to
    * @param sequenceNumber position of this block within its partition's stream, counted from zero
    * @param checksum the CRC32C value covering this block
@@ -321,20 +353,22 @@ public final class DataBlockMessage extends StreamingShuffleMessage {
   public static DataBlockMessage withOwnedPayload(
       byte protocolVersion,
       int shuffleId,
+      long mapId,
       int partitionId,
       long sequenceNumber,
       long checksum,
       byte[] payload) {
-    return new DataBlockMessage(protocolVersion, shuffleId, partitionId, sequenceNumber, checksum,
-      payload, true);
+    return new DataBlockMessage(protocolVersion, shuffleId, mapId, partitionId, sequenceNumber,
+      checksum, payload, true);
   }
 
   /**
    * Creates a data block and computes its checksum, for the common producer-side case where the
    * value is not already in hand.
    *
-   * The computation is routed through {@link StreamingShuffleChecksum#computeBlock(int, int, long,
-   * byte[])} rather than performed here, so that producer and consumer are provably running the
+   * The computation is routed through {@link StreamingShuffleChecksum#computeBlock(int, long, int,
+   * long, byte[])} rather than performed here, so that producer and consumer are provably running
+   * the
    * same arithmetic over the same bytes, and so that the value binds the payload to the identity
    * this block is being sent under rather than covering the payload in isolation.
    *
@@ -344,6 +378,7 @@ public final class DataBlockMessage extends StreamingShuffleMessage {
    * correct however the caller goes on to use its own array.
    *
    * @param shuffleId identifier of the shuffle this block belongs to
+   * @param mapId identifier of the map task whose output this block carries
    * @param partitionId identifier of the reduce partition this block belongs to
    * @param sequenceNumber position of this block within its partition's stream, counted from zero
    * @param payload the block's bytes; must not be null and must not exceed
@@ -354,14 +389,16 @@ public final class DataBlockMessage extends StreamingShuffleMessage {
    */
   public static DataBlockMessage withComputedChecksum(
       int shuffleId,
+      long mapId,
       int partitionId,
       long sequenceNumber,
       byte[] payload) {
     // Checked before the payload is read, so an over-size block is rejected without first paying
     // for a checksum over bytes that are about to be discarded.
     checkPayload(payload);
-    return new DataBlockMessage(CURRENT_PROTOCOL_VERSION, shuffleId, partitionId, sequenceNumber,
-      StreamingShuffleChecksum.computeBlock(shuffleId, partitionId, sequenceNumber, payload),
+    return new DataBlockMessage(CURRENT_PROTOCOL_VERSION, shuffleId, mapId, partitionId,
+      sequenceNumber,
+      StreamingShuffleChecksum.computeBlock(shuffleId, mapId, partitionId, sequenceNumber, payload),
       payload, false);
   }
 
@@ -424,23 +461,31 @@ public final class DataBlockMessage extends StreamingShuffleMessage {
    * Recomputes this block's checksum and compares it with the value the producer sent, which is the
    * check a consumer runs before making the block's records visible.
    *
-   * The recomputation covers the payload together with the shuffle id, partition id and sequence
-   * number carried in <em>this</em> block's header, so the check answers two questions at once:
+   * The recomputation covers the payload together with the shuffle id, map id, partition id and
+   * sequence number carried in <em>this</em> block's header, so the check answers two questions at
+   * once:
    * were the payload bytes delivered intact, and is this block addressed where its producer
    * addressed it. A block whose header was rewritten in flight fails here even though every payload
    * byte survived, which a payload-only checksum could not detect.
    *
    * When this returns false the caller needs both numbers for its diagnostic: the expected value is
    * {@link #checksum()} and the recomputed one is {@code
-   * StreamingShuffleChecksum.computeBlock(shuffleId(), partitionId(), sequenceNumber(),
+   * StreamingShuffleChecksum.computeBlock(shuffleId(), mapId(), partitionId(), sequenceNumber(),
    * copyPayload())}.
    *
    * @return true if the block matches the checksum it arrived with, false if it is corrupt or
    *         misaddressed
    */
   public boolean verifyChecksum() {
-    return StreamingShuffleChecksum.verifyBlock(
-      shuffleId(), partitionId(), sequenceNumber(), payload, checksum);
+    if (checksumVerified) {
+      return true;
+    }
+    boolean intact = StreamingShuffleChecksum.verifyBlock(
+      shuffleId(), mapId(), partitionId(), sequenceNumber(), payload, checksum);
+    if (intact) {
+      checksumVerified = true;
+    }
+    return intact;
   }
 
   @Override
@@ -530,8 +575,8 @@ public final class DataBlockMessage extends StreamingShuffleMessage {
     // The array was allocated by the decoder a line ago and is reachable from nowhere else, so
     // handing ownership to the block is safe and saves copying up to two mebibytes per block on the
     // receive path.
-    return withOwnedPayload(header.protocolVersion(), header.shuffleId(), header.partitionId(),
-      header.sequenceNumber(), checksum, payload);
+    return withOwnedPayload(header.protocolVersion(), header.shuffleId(), header.mapId(),
+      header.partitionId(), header.sequenceNumber(), checksum, payload);
   }
 
   /**

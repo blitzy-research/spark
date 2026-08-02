@@ -34,7 +34,6 @@ private[spark] object StaticSources {
   // conf/metrics.properties.template) and over any other sink they have already configured. What
   // this append does guarantee is that the streaming shuffle needs no metrics agent or sink of its
   // own. The source is referenced fully qualified rather than imported.
-  // Streaming shuffle coexists with sort-based shuffle; sort remains the default.
   val allSources =
     Seq(
       CodegenMetrics,

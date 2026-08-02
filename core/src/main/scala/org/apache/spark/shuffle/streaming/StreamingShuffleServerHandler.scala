@@ -19,22 +19,25 @@ package org.apache.spark.shuffle.streaming
 
 import java.nio.ByteBuffer
 import java.util.Comparator
-import java.util.concurrent.{ConcurrentHashMap, ConcurrentSkipListMap, PriorityBlockingQueue}
+import java.util.concurrent.{ConcurrentHashMap, ConcurrentSkipListMap, PriorityBlockingQueue, TimeUnit}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong, AtomicReference}
 
 import scala.collection.mutable.ArrayBuffer
 import scala.jdk.CollectionConverters._
 import scala.util.control.NonFatal
 
-import io.netty.buffer.{ByteBuf, Unpooled}
-import io.netty.channel.{ChannelFuture, ChannelFutureListener, ChannelHandlerContext, ChannelInboundHandlerAdapter}
-import io.netty.util.ReferenceCountUtil
+import io.netty.channel.{Channel, ChannelFuture, ChannelFutureListener}
 
-import org.apache.spark.{SparkConf, SparkException}
+import org.apache.spark.{SecurityManager, SparkConf, SparkEnv, SparkException}
 import org.apache.spark.internal.Logging
-import org.apache.spark.internal.LogKeys.{CONFIG, COUNT, DURATION, ERROR, HOST_PORT, MAX_ATTEMPTS, NUM_BLOCKS, NUM_BYTES, PARTITION_ID, REASON, SHUFFLE_ID, STATUS, TIMEOUT, VALUE}
+import org.apache.spark.internal.LogKeys.{CONFIG, COUNT, DURATION, ERROR, HOST_PORT, MAX_ATTEMPTS, MAX_SIZE, NUM_BLOCKS, NUM_BYTES, PARTITION_ID, REASON, SESSION_ID, SHUFFLE_ID, STATUS, TIMEOUT, VALUE}
 import org.apache.spark.internal.config.SHUFFLE_STREAMING_DEBUG
+import org.apache.spark.network.buffer.NioManagedBuffer
+import org.apache.spark.network.client.{RpcResponseCallback, TransportClient, TransportClientBootstrap}
+import org.apache.spark.network.crypto.{AuthClientBootstrap, AuthServerBootstrap}
 import org.apache.spark.network.netty.SparkTransportConf
+import org.apache.spark.network.protocol.OneWayMessage
+import org.apache.spark.network.server.{OneForOneStreamManager, RpcHandler, StreamManager, TransportServerBootstrap}
 import org.apache.spark.network.shuffle.protocol.streaming.{AckMessage, DataBlockMessage, HeartbeatMessage, RetransmitRequestMessage, StreamingShuffleMessage, StreamingShuffleMessageType, StreamTerminationMessage}
 import org.apache.spark.network.util.TransportConf
 import org.apache.spark.util.{Clock, SystemClock}
@@ -42,11 +45,11 @@ import org.apache.spark.util.{Clock, SystemClock}
 /**
  * The producer side channel handler of the streaming shuffle.
  *
- * This handler owns egress for one shuffle on one channel: it takes the blocks a
- * `StreamingShuffleWriter` has framed, orders them, charges them against the executor's egress
- * budget and puts them on the wire; and it consumes the control traffic the reduce side sends back
- * -- acknowledgements, heartbeats and retransmission requests -- turning acknowledgements into
- * reclaimed producer memory.
+ * This handler owns egress for one map output: it takes the blocks a `StreamingShuffleWriter` has
+ * admitted to the retained store, orders them, charges them against the executor's egress budget
+ * and puts them on the wire for every consumer that has subscribed; and it consumes the control
+ * traffic the reduce side sends back -- acknowledgements, heartbeats and retransmission requests --
+ * turning acknowledgements into reclaimed producer memory.
  *
  * Together with `StreamingShuffleClientHandler` it is the only place in Spark where channel level
  * flow control idioms live. That containment is deliberate: neither this file nor its consumer side
@@ -101,12 +104,48 @@ import org.apache.spark.util.{Clock, SystemClock}
  * .streaming` is deliberately free of any Spark core coupling -- it reads no configuration, emits
  * no log line and reads no clock -- so this package owns all four of those concerns.
  *
- * This handler is NOT annotated `Sharable`, and must not be: it holds per channel state, so Netty's
- * own check that a non-sharable handler is added to at most one pipeline is exactly the protection
- * required.
+ * =One handler, many consumers=
+ *
+ * A map output is read by every reduce task that wants one of its partitions, and each of those
+ * consumers opens its own connection. This handler therefore serves many channels at once, and it
+ * keeps one [[StreamingShuffleServerHandler.ConsumerSession]] per channel: an authenticated
+ * identity, the set of partitions that consumer has asked for, its own egress queue, and its own
+ * acknowledgement cursors. Nothing is ever written to a channel that did not ask for the partition
+ * in question, and a block is retained until *every* subscribed consumer has acknowledged it, which
+ * is what the retained store's minimum-across-consumers retirement rule enforces.
+ *
+ * Subscription needs no message type of its own. A consumer announces the partition it wants with
+ * the same heartbeat that proves it is alive, and that heartbeat carries the position it has
+ * reached -- so the first heartbeat of a fresh consumer subscribes it at the beginning of the
+ * stream, and the first heartbeat of a reconnecting one subscribes it exactly where it left off.
+ * Resumption is therefore the ordinary case of subscription rather than a separate protocol.
+ *
+ * =Where the bytes live=
+ *
+ * This handler owns no payload. Every block it sends is read, at the moment it is framed, from the
+ * [[MemorySpillManager]] that already charged those bytes against the executor's buffer budget and
+ * that will spill them to disk under pressure -- reached through the executor-scoped
+ * [[StreamingShuffleBlockResolver]], which also refuses to hand over the store of a superseded
+ * generation. Holding a second copy here would double the memory a bounded budget is supposed to
+ * bound, and would make a replay servable from memory but not from spill. Because the lookup goes
+ * through the retained store, a retransmission is answered identically whether the block is still
+ * in memory or has been evicted.
+ *
+ * This handler is a `RpcHandler` rather than a Netty channel handler, which is what lets it be
+ * installed by `TransportContext` and therefore inherit the transport's authentication, its
+ * optional SSL and its keep-alive without a single edit to any shared transport class. Every
+ * streaming frame travels as the body of a one-way RPC.
  *
  * @param conf the executor's configuration, read exactly once during construction
  * @param shuffleId the shuffle whose partitions this handler streams
+ * @param mapId the map output whose partitions this handler streams
+ * @param taskAttemptId the producing generation, which is what keeps a superseded attempt's
+ *                      accounting separate from that of the attempt which replaced it
+ * @param blockResolver the executor-scoped registry through which this handler reaches the retained
+ *                      output of the map task it serves. Retained output outlives the producing
+ *                      task, so the store is found through the resolver rather than held directly,
+ *                      and the resolver's generation check is what stops a superseded attempt from
+ *                      serving the bytes of the attempt that replaced it
  * @param backpressure the protocol that owns the credit ledger, the acknowledgement and heartbeat
  *                     timeouts, cross shuffle utilisation aggregation and the backpressure event
  *                     counter. This handler reports to it and consumes its pacing decisions; it
@@ -119,14 +158,42 @@ import org.apache.spark.util.{Clock, SystemClock}
  */
 private[spark] class StreamingShuffleServerHandler(
     conf: SparkConf,
-    shuffleId: Int,
+    val shuffleId: Int,
+    val mapId: Long,
+    val taskAttemptId: Long,
+    blockResolver: StreamingShuffleBlockResolver,
     backpressure: BackpressureProtocol,
     rateLimiter: TokenBucketRateLimiter,
     errorNotifier: StreamingShuffleErrorNotifier,
     clock: Clock = new SystemClock)
-  extends ChannelInboundHandlerAdapter with Logging {
+  extends RpcHandler with Logging {
 
   import StreamingShuffleServerHandler._
+
+  require(mapId >= 0L, s"The map id must be non-negative but was $mapId.")
+  require(taskAttemptId >= 0L,
+    s"The producing task attempt id must be non-negative but was $taskAttemptId.")
+
+  /**
+   * The ledger identity of one partition of this map output, as seen from the sending end.
+   *
+   * The producer generation is part of the identity because two attempts of one map task -- a
+   * speculative copy, or a retry after a failure -- produce the same shuffle and the same
+   * partitions and are nevertheless two separate flows with two separate windows of unacknowledged
+   * bytes. The role distinguishes this sending ledger from the receiving ledger of a consumer that
+   * happens to be running in the same JVM, which is always the case under `local[*]`.
+   *
+   * The consumer is deliberately '''not''' part of the identity, even though this handler may serve
+   * several. What this ledger measures is one producer's partition flow -- the credit, pacing and
+   * reclamation window the rate limiter and the spill decision are driven by -- which is a
+   * property of the sending side and is the same however many consumers are attached. What is
+   * genuinely per consumer is the release of retained bytes, and that is keyed per consumer by the
+   * retained store, which retires only to the minimum position across every consumer registered for
+   * a partition. Splitting the ledger per consumer would duplicate the pacing state without making
+   * any release safer, since no ledger releases anything.
+   */
+  private def producerKey(partitionId: Int): BackpressureStreamKey =
+    BackpressureStreamKey.forProducer(shuffleId, mapId, taskAttemptId, partitionId)
 
   /**
    * The value of spark.shuffle.streaming.debug, read once and held immutably.
@@ -159,31 +226,47 @@ private[spark] class StreamingShuffleServerHandler(
   private val streams = new ConcurrentHashMap[Int, PartitionStream]()
 
   /**
-   * Blocks framed and waiting for the wire, ordered across partitions by [[EgressOrdering]].
+   * One session per consumer channel, keyed by the channel's own identity.
    *
-   * This queue is the whole of the "quality of service prioritisation" the streaming shuffle
-   * offers, and it is worth being exact about what that means: nothing in Spark marks packets at
-   * the operating system or network level, and this handler does not attempt to. Prioritisation
-   * here is flush ordering, and nothing more.
-   *
-   * `poll` and `offer` on a `PriorityBlockingQueue` never block, which is what makes it usable from
-   * an event-loop thread. Its internal lock is never held across a channel write, because the drain
-   * loop removes an entry first and writes afterwards.
+   * Keying by channel rather than by consumer identity is what makes a reconnection safe: the new
+   * channel is a new session, and the old one is torn down independently by its own inactivity
+   * callback, so a late teardown of the lost connection can never dispossess the live one. The
+   * consumer identity is carried inside the session and is what the retained store's per-consumer
+   * cursors are keyed by, so a reconnecting consumer resumes against its own acknowledged position
+   * rather than starting again.
    */
-  private val egressQueue =
-    new PriorityBlockingQueue[PendingBlock](INITIAL_EGRESS_QUEUE_CAPACITY, EgressOrdering)
+  private val sessions = new ConcurrentHashMap[String, ConsumerSession]()
 
   /** Monotonic enqueue ticket, which makes the ordering stable for equally urgent blocks. */
   private val egressTicket = new AtomicLong(0L)
 
-  /** Guards the drain loop, so exactly one thread writes to the channel at a time. */
-  private val draining = new AtomicBoolean(false)
+  /**
+   * One-shot close transition, so teardown happens exactly once however many threads reach it.
+   *
+   * The producing task's completion listener, an unsuccessful stop and a channel failure can all
+   * arrive concurrently, and every one of them wants everything released. Latching the transition
+   * here means the release path runs once, and everything that could schedule further work consults
+   * this flag first, so nothing is queued after the queues have been emptied.
+   */
+  private val closed = new AtomicBoolean(false)
 
-  /** Set when a drain is requested while another thread holds the guard, to avoid a lost wakeup. */
-  private val drainWakeup = new AtomicBoolean(false)
-
-  /** The active channel context, or null before activation and after loss. */
-  private val channelContext = new AtomicReference[ChannelHandlerContext](null)
+  /**
+   * The retained output of the map task this handler serves, or `None` when it is not servable.
+   *
+   * Resolved on every use rather than captured once, because the store is registered by the
+   * producing task and is deliberately outlived by nothing: after the shuffle is unregistered, or
+   * once a newer attempt has taken the registration over, this returns `None` and the handler stops
+   * being able to send -- which is exactly the intended behaviour, since the bytes it would send no
+   * longer belong to it. The generation check is what distinguishes the two cases from a
+   * registration that simply has not happened yet.
+   */
+  private def retainedOutput: Option[MemorySpillManager] = {
+    if (blockResolver.registeredGeneration(shuffleId, mapId).contains(taskAttemptId)) {
+      blockResolver.producerFor(shuffleId, mapId)
+    } else {
+      None
+    }
+  }
 
   /**
    * The producing task's attributes, which decide flush order between blocks that are otherwise
@@ -202,6 +285,17 @@ private[spark] class StreamingShuffleServerHandler(
   private val misaddressedMessages = new AtomicLong(0L)
   private val misaddressReported = new AtomicBoolean(false)
   private val versionMismatch = new AtomicBoolean(false)
+  private val unservableBlocks = new AtomicLong(0L)
+  private val refusedAcks = new AtomicLong(0L)
+  private val resumedSessions = new AtomicLong(0L)
+
+  // Partitions whose end of stream has been requested. Read on the egress hot path to decide
+  // whether the deferral scan below has anything to look for: that scan visits every stream this
+  // handler owns, so running it after each drain pass while the task is still producing would make
+  // the cost of writing one block a function of the shuffle's partition count. Terminations are
+  // requested only as a map task finishes, so the counter is zero for the whole of the write and
+  // the scan costs nothing until it can do something.
+  private val terminationRequests = new AtomicInteger(0)
 
   /**
    * Reports an asynchronous write failure to the notifier.
@@ -261,88 +355,55 @@ private[spark] class StreamingShuffleServerHandler(
   // ==========================================================================================
 
   /**
-   * Splits a payload into protocol sized blocks and enqueues each of them for one partition.
-   *
-   * This is the entry point the writer should reach for, because it is the only one that guarantees
-   * the two mebibyte block cap without the caller having to restate it. A payload larger than the
-   * cap becomes several consecutively numbered blocks; a payload at or below it becomes one. An
-   * empty payload produces no block at all, which is the honest representation of a partition that
-   * received no records: end of stream is then signalled by [[terminateStream]] alone.
-   *
-   * Keeping every block at or under the cap is what lets the reduce side start consuming before
-   * the producer has finished, which is the whole point of the streaming path -- a single enormous
-   * frame would reintroduce exactly the materialisation barrier this shuffle exists to remove.
-   *
-   * @param partitionId the reduce partition the bytes belong to
-   * @param payload the bytes to stream; the array is not retained, so the caller may reuse it
-   * @return the sequence numbers assigned to the blocks, in the order they will be written
-   */
-  def enqueuePayload(partitionId: Int, payload: Array[Byte]): Seq[Long] = {
-    enqueuePayload(partitionId, payload, attempt.get())
-  }
-
-  /**
-   * Splits a payload into protocol sized blocks and enqueues them under an explicit priority.
-   *
-   * @param partitionId the reduce partition the bytes belong to
-   * @param payload the bytes to stream; the array is not retained, so the caller may reuse it
-   * @param priority the attributes of the attempt that produced these bytes
-   * @return the sequence numbers assigned to the blocks, in the order they will be written
-   */
-  def enqueuePayload(
-      partitionId: Int,
-      payload: Array[Byte],
-      priority: EgressPriority): Seq[Long] = {
-    require(payload != null, "The streaming shuffle payload must not be null.")
-    val assigned = new ArrayBuffer[Long](
-      math.max(1, payload.length / MAX_PAYLOAD_BYTES + 1))
-    var offset = 0
-    while (offset < payload.length) {
-      val length = math.min(MAX_PAYLOAD_BYTES, payload.length - offset)
-      val block = new Array[Byte](length)
-      System.arraycopy(payload, offset, block, 0, length)
-      assigned += enqueueBlock(partitionId, block, priority)
-      offset += length
-    }
-    assigned.toSeq
-  }
-
-  /**
-   * Enqueues one block for one partition, checksummed and ready for the wire.
+   * Enqueues one block for one partition, referenced by its payload size.
    *
    * @param partitionId the reduce partition the block belongs to
-   * @param payload the block's bytes, at most [[MAX_PAYLOAD_BYTES]] of them
+   * @param payloadBytes the block's payload size, at most [[MAX_PAYLOAD_BYTES]]
    * @return the sequence number assigned to the block
    */
-  def enqueueBlock(partitionId: Int, payload: Array[Byte]): Long = {
-    enqueueBlock(partitionId, payload, attempt.get())
+  def enqueueBlock(partitionId: Int, payloadBytes: Int): Long = {
+    enqueueBlock(partitionId, payloadBytes, attempt.get())
   }
 
   /**
    * Enqueues one block for one partition under an explicit priority.
    *
-   * The CRC32C is computed by `DataBlockMessage.withComputedChecksum`, which routes the arithmetic
-   * through `StreamingShuffleChecksum` so that producer and consumer are provably running the same
-   * computation over the same bytes, and so that the value binds the payload to the shuffle,
-   * partition and sequence number it is being sent under rather than covering the bytes in
-   * isolation. No checksum arithmetic is reimplemented on this side of the boundary.
+   * The block's bytes are not passed to this call at all, and that is the point. By the time the
+   * writer reaches here it has already admitted these exact bytes to the retained store under this
+   * exact sequence number, so the store is where they live and this call needs nothing but their
+   * size in order to pace them. Accepting an array would invite a second copy of every block in
+   * flight, which would double the memory the buffer budget is supposed to bound and would make a
+   * block replayable while it sat in memory but not once it had been evicted. The bytes are read
+   * back, and the CRC32C computed over them, at the moment the block is framed for a particular
+   * consumer -- by `DataBlockMessage.withComputedChecksum`, which routes the arithmetic through
+   * `StreamingShuffleChecksum` so that producer and consumer are provably running the same
+   * computation, and which binds the value to the shuffle, partition and sequence number rather
+   * than covering the bytes in isolation.
    *
    * The block is charged against the executor's egress budget only when it is written, never here:
    * enqueueing is free, so a writer is never refused the chance to hand over bytes it has already
    * produced. Pacing decides when those bytes leave, not whether they may be offered.
    *
+   * A block is fanned out to every session that has subscribed to its partition, and to no other.
+   * A partition with no subscriber yet queues nothing at all: the bytes are retained by the store
+   * regardless, and a consumer that subscribes later is served from its own acknowledged position,
+   * so nothing is lost by not having speculated about who would ask.
+   *
    * @param partitionId the reduce partition the block belongs to
-   * @param payload the block's bytes, at most [[MAX_PAYLOAD_BYTES]] of them
+   * @param payloadBytes the block's payload size, at most [[MAX_PAYLOAD_BYTES]]
    * @param priority the attributes of the attempt that produced the block
    * @return the sequence number assigned to the block
-   * @throws IllegalArgumentException if the payload is null or larger than the block cap
-   * @throws IllegalStateException if the partition's stream has already been terminated
+   * @throws IllegalArgumentException if the size is negative or larger than the block cap
+   * @throws IllegalStateException if the partition's stream has already been terminated, or if the
+   *                               retained store does not hold the block under the assigned
+   *                               sequence number
    */
-  def enqueueBlock(partitionId: Int, payload: Array[Byte], priority: EgressPriority): Long = {
-    require(payload != null, "The streaming shuffle block payload must not be null.")
-    require(payload.length <= MAX_PAYLOAD_BYTES,
-      s"A streaming shuffle block carries ${payload.length} byte(s), which exceeds the protocol " +
-        s"cap of $MAX_PAYLOAD_BYTES byte(s). Frame the payload with enqueuePayload instead.")
+  def enqueueBlock(partitionId: Int, payloadBytes: Int, priority: EgressPriority): Long = {
+    require(payloadBytes >= 0,
+      s"A streaming shuffle block payload size must not be negative, but was $payloadBytes.")
+    require(payloadBytes <= MAX_PAYLOAD_BYTES,
+      s"A streaming shuffle block carries $payloadBytes byte(s), which exceeds the protocol cap " +
+        s"of $MAX_PAYLOAD_BYTES byte(s). Frame the payload into smaller blocks before offering it.")
     require(priority != null, "The streaming shuffle egress priority must not be null.")
     val stream = streamFor(partitionId)
     if (stream.terminationRequested.get()) {
@@ -350,29 +411,76 @@ private[spark] class StreamingShuffleServerHandler(
         "already been terminated, so no further block may be enqueued for it.")
     }
     val sequenceNumber = stream.nextSequenceNumber.getAndIncrement()
-    val block = DataBlockMessage.withComputedChecksum(
-      shuffleId, partitionId, sequenceNumber, payload)
-    val framedBytes = StreamingShuffleMessage.framedLength(block.encodedLength())
+    // Asserted, not assumed. The writer admits a block to the retained store before offering it
+    // here, so an absence at this point means the two have disagreed about identity or ordering --
+    // the signature of a handler shared between two producers of the same map output -- and sending
+    // bytes read under a sequence number nobody admitted would corrupt the consumer's stream.
+    val store = retainedOutput.getOrElse {
+      throw new IllegalStateException(s"Streaming shuffle $shuffleId map $mapId has no retained " +
+        s"output registered for generation $taskAttemptId, so partition $partitionId block " +
+        s"$sequenceNumber cannot be streamed.")
+    }
+    if (!store.retainsBlock(partitionId, sequenceNumber)) {
+      throw new IllegalStateException(s"Streaming shuffle $shuffleId partition $partitionId " +
+        s"block $sequenceNumber was offered for egress but the retained store does not hold it.")
+    }
+    val framedBytes = framedLengthOf(payloadBytes)
     stream.blocksEnqueued.incrementAndGet()
-    stream.pendingBlocks.incrementAndGet()
-    stream.pendingBytes.addAndGet(framedBytes.toLong)
-    egressQueue.offer(
-      PendingBlock(block, priority, egressTicket.getAndIncrement(), framedBytes))
-    // Queued volume is accounted locally only, in the three counters above. The protocol's ledger
-    // records a block when it is admitted for egress, not when it is queued, so a queued block has
-    // no ledger slot yet; `pendingBytes` is what `pendingBytes(partitionId)` reports to the writer.
+    stream.highestOffered.set(sequenceNumber)
+    // Queued volume is accounted per session, and aggregated for the writer by summing over them.
+    // The protocol's ledger records a block when it is admitted for egress, not when it is queued.
+    val subscribed = fanOut(partitionId, sequenceNumber, framedBytes, priority, replay = false)
     if (debugEnabled) {
       logInfo(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} partition " +
         log"${MDC(PARTITION_ID, partitionId)} enqueued block ${MDC(COUNT, sequenceNumber)} of " +
-        log"${MDC(NUM_BYTES, framedBytes)} framed byte(s)")
+        log"${MDC(NUM_BYTES, framedBytes)} framed byte(s) for ${MDC(VALUE, subscribed)} " +
+        log"subscribed consumer(s)")
     }
     val written = drain()
     if (debugEnabled && written == 0L) {
       logInfo(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} partition " +
         log"${MDC(PARTITION_ID, partitionId)} is holding block ${MDC(COUNT, sequenceNumber)}: " +
-        log"egress is paced or the channel is not writable")
+        log"egress is paced, no consumer has subscribed, or no channel is writable")
     }
     sequenceNumber
+  }
+
+  /**
+   * Queues one block reference on every session subscribed to its partition.
+   *
+   * @return the number of sessions the block was queued for
+   */
+  private def fanOut(
+      partitionId: Int,
+      sequenceNumber: Long,
+      framedBytes: Int,
+      priority: EgressPriority,
+      replay: Boolean): Int = {
+    if (closed.get()) {
+      0
+    } else {
+      var queued = 0
+      sessions.values().asScala.foreach { session =>
+        if (session.subscribedTo(partitionId) && session.offer(
+            PendingBlock(partitionId, sequenceNumber, framedBytes, priority,
+              egressTicket.getAndIncrement(), replay))) {
+          queued += 1
+        }
+      }
+      queued
+    }
+  }
+
+  /**
+   * Framed size of a block carrying a payload of the given length.
+   *
+   * The overhead is read from the message type rather than restated, which is what keeps this
+   * handler's accounting equal to the number of bytes that actually leave the socket. It is derived
+   * arithmetically instead of by framing a message, so a block's cost is known before its bytes
+   * have been read back out of the retained store.
+   */
+  private def framedLengthOf(payloadBytes: Int): Int = {
+    payloadBytes + DataBlockMessage.FRAMING_OVERHEAD_BYTES
   }
 
   // ==========================================================================================
@@ -392,68 +500,94 @@ private[spark] class StreamingShuffleServerHandler(
    */
   def flushPending(): Long = drain()
 
+  /**
+   * Drains every session, in the flush order the producing attempts' priorities imply.
+   *
+   * Sessions are drained independently, and that independence is the point: one consumer whose
+   * socket is full or whose credit is exhausted must not hold up another consumer that is keeping
+   * up, which a single shared queue could not avoid. Each session holds its own guard, so several
+   * threads may drain different sessions at once while never writing twice to one channel.
+   */
   private def drain(): Long = {
+    if (closed.get()) {
+      0L
+    } else {
+      var total = 0L
+      val ordered = sessions.values().asScala.toSeq.sortBy(_.orderingKey)
+      ordered.foreach(session => total += drainSession(session))
+      total
+    }
+  }
+
+  private def drainSession(session: ConsumerSession): Long = {
     var total = 0L
     var again = true
     while (again) {
       again = false
-      if (draining.compareAndSet(false, true)) {
-        drainWakeup.set(false)
+      if (session.draining.compareAndSet(false, true)) {
+        session.drainWakeup.set(false)
         val written = try {
-          drainOnce()
+          drainOnce(session)
         } finally {
-          draining.set(false)
+          session.draining.set(false)
         }
         total += written
         // Re-run when this pass made progress and work remains, or when a contending thread left a
         // note while the guard was held, so a block offered during the pass is not stranded. The
         // progress condition is what stops a throttled or unwritable channel from spinning: a pass
         // that wrote nothing runs at most once more, and the note is cleared at the top of it.
-        again = !egressQueue.isEmpty && (written > 0L || drainWakeup.get())
+        again = !session.queue.isEmpty && (written > 0L || session.drainWakeup.get())
       } else {
-        drainWakeup.set(true)
+        session.drainWakeup.set(true)
       }
     }
     total
   }
 
   /**
-   * One pass of the drain loop, executed by the single thread holding the drain guard.
+   * One pass of one session's drain loop, executed by the single thread holding its guard.
    *
    * A block is removed from the queue before it is charged, and returned to the queue unchanged if
    * the charge is refused. Returning it is order preserving, because a pending block's position is
    * decided by its priority and its monotonic ticket, neither of which the round trip alters.
+   *
+   * A refusal by the rate limiter schedules a wake-up at the bucket's own next refill instant, so
+   * the block leaves as soon as pacing permits instead of waiting for another event to happen to
+   * trigger a drain. Without that wake-up a final rate-limited block could sit queued until the
+   * producing task shut down and discarded it, which is a silent loss of output rather than the
+   * throttle it is meant to be.
    */
-  private def drainOnce(): Long = {
-    val ctx = channelContext.get()
-    if (ctx == null || !ctx.channel().isActive()) {
+  private def drainOnce(session: ConsumerSession): Long = {
+    val channel = session.channel
+    if (session.isClosed || !channel.isActive()) {
       0L
     } else {
       val startedAtNanos = clock.nanoTime()
       var written = 0L
       var flushNeeded = false
       var keepGoing = true
+      var throttled = false
       while (keepGoing) {
-        if (!ctx.channel().isWritable()) {
+        if (!channel.isWritable()) {
           // The socket's outbound buffer is full. Leaving the block queued is correct: writability
-          // is signalled on this very pipeline, and channelWritabilityChanged resumes the drain.
+          // is signalled on this very channel, and the writability callback resumes the drain.
           keepGoing = false
         } else {
-          val pending = egressQueue.poll()
+          val pending = session.queue.poll()
           if (pending == null) {
             keepGoing = false
           } else if (!admitForEgress(pending)) {
-            egressQueue.offer(pending)
+            session.queue.offer(pending)
             throttles.incrementAndGet()
+            throttled = true
             if (debugEnabled) {
               logInfo(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} partition " +
-                log"${MDC(PARTITION_ID, pending.block.partitionId())} is throttled holding " +
+                log"${MDC(PARTITION_ID, pending.partitionId)} is throttled holding " +
                 log"${MDC(NUM_BYTES, pending.framedBytes)} framed byte(s); " +
                 log"${MDC(VALUE, rateLimiter.availableTokens)} token(s) available")
             }
             keepGoing = false
-          } else {
-            writeBlock(ctx, pending)
+          } else if (writeBlock(session, pending)) {
             written += pending.framedBytes.toLong
             flushNeeded = true
           }
@@ -462,41 +596,121 @@ private[spark] class StreamingShuffleServerHandler(
       // One flush for the whole batch rather than one per block: the two mebibyte cap only
       // pipelines if consecutive blocks share a syscall instead of trickling out one at a time.
       if (flushNeeded) {
-        ctx.flush()
+        channel.flush()
       }
-      emitDeferredTerminations(ctx)
+      emitDeferredTerminations(session)
+      if (throttled) {
+        scheduleRefillDrain(session)
+      }
       writeNanos.addAndGet(math.max(0L, clock.nanoTime() - startedAtNanos))
       written
     }
   }
 
   /**
-   * Writes one block and retains it against the possibility of retransmission.
+   * Arranges for one more drain attempt once the egress bucket has refilled.
    *
-   * The block enters the unacknowledged window before it is written, never after: a retransmission
-   * request that arrives while the write is still in flight must find the block retained rather
-   * than find a hole in the window.
+   * The delay comes from the bucket itself, so the wake-up lands when tokens are actually available
+   * rather than at an interval this handler guessed. It is scheduled on the session's own event
+   * loop, which needs no thread of this handler's own and serialises naturally with every other
+   * callback on that channel. One outstanding wake-up per session is enough, because a drain that
+   * is still throttled schedules the next one before it returns.
    */
-  private def writeBlock(ctx: ChannelHandlerContext, pending: PendingBlock): Unit = {
-    val block = pending.block
-    val partitionId = block.partitionId()
-    val stream = streamFor(partitionId)
-    val framedBytes = pending.framedBytes.toLong
-    val previous = stream.unacknowledged.put(block.sequenceNumber(), block)
-    if (previous == null) {
-      stream.unacknowledgedBytes.addAndGet(framedBytes)
+  private def scheduleRefillDrain(session: ConsumerSession): Unit = {
+    if (!closed.get() && !session.isClosed &&
+        session.refillScheduled.compareAndSet(false, true)) {
+      val delayMs = math.max(1L,
+        math.min(rateLimiter.millisUntilAvailable(session.headFramedBytes), MAX_REFILL_WAIT_MS))
+      try {
+        session.channel.eventLoop().schedule(new Runnable {
+          override def run(): Unit = {
+            session.refillScheduled.set(false)
+            guard(drainSession(session))
+          }
+        }, delayMs, TimeUnit.MILLISECONDS)
+      } catch {
+        case NonFatal(e) =>
+          // A rejected schedule means the event loop is shutting down, which the inactivity
+          // callback handles; clearing the flag keeps a later attempt possible.
+          session.refillScheduled.set(false)
+          if (debugEnabled) {
+            logDebug(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} could not schedule a " +
+              log"refill drain for consumer ${MDC(SESSION_ID, session.consumerId)}: " +
+              log"${MDC(REASON, e.getMessage())}")
+          }
+      }
     }
-    stream.pendingBytes.addAndGet(-framedBytes)
-    stream.pendingBlocks.decrementAndGet()
-    ctx.write(Unpooled.wrappedBuffer(block.toByteBuffer())).addListener(writeFailureListener)
-    bytesWritten.addAndGet(framedBytes)
-    blocksWritten.incrementAndGet()
-    if (debugEnabled) {
-      logInfo(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} partition " +
-        log"${MDC(PARTITION_ID, partitionId)} wrote block ${MDC(COUNT, block.sequenceNumber())} " +
-        log"of ${MDC(NUM_BYTES, framedBytes)} framed byte(s), checksum " +
-        log"${MDC(VALUE, block.checksum())}")
+  }
+
+  /**
+   * Frames one block from the retained store and writes it to one consumer's channel.
+   *
+   * The bytes are read at this moment rather than held since production, so a block that has been
+   * evicted to disk is framed from its spill segment and one still in memory is framed from memory,
+   * with no difference visible on the wire. A block the store no longer retains cannot be framed at
+   * all: that means every subscribed consumer had already acknowledged it, so the write is dropped
+   * and counted rather than failed, because there is no consumer left that needs it.
+   *
+   * <b>Why the framing copy is not charged to the buffer budget.</b> Building the message and
+   * encoding it allocates one transient copy of the payload, and that copy is deliberately
+   * outside the executor-wide quota, because it is not retained: it is handed to the channel and
+   * released as the socket drains it. What bounds it is the transport's own outbound accounting --
+   * the caller writes only while `Channel.isWritable` holds, so the number of framing copies in
+   * flight at once is capped by Netty's write water marks rather than being unbounded. The quota's
+   * job is the different one of bounding what is *held*, and every held byte is in the retained
+   * store, exactly once, charged before it was admitted. A framing copy that was charged as well
+   * would double-count the same block and shrink the real streaming window to half of what the
+   * operator configured.
+   *
+   * @return true if a frame was handed to the channel
+   */
+  private def writeBlock(session: ConsumerSession, pending: PendingBlock): Boolean = {
+    val partitionId = pending.partitionId
+    val sequenceNumber = pending.sequenceNumber
+    val payload = retainedOutput.flatMap(_.retainedPayload(partitionId, sequenceNumber))
+    session.releasePending(pending)
+    payload match {
+      case Some(bytes) =>
+        val block = DataBlockMessage.withComputedChecksum(
+          shuffleId, mapId, partitionId, sequenceNumber, bytes)
+        val framedBytes = pending.framedBytes.toLong
+        session.recordSent(partitionId, sequenceNumber, framedBytes)
+        session.channel.write(sendable(block)).addListener(writeFailureListener)
+        bytesWritten.addAndGet(framedBytes)
+        blocksWritten.incrementAndGet()
+        if (pending.replay) {
+          retransmittedBlocks.incrementAndGet()
+        }
+        if (debugEnabled) {
+          logInfo(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} partition " +
+            log"${MDC(PARTITION_ID, partitionId)} wrote block ${MDC(COUNT, sequenceNumber)} of " +
+            log"${MDC(NUM_BYTES, framedBytes)} framed byte(s) to consumer " +
+            log"${MDC(SESSION_ID, session.consumerId)}, checksum ${MDC(VALUE, block.checksum())}")
+        }
+        true
+      case None =>
+        unservableBlocks.incrementAndGet()
+        if (debugEnabled) {
+          logDebug(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} partition " +
+            log"${MDC(PARTITION_ID, partitionId)} dropped block ${MDC(COUNT, sequenceNumber)} " +
+            log"for consumer ${MDC(SESSION_ID, session.consumerId)}: " +
+            log"${MDC(REASON, "the retained store no longer holds it")}")
+        }
+        false
     }
+  }
+
+  /**
+   * Wraps one message as the body of a one-way RPC, which is how every streaming frame travels.
+   *
+   * This is precisely what `TransportClient.send` constructs, and it is built here rather than
+   * delegated to that method for one reason: `send` flushes on every call, and the two mebibyte
+   * block cap only pipelines if consecutive blocks share a syscall. Writing the same message and
+   * flushing once per batch keeps the transport's encoding, its optional encryption and its frame
+   * accounting exactly as they are, and changes only how often the socket is poked.
+   */
+  private def sendable(message: StreamingShuffleMessage): OneWayMessage = {
+    new OneWayMessage(new NioManagedBuffer(message.toByteBuffer()))
   }
 
   /**
@@ -509,17 +723,20 @@ private[spark] class StreamingShuffleServerHandler(
    * keeps the accounting of bytes on the wire honest, and control frames are tens of bytes, so the
    * surplus a refusal lets through cannot meaningfully perturb the rate.
    */
-  private def writeControl(ctx: ChannelHandlerContext, message: StreamingShuffleMessage): Unit = {
+  private def writeControl(
+      session: ConsumerSession,
+      message: StreamingShuffleMessage): ChannelFuture = {
     val framedBytes = StreamingShuffleMessage.framedLength(message.encodedLength()).toLong
     val charged = rateLimiter.tryAcquire(framedBytes)
-    ctx.writeAndFlush(Unpooled.wrappedBuffer(message.toByteBuffer()))
-      .addListener(writeFailureListener)
+    val future = session.channel.writeAndFlush(sendable(message))
+    future.addListener(writeFailureListener)
     bytesWritten.addAndGet(framedBytes)
     if (debugEnabled && !charged) {
       logInfo(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} partition " +
         log"${MDC(PARTITION_ID, message.partitionId())} sent an uncharged control frame of " +
         log"${MDC(NUM_BYTES, framedBytes)} byte(s) because the egress bucket was empty")
     }
+    future
   }
 
   // ==========================================================================================
@@ -539,15 +756,17 @@ private[spark] class StreamingShuffleServerHandler(
    * @return true if the frame was handed to the channel, false if there is no active channel
    */
   def sendHeartbeat(partitionId: Int): Boolean = {
-    val ctx = channelContext.get()
-    if (ctx == null || !ctx.channel().isActive()) {
-      false
-    } else {
-      val stream = streamFor(partitionId)
-      writeControl(ctx, new HeartbeatMessage(
-        shuffleId, partitionId, stream.nextSequenceNumber.get(), clock.getTimeMillis()))
-      true
+    val stream = streamFor(partitionId)
+    val subscribers = sessions.values().asScala.filter { session =>
+      !session.isClosed && session.channel.isActive() && session.subscribedTo(partitionId)
+    }.toSeq
+    var sent = false
+    subscribers.foreach { session =>
+      writeControl(session, new HeartbeatMessage(
+        shuffleId, mapId, partitionId, stream.nextSequenceNumber.get(), clock.getTimeMillis()))
+      sent = true
     }
+    sent
   }
 
   /**
@@ -562,44 +781,146 @@ private[spark] class StreamingShuffleServerHandler(
    * partition's queued blocks have all been written. When egress is paced or the socket is full the
    * request is remembered and emitted by a later drain; the return value says which happened.
    *
+   * The single-partition form of [[terminateStreams]], which is where the work is done.
+   *
    * @param partitionId the reduce partition whose stream is complete
    * @return true if the terminator was written by this call, false if it was deferred
    */
-  def terminateStream(partitionId: Int): Boolean = {
-    val stream = streamFor(partitionId)
-    stream.terminationRequested.set(true)
-    stream.totalBlocksAtTermination.set(stream.blocksEnqueued.get())
+  def terminateStream(partitionId: Int): Boolean = terminateStreams(Seq(partitionId)) == 1
+
+  /**
+   * Signals the orderly end of several partitions' streams with a single egress pass.
+   *
+   * This is the form a finishing map task uses, and the reason it exists is cost rather than
+   * convenience. Requesting a terminator has to be followed by a drain, because a terminator is
+   * deferred until the partition's queued blocks have been written; doing that once per partition
+   * would run one drain per partition, and a drain visits every session and every stream, so
+   * finishing would cost the square of the partition count in scans. Requesting every terminator
+   * first and draining once afterwards produces exactly the same wire output for a cost linear in
+   * partitions.
+   *
+   * @param partitionIds the reduce partitions whose streams are complete
+   * @return how many of them had their terminator written by this call rather than deferred
+   */
+  def terminateStreams(partitionIds: Seq[Int]): Int = {
+    partitionIds.foreach { partitionId =>
+      val stream = streamFor(partitionId)
+      // Counted on the edge, so the hot-path gate sees a request once however often termination is
+      // requested for the same partition -- which a retried or repeated finish does.
+      if (stream.terminationRequested.compareAndSet(false, true)) {
+        terminationRequests.incrementAndGet()
+      }
+      stream.totalBlocksAtTermination.set(stream.blocksEnqueued.get())
+    }
     drain()
-    val sent = stream.terminationSent.get()
-    if (!sent) {
+    var written = 0
+    partitionIds.foreach { partitionId =>
+      if (terminationSignalled(partitionId)) {
+        written += 1
+      }
+    }
+    written
+  }
+
+  /**
+   * Whether every consumer subscribed to one partition has been told its stream ended.
+   *
+   * A partition with no subscriber has told nobody, which is not the same as having finished, so it
+   * reports false and the terminator stays pending for a consumer that subscribes later.
+   */
+  private def terminationSignalled(partitionId: Int): Boolean = {
+    val subscribers = sessions.values().asScala.count(_.subscribedTo(partitionId))
+    val delivered = terminationsDelivered(partitionId)
+    val sent = subscribers > 0 && delivered >= subscribers
+    // One record per partition, and a wide shuffle has tens of thousands of them, so this stays
+    // under the streaming debug key: deferral is routine whenever egress is paced or the socket is
+    // full rather than an incident, the terminator's eventual delivery is what matters, and a
+    // failure to deliver it is reported at warning level regardless of this gate.
+    if (!sent && debugEnabled) {
       logInfo(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} partition " +
-        log"${MDC(PARTITION_ID, partitionId)} deferred its end of stream marker with " +
-        log"${MDC(COUNT, stream.pendingBlocks.get())} block(s) still queued")
+        log"${MDC(PARTITION_ID, partitionId)} deferred its end of stream marker: " +
+        log"${MDC(COUNT, delivered)} of ${MDC(VALUE, subscribers)} subscribed consumer(s) have " +
+        log"been told, with ${MDC(NUM_BLOCKS, pendingBlocksFor(partitionId))} block(s) queued")
     }
     sent
   }
 
   /**
-   * Emits any terminator whose partition has finished draining.
+   * Emits any terminator whose partition has finished draining, for one consumer.
    *
    * Called at the end of every drain pass, which is the only moment at which a partition can have
-   * become empty. The one-shot guard means a terminator is written exactly once even though several
-   * drains may observe the same empty partition.
+   * become empty for that consumer, and returning at once while no terminator has been requested,
+   * which is the whole of the write, because the scan below visits every stream this handler owns.
+   * Termination is per session because it is per stream: one consumer may have caught up while
+   * another is still receiving, and telling the second that the stream has ended before its blocks
+   * have been written would make it stop reading early.
+   *
+   * The one-shot guard is claimed before the write and *released* if the write fails, and the
+   * delivery is recorded only in a successful listener. A terminator marked sent on the strength of
+   * an enqueue that never reached the socket would leave the consumer waiting out its producer
+   * liveness detector for a stream that will never be terminated again.
    */
-  private def emitDeferredTerminations(ctx: ChannelHandlerContext): Unit = {
-    if (ctx.channel().isActive()) {
+  private def emitDeferredTerminations(session: ConsumerSession): Unit = {
+    if (terminationRequests.get() > 0 && !session.isClosed && session.channel.isActive()) {
       streams.values().asScala.foreach { stream =>
-        val ready = stream.terminationRequested.get() && stream.pendingBlocks.get() <= 0L
-        if (ready && stream.terminationSent.compareAndSet(false, true)) {
+        val partitionId = stream.partitionId
+        val ready = stream.terminationRequested.get() &&
+          session.subscribedTo(partitionId) &&
+          session.pendingBlocksFor(partitionId) <= 0L &&
+          session.caughtUpWith(partitionId, stream.highestOffered.get())
+        if (ready && session.claimTermination(partitionId)) {
           val totalBlocks = stream.totalBlocksAtTermination.get()
-          writeControl(ctx, new StreamTerminationMessage(
-            shuffleId, stream.partitionId, stream.nextSequenceNumber.get(), totalBlocks))
-          logInfo(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} partition " +
-            log"${MDC(PARTITION_ID, stream.partitionId)} streamed " +
-            log"${MDC(NUM_BLOCKS, totalBlocks)} block(s) and signalled end of stream")
+          val future = writeControl(session, new StreamTerminationMessage(
+            shuffleId, mapId, partitionId, stream.nextSequenceNumber.get(), totalBlocks))
+          future.addListener(new ChannelFutureListener {
+            override def operationComplete(completed: ChannelFuture): Unit = {
+              if (completed.isSuccess) {
+                session.confirmTermination(partitionId)
+                // One record per partition per subscribed consumer -- the largest log source this
+                // handler has -- so the per-consumer detail is debug only. The task's own summary
+                // reports the aggregate at default level once the write completes.
+                if (debugEnabled) {
+                  logInfo(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} partition " +
+                    log"${MDC(PARTITION_ID, partitionId)} streamed " +
+                    log"${MDC(NUM_BLOCKS, totalBlocks)} block(s) and signalled end of stream to " +
+                    log"consumer ${MDC(SESSION_ID, session.consumerId)}")
+                }
+              } else {
+                // The claim is surrendered so a reconnecting consumer is terminated properly, and
+                // the failure travels to the task thread rather than being lost with the write.
+                session.releaseTerminationClaim(partitionId)
+                errorNotifier.setError(completed.cause())
+                logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} partition " +
+                  log"${MDC(PARTITION_ID, partitionId)} could not signal end of stream to " +
+                  log"consumer ${MDC(SESSION_ID, session.consumerId)}", completed.cause())
+              }
+            }
+          })
         }
       }
     }
+  }
+
+  /** How many subscribed consumers have had the terminator for one partition confirmed. */
+  private def terminationsDelivered(partitionId: Int): Int = {
+    sessions.values().asScala.count(_.terminationConfirmed(partitionId))
+  }
+
+  /**
+   * Blocks queued but not yet written for one partition, summed over every session.
+   *
+   * Read by the writer to decide whether a terminated stream still owes a consumer anything. A
+   * stream that has been marked terminated but still has queued blocks must keep being heartbeated,
+   * because the consumer waiting for those blocks measures producer liveness on its own timer and
+   * would otherwise declare a healthy producer dead while its bytes were still in the queue.
+   *
+   * @param partitionId the reduce partition to measure
+   * @return the number of queued, unwritten blocks across every subscribed consumer
+   */
+  def pendingBlocksFor(partitionId: Int): Long = {
+    var total = 0L
+    sessions.values().asScala.foreach(session => total += session.pendingBlocksFor(partitionId))
+    total
   }
 
   /**
@@ -618,25 +939,93 @@ private[spark] class StreamingShuffleServerHandler(
    * @return true if the partition has unacknowledged output and has seen no progress in the window
    */
   def isConsumerStalled(partitionId: Int): Boolean = {
-    val stream = streams.get(partitionId)
-    stream != null && stalled(stream, clock.getTimeMillis())
+    stalled(partitionId, clock.getTimeMillis())
   }
 
   /** Every partition whose consumer has stopped acknowledging for longer than the window. */
   def stalledPartitions: Seq[Int] = {
     val nowMs = clock.getTimeMillis()
     val stalledIds = new ArrayBuffer[Int](streams.size())
-    streams.values().asScala.foreach { stream =>
-      if (stalled(stream, nowMs)) {
-        stalledIds += stream.partitionId
+    streams.keySet().asScala.foreach { partitionId =>
+      if (stalled(partitionId, nowMs)) {
+        stalledIds += partitionId
       }
     }
     stalledIds.sorted.toSeq
   }
 
-  private def stalled(stream: PartitionStream, nowMs: Long): Boolean = {
-    stream.unacknowledged.size() > 0 &&
-      nowMs - stream.lastProgressMs.get() >= CONSUMER_LIVENESS_TIMEOUT_MS
+  /**
+   * Whether any subscribed consumer of one partition has stopped *acknowledging*.
+   *
+   * The distinction between acknowledging and merely being alive is the whole of this method. A
+   * heartbeat proves a consumer's process is running; it says nothing about whether that consumer
+   * is consuming. Timing them together would let a consumer that heartbeats every five seconds and
+   * acknowledges nothing hold the producer's window open indefinitely, which is exactly the ten
+   * second missing-acknowledgement condition the failure protocol exists to detect. Each session
+   * therefore stamps the two events separately, and only the acknowledgement stamp is consulted
+   * here.
+   *
+   * A partition with nothing outstanding for a session is never stalled on that session's account,
+   * however long it has been quiet: there is nothing for that consumer to acknowledge. A partition
+   * with no subscriber at all is likewise not stalled -- there is no consumer to be slow.
+   */
+  private def stalled(partitionId: Int, nowMs: Long): Boolean = {
+    sessions.values().asScala.exists { session =>
+      session.subscribedTo(partitionId) &&
+        session.outstandingFor(partitionId) > 0L &&
+        nowMs - session.lastAckProgressMs >= CONSUMER_LIVENESS_TIMEOUT_MS
+    }
+  }
+
+  /**
+   * Waits, up to a bound, for every subscribed consumer to have been sent everything it is owed.
+   *
+   * This is what makes a successful producer stop honest. Egress is paced, so a block offered at
+   * the very end of a map task may still be queued when the task finishes; discarding it there
+   * would lose output the reduce side is entitled to and report success while doing it. Waiting
+   * gives pacing the chance to release those bytes, and the return value says plainly whether it
+   * did, so the caller can fail rather than claim a delivery that did not happen.
+   *
+   * The wait drains rather than sleeps through the whole interval: each pass attempts real progress
+   * and then yields for a short step, so a refill or a writability change is acted on immediately.
+   * It reads the injected clock, so a suite drives it deterministically.
+   *
+   * @param timeoutMs the longest this call may wait; a non-positive value polls once
+   * @return true when nothing is queued for any consumer and every subscribed consumer of every
+   *         terminated partition has been sent its terminator
+   */
+  def awaitDrain(timeoutMs: Long): Boolean = {
+    val deadlineMs = clock.getTimeMillis() + math.max(0L, timeoutMs)
+    var satisfied = drainSatisfied()
+    while (!satisfied && clock.getTimeMillis() < deadlineMs && !closed.get()) {
+      drain()
+      satisfied = drainSatisfied()
+      if (!satisfied) {
+        // Yielding rather than sleeping the whole remaining interval: the event loop that will
+        // deliver a writability change or a refill wake-up needs the CPU more than this one does.
+        Thread.`yield`()
+      }
+    }
+    satisfied
+  }
+
+  /** Whether every session's queue is empty and every terminated partition has been terminated. */
+  private def drainSatisfied(): Boolean = {
+    // A session whose channel is open but which has sent nothing for a whole liveness window is
+    // presumed lost and is not waited for. Its output is not abandoned: it stays in the retained
+    // store, replayable in full when that consumer reconnects, which is what makes excluding it
+    // from the drain condition honest rather than a way of declaring success prematurely.
+    val nowMs = clock.getTimeMillis()
+    val live = sessions.values().asScala
+      .filterNot(_.isClosed)
+      .filter(session => nowMs - session.lastInboundMs < CONSUMER_LIVENESS_TIMEOUT_MS)
+      .toSeq
+    live.forall(_.queue.isEmpty) && streams.values().asScala.forall { stream =>
+      !stream.terminationRequested.get() ||
+        live.forall(session =>
+          !session.subscribedTo(stream.partitionId) ||
+            session.terminationConfirmed(stream.partitionId))
+    }
   }
 
   // ==========================================================================================
@@ -666,6 +1055,29 @@ private[spark] class StreamingShuffleServerHandler(
    *         or escalated
    */
   def retransmit(partitionId: Int, firstSequenceNumber: Long, lastSequenceNumber: Long): Int = {
+    val session = sessions.values().asScala.find(_.subscribedTo(partitionId))
+    session.map(retransmitTo(_, partitionId, firstSequenceNumber, lastSequenceNumber)).getOrElse {
+      misaddressedMessages.incrementAndGet()
+      logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} discarded a retransmission " +
+        log"request for partition ${MDC(PARTITION_ID, partitionId)}: " +
+        log"${MDC(REASON, "no consumer is subscribed to it")}")
+      0
+    }
+  }
+
+  /**
+   * Replays retained blocks for one partition to one consumer, bounded by that consumer's own
+   * retransmission budget.
+   *
+   * The budget is per session rather than per partition, because it measures a *peer's* health: a
+   * consumer that keeps asking for the same bytes has a problem that its neighbour, reading the
+   * same partition perfectly well, does not share and must not be escalated for.
+   */
+  private def retransmitTo(
+      session: ConsumerSession,
+      partitionId: Int,
+      firstSequenceNumber: Long,
+      lastSequenceNumber: Long): Int = {
     val stream = streams.get(partitionId)
     if (stream == null || lastSequenceNumber < firstSequenceNumber) {
       misaddressedMessages.incrementAndGet()
@@ -675,63 +1087,97 @@ private[spark] class StreamingShuffleServerHandler(
       0
     } else {
       val nowMs = clock.getTimeMillis()
-      if (nowMs < stream.nextRetransmitAtMs.get()) {
+      if (nowMs < session.nextRetransmitAtMs(partitionId)) {
         // Deferred rather than refused: the consumer may ask again once the backoff has elapsed.
         0
       } else {
-        val attempts = stream.retransmitAttempts.incrementAndGet()
+        val attempts = session.chargeRetransmitAttempt(partitionId)
         if (attempts > MAX_RETRANSMIT_ATTEMPTS) {
           escalateRetransmissionBudget(partitionId, attempts)
           0
         } else {
-          stream.nextRetransmitAtMs.set(nowMs + backoffMs(attempts))
-          serviceRetransmission(stream, firstSequenceNumber, lastSequenceNumber)
+          session.deferRetransmitUntil(partitionId, nowMs + backoffMs(attempts))
+          serviceRetransmission(session, partitionId, firstSequenceNumber, lastSequenceNumber)
         }
       }
     }
   }
 
   /**
-   * Re-queues every retained block in the requested range, or escalates if the range has been
-   * reclaimed. The retained window is exactly the open interval above the acknowledged position, so
-   * the acknowledged position alone decides serviceability.
+   * Re-queues every block in the requested range, having first established that the whole of it is
+   * still retained.
+   *
+   * Validating the complete range before emitting any part of it is the correctness requirement
+   * here, not an optimisation. A partial replay is worse than a refusal: the consumer receives some
+   * of what it asked for, cannot tell that the rest will never arrive, and waits out its producer
+   * liveness detector before failing -- by which time the diagnosis points at the network rather
+   * than at reclaimed memory. Refusing the whole request instead escalates immediately, through the
+   * notifier, to the fetch failure whose stage recomputation is the real recovery.
+   *
+   * Eligibility is read from the retained store rather than inferred from an acknowledged position,
+   * because the store is the authority on what it still holds -- in memory, mid-eviction or on disk
+   * -- and because the store, not this handler, is what retires a block once every subscribed
+   * consumer has confirmed it. A block already evicted to disk is fully serviceable and would have
+   * been wrongly refused by a memory-only view of the window.
    */
   private def serviceRetransmission(
-      stream: PartitionStream,
+      session: ConsumerSession,
+      partitionId: Int,
       firstSequenceNumber: Long,
       lastSequenceNumber: Long): Int = {
-    val reclaimedThrough = stream.lastAckPosition.get()
-    if (firstSequenceNumber <= reclaimedThrough) {
+    val store = retainedOutput
+    val lowestRetained =
+      store.map(_.lowestRetainedSequence(partitionId)).getOrElse(MemorySpillManager.UNSET_SEQUENCE)
+    val highestRetained =
+      store.map(_.lastAcceptedSequence(partitionId)).getOrElse(MemorySpillManager.UNSET_SEQUENCE)
+    val withinBounds = store.isDefined &&
+      lowestRetained != MemorySpillManager.UNSET_SEQUENCE &&
+      firstSequenceNumber >= lowestRetained &&
+      lastSequenceNumber <= highestRetained
+    val complete = withinBounds && store.exists { retained =>
+      var sequenceNumber = firstSequenceNumber
+      var held = true
+      while (held && sequenceNumber <= lastSequenceNumber) {
+        held = retained.retainsBlock(partitionId, sequenceNumber)
+        sequenceNumber += 1L
+      }
+      held
+    }
+    if (!complete) {
       errorNotifier.setError(StreamingShuffleErrors.invalidSequenceNumber(
-        shuffleId, stream.partitionId, reclaimedThrough + 1L, firstSequenceNumber))
+        shuffleId, partitionId, math.max(0L, lowestRetained), firstSequenceNumber))
       logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} partition " +
-        log"${MDC(PARTITION_ID, stream.partitionId)} cannot retransmit block " +
-        log"${MDC(COUNT, firstSequenceNumber)}: everything up to " +
-        log"${MDC(VALUE, reclaimedThrough)} was acknowledged and released, so the read must be " +
-        log"invalidated and the upstream stage recomputed")
+        log"${MDC(PARTITION_ID, partitionId)} cannot replay blocks " +
+        log"${MDC(COUNT, firstSequenceNumber)} through ${MDC(VALUE, lastSequenceNumber)}: the " +
+        log"retained window is ${MDC(NUM_BLOCKS, lowestRetained)} through " +
+        log"${MDC(MAX_SIZE, highestRetained)}, so the read must be invalidated and the upstream " +
+        log"stage recomputed")
       0
     } else {
       val priority = attempt.get()
-      val replayed = stream.unacknowledged
-        .subMap(firstSequenceNumber, true, lastSequenceNumber, true)
-        .values()
-        .asScala
-        .toSeq
-      replayed.foreach { block =>
-        val framedBytes = StreamingShuffleMessage.framedLength(block.encodedLength())
-        stream.pendingBlocks.incrementAndGet()
-        stream.pendingBytes.addAndGet(framedBytes.toLong)
-        egressQueue.offer(
-          PendingBlock(block, priority, egressTicket.getAndIncrement(), framedBytes))
+      var sequenceNumber = firstSequenceNumber
+      var queued = 0
+      while (sequenceNumber <= lastSequenceNumber) {
+        val framedBytes = framedLengthOf(
+          store.flatMap(_.retainedPayload(partitionId, sequenceNumber)).map(_.length).getOrElse(0))
+        if (session.offer(PendingBlock(partitionId, sequenceNumber, framedBytes, priority,
+            egressTicket.getAndIncrement(), replay = true))) {
+          queued += 1
+        }
+        sequenceNumber += 1L
       }
-      if (replayed.nonEmpty) {
-        retransmittedBlocks.addAndGet(replayed.size.toLong)
-        logInfo(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} partition " +
-          log"${MDC(PARTITION_ID, stream.partitionId)} is replaying " +
-          log"${MDC(NUM_BLOCKS, replayed.size)} retained block(s) from the unacknowledged window")
-        drain()
+      if (queued > 0) {
+        // A consumer may ask for the same window several times inside its retry budget, and every
+        // partition it reads can do so, so the per-replay record is detail. The producer reports
+        // the replay total at default level in its summary, and an exhausted budget escalates.
+        if (debugEnabled) {
+          logInfo(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} partition " +
+            log"${MDC(PARTITION_ID, partitionId)} is replaying ${MDC(NUM_BLOCKS, queued)} " +
+            log"retained block(s) to consumer ${MDC(SESSION_ID, session.consumerId)}")
+        }
+        drainSession(session)
       }
-      replayed.size
+      queued
     }
   }
 
@@ -759,97 +1205,113 @@ private[spark] class StreamingShuffleServerHandler(
   }
 
   // ==========================================================================================
-  // Netty callbacks
+  // Transport callbacks
+  //
+  // This handler is installed by `TransportContext`, so every callback below is the transport's
+  // rather than Netty's directly. That is what gives streaming its authentication, its optional
+  // SSL and its keep-alive without touching a single shared transport class: a `TransportClient`
+  // arrives already authenticated when `spark.authenticate` is on, and its identity is what a
+  // session is bound to.
   // ==========================================================================================
 
-  override def channelActive(ctx: ChannelHandlerContext): Unit = {
-    guard {
-      channelContext.set(ctx)
-      logInfo(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} egress channel to " +
-        log"${MDC(HOST_PORT, ctx.channel().remoteAddress())} is active")
-      // Output produced before the channel came up is queued, not lost, so drain it now.
-      drain()
-    }
-    super.channelActive(ctx)
-  }
-
   /**
-   * Consumes the control traffic the reduce side sends back.
-   *
-   * Three shapes are accepted, so the handler composes with either pipeline it can legitimately sit
-   * in: an already decoded message, when a decoder precedes it; a `ByteBuf` holding one framed
-   * message, when only length delimitation precedes it; and a `ByteBuffer` of the same. Anything
-   * else is passed on untouched rather than swallowed, because a handler that consumes messages it
-   * does not understand breaks every handler behind it.
-   *
-   * A `ByteBuf` is released on every path, including the failing ones, so a decode failure cannot
-   * leak a pooled buffer.
+   * This handler serves no chunked streams, only one-way messages, so the stream manager it offers
+   * is an ordinary empty one. It is a real instance rather than null because the transport
+   * dereferences it unconditionally when a stream request arrives, and answering "no such stream"
+   * is the correct response to a request this subsystem never invites.
    */
-  override def channelRead(ctx: ChannelHandlerContext, message: AnyRef): Unit = {
-    var forwardable = false
-    guard {
-      message match {
-        case decoded: StreamingShuffleMessage =>
-          handleInbound(ctx, decoded)
-        case buffer: ByteBuf =>
-          try {
-            decodeAndHandle(ctx, buffer.nioBuffer())
-          } finally {
-            ReferenceCountUtil.release(buffer)
-          }
-        case buffer: ByteBuffer =>
-          decodeAndHandle(ctx, buffer)
-        case _ =>
-          forwardable = true
-      }
-    }
-    if (forwardable) {
-      super.channelRead(ctx, message)
-    }
-  }
+  private val streamManager = new OneForOneStreamManager()
 
-  override def channelWritabilityChanged(ctx: ChannelHandlerContext): Unit = {
+  override def getStreamManager(): StreamManager = streamManager
+
+  /**
+   * Consumes one control frame that arrived as a one-way message.
+   *
+   * One-way is the shape every streaming frame travels in, in both directions: the protocol's own
+   * acknowledgements and heartbeats are the reply, so a request-response round trip would add a
+   * second, redundant reply to every one of them.
+   */
+  override def receive(client: TransportClient, message: ByteBuffer): Unit = {
     guard {
-      if (ctx.channel().isWritable()) {
-        // The socket has drained, so blocks held back for want of room can go now.
-        drain()
-      }
+      decodeAndHandle(client, message)
     }
-    super.channelWritabilityChanged(ctx)
   }
 
   /**
-   * Records the loss of the consumer's channel, retaining everything not yet acknowledged.
+   * Consumes one control frame that arrived as a request expecting a reply.
+   *
+   * A consumer has no need to use this shape, but a transport peer may, and answering it is cheaper
+   * than refusing it: the frame is handled exactly as a one-way frame would be and the reply is
+   * empty. Replying is what stops the peer from waiting out its RPC timeout for an answer this
+   * protocol never intended to send.
+   */
+  override def receive(
+      client: TransportClient,
+      message: ByteBuffer,
+      callback: RpcResponseCallback): Unit = {
+    guard {
+      decodeAndHandle(client, message)
+    }
+    callback.onSuccess(ByteBuffer.allocate(0))
+  }
+
+  /**
+   * Notes the arrival of a consumer's channel, without allocating anything for it yet.
+   *
+   * No session is created here, and deliberately: a channel that has not yet named a partition has
+   * asked for nothing, and allocating per-partition state for a peer that has made no request is
+   * exactly the unbounded-state exposure this subsystem has to avoid. The session appears with the
+   * consumer's first control frame, which is also the frame that says which partition it wants.
+   */
+  override def channelActive(client: TransportClient): Unit = {
+    guard {
+      // One record per accepted connection, and a wide shuffle brings one connection per reduce
+      // task, so the arrival is debug detail. A connection that goes on to matter -- because it
+      // subscribes, stalls, or is lost -- is reported by the path that observes that instead.
+      if (debugEnabled) {
+        logInfo(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} accepted an egress channel " +
+          log"from ${MDC(HOST_PORT, client.getSocketAddress())}")
+      }
+    }
+  }
+
+  /**
+   * Records the loss of one consumer's channel, retaining everything it had not acknowledged.
    *
    * Retention is the point: the failure protocol requires that a consumer which reconnects be
-   * served from memory or from spill rather than forcing the whole upstream stage to be
-   * recomputed, so this callback deliberately clears nothing. Releasing the window is
-   * [[releaseAll]]'s job, and the writer calls it when the task is finished with the shuffle.
+   * served from memory or from spill rather than forcing the whole upstream stage to be recomputed.
+   * The session is dropped, because that channel will never carry anything again, but the *bytes*
+   * belong to the retained store and stay there -- the consumer's acknowledged position is recorded
+   * against its identity in that store, so its next connection resumes from exactly where this one
+   * stopped. Releasing output is [[releaseAll]]'s job alone.
    */
-  override def channelInactive(ctx: ChannelHandlerContext): Unit = {
+  override def channelInactive(client: TransportClient): Unit = {
     guard {
-      channelContext.compareAndSet(ctx, null)
-      logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} egress channel to " +
-        log"${MDC(HOST_PORT, ctx.channel().remoteAddress())} became inactive with " +
-        log"${MDC(NUM_BYTES, unacknowledgedBytes)} unacknowledged byte(s) retained for replay")
+      val session = sessions.remove(sessionKeyOf(client))
+      if (session != null) {
+        session.close()
+        logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} lost its egress channel " +
+          log"to consumer ${MDC(SESSION_ID, session.consumerId)} at " +
+          log"${MDC(HOST_PORT, client.getSocketAddress())} with " +
+          log"${MDC(NUM_BYTES, unacknowledgedBytes)} unacknowledged byte(s) retained for replay")
+      }
       reportPeerLoss()
     }
-    super.channelInactive(ctx)
   }
 
   /**
-   * Latches a channel level failure and closes the channel.
+   * Latches a channel level failure and closes that consumer's channel.
    *
-   * The failure is not forwarded down the pipeline, because the notifier is the single place the
-   * task thread consults and the channel is being closed regardless; forwarding would add a second,
-   * weaker report of the same event.
+   * Only the failing channel is closed. A fault on one consumer's connection says nothing about the
+   * others, and tearing them all down turns one consumer's problem into the map output's problem.
    */
-  override def exceptionCaught(ctx: ChannelHandlerContext, cause: Throwable): Unit = {
+  override def exceptionCaught(cause: Throwable, client: TransportClient): Unit = {
     guard {
       errorNotifier.setError(cause)
-      logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} egress channel raised " +
+      logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} egress channel to " +
+        log"${MDC(HOST_PORT, client.getSocketAddress())} raised " +
         log"${MDC(ERROR, cause.getMessage())}; closing it and failing the producing task", cause)
-      ctx.close()
+      closeSession(client)
     }
   }
 
@@ -865,12 +1327,12 @@ private[spark] class StreamingShuffleServerHandler(
    * which the streaming shuffle steps aside in favour of the sort based implementation, which is
    * why it is published through [[versionMismatchDetected]] as well as escalated.
    */
-  private def decodeAndHandle(ctx: ChannelHandlerContext, frame: ByteBuffer): Unit = {
+  private def decodeAndHandle(client: TransportClient, frame: ByteBuffer): Unit = {
     val version = StreamingShuffleMessage.peekProtocolVersion(frame)
     if (StreamingShuffleMessage.isCompatible(version)) {
-      handleInbound(ctx, StreamingShuffleMessage.Decoder.fromByteBuffer(frame))
+      handleInbound(client, StreamingShuffleMessage.Decoder.fromByteBuffer(frame))
     } else {
-      reportVersionMismatch(ctx, version)
+      reportVersionMismatch(client, version)
     }
   }
 
@@ -881,26 +1343,42 @@ private[spark] class StreamingShuffleServerHandler(
    * retransmission request and an end of stream marker all encode to exactly the same number of
    * bytes, so length carries no information about which of them arrived.
    */
-  private def handleInbound(ctx: ChannelHandlerContext, message: StreamingShuffleMessage): Unit = {
-    if (message.shuffleId() != shuffleId) {
+  private def handleInbound(client: TransportClient, message: StreamingShuffleMessage): Unit = {
+    if (message.shuffleId() != shuffleId || message.mapId() != mapId ||
+        !servesPartition(message.partitionId())) {
       misaddressedMessages.incrementAndGet()
       if (misaddressReported.compareAndSet(false, true)) {
         logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} dropped a message " +
-          log"addressed to shuffle ${MDC(VALUE, message.shuffleId())}: " +
-          log"${MDC(REASON, "the frame does not belong to this stream")}. Further occurrences " +
-          log"are counted but not logged")
+          log"addressed to shuffle ${MDC(VALUE, message.shuffleId())} partition " +
+          log"${MDC(PARTITION_ID, message.partitionId())}: " +
+          log"${MDC(REASON, "the frame names no stream this handler serves")}. Further " +
+          log"occurrences are counted but not logged")
       }
     } else {
       message match {
         case ack: AckMessage =>
-          handleAck(ack)
+          handleAck(client, ack)
         case heartbeat: HeartbeatMessage =>
-          handleHeartbeat(heartbeat)
+          handleHeartbeat(client, heartbeat)
         case request: RetransmitRequestMessage =>
-          handleRetransmitRequest(request)
+          handleRetransmitRequest(client, request)
         case unexpected =>
-          rejectUnexpected(ctx, unexpected)
+          rejectUnexpected(client, unexpected)
       }
+    }
+  }
+
+  /**
+   * Whether a partition id could belong to this map output at all.
+   *
+   * Checked before any state is created for it, which is what bounds the metadata a remote peer can
+   * provoke: an arbitrary partition id names nothing, so it allocates nothing. The bound is the
+   * partition count the retained store was told at registration, and before that is known the
+   * protocol's own non-negativity is all that can honestly be enforced.
+   */
+  private def servesPartition(partitionId: Int): Boolean = {
+    partitionId >= 0 && retainedOutput.forall { store =>
+      !store.partitionCountRegistered || partitionId < store.numPartitions
     }
   }
 
@@ -912,7 +1390,7 @@ private[spark] class StreamingShuffleServerHandler(
    * Spark's error catalogue and is raised as one.
    */
   private def rejectUnexpected(
-      ctx: ChannelHandlerContext,
+      client: TransportClient,
       message: StreamingShuffleMessage): Unit = {
     val actual = message match {
       case _: DataBlockMessage => StreamingShuffleMessageType.DATA_BLOCK.name()
@@ -926,94 +1404,277 @@ private[spark] class StreamingShuffleServerHandler(
     logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} received " +
       log"${MDC(VALUE, actual)} on its egress channel, which a producer may never be sent; " +
       log"closing the channel")
-    ctx.close()
+    closeSession(client)
   }
 
   /**
-   * Applies one acknowledgement: advances the consumer position and releases what it covers.
+   * Applies one acknowledgement: advances that consumer's position and releases what it covers.
    *
-   * This is the moment producer memory is reclaimed, and the reclamation is bounded: the protocol
-   * requires it to complete within one hundred milliseconds of the acknowledgement, so the elapsed
-   * time is measured and a breach is reported once per stream rather than on every acknowledgement.
-   * Releasing here is also what lets the consumer side handler re-enable reading, because the
-   * credit the ledger hands out is exactly what this release makes available.
+   * This is the moment producer memory is reclaimed, and it is also the single most abusable frame
+   * in the protocol -- an acknowledgement is a request to *forget* output, so a forged one is a
+   * request to lose data. Four conditions therefore stand between a frame and the bytes it would
+   * retire, and no part of the release happens until all four hold.
+   *
+   *  - The frame must arrive on a channel that holds a session, and it may only acknowledge a
+   *    partition that session subscribed to. A peer cannot acknowledge on another consumer's behalf
+   *    or for output it never asked for.
+   *  - The position must strictly advance that session's own previous position, so a replayed frame
+   *    is inert and a late lower one cannot un-retire what a higher one covered.
+   *  - The position may not exceed the highest sequence number this producer has actually charged
+   *    for the partition. A position plucked from the air -- `Long.MaxValue` being the obvious
+   *    choice -- is refused rather than honoured, which is what stops unconsumed output from being
+   *    released. The ledger is the authority, and its refusal is fatal to the channel: a peer
+   *    acknowledging bytes that were never sent is not a peer this producer can go on serving.
+   *  - The retained store applies the same bound independently, and retires only to the *minimum*
+   *    position across every registered consumer, so a block survives until every consumer entitled
+   *    to it has confirmed receipt.
+   *
+   * Reclamation is bounded: the protocol requires it to complete within one hundred milliseconds of
+   * the acknowledgement, so the elapsed time is measured and a breach is reported once per session
+   * rather than on every acknowledgement.
    */
-  private def handleAck(ack: AckMessage): Unit = {
+  private def handleAck(client: TransportClient, ack: AckMessage): Unit = {
     val partitionId = ack.partitionId()
     val position = ack.consumerPosition()
-    val stream = streamFor(partitionId)
-    acks.incrementAndGet()
-    val startedAtMs = clock.getTimeMillis()
-    stream.lastProgressMs.set(startedAtMs)
-    advanceAckPosition(stream, position)
-    var reclaimedBytes = 0L
-    var reclaimedBlocks = 0
-    if (position >= 0L) {
-      val iterator = stream.unacknowledged.headMap(position, true).entrySet().iterator()
-      while (iterator.hasNext()) {
-        val released = iterator.next().getValue()
-        iterator.remove()
-        reclaimedBytes += StreamingShuffleMessage.framedLength(released.encodedLength()).toLong
-        reclaimedBlocks += 1
-      }
-      if (reclaimedBytes > 0L) {
-        stream.unacknowledgedBytes.addAndGet(-reclaimedBytes)
-      }
-    }
-    if (reclaimedBlocks > 0) {
-      // Progress means the peer is healthy, so the retransmission budget starts afresh.
-      stream.retransmitAttempts.set(0)
-      stream.nextRetransmitAtMs.set(0L)
-    }
-    reportAck(partitionId, position)
-    val elapsedMs = clock.getTimeMillis() - startedAtMs
-    if (elapsedMs > ACK_RECLAMATION_BUDGET_MS &&
-      stream.reclamationWarned.compareAndSet(false, true)) {
+    val session = sessions.get(sessionKeyOf(client))
+    if (session == null || !session.subscribedTo(partitionId)) {
+      refusedAcks.incrementAndGet()
+      misaddressedMessages.incrementAndGet()
+      logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} refused an acknowledgement " +
+        log"of partition ${MDC(PARTITION_ID, partitionId)} through ${MDC(COUNT, position)} from " +
+        log"${MDC(HOST_PORT, client.getSocketAddress())}: " +
+        log"${MDC(REASON, "that channel is not subscribed to the partition")}")
+    } else if (position > session.sentPosition(partitionId)) {
+      // The per-session bound, and the one a forged acknowledgement runs into first: this consumer
+      // may only confirm blocks that were written to *its* channel. Every send records its sequence
+      // number before the bytes are handed to the socket, so a position beyond that record cannot
+      // be the report of a real receipt. Refusing it here rather than letting the ledger and the
+      // store each apply their own weaker bound is what keeps the three cursors on one prefix.
+      refusedAcks.incrementAndGet()
+      errorNotifier.setError(StreamingShuffleErrors.invalidSequenceNumber(
+        shuffleId, partitionId, session.sentPosition(partitionId), position))
       logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} partition " +
-        log"${MDC(PARTITION_ID, partitionId)} took ${MDC(DURATION, elapsedMs)} ms to reclaim " +
-        log"${MDC(NUM_BLOCKS, reclaimedBlocks)} block(s), beyond the " +
-        log"${MDC(TIMEOUT, ACK_RECLAMATION_BUDGET_MS)} ms budget. Further breaches on this " +
-        log"stream are not logged")
+        log"${MDC(PARTITION_ID, partitionId)} refused an acknowledgement through " +
+        log"${MDC(COUNT, position)} from consumer ${MDC(SESSION_ID, session.consumerId)}: " +
+        log"only ${MDC(MAX_SIZE, session.sentPosition(partitionId))} has been written to that " +
+        log"channel; closing it")
+      closeSession(client)
+    } else {
+      acks.incrementAndGet()
+      val startedAtMs = clock.getTimeMillis()
+      session.stampAckProgress(startedAtMs)
+      // The ledger refuses a position beyond what the producer charged, and its refusal is what
+      // makes the whole transition atomic: nothing is released, no cursor moves, the channel fails.
+      backpressure.tryAcknowledge(producerKey(partitionId), ack) match {
+        case None =>
+          refusedAcks.incrementAndGet()
+          errorNotifier.setError(StreamingShuffleErrors.invalidSequenceNumber(
+            shuffleId, partitionId,
+            backpressure.highestChargedSequenceNumber(producerKey(partitionId)), position))
+          logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} partition " +
+            log"${MDC(PARTITION_ID, partitionId)} refused an acknowledgement through " +
+            log"${MDC(COUNT, position)} from consumer ${MDC(SESSION_ID, session.consumerId)}: " +
+            log"${MDC(REASON, "no such block has been sent")}; closing the channel")
+          closeSession(client)
+        case Some(_) =>
+          val advanced = session.advanceAck(partitionId, position)
+          val reclaimedBytes = if (advanced) {
+            retainedOutput
+              .map(_.acknowledge(session.consumerId, partitionId, position))
+              .getOrElse(0L)
+          } else {
+            0L
+          }
+          if (advanced) {
+            // Progress means the peer is healthy, so the retransmission budget starts afresh.
+            session.resetRetransmitBudget(partitionId)
+          }
+          val elapsedMs = clock.getTimeMillis() - startedAtMs
+          if (elapsedMs > ACK_RECLAMATION_BUDGET_MS && session.warnReclamationOnce()) {
+            logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} partition " +
+              log"${MDC(PARTITION_ID, partitionId)} took ${MDC(DURATION, elapsedMs)} ms to " +
+              log"reclaim ${MDC(NUM_BYTES, reclaimedBytes)} byte(s), beyond the " +
+              log"${MDC(TIMEOUT, ACK_RECLAMATION_BUDGET_MS)} ms budget. Further breaches on this " +
+              log"session are not logged")
+          }
+          if (debugEnabled) {
+            logInfo(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} partition " +
+              log"${MDC(PARTITION_ID, partitionId)} acknowledged through " +
+              log"${MDC(COUNT, position)} by consumer ${MDC(SESSION_ID, session.consumerId)}, " +
+              log"reclaiming ${MDC(NUM_BYTES, reclaimedBytes)} byte(s) in " +
+              log"${MDC(DURATION, elapsedMs)} ms")
+          }
+          // Reclaimed memory and advanced credit may both have unblocked egress.
+          drain()
+      }
     }
-    if (debugEnabled) {
-      logInfo(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} partition " +
-        log"${MDC(PARTITION_ID, partitionId)} acknowledged through ${MDC(COUNT, position)}, " +
-        log"reclaiming ${MDC(NUM_BYTES, reclaimedBytes)} byte(s) in " +
-        log"${MDC(DURATION, elapsedMs)} ms")
-    }
-    // Reclaimed memory and advanced credit may both have unblocked egress.
-    drain()
   }
 
   /**
-   * Moves the acknowledged position forward only, so a reordered or duplicated acknowledgement can
-   * never resurrect blocks that a later one already released.
+   * Applies one consumer heartbeat, which is also how a consumer subscribes and how it resumes.
+   *
+   * The protocol needs no request message of its own because a heartbeat already carries everything
+   * a subscription requires: it names the partition the consumer wants and it states the position
+   * that consumer has reached. So the first heartbeat from a fresh consumer subscribes it from the
+   * beginning, and the first heartbeat from a reconnecting one subscribes it from exactly where it
+   * left off -- which is the resume handshake the failure protocol calls for, with the retained
+   * window replayed before any newly produced block, because the queue is filled in sequence order
+   * from that position.
+   *
+   * A heartbeat stamps liveness and *not* acknowledgement progress. Conflating the two would let a
+   * consumer that heartbeats punctually and consumes nothing keep the producer's window open for
+   * ever, which is the condition the ten second detector exists to catch.
+   *
+   * <b>What the position on a heartbeat means.</b> One thing in both directions: the <b>next</b>
+   * position the sender expects to handle. A producer's heartbeat carries the next position it will
+   * produce and a consumer's carries the next position it expects to receive, so a consumer that
+   * has received nothing announces zero. It has to be stated in those terms rather than as
+   * "consumed through", because the message type refuses a negative sequence number and there is
+   * therefore no value with which a fresh consumer could say "nothing yet" -- and because after a
+   * gap the next expected position and the highest received one differ, so announcing the latter
+   * would have the producer resume past the positions still missing.
    */
-  private def advanceAckPosition(stream: PartitionStream, position: Long): Unit = {
-    var observed = stream.lastAckPosition.get()
-    while (position > observed && !stream.lastAckPosition.compareAndSet(observed, position)) {
-      observed = stream.lastAckPosition.get()
-    }
-  }
-
-  private def handleHeartbeat(heartbeat: HeartbeatMessage): Unit = {
+  private def handleHeartbeat(client: TransportClient, heartbeat: HeartbeatMessage): Unit = {
     val partitionId = heartbeat.partitionId()
-    val stream = streamFor(partitionId)
     heartbeats.incrementAndGet()
-    stream.lastProgressMs.set(clock.getTimeMillis())
+    val session = sessionFor(client)
+    session.stampHeartbeat(clock.getTimeMillis())
+    if (session.subscribe(partitionId)) {
+      resumeFrom(session, partitionId, heartbeat.sequenceNumber())
+    }
     reportHeartbeat(heartbeat)
+    // A drain unconditionally, and this is load bearing rather than tidy. Every consumer of a
+    // completed map output subscribes *after* the producing task has ended -- the scheduler starts
+    // no reduce task before its map stage finishes -- so this heartbeat is frequently the only
+    // event that will ever occur on this stream, with no producer thread left to flush anything.
+    // A pass here is what delivers the deferred end of stream markers for the two cases
+    // [[resumeFrom]] leaves undrained: a partition this map produced nothing for, and a consumer
+    // whose position already covers everything retained.
+    drain()
     if (debugEnabled) {
       logInfo(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} partition " +
-        log"${MDC(PARTITION_ID, partitionId)} saw a consumer heartbeat stamped " +
-        log"${MDC(VALUE, heartbeat.timestampMs())}")
+        log"${MDC(PARTITION_ID, partitionId)} saw a heartbeat from consumer " +
+        log"${MDC(SESSION_ID, session.consumerId)} stamped " +
+        log"${MDC(VALUE, heartbeat.timestampMs())} at position " +
+        log"${MDC(COUNT, heartbeat.sequenceNumber())}")
     }
   }
 
-  private def handleRetransmitRequest(request: RetransmitRequestMessage): Unit = {
+  /**
+   * Queues everything one newly subscribed consumer is owed, from its own position onward.
+   *
+   * The consumer announces the <b>next</b> position it expects, the convention every heartbeat on
+   * this protocol follows in both directions, so the position it has effectively confirmed is one
+   * below that. Converting here rather than at the call site keeps the conversion in the one place
+   * that reasons about retained windows, and means a consumer that has received nothing -- which
+   * announces zero, because the message type permits no negative sequence number -- is correctly
+   * read as having confirmed nothing and is served from block zero rather than from block one.
+   *
+   * That converted position is trusted only as a lower bound and is reconciled against two
+   * authorities before anything is queued: the store's record of what that consumer has already
+   * acknowledged, which a peer cannot talk its way past, and the store's record of what is still
+   * retained. The higher of the announced and recorded positions is where delivery starts, so a
+   * consumer cannot replay bytes it has already confirmed -- which would be a request to un-retire
+   * released memory -- and the lower bound of the retained window is where delivery starts if the
+   * consumer is further behind than that.
+   *
+   * A consumer behind the retained window has lost output that no longer exists. That is not
+   * repairable here and is not treated as repairable: it escalates through the notifier so the read
+   * is invalidated and the upstream stage recomputed.
+   *
+   * @param session the consumer session that has just subscribed to the partition
+   * @param partitionId the reduce partition the consumer subscribed to
+   * @param announcedNextPosition the next block position the consumer says it expects
+   */
+  private def resumeFrom(
+      session: ConsumerSession,
+      partitionId: Int,
+      announcedNextPosition: Long): Unit = {
+    // A heartbeat states the next expected position, so the confirmed position is one below it.
+    val announcedPosition = math.max(AckMessage.NOTHING_CONSUMED, announcedNextPosition - 1L)
+    retainedOutput.foreach { store =>
+      store.registerConsumer(session.consumerId)
+      val recorded = store.consumerPosition(session.consumerId, partitionId)
+        .getOrElse(AckMessage.NOTHING_CONSUMED)
+      val resumeAfter = math.max(announcedPosition, recorded)
+      session.advanceAck(partitionId, resumeAfter)
+      val lowestRetained = store.lowestRetainedSequence(partitionId)
+      val highestRetained = store.lastAcceptedSequence(partitionId)
+      if (highestRetained == MemorySpillManager.UNSET_SEQUENCE) {
+        // Nothing has been produced for this partition yet; the subscription alone is enough, and
+        // blocks will be fanned out to this session as they are admitted.
+        session.advanceSent(partitionId, resumeAfter)
+      } else if (lowestRetained != MemorySpillManager.UNSET_SEQUENCE &&
+          lowestRetained > resumeAfter + 1L) {
+        errorNotifier.setError(StreamingShuffleErrors.invalidSequenceNumber(
+          shuffleId, partitionId, lowestRetained, resumeAfter + 1L))
+        logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} partition " +
+          log"${MDC(PARTITION_ID, partitionId)} cannot resume consumer " +
+          log"${MDC(SESSION_ID, session.consumerId)} from ${MDC(COUNT, resumeAfter + 1L)}: the " +
+          log"retained window begins at ${MDC(NUM_BLOCKS, lowestRetained)}, so the read must be " +
+          log"invalidated and the upstream stage recomputed")
+      } else {
+        val queued = serviceRetransmission(
+          session, partitionId, math.max(0L, resumeAfter + 1L), highestRetained)
+        session.advanceSent(partitionId, resumeAfter)
+        if (queued > 0) {
+          resumedSessions.incrementAndGet()
+          // One record per resumed partition per reconnecting consumer. The counter incremented
+          // just above is what carries the volume to an operator; the identity of each resumed
+          // stream is detail behind the streaming debug key.
+          if (debugEnabled) {
+            logInfo(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} partition " +
+              log"${MDC(PARTITION_ID, partitionId)} resumed consumer " +
+              log"${MDC(SESSION_ID, session.consumerId)} with ${MDC(NUM_BLOCKS, queued)} " +
+              log"retained block(s) from position ${MDC(COUNT, resumeAfter)}")
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * Handles an inbound retransmission request by putting it through the protocol's own transition
+   * before servicing it.
+   *
+   * The protocol is the authority on whether a request can be served and on how many attempts a
+   * stream has spent, because it owns the unacknowledged window that bounds replay and the retry
+   * budget the failure protocol prescribes. Consulting it also refreshes the stream's inbound
+   * activity instant, so a consumer that is asking for repairs is recognised as alive rather than
+   * timed out while it waits for them.
+   *
+   * A request the protocol refuses is one whose bytes are no longer retained, or one from a stream
+   * whose replay budget is spent. Neither is serviceable, and the reader escalates such a request
+   * to a fetch failure so that the unmodified scheduler recomputes the upstream stage -- which is
+   * why refusing here is a complete answer rather than a dropped frame.
+   */
+  private def handleRetransmitRequest(
+      client: TransportClient,
+      request: RetransmitRequestMessage): Unit = {
     val partitionId = request.partitionId()
-    val serviced =
-      retransmit(partitionId, request.firstSequenceNumber(), request.lastSequenceNumber())
-    if (debugEnabled) {
+    val session = sessions.get(sessionKeyOf(client))
+    if (session == null || !session.subscribedTo(partitionId)) {
+      misaddressedMessages.incrementAndGet()
+      logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} refused a replay request " +
+        log"for partition ${MDC(PARTITION_ID, partitionId)} from " +
+        log"${MDC(HOST_PORT, client.getSocketAddress())}: " +
+        log"${MDC(REASON, "that channel is not subscribed to the partition")}")
+      return
+    }
+    val admitted = backpressure.onRetransmitRequest(producerKey(partitionId), request)
+    val serviced = if (admitted) {
+      retransmitTo(session, partitionId, request.firstSequenceNumber(),
+        request.lastSequenceNumber())
+    } else {
+      0
+    }
+    if (!admitted) {
+      logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} partition " +
+        log"${MDC(PARTITION_ID, partitionId)} refused a request to replay blocks " +
+        log"${MDC(COUNT, request.firstSequenceNumber())} through " +
+        log"${MDC(VALUE, request.lastSequenceNumber())}: " +
+        log"${MDC(REASON, "the range is no longer retained or the replay budget is spent")}")
+    } else if (debugEnabled) {
       logInfo(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} partition " +
         log"${MDC(PARTITION_ID, partitionId)} was asked to replay " +
         log"${MDC(NUM_BLOCKS, request.blockCount())} block(s) and re-queued " +
@@ -1021,7 +1682,7 @@ private[spark] class StreamingShuffleServerHandler(
     }
   }
 
-  private def reportVersionMismatch(ctx: ChannelHandlerContext, version: Byte): Unit = {
+  private def reportVersionMismatch(client: TransportClient, version: Byte): Unit = {
     versionMismatch.set(true)
     errorNotifier.setError(new SparkException(s"Streaming shuffle $shuffleId received protocol " +
       s"version $version from its consumer but this executor speaks " +
@@ -1031,7 +1692,7 @@ private[spark] class StreamingShuffleServerHandler(
       log"mismatch: peer sent ${MDC(VALUE, version)} against " +
       log"${MDC(COUNT, StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION)}. " +
       log"${MDC(REASON, "streaming yields to sort based shuffle")}")
-    ctx.close()
+    closeSession(client)
   }
 
   // ==========================================================================================
@@ -1041,8 +1702,12 @@ private[spark] class StreamingShuffleServerHandler(
   // place is deliberate: the protocol owns the credit ledger, the acknowledgement and heartbeat
   // timeouts, the consumer liveness window, cross shuffle utilisation aggregation, arbitration on
   // partition count and pending volume, and the backpressure event counter. This handler supplies
-  // the observations that ledger is computed from and reimplements none of it, so the reporting
-  // surface it depends on is exactly the four calls below and nothing else.
+  // the observations that ledger is computed from and reimplements none of it.
+  //
+  // Acknowledgement is the exception to "reported here": it is applied in handleAck rather than
+  // forwarded from here, because the ledger's refusal of an impossible position is not a report but
+  // a decision -- nothing may be released and the channel must be failed -- and splitting the
+  // decision from its consequences across two methods is how a refusal gets ignored.
   // ==========================================================================================
 
   /**
@@ -1067,21 +1732,17 @@ private[spark] class StreamingShuffleServerHandler(
    * @return true if the block may be written now, false if it must stay queued and be retried
    */
   private def admitForEgress(pending: PendingBlock): Boolean = {
-    backpressure.tryAdmit(
-      shuffleId,
-      pending.block.partitionId(),
-      pending.framedBytes.toLong,
-      pending.block.sequenceNumber())
-  }
-
-  /**
-   * Reports a consumer acknowledgement, so the ledger can release credit and time reclamation.
-   *
-   * The position is the consumer's, not this handler's view of it: the ledger retires every block
-   * at or below it, which is the event the hundred millisecond reclamation bound is measured from.
-   */
-  private def reportAck(partitionId: Int, consumerPosition: Long): Unit = {
-    backpressure.onAck(shuffleId, partitionId, consumerPosition)
+    val key = producerKey(pending.partitionId)
+    if (pending.replay) {
+      // A replay is paced but not charged for credit and not counted as production. Its bytes are
+      // already inside the unacknowledged window, so charging them again would refuse a request to
+      // replay the whole window against the very allowance that window is measured by; and counting
+      // them as newly produced output would inflate this producer's measured rate, which is one
+      // half of the ratio the sustained-slowness fallback trips on.
+      backpressure.tryAdmitReplay(key, pending.framedBytes.toLong, pending.sequenceNumber)
+    } else {
+      backpressure.tryAdmit(key, pending.framedBytes.toLong, pending.sequenceNumber)
+    }
   }
 
   /**
@@ -1092,7 +1753,7 @@ private[spark] class StreamingShuffleServerHandler(
    * consumer's clock be compared with this executor's.
    */
   private def reportHeartbeat(heartbeat: HeartbeatMessage): Unit = {
-    backpressure.onHeartbeat(heartbeat)
+    backpressure.onHeartbeat(producerKey(heartbeat.partitionId()), heartbeat)
   }
 
   /**
@@ -1127,26 +1788,61 @@ private[spark] class StreamingShuffleServerHandler(
   def writeTimeNanos: Long = writeNanos.get()
 
   /** Framed bytes queued for the wire but not yet written. */
-  def pendingBytes: Long = sumOverStreams(stream => stream.pendingBytes.get())
+  def pendingBytes: Long = sumOverSessions(session => session.pendingBytes)
 
-  /** Framed bytes written but not yet acknowledged, and therefore still retained for replay. */
-  def unacknowledgedBytes: Long = sumOverStreams(stream => stream.unacknowledgedBytes.get())
+  /**
+   * Framed bytes written but not yet acknowledged by every consumer, and therefore still retained
+   * for replay. Summed over sessions, because "unacknowledged" is a per-consumer fact: a block one
+   * consumer has confirmed is still outstanding for another that has not.
+   */
+  def unacknowledgedBytes: Long = sumOverSessions(session => session.unacknowledgedBytes)
 
-  /** Blocks retained for replay across every partition of this shuffle. */
+  /** Blocks retained for replay across every partition of this shuffle, per the retained store. */
   def unacknowledgedBlockCount: Int = {
+    val store = retainedOutput
     var total = 0
-    streams.values().asScala.foreach(stream => total += stream.unacknowledged.size())
+    streams.keySet().asScala.foreach { partitionId =>
+      total += store.map(_.retainedBlockCount(partitionId)).getOrElse(0)
+    }
     total
   }
 
   /**
-   * The highest block sequence number the consumer has acknowledged for one partition, or
-   * `AckMessage.NOTHING_CONSUMED` if it has acknowledged nothing.
+   * The highest block sequence number that *every* subscribed consumer of one partition has
+   * acknowledged, or `AckMessage.NOTHING_CONSUMED` when one of them has acknowledged nothing.
+   *
+   * The minimum rather than the maximum, and the distinction is a correctness one: this figure is
+   * what the producer treats as safely delivered, so taking the highest would let one fast consumer
+   * authorise the release of bytes a slower one has not yet received. A partition nobody has
+   * subscribed to reports nothing consumed, which is the truth.
    */
   def acknowledgedPosition(partitionId: Int): Long = {
-    val stream = streams.get(partitionId)
-    if (stream == null) AckMessage.NOTHING_CONSUMED else stream.lastAckPosition.get()
+    val subscribed = sessions.values().asScala.filter(_.subscribedTo(partitionId)).toSeq
+    if (subscribed.isEmpty) {
+      AckMessage.NOTHING_CONSUMED
+    } else {
+      subscribed.map(_.ackPosition(partitionId)).min
+    }
   }
+
+  /** Consumer sessions currently attached to this map output. */
+  def sessionCount: Int = sessions.size()
+
+  /** Distinct (consumer, partition) subscriptions currently held. */
+  def subscriptionCount: Int = {
+    var total = 0
+    sessions.values().asScala.foreach(session => total += session.subscriptionCount)
+    total
+  }
+
+  /** Acknowledgements refused because they were unauthorised or named unsent output. */
+  def refusedAckCount: Long = refusedAcks.get()
+
+  /** Blocks that could not be framed because the retained store no longer held them. */
+  def unservableBlockCount: Long = unservableBlocks.get()
+
+  /** Consumers resumed from a recorded position after reconnecting. */
+  def resumedSessionCount: Long = resumedSessions.get()
 
   /** How many times egress was refused by the rate limiter and the block was held instead. */
   def throttleCount: Long = throttles.get()
@@ -1171,15 +1867,27 @@ private[spark] class StreamingShuffleServerHandler(
    */
   def versionMismatchDetected: Boolean = versionMismatch.get()
 
-  /** Whether there is a live channel to write to right now. */
+  /** Whether there is at least one live consumer channel to write to right now. */
   def isChannelReady: Boolean = {
-    val ctx = channelContext.get()
-    ctx != null && ctx.channel().isActive()
+    !closed.get() && sessions.values().asScala.exists { session =>
+      !session.isClosed && session.channel.isActive()
+    }
   }
 
-  private def sumOverStreams(measure: PartitionStream => Long): Long = {
+  /**
+   * Whether this handler still has retained output it is entitled to serve.
+   *
+   * True exactly while the executor-scoped resolver holds this generation's registration, which is
+   * the same question every send already asks before it reads a byte. Published because the
+   * producing task has to be able to distinguish a handler that is finished from one that is merely
+   * idle: a successful map task's handler is idle for as long as it takes the reduce stage to
+   * start, and tearing it down then would destroy the only endpoint its consumers can reach.
+   */
+  def servesRetainedOutput: Boolean = retainedOutput.isDefined
+
+  private def sumOverSessions(measure: ConsumerSession => Long): Long = {
     var total = 0L
-    streams.values().asScala.foreach(stream => total += measure(stream))
+    sessions.values().asScala.foreach(session => total += measure(session))
     total
   }
 
@@ -1188,27 +1896,41 @@ private[spark] class StreamingShuffleServerHandler(
   // ==========================================================================================
 
   /**
-   * Releases every buffered and retained block for this shuffle.
+   * Releases every queued reference and every consumer session, exactly once.
    *
    * This is the counterpart of the writer's unsuccessful stop and of its task completion listener:
-   * once the producing task is finished with the shuffle, nothing may be retained, whether the task
-   * succeeded, failed or was cancelled. Channel loss deliberately does not come here, because a
-   * consumer that reconnects must still be replayable.
+   * once nothing this handler could serve remains published, nothing may be queued or scheduled on
+   * it again. A successful producer deliberately does *not* come here when its task ends -- its
+   * output stays published and, because the scheduler starts no reduce task until the map stage has
+   * finished, its consumers have not started yet -- so the callers are failure, cancellation, a
+   * refused hand-off and a superseded generation. Channel loss deliberately does not come here
+   * either, because a consumer that reconnects must still be replayable.
+   *
+   * The order matters and is the whole of the fix for the race this replaces. The close transition
+   * is latched first, so no thread can queue a block, schedule a refill wake-up or start a drain
+   * pass after this point; only then are the sessions closed and their queues emptied. Latching
+   * first also makes the method idempotent: a second caller -- and there are three plausible ones,
+   * arriving concurrently -- returns without touching anything.
+   *
+   * The payload bytes themselves are *not* released here, and must not be: they belong to the
+   * retained store, whose own lifetime is the shuffle's rather than the task's, and whose release
+   * is driven by acknowledgement, by the shuffle being unregistered, or by a generation being
+   * invalidated. Discarding them here is what would destroy output a reduce task is still entitled
+   * to read.
    */
   def releaseAll(): Unit = {
-    val releasedBytes = pendingBytes + unacknowledgedBytes
-    egressQueue.clear()
-    streams.values().asScala.foreach { stream =>
-      stream.unacknowledged.clear()
-      stream.unacknowledgedBytes.set(0L)
-      stream.pendingBytes.set(0L)
-      stream.pendingBlocks.set(0L)
-    }
-    streams.clear()
-    if (releasedBytes > 0L || debugEnabled) {
-      logInfo(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} released " +
-        log"${MDC(NUM_BYTES, releasedBytes)} buffered and retained byte(s) after " +
-        log"${MDC(NUM_BLOCKS, blocksWritten.get())} block(s) written")
+    if (closed.compareAndSet(false, true)) {
+      val releasedBytes = pendingBytes
+      val queuedBlocks = sumOverSessions(session => session.pendingBlocks)
+      sessions.values().asScala.foreach(_.close())
+      sessions.clear()
+      streams.clear()
+      if (releasedBytes > 0L || debugEnabled) {
+        logInfo(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} released " +
+          log"${MDC(NUM_BLOCKS, queuedBlocks)} queued block reference(s) totalling " +
+          log"${MDC(NUM_BYTES, releasedBytes)} framed byte(s) after " +
+          log"${MDC(COUNT, blocksWritten.get())} block(s) written")
+      }
     }
   }
 
@@ -1224,10 +1946,59 @@ private[spark] class StreamingShuffleServerHandler(
     if (existing != null) {
       existing
     } else {
-      val created = new PartitionStream(partitionId, clock.getTimeMillis())
+      val created = new PartitionStream(partitionId)
       val raced = streams.putIfAbsent(partitionId, created)
       if (raced != null) raced else created
     }
+  }
+
+  /**
+   * The session key of one consumer channel.
+   *
+   * The channel's own id, not the consumer's identity: a reconnection is a different channel and
+   * must be a different session, so that a late teardown of the connection that was lost cannot
+   * dispossess the one that replaced it. The consumer identity lives inside the session and is what
+   * the retained store's cursors are keyed by, which is what makes the resumption work across the
+   * two channels.
+   */
+  private def sessionKeyOf(client: TransportClient): String = {
+    client.getChannel().id().asLongText()
+  }
+
+  /**
+   * The session for one consumer channel, created on first use.
+   *
+   * The consumer identity is taken from the transport's authenticated client id when there is one,
+   * and from the socket identity when authentication is off. That is the honest binding available:
+   * with `spark.authenticate` on, the identity has been established by SASL before this handler
+   * sees a single frame, and with it off nothing stronger exists to bind to than the connection.
+   * Either way a session may only ever affect the partitions it subscribed to on its own channel,
+   * which is the invariant that does not depend on the operator's authentication choice.
+   */
+  private def sessionFor(client: TransportClient): ConsumerSession = {
+    val key = sessionKeyOf(client)
+    val existing = sessions.get(key)
+    if (existing != null) {
+      existing
+    } else {
+      val identity = Option(client.getClientId())
+        .filter(_.nonEmpty)
+        .map(id => s"$id@${client.getSocketAddress()}")
+        .getOrElse(s"anonymous@${client.getSocketAddress()}")
+      val created =
+        new ConsumerSession(key, identity, client.getChannel(), clock.getTimeMillis())
+      val raced = sessions.putIfAbsent(key, created)
+      if (raced != null) raced else created
+    }
+  }
+
+  /** Closes one consumer's session and its channel, leaving every other consumer untouched. */
+  private def closeSession(client: TransportClient): Unit = {
+    val session = sessions.remove(sessionKeyOf(client))
+    if (session != null) {
+      session.close()
+    }
+    client.getChannel().close()
   }
 
   /**
@@ -1238,7 +2009,7 @@ private[spark] class StreamingShuffleServerHandler(
    * down the pipeline without ever reaching the task that is waiting. A fatal error is
    * deliberately not contained: those belong to the JVM, not to this handler.
    */
-  private def guard(operation: => Unit): Unit = {
+  private def guard(operation: => Any): Unit = {
     try {
       operation
     } catch {
@@ -1282,6 +2053,39 @@ private[spark] object StreamingShuffleServerHandler {
    */
   val TCP_KEEP_ALIVE_KEY: String = s"spark.$TRANSPORT_MODULE_NAME.io.enableTcpKeepAlive"
 
+  /**
+   * The key that bounds how long a streaming channel may be idle, for this module only.
+   *
+   * The transport derives this from `spark.network.timeout` when it is unset, which is normally two
+   * minutes -- twenty-four times the bound this subsystem promises. Setting it per module is what
+   * makes the promise true of the socket as well as of the protocol timer, and setting it *per
+   * module* is what keeps that aggressive value away from the block transfer service, where a
+   * two-minute idle window is entirely appropriate.
+   */
+  val CONNECTION_TIMEOUT_KEY: String = s"spark.$TRANSPORT_MODULE_NAME.io.connectionTimeout"
+
+  /**
+   * The key that bounds how long opening a streaming channel may take, for this module only.
+   *
+   * The transport defaults this to the idle timeout above, which in turn defaults to
+   * `spark.network.timeout`. A consumer that waited that long to discover a producer had gone would
+   * report the loss long after the five-second detector had promised to, so the connect deadline is
+   * pinned to the same five seconds rather than inherited.
+   */
+  val CONNECTION_CREATION_TIMEOUT_KEY: String =
+    s"spark.$TRANSPORT_MODULE_NAME.io.connectionCreationTimeout"
+
+  /**
+   * The five-second connection bound of this subsystem, expressed in whole seconds.
+   *
+   * Derived from the one place the bound is declared rather than restated, so the transport and the
+   * protocol timer can never disagree. Seconds, because the transport parses both timeout keys at
+   * second granularity and would silently truncate anything finer; never below one second, so a
+   * hypothetical sub-second acknowledgement timeout could not turn into a zero-length deadline that
+   * refuses every connection.
+   */
+  val CONNECTION_TIMEOUT_SECONDS: Long = math.max(1L, BackpressureProtocol.ACK_TIMEOUT_MS / 1000L)
+
   /** Largest payload a single block may carry, being the protocol's own cap of two mebibytes. */
   val MAX_PAYLOAD_BYTES: Int = DataBlockMessage.MAX_BLOCK_SIZE_BYTES
 
@@ -1316,6 +2120,16 @@ private[spark] object StreamingShuffleServerHandler {
   val INITIAL_EGRESS_QUEUE_CAPACITY: Int = 16
 
   /**
+   * Longest a refill wake-up may be scheduled for, whatever the bucket's own arithmetic says.
+   *
+   * A very small bandwidth cap can make the wait for one block's worth of tokens arbitrarily long,
+   * and an arbitrarily long wake-up would look exactly like a producer that had stopped. Capping
+   * the wait costs nothing but a re-evaluation, and it keeps the drain loop responsive to
+   * writability changes and acknowledgements that arrive while the bucket is still empty.
+   */
+  val MAX_REFILL_WAIT_MS: Long = 1000L
+
+  /**
    * Attributes of the task attempt that produced a block, which decide flush order.
    *
    * This is the concrete meaning of prioritising shuffle traffic over speculative execution in a
@@ -1343,38 +2157,141 @@ private[spark] object StreamingShuffleServerHandler {
   val DEFAULT_PRIORITY: EgressPriority = EgressPriority(0, 0, 0L, 0)
 
   /**
-   * Builds the transport configuration for the streaming shuffle module with keep-alive enabled.
+   * Builds the transport configuration for the streaming shuffle module.
    *
-   * The configuration is cloned before the keep-alive key is set, so enabling it for streaming can
-   * never leak into the caller's own `SparkConf` and perturb another module. `SparkTransportConf`
-   * clones again on its own account, which means the returned configuration is a snapshot: reading
-   * it later cannot observe a change made afterwards, and that immutability is what makes
-   * "streaming shuffle configuration changes require an executor restart" true rather than merely
-   * intended.
+   * Three things are settled here, and all three are settled for the streaming module alone.
+   *
+   *  - <b>Keep-alive</b> is enabled, so a connection nobody is using is eventually reaped by the
+   *    kernel. It is a coarse safety net beneath the protocol's own timer and never a substitute
+   *    for it.
+   *  - <b>The five-second connection bound</b> is applied to the socket as well as to the protocol
+   *    timer. Without it the transport would inherit `spark.network.timeout`, normally two minutes,
+   *    and a consumer would wait twenty-four times its stated deadline before reporting a producer
+   *    it could not reach. Both keys are set only when the operator has not set them, so an
+   *    explicit value in the executor's configuration still wins.
+   *  - <b>Transport-level encryption</b> is taken from the security manager's RPC SSL options,
+   *    which is the same material every other Spark connection is protected with. Passing `None`
+   *    yields a plaintext channel, which is correct only when the application is unprotected.
+   *
+   * The configuration is cloned before any key is set, so none of it can leak into the caller's own
+   * `SparkConf` and perturb another module. `SparkTransportConf` clones again on its own account,
+   * which means the returned configuration is a snapshot: reading it later cannot observe a change
+   * made afterwards, and that immutability is what makes "streaming shuffle configuration changes
+   * require an executor restart" true rather than merely intended.
    *
    * @param conf the executor's configuration, left untouched
    * @param numUsableCores cores this JVM may use for transport threads, or zero for the default
+   * @param security the security manager whose RPC SSL options protect the channel, defaulting to
+   *                 this executor's own
    * @return a configuration whose keys live under `spark.shuffle-streaming.io.*`
    */
-  def streamingTransportConf(conf: SparkConf, numUsableCores: Int = 0): TransportConf = {
+  def streamingTransportConf(
+      conf: SparkConf,
+      numUsableCores: Int = 0,
+      security: Option[SecurityManager] = currentSecurityManager): TransportConf = {
     val streamingConf = conf.clone
     streamingConf.set(TCP_KEEP_ALIVE_KEY, "true")
-    SparkTransportConf.fromSparkConf(streamingConf, TRANSPORT_MODULE_NAME, numUsableCores)
+    if (!streamingConf.contains(CONNECTION_TIMEOUT_KEY)) {
+      streamingConf.set(CONNECTION_TIMEOUT_KEY, s"${CONNECTION_TIMEOUT_SECONDS}s")
+    }
+    if (!streamingConf.contains(CONNECTION_CREATION_TIMEOUT_KEY)) {
+      streamingConf.set(CONNECTION_CREATION_TIMEOUT_KEY, s"${CONNECTION_TIMEOUT_SECONDS}s")
+    }
+    SparkTransportConf.fromSparkConf(streamingConf, TRANSPORT_MODULE_NAME, numUsableCores,
+      sslOptions = security.map(_.getRpcSSLOptions()))
   }
 
   /**
-   * One block waiting for the wire, together with the ordering it is queued under.
+   * The client-side bootstraps a streaming consumer channel must be created with.
    *
-   * @param block the framed, checksummed block
+   * A streaming shuffle channel carries serialized records straight into Spark's deserialization,
+   * so an unauthenticated one is a remote code execution surface: the block checksum is a CRC32C,
+   * which detects corruption and forges trivially, and is therefore no part of the answer. The
+   * answer is the platform's own: when the application has authentication enabled, every channel
+   * completes the auth handshake before a single frame is exchanged, exactly as the block transfer
+   * service does. When it is disabled the list is empty, which reproduces the platform's behaviour
+   * for every other connection in the same application rather than inventing a different one.
+   *
+   * @param conf the executor's configuration, read for the application id the handshake names
+   * @param transportConf the streaming module's transport configuration
+   * @param security the security manager holding the application secret, defaulting to this
+   *                 executor's own
+   * @return the bootstraps to hand to `TransportContext.createClientFactory`
+   */
+  def streamingClientBootstraps(
+      conf: SparkConf,
+      transportConf: TransportConf,
+      security: Option[SecurityManager] = currentSecurityManager)
+    : java.util.List[TransportClientBootstrap] = {
+    val bootstraps = new java.util.ArrayList[TransportClientBootstrap]()
+    security.filter(_.isAuthenticationEnabled()).foreach { manager =>
+      bootstraps.add(new AuthClientBootstrap(transportConf, conf.getAppId, manager))
+    }
+    bootstraps
+  }
+
+  /**
+   * The server-side bootstraps a streaming producer server must be created with.
+   *
+   * The counterpart of [[streamingClientBootstraps]], and required for the same reason: a producer
+   * that accepted unauthenticated channels would serve one map task's output to any peer that could
+   * reach the port, and would accept acknowledgements -- which release producer memory -- from that
+   * same peer. Installing the bootstrap makes the channel's authenticated identity the capability
+   * that admits a consumer, and it is installed by the manager when it creates the server, so no
+   * shared transport class is touched to achieve it.
+   *
+   * @param transportConf the streaming module's transport configuration
+   * @param security the security manager holding the application secret, defaulting to this
+   *                 executor's own
+   * @return the bootstraps to hand to `TransportContext.createServer`
+   */
+  def streamingServerBootstraps(
+      transportConf: TransportConf,
+      security: Option[SecurityManager] = currentSecurityManager)
+    : java.util.List[TransportServerBootstrap] = {
+    val bootstraps = new java.util.ArrayList[TransportServerBootstrap]()
+    security.filter(_.isAuthenticationEnabled()).foreach { manager =>
+      bootstraps.add(new AuthServerBootstrap(transportConf, manager))
+    }
+    bootstraps
+  }
+
+  /**
+   * This executor's security manager, when there is a live environment to read it from.
+   *
+   * Read through `SparkEnv` rather than accepted as a constructor argument because the manager that
+   * owns these components is itself constructed by `SparkEnv`, before the environment it belongs to
+   * is published; a component that demanded the security manager at construction could therefore
+   * not be built at all. `None` means no environment, which happens only outside a running executor
+   * and yields the plaintext, unauthenticated configuration that such a context has no secret for.
+   */
+  private def currentSecurityManager: Option[SecurityManager] =
+    Option(SparkEnv.get).map(_.securityManager)
+
+  /**
+   * One block waiting for the wire, identified rather than carried.
+   *
+   * The block's bytes are deliberately absent. They live in the producer's retained store, which is
+   * charged against the executor's memory quota and which spills under pressure, and they are read
+   * back only at the moment the frame is written. A queue entry that carried the payload would be a
+   * second, unaccounted copy of every block in flight -- the bytes would be charged once to the
+   * store and held again here, outside any budget -- and a block the store had spilled would still
+   * be pinned in memory by this queue, defeating the eviction that spilling performed.
+   *
+   * @param partitionId the reduce partition the block belongs to
+   * @param sequenceNumber the block's position in its partition's sequence
+   * @param framedBytes bytes the block occupies on the wire, framing prefix included
    * @param priority attributes of the attempt that produced it
    * @param ticket monotonic enqueue order, which makes the ordering total and stable
-   * @param framedBytes bytes the block occupies on the wire, framing prefix included
+   * @param replay whether this entry is a retransmission rather than an original send
    */
   private final case class PendingBlock(
-      block: DataBlockMessage,
+      partitionId: Int,
+      sequenceNumber: Long,
+      framedBytes: Int,
       priority: EgressPriority,
       ticket: Long,
-      framedBytes: Int)
+      replay: Boolean = false)
 
   /**
    * Flush order: original attempts before retries, lower attempt numbers first, and enqueue order
@@ -1399,61 +2316,430 @@ private[spark] object StreamingShuffleServerHandler {
   }
 
   /**
-   * Egress and acknowledgement state of one reduce partition.
+   * Production state of one reduce partition, shared by every consumer of it.
    *
-   * Every field is atomic or concurrent, because the writer's task thread and the channel's
-   * event-loop thread both reach this state and neither may wait for the other.
+   * What remains here is only what is genuinely common to all consumers: the sequence the producer
+   * assigns, how many blocks it has produced, and whether it has declared the stream complete.
+   * Everything that differs between consumers -- what has been sent, what has been acknowledged,
+   * what is queued, and whether the terminator has been delivered -- belongs to the session that
+   * consumer holds, because treating any of it as a property of the partition would let one
+   * consumer's progress be mistaken for another's.
+   *
+   * Every field is atomic, because the writer's task thread and the channels' event-loop threads
+   * all reach this state and none of them may wait for the others.
    *
    * @param partitionId the reduce partition this state belongs to
-   * @param createdAtMs the instant the stream was opened, which seeds the liveness window
    */
-  private final class PartitionStream(val partitionId: Int, createdAtMs: Long) {
+  private final class PartitionStream(val partitionId: Int) {
 
     /** Next sequence number to assign, counted from zero and increasing by one per block. */
     val nextSequenceNumber: AtomicLong = new AtomicLong(0L)
 
-    /** Blocks ever enqueued for this partition, which is the total the terminator reports. */
+    /** Blocks ever produced for this partition, which is the total the terminator reports. */
     val blocksEnqueued: AtomicLong = new AtomicLong(0L)
 
-    /** Blocks queued but not yet written, including blocks re-queued for retransmission. */
-    val pendingBlocks: AtomicLong = new AtomicLong(0L)
-
-    /** Framed bytes queued but not yet written. */
-    val pendingBytes: AtomicLong = new AtomicLong(0L)
-
-    /** Framed bytes written but not yet acknowledged. */
-    val unacknowledgedBytes: AtomicLong = new AtomicLong(0L)
-
     /**
-     * The unacknowledged window: blocks written and retained against retransmission, keyed by
-     * sequence number. Ordered so that the range an acknowledgement releases, and the range a
-     * retransmission request asks for, are both sub-map views rather than scans.
+     * Highest sequence number offered to any consumer, or `AckMessage.NOTHING_CONSUMED` when the
+     * partition has produced nothing. This is what a session is measured against to decide it has
+     * received everything, so a partition that produced no records is caught up from the outset.
      */
-    val unacknowledged: ConcurrentSkipListMap[Long, DataBlockMessage] =
-      new ConcurrentSkipListMap[Long, DataBlockMessage]()
+    val highestOffered: AtomicLong = new AtomicLong(AckMessage.NOTHING_CONSUMED)
 
-    /** Highest sequence number the consumer has acknowledged, or nothing consumed. */
-    val lastAckPosition: AtomicLong = new AtomicLong(AckMessage.NOTHING_CONSUMED)
-
-    /** When this stream last saw an acknowledgement or a heartbeat from its consumer. */
-    val lastProgressMs: AtomicLong = new AtomicLong(createdAtMs)
-
-    /** Whether the writer has asked for end of stream. */
+    /** Whether the writer has declared the end of this partition's stream. */
     val terminationRequested: AtomicBoolean = new AtomicBoolean(false)
 
-    /** One-shot guard so the terminator is written exactly once. */
-    val terminationSent: AtomicBoolean = new AtomicBoolean(false)
-
-    /** The block total captured when termination was requested. */
+    /** The block total captured when termination was declared. */
     val totalBlocksAtTermination: AtomicLong = new AtomicLong(0L)
+  }
 
-    /** Retransmission attempts serviced for this partition since the last acknowledgement. */
+  /**
+   * Everything one consumer's channel is owed, and everything it has confirmed.
+   *
+   * A session exists per channel, not per consumer identity: a reconnection is a new channel and so
+   * a new session, which is what stops a late teardown of the connection that was lost from
+   * dispossessing the one that replaced it. The consumer identity is carried inside, because it is
+   * what the retained store's release cursors are keyed by, and that is what lets a reconnecting
+   * consumer resume from exactly the position its predecessor reached.
+   *
+   * Two properties of this class are load-bearing for correctness rather than tidiness:
+   *
+   *  - A session may only ever affect the partitions it subscribed to on its own channel. Every
+   *    inbound frame is checked against that subscription set before it is allowed to move a cursor
+   *    or release a byte, so a peer cannot acknowledge, terminate or ask for the replay of a
+   *    partition it never asked to receive.
+   *  - Queues are per session, not shared. One slow consumer's un-writable socket therefore cannot
+   *    hold the head of a queue that a fast consumer is waiting on, which a single shared queue
+   *    would allow and which would make the slowest reader the pace of the whole map output.
+   *
+   * @param sessionKey the channel's own identifier, this session's identity in the registry
+   * @param consumerId the consumer's identity, authenticated where authentication is enabled
+   * @param channel the consumer's channel, used for writes and for writability
+   * @param createdAtMs the instant the session was opened, which seeds its activity stamps
+   */
+  private final class ConsumerSession(
+      val sessionKey: String,
+      val consumerId: String,
+      val channel: Channel,
+      createdAtMs: Long) {
+
+    /** Blocks queued for this consumer, ordered by the egress priority they were queued under. */
+    val queue: PriorityBlockingQueue[PendingBlock] =
+      new PriorityBlockingQueue[PendingBlock](INITIAL_EGRESS_QUEUE_CAPACITY, EgressOrdering)
+
+    /** Guard that keeps exactly one thread writing to this channel at a time. */
+    val draining: AtomicBoolean = new AtomicBoolean(false)
+
+    /** Set when work arrives while a drain is in flight, so the drain runs one more pass. */
+    val drainWakeup: AtomicBoolean = new AtomicBoolean(false)
+
+    /** One outstanding refill wake-up per session is enough; this is that one-shot guard. */
+    val refillScheduled: AtomicBoolean = new AtomicBoolean(false)
+
+    /** Per partition subscription state, created when the consumer first names the partition. */
+    private val subscriptions: ConcurrentHashMap[Int, Subscription] =
+      new ConcurrentHashMap[Int, Subscription]()
+
+    private val closedFlag: AtomicBoolean = new AtomicBoolean(false)
+    private val queuedBlockCount: AtomicLong = new AtomicLong(0L)
+    private val queuedByteCount: AtomicLong = new AtomicLong(0L)
+    private val bytesServed: AtomicLong = new AtomicLong(0L)
+    private val ackProgressMs: AtomicLong = new AtomicLong(createdAtMs)
+    private val inboundMs: AtomicLong = new AtomicLong(createdAtMs)
+    private val reclamationWarned: AtomicBoolean = new AtomicBoolean(false)
+
+    /**
+     * The key sessions are visited in when egress is drained, lowest first.
+     *
+     * Fewest bytes served goes first, which is max-min fairness under a shared rate cap: when the
+     * bucket holds less than the whole batch, the consumer that has had the least of the budget so
+     * far is the one that gets the next tokens. A fixed order would instead let whichever consumer
+     * happened to sort first take the entire refill on every pass.
+     */
+    def orderingKey: Long = bytesServed.get()
+
+    /** Whether this session has been released; a closed session accepts nothing further. */
+    def isClosed: Boolean = closedFlag.get()
+
+    /**
+     * Releases this session's queue, once.
+     *
+     * The channel is deliberately left alone: closing it belongs to whoever decided the session was
+     * over, and the retained payloads belong to the store, whose lifetime is the shuffle's rather
+     * than this connection's.
+     */
+    def close(): Unit = {
+      if (closedFlag.compareAndSet(false, true)) {
+        var pending = queue.poll()
+        while (pending != null) {
+          releasePending(pending)
+          pending = queue.poll()
+        }
+      }
+    }
+
+    /** Whether this consumer has subscribed to one partition on this channel. */
+    def subscribedTo(partitionId: Int): Boolean = subscriptions.containsKey(partitionId)
+
+    /**
+     * Subscribes this consumer to one partition.
+     *
+     * @return true when the subscription is new, which is the signal to resume delivery from the
+     *         position this consumer reports
+     */
+    def subscribe(partitionId: Int): Boolean = {
+      !isClosed && subscriptions.putIfAbsent(partitionId, new Subscription()) == null
+    }
+
+    /** How many partitions this consumer has subscribed to. */
+    def subscriptionCount: Int = subscriptions.size()
+
+    /**
+     * Queues one block reference for this consumer.
+     *
+     * Refused for a partition this consumer never subscribed to, which is what keeps fan-out from
+     * accumulating state for a peer that never asked for the data.
+     *
+     * @return true if the reference was queued
+     */
+    def offer(pending: PendingBlock): Boolean = {
+      val subscription = subscriptions.get(pending.partitionId)
+      if (isClosed || subscription == null) {
+        false
+      } else {
+        subscription.queuedBlocks.incrementAndGet()
+        subscription.queuedBytes.addAndGet(pending.framedBytes.toLong)
+        queuedBlockCount.incrementAndGet()
+        queuedByteCount.addAndGet(pending.framedBytes.toLong)
+        val queued = queue.offer(pending)
+        if (!queued) {
+          releasePending(pending)
+        } else {
+          drainWakeup.set(true)
+        }
+        queued
+      }
+    }
+
+    /** Discharges the queue accounting of one reference that has left the queue. */
+    def releasePending(pending: PendingBlock): Unit = {
+      val subscription = subscriptions.get(pending.partitionId)
+      if (subscription != null) {
+        subscription.queuedBlocks.decrementAndGet()
+        subscription.queuedBytes.addAndGet(-pending.framedBytes.toLong)
+      }
+      queuedBlockCount.decrementAndGet()
+      queuedByteCount.addAndGet(-pending.framedBytes.toLong)
+    }
+
+    /**
+     * Records that one block has been handed to this consumer's channel.
+     *
+     * The block's framed size is remembered against its sequence number -- metadata only, never the
+     * payload -- so that an acknowledgement releases the exact bytes of the exact prefix it covers
+     * rather than an estimate. Without per-sequence sizes an acknowledgement spanning several
+     * blocks could only guess at how much it had released, and the outstanding figure the writer
+     * uses to decide whether to spill would drift away from the truth.
+     */
+    def recordSent(partitionId: Int, sequenceNumber: Long, framedBytes: Long): Unit = {
+      val subscription = subscriptions.get(partitionId)
+      if (subscription != null) {
+        if (subscription.sentBytes.putIfAbsent(sequenceNumber, framedBytes) == null) {
+          subscription.unacknowledgedBytes.addAndGet(framedBytes)
+        }
+        advanceSent(partitionId, sequenceNumber)
+        bytesServed.addAndGet(framedBytes)
+      }
+    }
+
+    /** Advances the highest position this consumer has been sent, never backwards. */
+    def advanceSent(partitionId: Int, position: Long): Unit = {
+      val subscription = subscriptions.get(partitionId)
+      if (subscription != null) {
+        subscription.sentPosition.accumulateAndGet(position, (a, b) => math.max(a, b))
+      }
+    }
+
+    /**
+     * Advances this consumer's acknowledged position and discharges the prefix it covers.
+     *
+     * @return true when the position genuinely advanced, which is what authorises the retained
+     *         store to be told about it; a repeated or stale position moves nothing
+     */
+    def advanceAck(partitionId: Int, position: Long): Boolean = {
+      val subscription = subscriptions.get(partitionId)
+      if (subscription == null) {
+        false
+      } else {
+        val previous = subscription.ackPosition.getAndAccumulate(position, (a, b) => math.max(a, b))
+        if (position <= previous) {
+          false
+        } else {
+          val released = subscription.sentBytes.headMap(position, true)
+          var releasedBytes = 0L
+          var entry = released.pollFirstEntry()
+          while (entry != null) {
+            releasedBytes += entry.getValue.longValue()
+            entry = released.pollFirstEntry()
+          }
+          if (releasedBytes > 0L) {
+            subscription.unacknowledgedBytes.addAndGet(-releasedBytes)
+          }
+          true
+        }
+      }
+    }
+
+    /**
+     * The highest position written to this consumer for one partition, or nothing sent.
+     *
+     * This is the bound an acknowledgement is held to. It is recorded before each block's bytes are
+     * handed to the socket, so it is never behind what the consumer could legitimately have seen.
+     */
+    def sentPosition(partitionId: Int): Long = {
+      val subscription = subscriptions.get(partitionId)
+      if (subscription == null) AckMessage.NOTHING_CONSUMED else subscription.sentPosition.get()
+    }
+
+    /** The highest position this consumer has acknowledged for one partition. */
+    def ackPosition(partitionId: Int): Long = {
+      val subscription = subscriptions.get(partitionId)
+      if (subscription == null) AckMessage.NOTHING_CONSUMED else subscription.ackPosition.get()
+    }
+
+    /** Blocks sent to this consumer but not yet acknowledged by it, for one partition. */
+    def outstandingFor(partitionId: Int): Long = {
+      val subscription = subscriptions.get(partitionId)
+      if (subscription == null) 0L else subscription.sentBytes.size().toLong
+    }
+
+    /** Blocks queued but not yet written for one partition. */
+    def pendingBlocksFor(partitionId: Int): Long = {
+      val subscription = subscriptions.get(partitionId)
+      if (subscription == null) 0L else math.max(0L, subscription.queuedBlocks.get())
+    }
+
+    /** Blocks queued but not yet written, across every partition. */
+    def pendingBlocks: Long = math.max(0L, queuedBlockCount.get())
+
+    /** Framed bytes queued but not yet written, across every partition. */
+    def pendingBytes: Long = math.max(0L, queuedByteCount.get())
+
+    /** Framed bytes written to this consumer but not yet acknowledged by it. */
+    def unacknowledgedBytes: Long = {
+      var total = 0L
+      subscriptions.values().asScala.foreach { subscription =>
+        total += math.max(0L, subscription.unacknowledgedBytes.get())
+      }
+      total
+    }
+
+    /** Framed size of the block at the head of the queue, which is what a refill must cover. */
+    def headFramedBytes: Long = {
+      val head = queue.peek()
+      if (head == null) 0L else head.framedBytes.toLong
+    }
+
+    /** Whether everything a partition has offered has been written to this consumer. */
+    def caughtUpWith(partitionId: Int, highestOffered: Long): Boolean = {
+      val subscription = subscriptions.get(partitionId)
+      subscription != null && subscription.sentPosition.get() >= highestOffered
+    }
+
+    /** Claims the one-shot right to write one partition's terminator to this consumer. */
+    def claimTermination(partitionId: Int): Boolean = {
+      val subscription = subscriptions.get(partitionId)
+      subscription != null && subscription.terminationClaimed.compareAndSet(false, true)
+    }
+
+    /** Records that a terminator reached the socket. */
+    def confirmTermination(partitionId: Int): Unit = {
+      val subscription = subscriptions.get(partitionId)
+      if (subscription != null) {
+        subscription.terminationDelivered.set(true)
+      }
+    }
+
+    /** Surrenders a termination claim whose write failed, so a later pass may try again. */
+    def releaseTerminationClaim(partitionId: Int): Unit = {
+      val subscription = subscriptions.get(partitionId)
+      if (subscription != null) {
+        subscription.terminationClaimed.set(false)
+      }
+    }
+
+    /** Whether one partition's terminator has been confirmed onto this consumer's socket. */
+    def terminationConfirmed(partitionId: Int): Boolean = {
+      val subscription = subscriptions.get(partitionId)
+      subscription != null && subscription.terminationDelivered.get()
+    }
+
+    /** Stamps acknowledgement progress, which is the only stamp the stall detector consults. */
+    def stampAckProgress(nowMs: Long): Unit = {
+      ackProgressMs.set(nowMs)
+      inboundMs.set(nowMs)
+    }
+
+    /** When this consumer last acknowledged anything. */
+    def lastAckProgressMs: Long = ackProgressMs.get()
+
+    /**
+     * Stamps liveness without stamping progress.
+     *
+     * Deliberately separate: a heartbeat proves the consumer's process is running and says nothing
+     * about whether it is consuming. Timing them together would let a consumer that heartbeats
+     * punctually and acknowledges nothing hold the producer's window open indefinitely.
+     */
+    def stampHeartbeat(nowMs: Long): Unit = inboundMs.set(nowMs)
+
+    /** When this consumer last sent anything at all, acknowledgement or heartbeat. */
+    def lastInboundMs: Long = inboundMs.get()
+
+    /** The instant from which this consumer's next retransmission request may be serviced. */
+    def nextRetransmitAtMs(partitionId: Int): Long = {
+      val subscription = subscriptions.get(partitionId)
+      if (subscription == null) 0L else subscription.nextRetransmitAtMs.get()
+    }
+
+    /**
+     * Charges one retransmission attempt against this consumer's budget for one partition.
+     *
+     * A request for a partition this consumer is not subscribed to spends an unbounded budget, so
+     * the caller refuses it rather than servicing a stream that does not exist.
+     */
+    def chargeRetransmitAttempt(partitionId: Int): Int = {
+      val subscription = subscriptions.get(partitionId)
+      if (subscription == null) Int.MaxValue else subscription.retransmitAttempts.incrementAndGet()
+    }
+
+    /** Defers this consumer's next retransmission of one partition until an instant. */
+    def deferRetransmitUntil(partitionId: Int, atMs: Long): Unit = {
+      val subscription = subscriptions.get(partitionId)
+      if (subscription != null) {
+        subscription.nextRetransmitAtMs.set(atMs)
+      }
+    }
+
+    /** Restores the retransmission budget of one partition, because the consumer made progress. */
+    def resetRetransmitBudget(partitionId: Int): Unit = {
+      val subscription = subscriptions.get(partitionId)
+      if (subscription != null) {
+        subscription.retransmitAttempts.set(0)
+        subscription.nextRetransmitAtMs.set(0L)
+      }
+    }
+
+    /**
+     * Claims the one-shot right to report a reclamation budget breach for this session.
+     *
+     * Once per session rather than once per breach, because a consumer whose acknowledgements are
+     * consistently slow would otherwise produce one warning per acknowledgement and, on a
+     * many-partition shuffle, put the log budget of ten megabytes an hour out of reach on its own.
+     */
+    def warnReclamationOnce(): Boolean = reclamationWarned.compareAndSet(false, true)
+  }
+
+  /**
+   * One consumer's state for one reduce partition.
+   *
+   * Held per (session, partition) rather than per partition, because every quantity here is a fact
+   * about a particular consumer: a block one consumer has acknowledged is still outstanding for
+   * another that has not, and a terminator delivered to one says nothing about the other.
+   */
+  private final class Subscription {
+
+    /** Blocks queued for this partition on this session but not yet written. */
+    val queuedBlocks: AtomicLong = new AtomicLong(0L)
+
+    /** Framed bytes queued for this partition on this session but not yet written. */
+    val queuedBytes: AtomicLong = new AtomicLong(0L)
+
+    /**
+     * Framed size of each block written to this consumer and not yet acknowledged, keyed by
+     * sequence number. Metadata only -- the payloads themselves are the retained store's -- and
+     * ordered so that the prefix an acknowledgement releases is a sub-map view rather than a scan.
+     */
+    val sentBytes: ConcurrentSkipListMap[Long, java.lang.Long] =
+      new ConcurrentSkipListMap[Long, java.lang.Long]()
+
+    /** Highest sequence number written to this consumer, or nothing sent. */
+    val sentPosition: AtomicLong = new AtomicLong(AckMessage.NOTHING_CONSUMED)
+
+    /** Highest sequence number this consumer has acknowledged, or nothing consumed. */
+    val ackPosition: AtomicLong = new AtomicLong(AckMessage.NOTHING_CONSUMED)
+
+    /** Framed bytes written to this consumer and not yet acknowledged. */
+    val unacknowledgedBytes: AtomicLong = new AtomicLong(0L)
+
+    /** One-shot guard so the terminator is written to this consumer at most once at a time. */
+    val terminationClaimed: AtomicBoolean = new AtomicBoolean(false)
+
+    /** Set once the terminator has been confirmed onto this consumer's socket. */
+    val terminationDelivered: AtomicBoolean = new AtomicBoolean(false)
+
+    /** Retransmission attempts serviced for this consumer since its last acknowledgement. */
     val retransmitAttempts: AtomicInteger = new AtomicInteger(0)
 
-    /** The instant from which the next retransmission may be serviced. */
+    /** The instant from which this consumer's next retransmission may be serviced. */
     val nextRetransmitAtMs: AtomicLong = new AtomicLong(0L)
-
-    /** One-shot guard so a reclamation budget breach is reported once per stream. */
-    val reclamationWarned: AtomicBoolean = new AtomicBoolean(false)
   }
 }

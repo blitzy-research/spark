@@ -109,6 +109,24 @@ private[spark] object StreamingShuffleFallbackReason {
    */
   val all: Seq[StreamingShuffleFallbackReason] =
     Seq(ConsumerTooSlow, MemoryPressure, NetworkSaturation, ProtocolVersionMismatch)
+
+  /**
+   * Resolves a reason from its stable name, answering `None` for anything outside the closed set.
+   *
+   * A shuffle-wide fallback is agreed over RPC, so the condition has to cross a process boundary,
+   * and it crosses as this name rather than as the object. Two properties follow, and both matter.
+   * The name is stable -- it is the synthesised case-object name, which is also what tests assert
+   * on -- so it survives serialization without depending on how a `case object` happens to be
+   * reconstructed. And resolution is a lookup in a set this build owns, so a peer can neither
+   * introduce a fifth condition nor choose the text of a driver log record: an unrecognised name
+   * resolves to `None` and is refused at the boundary rather than recorded.
+   *
+   * @param name candidate reason name, which may be `null`
+   * @return the matching reason, or `None` when this build does not know the name
+   */
+  def fromName(name: String): Option[StreamingShuffleFallbackReason] = {
+    if (name == null) None else all.find(_.toString == name)
+  }
 }
 
 /**
@@ -267,6 +285,42 @@ private[spark] class StreamingShuffleFallbackPolicy(
    * map without limit; that bound is the reason a long-running executor cannot leak here.
    */
   private val throughputWindows = new ConcurrentHashMap[Int, ThroughputWindow]()
+
+  /**
+   * Shuffles whose fallback this executor has already declared to the coordinator.
+   *
+   * A trip latches once per executor but has to be declared once per shuffle, because the decision
+   * that has to be agreed is "this shuffle stands down", not "this executor stands down". The set
+   * is what makes the declaration exactly-once per shuffle from this executor: every producer and
+   * consumer of the shuffle running here observes the same latch, and without this they would each
+   * send the same declaration. Bounded by [[MAX_TRACKED_SHUFFLES]], with an over-bound claim
+   * answered `true` rather than refused, because a duplicate declaration is harmless -- the
+   * coordinator's own latch is first-writer-wins -- whereas a suppressed one would leave a shuffle
+   * streaming after streaming had been withdrawn.
+   */
+  private val announcedShuffles: java.util.Set[Int] =
+    ConcurrentHashMap.newKeySet[Int]()
+
+  /**
+   * The shuffle-wide fallback verdict this executor knows about, keyed by shuffle id.
+   *
+   * The executor-local latch and this map answer different questions, and both have to be asked.
+   * The latch says streaming is no longer sustainable here; this map says a particular shuffle has
+   * stood streaming down everywhere, which is a fact that may have been established by a trip on an
+   * entirely different executor. A producer that consulted only the latch would keep streaming a
+   * shuffle whose consumers had already been told to stop reading it.
+   *
+   * It is a cache of a verdict held authoritatively by the coordinator, populated by whichever
+   * component learns it first -- a consumer from a lookup reply, a producer from its own
+   * declaration, the manager from a registration grant or an explicit query -- so that every other
+   * component on the executor can then read it for the cost of one map lookup instead of one ask.
+   * The verdict latches at the coordinator, so a cached entry can never become stale in the
+   * direction that matters.
+   *
+   * Bounded by [[MAX_TRACKED_SHUFFLES]] for the same reason the sampling map is, and released by
+   * [[forgetShuffle]] when a shuffle is unregistered.
+   */
+  private val shuffleFallbacks = new ConcurrentHashMap[Int, StreamingShuffleFallbackState]()
 
   logConstruction()
 
@@ -467,21 +521,43 @@ private[spark] class StreamingShuffleFallbackPolicy(
    * is reached.
    *
    * The bound is what keeps a caller that never deregisters from growing the map without limit. It
-   * is checked before insertion rather than enforced by eviction, because evicting a window would
+   * is enforced by refusing admission rather than by eviction, because evicting a window would
    * silently reset a sustained-slowness timer that had nearly elapsed, turning a bound on memory
    * into a bound on correctness.
+   *
+   * Admission and insertion happen in one atomic `compute`, and they have to. Reading the size and
+   * then inserting are two steps, and every thread that passed the read before any of them inserted
+   * would go on to insert: the bound would then be exceeded by as many entries as there were
+   * concurrent first samples, which on an executor sampling from several producer and consumer
+   * threads at once is precisely the situation the bound exists for. Consulting `size()` inside the
+   * remapping function is safe -- it reads the map's own counters without taking a bin lock, so it
+   * neither deadlocks against the update in progress nor blocks another shuffle's insertion.
+   *
+   * A fast path reads the map first, so the overwhelmingly common case of a shuffle that is already
+   * tracked costs one lookup and takes no lock at all.
    */
   private def windowFor(shuffleId: Int): Option[ThroughputWindow] = {
     val existing = throughputWindows.get(shuffleId)
     if (existing != null) {
       Some(existing)
-    } else if (throughputWindows.size() >= MAX_TRACKED_SHUFFLES) {
-      noteUntrackedShuffle(shuffleId)
-      None
     } else {
-      val created = new ThroughputWindow
-      val raced = throughputWindows.putIfAbsent(shuffleId, created)
-      Some(if (raced == null) created else raced)
+      var refused = false
+      val admitted = throughputWindows.compute(shuffleId,
+        (_: Int, current: ThroughputWindow) =>
+          if (current != null) {
+            current
+          } else if (throughputWindows.size() >= MAX_TRACKED_SHUFFLES) {
+            refused = true
+            null
+          } else {
+            new ThroughputWindow
+          })
+      if (refused) {
+        noteUntrackedShuffle(shuffleId)
+        None
+      } else {
+        Some(admitted)
+      }
     }
   }
 
@@ -656,6 +732,100 @@ private[spark] class StreamingShuffleFallbackPolicy(
     checkProtocolVersion(StreamingShuffleMessage.peekProtocolVersion(framedMessage))
   }
 
+  /**
+   * Claims the right to declare one shuffle's fallback to the coordinator, once.
+   *
+   * The executor-local latch and the shuffle-wide one answer different questions. This policy
+   * decides that streaming is no longer sustainable '''here'''; the coordinator records that a
+   * shuffle has stood down '''everywhere'''. Only the second is enough to keep a shuffle from
+   * having two producers of the same output, so a local trip has to be propagated -- and propagated
+   * by whichever participant notices it, since none of them is privileged.
+   *
+   * That makes duplicate declarations the norm rather than the exception: every writer and reader
+   * of the shuffle on this executor sees the same latch at the same moment. This method suppresses
+   * the duplicates without suppressing the declaration, so the wire cost of a fallback is one ask
+   * per shuffle per executor instead of one per task.
+   *
+   * Answering `false` while the policy has not tripped is deliberate: there is nothing to declare,
+   * and claiming the slot early would consume the one-shot for a shuffle that is still healthy.
+   *
+   * @param shuffleId the shuffle whose fallback the caller intends to declare
+   * @return `true` when the caller must perform the declaration, `false` when it is already done or
+   *         not yet warranted
+   */
+  def claimFallbackAnnouncement(shuffleId: Int): Boolean = {
+    if (trippedReasonRef.get().isEmpty) {
+      false
+    } else if (announcedShuffles.size() >= MAX_TRACKED_SHUFFLES) {
+      // Bound reached, so the claim is not recorded -- but it is granted, because the coordinator
+      // deduplicates for us and a shuffle left streaming would be a correctness fault where a
+      // repeated ask is only a cost.
+      true
+    } else {
+      announcedShuffles.add(shuffleId)
+    }
+  }
+
+  /** How many shuffles this executor has declared a fallback for, bounded by the tracking bound. */
+  def announcedFallbackCount: Int = announcedShuffles.size()
+
+  /**
+   * Records a shuffle-wide fallback verdict learned from the coordinator, so that every other
+   * streaming component on this executor can see it without asking again.
+   *
+   * A verdict that reports streaming still in force is deliberately '''not''' recorded. The map is
+   * a record of decisions taken, not of the last answer received: caching "not fallen back" would
+   * have to be invalidated on some cadence to stay correct, whereas a latched decision never needs
+   * to be.
+   *
+   * @param shuffleId the shuffle the verdict concerns
+   * @param state the verdict as the coordinator reported it
+   * @return `true` when this call is the one that recorded the verdict
+   */
+  def observeShuffleFallback(
+      shuffleId: Int,
+      state: StreamingShuffleFallbackState): Boolean = {
+    if (!state.fallenBack) {
+      false
+    } else if (shuffleFallbacks.size() >= MAX_TRACKED_SHUFFLES &&
+        !shuffleFallbacks.containsKey(shuffleId)) {
+      // At the bound the verdict is not cached, which costs another component one ask rather than
+      // its correctness: every path that acts on a fallback still has the coordinator's own answer
+      // ahead of it -- a declined producer registration, or a lookup reply carrying the verdict.
+      noteUntrackedShuffle(shuffleId)
+      false
+    } else {
+      val recorded = shuffleFallbacks.putIfAbsent(shuffleId, state) == null
+      if (recorded) {
+        logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} has stood streaming down " +
+          log"for every participant: ${MDC(REASON, describeFallback(state))}. Every streaming " +
+          log"component of that shuffle on this executor now stands down, and the shuffle is " +
+          log"served by the unmodified SortShuffleManager.")
+      }
+      recorded
+    }
+  }
+
+  /**
+   * Whether a shuffle is known to have stood streaming down for every participant.
+   *
+   * One map lookup, no allocation, no clock read and no ask, so a producer may consult it as often
+   * as it consults [[hasTripped]] -- which it must, because the two cover different failures.
+   */
+  def shuffleHasFallenBack(shuffleId: Int): Boolean = shuffleFallbacks.containsKey(shuffleId)
+
+  /** The verdict recorded for a shuffle, or `None` when none has been learned. */
+  def knownShuffleFallback(shuffleId: Int): Option[StreamingShuffleFallbackState] =
+    Option(shuffleFallbacks.get(shuffleId))
+
+  /** How many shuffle-wide verdicts this executor has cached, bounded by the tracking bound. */
+  def knownShuffleFallbackCount: Int = shuffleFallbacks.size()
+
+  /** An operator-facing rendering of a verdict, preferring this build's prose to a bare name. */
+  private def describeFallback(state: StreamingShuffleFallbackState): String = {
+    state.reason.map(_.description).getOrElse(state.reasonName)
+  }
+
   // ------------------------------------------------------------------------------------------
   // Lifecycle.
   // ------------------------------------------------------------------------------------------
@@ -673,6 +843,12 @@ private[spark] class StreamingShuffleFallbackPolicy(
    */
   def forgetShuffle(shuffleId: Int): Unit = {
     val removed = throughputWindows.remove(shuffleId)
+    // The announcement slot is released with the sampling state, so that the bound tracks live
+    // shuffles rather than every shuffle the executor has ever served. Releasing it cannot cause a
+    // fallback to be missed: the shuffle is being unregistered, so there is nothing left to
+    // declare.
+    announcedShuffles.remove(shuffleId)
+    shuffleFallbacks.remove(shuffleId)
     if (removed != null && debugEnabled) {
       logInfo(log"Released streaming shuffle fallback sampling state for shuffle " +
         log"${MDC(SHUFFLE_ID, shuffleId)}")
@@ -697,6 +873,8 @@ private[spark] class StreamingShuffleFallbackPolicy(
     unevaluableSamples.set(0L)
     untrackedShuffleSamples.set(0L)
     throughputWindows.clear()
+    announcedShuffles.clear()
+    shuffleFallbacks.clear()
     if (debugEnabled) {
       logInfo(log"Streaming shuffle fallback policy reset to its untripped state")
     }

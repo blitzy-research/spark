@@ -51,14 +51,14 @@ import org.apache.spark.annotation.Private;
  * about how a non-serviceable one is answered.
  *
  * Wire format. The body is the shared header followed by a single {@code long}, so a request
- * encodes to {@link #HEADER_ENCODED_LENGTH} plus eight bytes, that is 25 bytes, and occupies 26
+ * encodes to {@link #HEADER_ENCODED_LENGTH} plus eight bytes, that is 33 bytes, and occupies 34
  * once framed with its type discriminator. The lower bound costs no byte of its own, because the
  * header already carries a sequence number and this message simply gives that field the meaning of
  * a lower bound; reusing it is also what makes the two bounds impossible to transpose on the wire.
  *
  * <pre>
  *   +---------------------------------------+----------------------------------+
- *   | header, 17 bytes                      | lastSequenceNumber               |
+ *   | header, 25 bytes                      | lastSequenceNumber               |
  *   | its sequenceNumber field is the       | long, 8 bytes                    |
  *   | inclusive LOWER bound of the window   | inclusive UPPER bound            |
  *   +---------------------------------------+----------------------------------+
@@ -66,7 +66,8 @@ import org.apache.spark.annotation.Private;
  *
  * Instances are immutable and validated on construction: an interval whose upper bound falls below
  * its lower bound is rejected with {@link IllegalArgumentException}, and the inherited
- * {@code shuffleId}, {@code partitionId} and {@code sequenceNumber} -- the last of which is this
+ * {@code shuffleId}, {@code mapId}, {@code partitionId} and {@code sequenceNumber} -- the last of
+ * which is this
  * window's lower bound -- are all required to be non-negative by
  * {@link StreamingShuffleMessage}, so a request can name neither an impossible partition nor a
  * negative window. Because the static
@@ -87,7 +88,7 @@ public final class RetransmitRequestMessage extends StreamingShuffleMessage {
    *
    * The count is a named constant rather than a literal repeated at each use, so that {@link
    * #encodedLength()} and the body-length check in {@link #decode(ByteBuf)} cannot drift apart.
-   * Added to {@link #HEADER_ENCODED_LENGTH} it yields an encoded length of 25 bytes.
+   * Added to {@link #HEADER_ENCODED_LENGTH} it yields an encoded length of 33 bytes.
    */
   private static final int BODY_ENCODED_LENGTH = 8;
 
@@ -119,6 +120,7 @@ public final class RetransmitRequestMessage extends StreamingShuffleMessage {
    *
    * @param protocolVersion the wire revision this message was encoded with
    * @param shuffleId identifier of the shuffle whose blocks are being requested
+   * @param mapId identifier of the map task whose output blocks are being requested
    * @param partitionId identifier of the shuffle partition whose blocks are being requested
    * @param sequenceNumber inclusive lower bound of the requested window
    * @param lastSequenceNumber inclusive upper bound of the requested window, which must not fall
@@ -128,10 +130,11 @@ public final class RetransmitRequestMessage extends StreamingShuffleMessage {
   public RetransmitRequestMessage(
       byte protocolVersion,
       int shuffleId,
+      long mapId,
       int partitionId,
       long sequenceNumber,
       long lastSequenceNumber) {
-    super(protocolVersion, shuffleId, partitionId, sequenceNumber);
+    super(protocolVersion, shuffleId, mapId, partitionId, sequenceNumber);
     // The check follows the super call because Java forbids any statement before it at this
     // language level. Nothing observable has happened by then: the base constructor only assigns
     // header fields, so a rejected request is simply discarded before anyone can hold a reference.
@@ -169,6 +172,7 @@ public final class RetransmitRequestMessage extends StreamingShuffleMessage {
    * not be repeated at every construction site.
    *
    * @param shuffleId identifier of the shuffle whose blocks are being requested
+   * @param mapId identifier of the map task whose output blocks are being requested
    * @param partitionId identifier of the shuffle partition whose blocks are being requested
    * @param sequenceNumber inclusive lower bound of the requested window
    * @param lastSequenceNumber inclusive upper bound of the requested window, which must not fall
@@ -177,15 +181,17 @@ public final class RetransmitRequestMessage extends StreamingShuffleMessage {
    */
   public RetransmitRequestMessage(
       int shuffleId,
+      long mapId,
       int partitionId,
       long sequenceNumber,
       long lastSequenceNumber) {
-    this(CURRENT_PROTOCOL_VERSION, shuffleId, partitionId, sequenceNumber, lastSequenceNumber);
+    this(CURRENT_PROTOCOL_VERSION, shuffleId, mapId, partitionId, sequenceNumber,
+      lastSequenceNumber);
   }
 
   /**
    * Creates a request from a header the base class has just read off the wire. This is the
-   * constructor {@link #decode(ByteBuf)} uses: passing the header as one value rather than as four
+   * constructor {@link #decode(ByteBuf)} uses: passing the header as one value rather than as five
    * positional arguments removes any chance of transposing {@code shuffleId} and {@code
    * partitionId} on the way in.
    *
@@ -200,7 +206,7 @@ public final class RetransmitRequestMessage extends StreamingShuffleMessage {
     // requireNonNull sits inside the argument list because no statement may precede a constructor
     // delegation; this is the same idiom the base class uses for its own header constructor.
     this(Objects.requireNonNull(header, "header").protocolVersion(), header.shuffleId(),
-      header.partitionId(), header.sequenceNumber(), lastSequenceNumber);
+      header.mapId(), header.partitionId(), header.sequenceNumber(), lastSequenceNumber);
   }
 
   @Override

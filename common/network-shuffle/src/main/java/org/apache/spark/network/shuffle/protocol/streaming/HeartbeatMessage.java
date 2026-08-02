@@ -54,16 +54,16 @@ import org.apache.spark.annotation.Private;
  * is made that two executors' clocks agree.
  *
  * <pre>
- *   framed by StreamingShuffleMessage#toByteBuffer, 26 bytes in total
+ *   framed by StreamingShuffleMessage#toByteBuffer, 34 bytes in total
  *   +--------+-----------------------------------------+--------------+
  *   | type   | header                                  | timestampMs  |
- *   | 1 byte | 17 bytes, written by encodeHeader       | long, 8      |
+ *   | 1 byte | 25 bytes, written by encodeHeader       | long, 8      |
  *   +--------+-----------------------------------------+--------------+
  * </pre>
  *
  * The body is a single {@code long}, so {@link #encodedLength()} is {@link
- * StreamingShuffleMessage#HEADER_ENCODED_LENGTH} plus eight, that is 25 bytes, and a framed
- * heartbeat therefore occupies 26.
+ * StreamingShuffleMessage#HEADER_ENCODED_LENGTH} plus eight, that is 33 bytes, and a framed
+ * heartbeat therefore occupies 34.
  *
  * The discriminator is {@link StreamingShuffleMessageType#HEARTBEAT}, whose wire id is 2. That is
  * unrelated to the {@code HEARTBEAT} constant of {@link
@@ -71,9 +71,10 @@ import org.apache.spark.annotation.Private;
  * separate id space of the block-transfer and push-based-shuffle families. The two families never
  * share a channel and neither is registered in the other, so the coincidence of names is harmless.
  *
- * The inherited {@code shuffleId}, {@code partitionId} and {@code sequenceNumber} are all required
- * to be non-negative, and {@link StreamingShuffleMessage} enforces that centrally on construction
- * and on decode, so a heartbeat cannot assert liveness for an impossible stream position. The
+ * The inherited {@code shuffleId}, {@code mapId}, {@code partitionId} and {@code sequenceNumber}
+ * are all required to be non-negative, and {@link StreamingShuffleMessage} enforces that centrally
+ * on construction and on decode, so a heartbeat cannot assert liveness for an impossible stream
+ * position. The
  * timestamp is a body field and carries no such restriction: it is caller-supplied and used only
  * for clock-skew diagnostics.
  *
@@ -103,6 +104,7 @@ public final class HeartbeatMessage extends StreamingShuffleMessage {
    * producer or a consumer raises one.
    *
    * @param shuffleId identifier of the shuffle this heartbeat belongs to
+   * @param mapId identifier of the map task whose output stream this heartbeat concerns
    * @param partitionId identifier of the shuffle partition this heartbeat belongs to
    * @param sequenceNumber position within the partition's stream that the sender has reached, so
    *                       that a heartbeat also confirms where the stream stands while carrying no
@@ -111,10 +113,11 @@ public final class HeartbeatMessage extends StreamingShuffleMessage {
    */
   public HeartbeatMessage(
       int shuffleId,
+      long mapId,
       int partitionId,
       long sequenceNumber,
       long timestampMs) {
-    this(CURRENT_PROTOCOL_VERSION, shuffleId, partitionId, sequenceNumber, timestampMs);
+    this(CURRENT_PROTOCOL_VERSION, shuffleId, mapId, partitionId, sequenceNumber, timestampMs);
   }
 
   /**
@@ -125,6 +128,7 @@ public final class HeartbeatMessage extends StreamingShuffleMessage {
    *
    * @param protocolVersion the wire revision this heartbeat was, or will be, encoded with
    * @param shuffleId identifier of the shuffle this heartbeat belongs to
+   * @param mapId identifier of the map task whose output stream this heartbeat concerns
    * @param partitionId identifier of the shuffle partition this heartbeat belongs to
    * @param sequenceNumber position within the partition's stream that the sender has reached
    * @param timestampMs the sending instant in milliseconds, supplied by the caller
@@ -132,16 +136,17 @@ public final class HeartbeatMessage extends StreamingShuffleMessage {
   public HeartbeatMessage(
       byte protocolVersion,
       int shuffleId,
+      long mapId,
       int partitionId,
       long sequenceNumber,
       long timestampMs) {
-    super(protocolVersion, shuffleId, partitionId, sequenceNumber);
+    super(protocolVersion, shuffleId, mapId, partitionId, sequenceNumber);
     this.timestampMs = checkTimestampMs(timestampMs);
   }
 
   /**
    * Creates a heartbeat from a header that has just been read off the wire, which is the form
-   * {@link #decode(ByteBuf)} uses. Accepting the header as one value rather than as four positional
+   * {@link #decode(ByteBuf)} uses. Accepting the header as one value rather than as five positional
    * arguments removes any chance of transposing {@code shuffleId} and {@code partitionId} on the
    * way in, which is the reason {@code StreamingShuffleMessage(Header)} exists.
    *
@@ -188,7 +193,7 @@ public final class HeartbeatMessage extends StreamingShuffleMessage {
   }
 
   /**
-   * The shared header followed by the eight bytes of {@code timestampMs}, that is 25 bytes, to
+   * The shared header followed by the eight bytes of {@code timestampMs}, that is 33 bytes, to
    * which framing adds one further byte for the type discriminator.
    *
    * @return the exact number of bytes {@link #encode(ByteBuf)} writes

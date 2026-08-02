@@ -27,7 +27,8 @@ import org.apache.spark.annotation.Private;
  * The orderly end-of-stream signal of the streaming shuffle wire protocol.
  *
  * A streaming shuffle producer sends exactly one of these once it has emitted every data block of a
- * single {@code (shuffleId, partitionId)} stream. Without such a marker a consumer could only infer
+ * single {@code (shuffleId, mapId, partitionId)} stream. Without such a marker a consumer could
+ * only infer
  * that the producer had finished from the fact that nothing further arrived, and silence is also
  * the symptom of the failure case: a producer that has crashed likewise stops sending. This message
  * is what separates the two. Its arrival means the stream ended because it was complete, whereas
@@ -46,31 +47,45 @@ import org.apache.spark.annotation.Private;
  * however many times the stream was throttled, spilled or partially retransmitted along the way.
  *
  * The header's {@code sequenceNumber} is the position this terminator itself occupies in the
- * stream. Because the terminator is sent after every data block, that position is never smaller
- * than {@link #totalBlocks}, and the constructor rejects a message claiming otherwise; it is
- * strictly greater whenever the producer also spent positions on control messages. The sequence
- * space therefore stays gap-free right up to the end, and a terminator can be detected as missing
- * by the same reasoning that detects a missing block.
+ * stream, and under this protocol's sequencing model it is required to equal {@link #totalBlocks}
+ * exactly. Only data blocks consume sequence numbers: they are numbered densely from zero, while a
+ * heartbeat and this terminator both report the next unissued position without claiming it. The
+ * position a terminator sits at is therefore precisely the number of data blocks that preceded it,
+ * and the constructor rejects any other relation.
+ *
+ * Requiring equality rather than merely {@code totalBlocks <= sequenceNumber} is a correctness
+ * requirement and not a tightening for its own sake. A terminator claiming <em>fewer</em> blocks
+ * than the positions preceding it is internally consistent under the weaker rule, yet it is exactly
+ * the shape that silently truncates a stream: a consumer that has accepted {@code n} blocks and is
+ * told the total was {@code m < n} reconciles the two, concludes the stream is complete and hands a
+ * short result to the reduce task, with every checksum intact and no error raised anywhere. Under
+ * the stronger rule that message cannot be constructed at all, on either side of the wire, so the
+ * only remaining outcome of a shortfall is the one that is safe: the consumer detects that it is
+ * missing blocks and either has them replayed or fails the fetch so the stage is recomputed.
+ *
+ * Because the relation is an equality, the sequence space stays gap-free right up to the end, and a
+ * terminator can be detected as missing by the same reasoning that detects a missing block.
  *
  * Wire layout, {@value StreamingShuffleMessage#HEADER_ENCODED_LENGTH} header bytes then one long,
- * for 25 bytes in total; framed by {@link StreamingShuffleMessage#toByteBuffer()} it occupies 26.
+ * for 33 bytes in total; framed by {@link StreamingShuffleMessage#toByteBuffer()} it occupies 34.
  *
  * <pre>
- *   +-----------------+-----------+-------------+----------------+-------------+
- *   | protocolVersion | shuffleId | partitionId | sequenceNumber | totalBlocks |
- *   | byte, 1 byte    | int, 4    | int, 4      | long, 8        | long, 8     |
- *   +-----------------+-----------+-------------+----------------+-------------+
+ *   +-----------------+-----------+---------+-------------+----------------+-------------+
+ *   | protocolVersion | shuffleId | mapId   | partitionId | sequenceNumber | totalBlocks |
+ *   | byte, 1 byte    | int, 4    | long, 8 | int, 4      | long, 8        | long, 8     |
+ *   +-----------------+-----------+---------+-------------+----------------+-------------+
  *   |&lt;----------------- inherited header ----------------------&gt;|&lt;-- body --&gt;|
  * </pre>
  *
- * Three of the sibling messages encode to the same 25 bytes, so length can never be used to tell
+ * Three of the sibling messages encode to the same 33 bytes, so length can never be used to tell
  * them apart. The one-byte discriminator that precedes the body does that on the wire, and {@link
  * #equals(Object)} does it in memory by requiring the concrete type to match before it looks at a
  * single field.
  *
- * The inherited {@code shuffleId}, {@code partitionId} and {@code sequenceNumber} are all required
- * to be non-negative, and {@link StreamingShuffleMessage} enforces that centrally on construction
- * and on decode, so a terminator can no more name an impossible partition or stream position
+ * The inherited {@code shuffleId}, {@code mapId}, {@code partitionId} and {@code sequenceNumber}
+ * are all required to be non-negative, and {@link StreamingShuffleMessage} enforces that centrally
+ * on construction and on decode, so a terminator can no more name an impossible partition or
+ * stream position
  * than it can claim a negative block count.
  *
  * This type is internal to Spark. It is pure data plus codec: it holds no reference to Spark core,
@@ -108,21 +123,23 @@ public final class StreamTerminationMessage extends StreamingShuffleMessage {
    *
    * @param protocolVersion the wire revision this message was encoded with
    * @param shuffleId identifier of the shuffle this stream belongs to
+   * @param mapId identifier of the map task whose output stream is ending
    * @param partitionId identifier of the shuffle partition whose stream is ending
-   * @param sequenceNumber position of this terminator within the stream; must be at least
+   * @param sequenceNumber position of this terminator within the stream; must equal
    *                       {@code totalBlocks}
    * @param totalBlocks number of data blocks emitted for this stream; zero is legal, negative is
    *                    not
-   * @throws IllegalArgumentException if totalBlocks is negative, if it exceeds sequenceNumber, or
-   *                                  if any header field is negative
+   * @throws IllegalArgumentException if totalBlocks is negative, if it differs from sequenceNumber,
+   *                                  or if any header field is negative
    */
   public StreamTerminationMessage(
       byte protocolVersion,
       int shuffleId,
+      long mapId,
       int partitionId,
       long sequenceNumber,
       long totalBlocks) {
-    super(protocolVersion, shuffleId, partitionId, sequenceNumber);
+    super(protocolVersion, shuffleId, mapId, partitionId, sequenceNumber);
     // Signalled as an argument failure rather than an error: a peer that sends a nonsensical count
     // is a recoverable protocol fault the caller converts into a fetch failure, not a condition
     // that should tear the executor down.
@@ -130,18 +147,24 @@ public final class StreamTerminationMessage extends StreamingShuffleMessage {
       throw new IllegalArgumentException("Total number of blocks in a streaming shuffle stream " +
         "cannot be negative: " + totalBlocks);
     }
-    // The terminator is sent after every data block, so it sits later in the stream than any of
-    // them: with blocks numbered from zero, its own sequenceNumber is at least the number of blocks
-    // that preceded it, and is strictly greater when the producer also spent sequence numbers on
-    // heartbeats. A claim of more blocks than positions is therefore arithmetically impossible, and
-    // refusing it here matters because a consumer sizes its completion bookkeeping from this count:
-    // an inflated total makes a stream that has in fact ended look permanently incomplete, and the
-    // consumer waits for blocks that were never sent.
-    if (totalBlocks > sequenceNumber) {
+    // Data blocks are the only messages that consume a sequence number, and they are numbered
+    // densely from zero; a heartbeat and this terminator both report the next unissued position
+    // without claiming it. The position a terminator sits at is therefore exactly the number of
+    // data blocks that preceded it, and any other relation is a protocol violation.
+    //
+    // The equality is enforced in both directions, because each direction is unsafe on its own.
+    // An inflated total -- more blocks than positions -- makes a stream that has in fact ended look
+    // permanently incomplete, so the consumer waits for blocks that were never sent. An undercount
+    // -- fewer blocks than positions -- is worse, because it is silent: a consumer that accepted n
+    // blocks and is told the total was m < n reconciles the two figures, concludes the stream
+    // completed and hands a truncated result to the reduce task with every checksum intact and no
+    // error raised anywhere. Refusing both here, on the one construction path that decode also
+    // funnels through, is what makes a shortfall detectable rather than self-consistent.
+    if (totalBlocks != sequenceNumber) {
       throw new IllegalArgumentException("Stream termination claims " + totalBlocks +
         " block(s) but sits at sequenceNumber " + sequenceNumber + " for shuffle " + shuffleId +
-        " partition " + partitionId + "; a stream cannot contain more blocks than the positions " +
-        "preceding its terminator");
+        " partition " + partitionId + "; a terminator must sit at exactly the position that " +
+        "follows the blocks it announces, because only data blocks consume sequence numbers");
     }
     this.totalBlocks = totalBlocks;
   }
@@ -152,37 +175,39 @@ public final class StreamTerminationMessage extends StreamingShuffleMessage {
    * repeated at every construction site.
    *
    * @param shuffleId identifier of the shuffle this stream belongs to
+   * @param mapId identifier of the map task whose output stream is ending
    * @param partitionId identifier of the shuffle partition whose stream is ending
-   * @param sequenceNumber position of this terminator within the stream; must be at least
+   * @param sequenceNumber position of this terminator within the stream; must equal
    *                       {@code totalBlocks}
    * @param totalBlocks number of data blocks emitted for this stream; zero is legal, negative is
    *                    not
-   * @throws IllegalArgumentException if totalBlocks is negative, if it exceeds sequenceNumber, or
-   *                                  if any header field is negative
+   * @throws IllegalArgumentException if totalBlocks is negative, if it differs from sequenceNumber,
+   *                                  or if any header field is negative
    */
   public StreamTerminationMessage(
       int shuffleId,
+      long mapId,
       int partitionId,
       long sequenceNumber,
       long totalBlocks) {
-    this(CURRENT_PROTOCOL_VERSION, shuffleId, partitionId, sequenceNumber, totalBlocks);
+    this(CURRENT_PROTOCOL_VERSION, shuffleId, mapId, partitionId, sequenceNumber, totalBlocks);
   }
 
   /**
    * Creates a terminator from a header just read off the wire, which is the form {@link
-   * #decode(ByteBuf)} uses. Taking the header as one value rather than as four positional arguments
+   * #decode(ByteBuf)} uses. Taking the header as one value rather than as five positional arguments
    * removes any chance of transposing {@code shuffleId} and {@code partitionId} on the way in.
    *
    * @param header the decoded header, which must not be null
    * @param totalBlocks number of data blocks emitted for this stream; zero is legal, negative is
    *                    not
    * @throws NullPointerException if header is null
-   * @throws IllegalArgumentException if totalBlocks is negative, if it exceeds sequenceNumber, or
-   *                                  if any header field is negative
+   * @throws IllegalArgumentException if totalBlocks is negative, if it differs from sequenceNumber,
+   *                                  or if any header field is negative
    */
   public StreamTerminationMessage(Header header, long totalBlocks) {
     this(Objects.requireNonNull(header, "header").protocolVersion(), header.shuffleId(),
-      header.partitionId(), header.sequenceNumber(), totalBlocks);
+      header.mapId(), header.partitionId(), header.sequenceNumber(), totalBlocks);
   }
 
   /**
@@ -225,7 +250,7 @@ public final class StreamTerminationMessage extends StreamingShuffleMessage {
 
   @Override
   public int encodedLength() {
-    // The shared header, then the eight bytes of totalBlocks: 25 bytes in all.
+    // The shared header, then the eight bytes of totalBlocks: 33 bytes in all.
     return HEADER_ENCODED_LENGTH + 8;
   }
 
@@ -253,7 +278,8 @@ public final class StreamTerminationMessage extends StreamingShuffleMessage {
    * @return the terminator just consumed from the buffer
    * @throws NullPointerException if buf is null
    * @throws IllegalArgumentException if the buffer is truncated, if it carries a negative block
-   *         count, or if its header carries a negative shuffle id, partition id or sequence number
+   *         count, if that count differs from the header's sequence number, or if its header
+   *         carries a negative shuffle id, partition id or sequence number
    */
   static StreamTerminationMessage decode(ByteBuf buf) {
     Header header = readHeader(buf);

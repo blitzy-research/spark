@@ -25,11 +25,11 @@ import scala.jdk.CollectionConverters._
 
 import org.apache.spark.SparkConf
 import org.apache.spark.internal.{config, Logging}
-import org.apache.spark.internal.LogKeys.{COUNT, MAX_ATTEMPTS, NUM_BYTES, PARTITION_ID, PERCENT,
-  REASON, SHUFFLE_ID, THRESHOLD}
-import org.apache.spark.network.shuffle.protocol.streaming.{AckMessage, HeartbeatMessage,
-  RetransmitRequestMessage, StreamingShuffleMessage, StreamingShuffleMessageType,
-  StreamTerminationMessage}
+import org.apache.spark.internal.LogKeys.{COUNT, MAX_ATTEMPTS, MAX_SIZE, NUM_BYTES, NUM_SKIPPED,
+  PARTITION_ID, PERCENT, REASON, SHUFFLE_ID, THRESHOLD}
+import org.apache.spark.network.shuffle.protocol.streaming.{AckMessage, DataBlockMessage,
+  HeartbeatMessage, RetransmitRequestMessage, StreamingShuffleMessage,
+  StreamingShuffleMessageType, StreamTerminationMessage}
 import org.apache.spark.util.{Clock, SystemClock}
 
 /**
@@ -120,20 +120,117 @@ private[spark] object BackpressureDegradationReason {
 }
 
 /**
- * Identity of one streaming shuffle stream: the flow of blocks from the producers of one shuffle to
- * the consumer of one of its reduce partitions.
+ * Identity of one streaming shuffle stream: the flow of blocks from one producer generation of one
+ * shuffle to one consumer session reading one of its reduce partitions.
  *
- * A shuffle id alone is too coarse to carry credit, because each reduce partition is consumed by a
- * different task and acknowledges at its own pace, and a partition id alone is not unique across
- * concurrent shuffles. The pair is the unit the credit ledger is keyed on, and it is a case class
- * so that value equality and a matching hash code come from the compiler rather than from a
- * hand-written pair of methods that could drift apart.
+ * Every component of this key is load-bearing, and omitting any one of them makes two genuinely
+ * distinct flows share a credit ledger:
  *
+ *  - `shuffleId` alone is far too coarse, because each reduce partition is consumed by a different
+ *    task and acknowledges at its own pace.
+ *  - `partitionId` is not unique across concurrent shuffles, and -- crucially -- it is not unique
+ *    across the map tasks of one shuffle either. Two map tasks running on the same executor both
+ *    stream partition zero of the same shuffle, and those are two separate flows with two separate
+ *    windows of unacknowledged bytes.
+ *  - `mapId` names the map output being streamed, so those two flows no longer collide.
+ *  - `taskAttemptId` names the producer *generation*. Spark allocates attempt ids from a single
+ *    monotonically increasing per-application counter, so a speculative or retried attempt of the
+ *    same map task is a different generation. Without it, a stale attempt completing after its
+ *    replacement had registered would unregister the replacement's live ledger.
+ *  - `consumerId` names the consumer session. One producer serves every reduce partition it
+ *    produces, and a reduce task that reconnects after a failure is a new session with a new
+ *    receive window, so credit must not be inherited across sessions.
+ *  - `role` names which end of the flow the ledger belongs to. A producer's ledger charges bytes it
+ *    has sent and a consumer's charges bytes it has received, and the two are separate windows even
+ *    when producer and consumer sit in the same JVM -- which they do whenever Spark runs locally.
+ *    Without the role, a local shuffle would charge one window twice and halve its own credit.
+ *
+ * A case class, so that value equality and a matching hash code come from the compiler rather than
+ * from a hand-written pair of methods that could drift apart. Every field is a primitive or an
+ * immutable string, so the key is safe to publish into a concurrent map and to read from a Netty
+ * event-loop thread.
+ *
+ * @param role which end of the flow this ledger accounts for
  * @param shuffleId shuffle the stream belongs to
+ * @param mapId map output being streamed
+ * @param taskAttemptId task attempt id of the producing generation
  * @param partitionId reduce partition the stream feeds
+ * @param consumerId identity of the consumer session reading that partition
  */
-private[spark] case class BackpressureStreamKey(shuffleId: Int, partitionId: Int) {
-  override def toString: String = s"shuffle $shuffleId partition $partitionId"
+private[spark] case class BackpressureStreamKey(
+    role: BackpressureStreamRole,
+    shuffleId: Int,
+    mapId: Long,
+    taskAttemptId: Long,
+    partitionId: Int,
+    consumerId: String) {
+
+  override def toString: String =
+    s"$role stream for shuffle $shuffleId map $mapId attempt $taskAttemptId partition " +
+      s"$partitionId consumer $consumerId"
+}
+
+/**
+ * Which end of a stream a ledger accounts for.
+ *
+ * The distinction is not cosmetic. A producer's ledger charges bytes it has handed to the wire and
+ * releases them when the consumer acknowledges; a consumer's charges bytes it has taken off the
+ * wire and releases them when it has consumed and acknowledged them. Both are the same arithmetic
+ * over the same window, but they are two different windows, and a key that could not tell them
+ * apart would merge them whenever both ends run in one JVM.
+ */
+private[spark] sealed abstract class BackpressureStreamRole(val name: String) {
+  override def toString: String = name
+}
+
+private[spark] object BackpressureStreamRole {
+
+  /** The sending end: charges on send, releases on the acknowledgement it receives. */
+  case object Producer extends BackpressureStreamRole("producer")
+
+  /** The receiving end: charges on receive, releases on the acknowledgement it emits. */
+  case object Consumer extends BackpressureStreamRole("consumer")
+
+  val values: Seq[BackpressureStreamRole] = Seq(Producer, Consumer)
+}
+
+/**
+ * Constructors for [[BackpressureStreamKey]].
+ *
+ * Two named factories rather than the compiler's positional apply, because the role is the one
+ * component a call site could plausibly get wrong and naming it in the method removes the
+ * opportunity. Both take every identifying component, so no call site can silently omit one.
+ */
+private[spark] object BackpressureStreamKey {
+
+  /**
+   * Placeholder consumer identity, used for a producer-side ledger opened before any consumer has
+   * subscribed -- the interval between a writer framing its first block and a reduce task
+   * announcing itself on a channel. It is a distinct session from every real consumer, so a real
+   * subscription always opens a ledger of its own rather than silently adopting this one's
+   * accounting.
+   */
+  val ANY_CONSUMER: String = "*"
+
+  /** A key for the sending end of a stream. */
+  def forProducer(
+      shuffleId: Int,
+      mapId: Long,
+      taskAttemptId: Long,
+      partitionId: Int,
+      consumerId: String = ANY_CONSUMER): BackpressureStreamKey =
+    BackpressureStreamKey(
+      BackpressureStreamRole.Producer, shuffleId, mapId, taskAttemptId, partitionId, consumerId)
+
+  /** A key for the receiving end of a stream. */
+  def forConsumer(
+      shuffleId: Int,
+      mapId: Long,
+      taskAttemptId: Long,
+      partitionId: Int,
+      consumerId: String): BackpressureStreamKey =
+    BackpressureStreamKey(
+      BackpressureStreamRole.Consumer, shuffleId, mapId, taskAttemptId, partitionId, consumerId)
 }
 
 /**
@@ -228,7 +325,8 @@ private[spark] class BackpressureProtocol(
     conf: SparkConf,
     coordinator: StreamingShuffleCoordinator,
     rateLimiter: TokenBucketRateLimiter,
-    clock: Clock = new SystemClock) extends Logging {
+    clock: Clock = new SystemClock)
+  extends StreamingShuffleBufferUtilizationContributor with Logging {
 
   require(conf != null, "The Spark configuration must not be null.")
   require(rateLimiter != null, "The streaming shuffle rate limiter must not be null.")
@@ -267,6 +365,50 @@ private[spark] class BackpressureProtocol(
 
   private val shuffleBudgetBytes = new ConcurrentHashMap[Int, java.lang.Long]()
 
+  /**
+   * The one consumer-side receive budget of this executor, in bytes.
+   *
+   * <b>Why it lives here and not in the reader.</b> A reduce task's own budget cannot bound the
+   * executor: a reader that computed `bufferSizePercent` of executor memory for itself would be
+   * joined by every other reduce task in the same JVM, each computing the same figure, and by every
+   * partition and every producer each of those readers happened to be reading from -- so the
+   * aggregate would be the configured percentage multiplied by a number nobody chose. The budget
+   * therefore has to be owned by a component every consumer on the executor already shares, and
+   * this is that component: it is constructed once per executor, it is handed to every reader and
+   * every consumer handler, and it already aggregates buffer utilisation across concurrent shuffles
+   * for exactly the same reason.
+   *
+   * It is the *same* percentage of the *same* executor memory the producer side is bounded by, read
+   * from the same entry, so the two halves of a streaming shuffle are sized from one number instead
+   * of two that could drift. Floored at one maximum-size frame, because a budget that could not
+   * admit the largest legal block would refuse every block and make no progress at all.
+   */
+  private val receiveQuotaTotalBytes: Long = {
+    val percent = conf.get(config.SHUFFLE_STREAMING_BUFFER_SIZE_PERCENT).toLong
+    val executorMemoryMib = conf.get(config.EXECUTOR_MEMORY)
+    math.max(DataBlockMessage.MAX_ENCODED_FRAME_BYTES.toLong,
+      executorMemoryMib * TokenBucketRateLimiter.BYTES_PER_MIB /
+        BackpressureProtocol.PERCENT_SCALE * percent)
+  }
+
+  // Bytes of that budget currently held by consumers, summed over every reader, every producer
+  // channel and every partition on this executor. Advanced when a frame is admitted anywhere on the
+  // consumer side and retired when the reduce task that owns it acknowledges consumption, so the
+  // reading covers the whole interval during which the bytes are on the heap -- the handler's
+  // hand-off queue and the reader's decoded payload alike, which are one interval and not two.
+  private val reservedReceiveBytes = new AtomicLong(0L)
+
+  // Reservations refused because the executor-wide budget was exhausted. Counted rather than logged
+  // per occurrence: a refusal is a throttle rather than a fault, it is repaired by the replay the
+  // consumer asks for, and the rate is chosen by a producer.
+  private val receiveQuotaRefusals = new AtomicLong(0L)
+
+  // Whether the executor-wide consumer budget is currently in an episode of exhaustion. The
+  // backpressure-event metric counts the edge into an episode and not each refusal within it, so
+  // that an operator reads "how many times consumer flow control engaged" rather than a number that
+  // grows with how fast producers happen to retry.
+  private val receiveQuotaThrottled = new AtomicBoolean(false)
+
   // Degradation reasons observed so far. A set rather than a single cell because more than one
   // condition can hold at once and an operator needs to see all of them, and latched rather than
   // momentary because the fallback policy may sample it after the condition that caused it has
@@ -279,6 +421,13 @@ private[spark] class BackpressureProtocol(
   // across every protocol in the process, so a local total is kept for assertions that need to
   // speak about one instance.
   private val throttleTransitions = new AtomicLong(0L)
+
+  // Rate gate for the default-level throttling record. A latch per stream would still be a line per
+  // stream, and a wide job has tens of thousands of them, so throttling is reported as one bounded
+  // aggregate carrying the episode total and the number of episodes it stands in for. Per-stream
+  // identity is detail behind the streaming debug key.
+  private val throttleLogGate =
+    new MemorySpillManager.LogAggregationGate(MemorySpillManager.LOG_AGGREGATION_WINDOW_MS)
 
   // Acknowledgement-driven reclamations that were not confirmed inside the 100 ms bound. Counted
   // rather than logged per occurrence, because the bound is per acknowledgement and a log line per
@@ -297,6 +446,45 @@ private[spark] class BackpressureProtocol(
   // Instant of the last pollOnce(), so that a caller driving the protocol on a timer can ask
   // whether the next poll is due instead of keeping that bookkeeping itself.
   private val lastPollMillis = new AtomicLong(clock.getTimeMillis())
+
+  // Acknowledgements naming a position this side has never charged. Refused rather than applied,
+  // and counted so that a caller can tell a misbehaving or hostile peer from a merely slow one.
+  private val impossibleAckPositions = new AtomicLong(0L)
+
+  // Frames whose shuffle and partition contradicted the stream they were delivered as. Counted
+  // rather than logged, because a misrouted frame is a routing defect that shows up in bulk and a
+  // line per frame would be a per-message line by another name.
+  private val misaddressedFrames = new AtomicLong(0L)
+
+  // Measured link usage in each direction. Saturation is a *measured* quantity here: bytes actually
+  // crossing the wire divided by the interval they crossed it over, compared against the capacity
+  // the operator declared. It is deliberately NOT inferred from how depleted the pacing bucket is.
+  // A bucket empties whenever a burst briefly outruns its refill rate, which happens constantly on
+  // a perfectly healthy link and says nothing whatsoever about the link being saturated -- and it
+  // empties by construction on a stream the limiter is pacing exactly as configured, which would
+  // make correct pacing look like the very condition that is supposed to make streaming stand down.
+  //
+  // Executor-wide rather than per stream, because the link belongs to the executor: one stream's
+  // rate systematically understates the usage of a link shared by every concurrent shuffle, and a
+  // policy fed that figure could never see a saturated link at all.
+  private val egressWindow = new BackpressureProtocol.RateWindow(clock)
+
+  private val ingressWindow = new BackpressureProtocol.RateWindow(clock)
+
+  /**
+   * The link capacity the operator declared, in bytes per second, or zero when none was declared.
+   *
+   * Read once from `spark.shuffle.streaming.maxBandwidthMBps`, whose absence expresses "unlimited"
+   * rather than a sentinel. It is the *administered* capacity and deliberately not the rate
+   * limiter's refill rate: the refill rate is already this executor's throttled share of the
+   * capacity, so dividing measured egress by it would report a stream that is being paced exactly
+   * as intended as a link at a hundred percent.
+   */
+  private val declaredLinkCapacityBytesPerSecond: Long =
+    conf.get(config.SHUFFLE_STREAMING_MAX_BANDWIDTH_MBPS)
+      .map(mbps => BackpressureProtocol.saturatingMultiply(
+        math.max(0L, mbps.toLong), TokenBucketRateLimiter.BYTES_PER_MIB))
+      .getOrElse(0L)
 
   /**
    * Registers a shuffle with the protocol, recording the reduce partition count that arbitration
@@ -417,46 +605,83 @@ private[spark] class BackpressureProtocol(
    * granting more credit than the buffer can hold would promise a retransmission the producer could
    * not perform, and granting less would idle a consumer that is keeping up.
    *
-   * Registering an already-registered stream is a no-op that keeps the existing ledger, so a
-   * defensive second call from a retried task cannot discard credit accounting that is in use.
+   * Ownership of a ledger is reference counted rather than single-shot. Registering a stream that
+   * is already open keeps the existing ledger -- discarding live credit accounting would strand the
+   * bytes already in flight -- and increments its owner count, so a component that legitimately
+   * re-registers the same stream after a transient channel loss does not have to know whether it is
+   * the first owner. It is the matching [[unregisterStream]] that closes the ledger, and only when
+   * the last owner has released it. Because the key carries the producer generation and the
+   * consumer session, a stale attempt and a superseded consumer session are distinct streams with
+   * distinct ledgers, so neither can be the owner that closes the other's.
    *
-   * @param shuffleId shuffle the stream belongs to; must be non-negative
-   * @param partitionId reduce partition the stream feeds; must be non-negative
+   * @param key identity of the stream, including producer generation and consumer session
    * @param creditLimitBytes bytes the producer may hold unacknowledged; must be positive
-   * @return true if a new ledger was opened, false if one already existed
+   * @return true if a new ledger was opened, false if an existing one gained another owner
    */
-  def registerStream(shuffleId: Int, partitionId: Int, creditLimitBytes: Long): Boolean = {
-    require(shuffleId >= 0, s"The shuffle id must be non-negative but was $shuffleId.")
-    require(partitionId >= 0, s"The partition id must be non-negative but was $partitionId.")
+  def registerStream(key: BackpressureStreamKey, creditLimitBytes: Long): Boolean = {
+    require(key != null, "The streaming shuffle stream key must not be null.")
+    require(key.shuffleId >= 0, s"The shuffle id must be non-negative but was ${key.shuffleId}.")
+    require(key.partitionId >= 0,
+      s"The partition id must be non-negative but was ${key.partitionId}.")
     require(creditLimitBytes > 0L,
-      s"The credit limit of shuffle $shuffleId partition $partitionId must be positive but was " +
-        s"$creditLimitBytes.")
-    val key = BackpressureStreamKey(shuffleId, partitionId)
-    val ledger = new BackpressureProtocol.StreamLedger(key, creditLimitBytes, clock.getTimeMillis())
-    val existing = streams.putIfAbsent(key, ledger)
-    val opened = existing == null
+      s"The credit limit of $key must be positive but was $creditLimitBytes.")
+    // compute() decides and mutates in one indivisible step, so two threads registering the same
+    // stream concurrently cannot each conclude that they opened it.
+    var opened = false
+    streams.compute(key, (_, existing) => {
+      if (existing == null) {
+        opened = true
+        new BackpressureProtocol.StreamLedger(key, creditLimitBytes, clock.getTimeMillis())
+      } else {
+        existing.retain()
+        existing
+      }
+    })
     if (opened && debugEnabled) {
       logDebug(log"Opened a streaming shuffle credit ledger for shuffle " +
-        log"${MDC(SHUFFLE_ID, shuffleId)} partition ${MDC(PARTITION_ID, partitionId)} with " +
+        log"${MDC(SHUFFLE_ID, key.shuffleId)} partition " +
+        log"${MDC(PARTITION_ID, key.partitionId)} with " +
         log"${MDC(NUM_BYTES, creditLimitBytes)} bytes of credit")
     }
     opened
   }
 
   /**
-   * Closes the ledger of one stream, releasing every byte of credit it held. Idempotent and safe
-   * for a stream that was never registered, because this runs from task-completion cleanup that
-   * executes on success, on failure and on cancellation alike.
+   * Releases one owner's claim on a stream's ledger, closing it -- and with it every byte of credit
+   * it held -- once the last owner has let go. Idempotent and safe for a stream that was never
+   * registered, because this runs from task-completion cleanup that executes on success, on failure
+   * and on cancellation alike.
    *
-   * @return true if a ledger was closed
+   * The key carries the producer generation and the consumer session, so a stale attempt calling
+   * this on completion can only ever release its own ledger. It can never remove the live ledger of
+   * the attempt that superseded it, which is the shared-state removal this reference counting and
+   * this key shape exist to prevent.
+   *
+   * @param key identity of the stream whose ledger is being released
+   * @return true if this call closed the ledger
    */
-  def unregisterStream(shuffleId: Int, partitionId: Int): Boolean = {
-    streams.remove(BackpressureStreamKey(shuffleId, partitionId)) != null
+  def unregisterStream(key: BackpressureStreamKey): Boolean = {
+    if (key == null) {
+      false
+    } else {
+      var closed = false
+      streams.compute(key, (_, existing) => {
+        if (existing == null) {
+          null
+        } else if (existing.release()) {
+          closed = true
+          null
+        } else {
+          existing
+        }
+      })
+      closed
+    }
   }
 
   /** Whether a ledger is open for this stream. */
-  def isStreamRegistered(shuffleId: Int, partitionId: Int): Boolean =
-    streams.containsKey(BackpressureStreamKey(shuffleId, partitionId))
+  def isStreamRegistered(key: BackpressureStreamKey): Boolean =
+    streams.containsKey(key)
 
   /** How many streams currently hold a ledger. */
   def streamCount: Int = streams.size()
@@ -495,13 +720,12 @@ private[spark] class BackpressureProtocol(
    * @return true if the caller may send the block now, false if it must hold it and retry
    */
   def tryAdmit(
-      shuffleId: Int,
-      partitionId: Int,
+      key: BackpressureStreamKey,
       bytes: Long,
       sequenceNumber: Long): Boolean = {
     require(sequenceNumber >= 0L,
       s"The sequence number must be non-negative but was $sequenceNumber.")
-    val ledger = streams.get(BackpressureStreamKey(shuffleId, partitionId))
+    val ledger = streams.get(key)
     if (ledger == null) {
       true
     } else if (bytes <= 0L) {
@@ -516,9 +740,43 @@ private[spark] class BackpressureProtocol(
       false
     } else {
       ledger.recordSent(sequenceNumber, bytes)
+      recordEgress(bytes)
       true
     }
   }
+
+  /** Accumulates bytes this executor handed to the wire. */
+  private def recordEgress(bytes: Long): Unit = egressWindow.record(bytes)
+
+  /** Accumulates bytes this executor took off the wire. */
+  private def recordIngress(bytes: Long): Unit = ingressWindow.record(bytes)
+
+  /**
+   * Measured egress over the last completed interval, in bytes per second, across every stream on
+   * this executor. This is the numerator the network-saturation fallback condition is evaluated
+   * from on the producing side.
+   */
+  def egressBytesPerSecond: Long = egressWindow.bytesPerSecond
+
+  /**
+   * Measured ingress over the last completed interval, in bytes per second, across every stream on
+   * this executor. This is the numerator the network-saturation fallback condition is evaluated
+   * from on the consuming side, which is the only side that can measure what actually arrived.
+   */
+  def ingressBytesPerSecond: Long = ingressWindow.bytesPerSecond
+
+  /** Bytes admitted to the wire since this protocol was created. */
+  def egressBytes: Long = egressWindow.total
+
+  /** Bytes taken off the wire since this protocol was created. */
+  def ingressBytes: Long = ingressWindow.total
+
+  /** The administered link capacity in bytes per second, or `None` when none was declared. */
+  def declaredLinkCapacity: Option[Long] =
+    if (declaredLinkCapacityBytesPerSecond > 0L) Some(declaredLinkCapacityBytesPerSecond) else None
+
+  /** Frames that were delivered as a stream whose shuffle or partition they did not name. */
+  def misaddressedFrameCount: Long = misaddressedFrames.get()
 
   /**
    * Whether the producer may send anything at all to this consumer right now.
@@ -533,8 +791,8 @@ private[spark] class BackpressureProtocol(
    * response: the first is a stream this protocol was never told about and the second has nothing
    * further to send.
    */
-  def hasCredit(shuffleId: Int, partitionId: Int): Boolean = {
-    val ledger = streams.get(BackpressureStreamKey(shuffleId, partitionId))
+  def hasCredit(key: BackpressureStreamKey): Boolean = {
+    val ledger = streams.get(key)
     ledger == null || ledger.isTerminated || ledger.hasCredit
   }
 
@@ -542,32 +800,32 @@ private[spark] class BackpressureProtocol(
    * Bytes of credit still available to this stream, or `Long.MaxValue` for a stream with no ledger,
    * which is the honest answer to "how much may I send" when no allowance is being tracked.
    */
-  def availableCreditBytes(shuffleId: Int, partitionId: Int): Long = {
-    val ledger = streams.get(BackpressureStreamKey(shuffleId, partitionId))
+  def availableCreditBytes(key: BackpressureStreamKey): Long = {
+    val ledger = streams.get(key)
     if (ledger == null) Long.MaxValue else ledger.availableCredit
   }
 
   /** Bytes this stream has sent but not yet had acknowledged; zero for an unknown stream. */
-  def outstandingBytes(shuffleId: Int, partitionId: Int): Long = {
-    val ledger = streams.get(BackpressureStreamKey(shuffleId, partitionId))
+  def outstandingBytes(key: BackpressureStreamKey): Long = {
+    val ledger = streams.get(key)
     if (ledger == null) 0L else ledger.outstandingBytes
   }
 
   /** The credit limit this stream was opened with, or zero for an unknown stream. */
-  def creditLimitBytes(shuffleId: Int, partitionId: Int): Long = {
-    val ledger = streams.get(BackpressureStreamKey(shuffleId, partitionId))
+  def creditLimitBytes(key: BackpressureStreamKey): Long = {
+    val ledger = streams.get(key)
     if (ledger == null) 0L else ledger.creditLimitBytes
   }
 
   /** Bytes this stream has sent in total, acknowledged or not; zero for an unknown stream. */
-  def sentBytes(shuffleId: Int, partitionId: Int): Long = {
-    val ledger = streams.get(BackpressureStreamKey(shuffleId, partitionId))
+  def sentBytes(key: BackpressureStreamKey): Long = {
+    val ledger = streams.get(key)
     if (ledger == null) 0L else ledger.sentBytes
   }
 
   /** Bytes of this stream the consumer has acknowledged; zero for an unknown stream. */
-  def acknowledgedBytes(shuffleId: Int, partitionId: Int): Long = {
-    val ledger = streams.get(BackpressureStreamKey(shuffleId, partitionId))
+  def acknowledgedBytes(key: BackpressureStreamKey): Long = {
+    val ledger = streams.get(key)
     if (ledger == null) 0L else ledger.acknowledgedBytes
   }
 
@@ -590,48 +848,126 @@ private[spark] class BackpressureProtocol(
    * is expected to confirm the release within 100 ms through [[confirmReclamation]], and a
    * confirmation that arrives later is counted as a breach.
    *
-   * @param shuffleId shuffle being acknowledged
-   * @param partitionId reduce partition being acknowledged
+   * An acknowledgement naming a position beyond what this stream has charged is refused outright,
+   * because honouring it would release output no consumer has read. Callers that must react to that
+   * -- a channel handler that has to fail the connection rather than keep serving it -- should use
+   * [[tryAcknowledge]], which distinguishes a refusal from an acknowledgement that simply advanced
+   * nothing.
+   *
+   * @param key identity of the stream being acknowledged
    * @param consumerPosition highest block sequence number the consumer has consumed, or
    *                         [[BackpressureProtocol.NOTHING_ACKNOWLEDGED]] when it has consumed
    *                         nothing
-   * @return bytes released by this acknowledgement, zero if it advanced nothing
+   * @return bytes released by this acknowledgement, zero if it advanced nothing or was refused
    */
-  def onAck(shuffleId: Int, partitionId: Int, consumerPosition: Long): Long = {
-    val ledger = streams.get(BackpressureStreamKey(shuffleId, partitionId))
+  def onAck(key: BackpressureStreamKey, consumerPosition: Long): Long =
+    tryAcknowledge(key, consumerPosition).getOrElse(0L)
+
+  /**
+   * Applies a consumer acknowledgement, reporting a refusal distinctly from a no-op.
+   *
+   * `None` means the position was impossible -- strictly beyond the highest sequence number this
+   * stream has charged -- and nothing at all was applied. That is a protocol violation rather than
+   * a race: the consumer cannot have consumed a block that was never sent to it, so the frame is
+   * either misrouted or forged, and releasing on it would hand away buffers the real consumer still
+   * needs. `Some(0)` means the acknowledgement was valid but advanced nothing, which is the
+   * ordinary outcome for a duplicate or a reordered frame.
+   *
+   * @return bytes released, or `None` when the acknowledgement was refused as impossible
+   */
+  def tryAcknowledge(key: BackpressureStreamKey, consumerPosition: Long): Option[Long] = {
+    val ledger = streams.get(key)
     if (ledger == null) {
-      0L
+      Some(0L)
     } else {
       val nowMillis = clock.getTimeMillis()
-      val released = ledger.applyAck(consumerPosition, nowMillis)
-      if (released > 0L || ledger.hasCredit) {
-        // Credit has been restored, so an episode of credit-driven throttling is over. Leaving the
-        // throttled flag set here would suppress the next transition and undercount the metric,
-        // which is why the flag is cleared on the acknowledgement rather than on the next send.
-        leaveThrottled(ledger)
+      ledger.applyAck(consumerPosition, nowMillis) match {
+        case None =>
+          impossibleAckPositions.incrementAndGet()
+          logWarning(log"Refusing a streaming shuffle acknowledgement for shuffle " +
+            log"${MDC(SHUFFLE_ID, key.shuffleId)} partition " +
+            log"${MDC(PARTITION_ID, key.partitionId)} that named position " +
+            log"${MDC(COUNT, consumerPosition)} beyond the highest position charged, " +
+            log"${MDC(MAX_SIZE, ledger.highestChargedSequenceNumber)}")
+          None
+        case Some(released) =>
+          if (released > 0L || ledger.hasCredit) {
+            // Credit has been restored, so an episode of credit-driven throttling is over. Leaving
+            // the throttled flag set here would suppress the next transition and undercount the
+            // metric, which is why the flag is cleared on the acknowledgement rather than the send.
+            leaveThrottled(ledger)
+          }
+          if (debugEnabled && released > 0L) {
+            logDebug(log"Acknowledgement released ${MDC(NUM_BYTES, released)} bytes of streaming " +
+              log"shuffle credit for shuffle ${MDC(SHUFFLE_ID, key.shuffleId)} partition " +
+              log"${MDC(PARTITION_ID, key.partitionId)}")
+          }
+          Some(released)
       }
-      if (debugEnabled && released > 0L) {
-        logDebug(log"Acknowledgement released ${MDC(NUM_BYTES, released)} bytes of streaming " +
-          log"shuffle credit for shuffle ${MDC(SHUFFLE_ID, shuffleId)} partition " +
-          log"${MDC(PARTITION_ID, partitionId)}")
-      }
-      released
     }
+  }
+
+  /** Acknowledgements refused because they named a position this side had never charged. */
+  def impossibleAckPositionCount: Long = impossibleAckPositions.get()
+
+  /**
+   * The highest sequence number this stream has charged, and therefore the highest position an
+   * acknowledgement for it may name. The nothing-sequence sentinel for an unknown stream.
+   */
+  def highestChargedSequenceNumber(key: BackpressureStreamKey): Long = {
+    val ledger = streams.get(key)
+    if (ledger == null) BackpressureProtocol.NO_SEQUENCE else ledger.highestChargedSequenceNumber
   }
 
   /**
    * Applies an acknowledgement that arrived on the wire. The message carries its own stream
    * identity and consumed position, so no call site has to restate either.
    *
+   * The stream key is supplied by the caller rather than derived from the message, because the wire
+   * carries only a shuffle id and a partition id and those two do not identify a stream: the
+   * producer generation and the consumer session are known to the handler that owns the channel the
+   * frame arrived on, and nowhere else. A message whose shuffle and partition contradict the key is
+   * refused rather than applied to the wrong ledger.
+   *
+   * @param key identity of the stream the frame arrived for
    * @param ack the acknowledgement received; a null message releases nothing
    * @return bytes released by this acknowledgement
    */
-  def onAck(ack: AckMessage): Long = {
-    if (ack == null) {
-      0L
+  def onAck(key: BackpressureStreamKey, ack: AckMessage): Long =
+    tryAcknowledge(key, ack).getOrElse(0L)
+
+  /**
+   * Applies an acknowledgement that arrived on the wire, reporting a refusal distinctly from a
+   * no-op. A null or misaddressed frame is refused, as is an impossible position.
+   *
+   * This is the form a channel handler uses, because a handler must fail the connection on a
+   * refusal rather than carry on serving a peer that has just claimed to have consumed output it
+   * was never sent.
+   *
+   * @return bytes released, or `None` when the frame was refused
+   */
+  def tryAcknowledge(key: BackpressureStreamKey, ack: AckMessage): Option[Long] = {
+    if (ack == null || !addresses(key, ack)) {
+      None
     } else {
-      onAck(ack.shuffleId(), ack.partitionId(), ack.consumerPosition())
+      tryAcknowledge(key, ack.consumerPosition())
     }
+  }
+
+  /**
+   * Whether a frame's shuffle and partition match the stream it was delivered as.
+   *
+   * A mismatch means the frame was routed to the wrong ledger, which must never be applied and must
+   * never be acknowledged. It is reported rather than thrown, because the caller is on a network
+   * thread that has to keep serving every other stream on the same channel.
+   */
+  private def addresses(key: BackpressureStreamKey, message: StreamingShuffleMessage): Boolean = {
+    val matches = key != null && message.shuffleId() == key.shuffleId &&
+      message.partitionId() == key.partitionId
+    if (!matches) {
+      misaddressedFrames.incrementAndGet()
+    }
+    matches
   }
 
   /**
@@ -639,8 +975,8 @@ private[spark] class BackpressureProtocol(
    * [[BackpressureProtocol.NOTHING_ACKNOWLEDGED]] when it has acknowledged nothing and for an
    * unknown stream.
    */
-  def acknowledgedPosition(shuffleId: Int, partitionId: Int): Long = {
-    val ledger = streams.get(BackpressureStreamKey(shuffleId, partitionId))
+  def acknowledgedPosition(key: BackpressureStreamKey): Long = {
+    val ledger = streams.get(key)
     if (ledger == null) BackpressureProtocol.NOTHING_ACKNOWLEDGED else ledger.acknowledgedPosition
   }
 
@@ -657,8 +993,8 @@ private[spark] class BackpressureProtocol(
    * @return the observed latency in milliseconds, or `None` when no acknowledgement is awaiting
    *         confirmation for this stream
    */
-  def confirmReclamation(shuffleId: Int, partitionId: Int): Option[Long] = {
-    val ledger = streams.get(BackpressureStreamKey(shuffleId, partitionId))
+  def confirmReclamation(key: BackpressureStreamKey): Option[Long] = {
+    val ledger = streams.get(key)
     if (ledger == null) {
       None
     } else {
@@ -677,8 +1013,8 @@ private[spark] class BackpressureProtocol(
    * 100 ms bound has already elapsed. This is the reading a poll uses to notice a buffer owner that
    * is not keeping up, without waiting for it to confirm at all.
    */
-  def isReclamationOverdue(shuffleId: Int, partitionId: Int): Boolean = {
-    val ledger = streams.get(BackpressureStreamKey(shuffleId, partitionId))
+  def isReclamationOverdue(key: BackpressureStreamKey): Boolean = {
+    val ledger = streams.get(key)
     ledger != null && ledger.isReclamationOverdue(clock.getTimeMillis(),
       BackpressureProtocol.RECLAMATION_DEADLINE_MS)
   }
@@ -696,23 +1032,22 @@ private[spark] class BackpressureProtocol(
    * moment the consumer acknowledged them. Loss or corruption outside the window is recovered
    * instead by failing the fetch and letting the unmodified scheduler recompute the upstream stage.
    */
-  def unacknowledgedWindow(shuffleId: Int, partitionId: Int): Option[(Long, Long)] = {
-    val ledger = streams.get(BackpressureStreamKey(shuffleId, partitionId))
+  def unacknowledgedWindow(key: BackpressureStreamKey): Option[(Long, Long)] = {
+    val ledger = streams.get(key)
     if (ledger == null) None else ledger.unacknowledgedWindow
   }
 
   /** How many blocks this stream has sent but not had acknowledged. */
-  def unacknowledgedBlockCount(shuffleId: Int, partitionId: Int): Int = {
-    val ledger = streams.get(BackpressureStreamKey(shuffleId, partitionId))
+  def unacknowledgedBlockCount(key: BackpressureStreamKey): Int = {
+    val ledger = streams.get(key)
     if (ledger == null) 0 else ledger.unacknowledgedBlockCount
   }
 
   /** Whether one block is still inside this stream's unacknowledged window. */
   def isWithinUnacknowledgedWindow(
-      shuffleId: Int,
-      partitionId: Int,
+      key: BackpressureStreamKey,
       sequenceNumber: Long): Boolean = {
-    val ledger = streams.get(BackpressureStreamKey(shuffleId, partitionId))
+    val ledger = streams.get(key)
     ledger != null && ledger.containsUnacknowledged(sequenceNumber)
   }
 
@@ -731,12 +1066,13 @@ private[spark] class BackpressureProtocol(
    *
    * @param request the retransmission request received; a null request is never serviceable
    */
-  def canServeRetransmit(request: RetransmitRequestMessage): Boolean = {
-    if (request == null) {
+  def canServeRetransmit(
+      key: BackpressureStreamKey,
+      request: RetransmitRequestMessage): Boolean = {
+    if (request == null || !addresses(key, request)) {
       false
     } else {
-      val ledger =
-        streams.get(BackpressureStreamKey(request.shuffleId(), request.partitionId()))
+      val ledger = streams.get(key)
       ledger != null &&
         ledger.containsUnacknowledged(request.firstSequenceNumber()) &&
         ledger.containsUnacknowledged(request.lastSequenceNumber()) &&
@@ -754,16 +1090,17 @@ private[spark] class BackpressureProtocol(
    *
    * @return true if the producer may replay every block the request names
    */
-  def onRetransmitRequest(request: RetransmitRequestMessage): Boolean = {
-    if (request == null) {
+  def onRetransmitRequest(
+      key: BackpressureStreamKey,
+      request: RetransmitRequestMessage): Boolean = {
+    if (request == null || !addresses(key, request)) {
       false
     } else {
-      val key = BackpressureStreamKey(request.shuffleId(), request.partitionId())
       val ledger = streams.get(key)
       if (ledger != null) {
         ledger.recordInbound(clock.getTimeMillis())
       }
-      val serviceable = ledger != null && canServeRetransmit(request)
+      val serviceable = ledger != null && canServeRetransmit(key, request)
       if (serviceable) {
         val attempt = ledger.recordRetransmitAttempt()
         if (debugEnabled) {
@@ -787,8 +1124,8 @@ private[spark] class BackpressureProtocol(
    * an acknowledgement that advances the consumer position means the stream is healthy again, so a
    * later, unrelated failure gets the full budget rather than inheriting an exhausted one.
    */
-  def nextRetryBackoffMillis(shuffleId: Int, partitionId: Int): Option[Long] = {
-    val ledger = streams.get(BackpressureStreamKey(shuffleId, partitionId))
+  def nextRetryBackoffMillis(key: BackpressureStreamKey): Option[Long] = {
+    val ledger = streams.get(key)
     if (ledger == null) {
       Some(BackpressureProtocol.RETRY_BASE_BACKOFF_MS)
     } else {
@@ -802,8 +1139,8 @@ private[spark] class BackpressureProtocol(
   }
 
   /** Replay attempts already made for this stream since it last made progress. */
-  def retransmitAttempts(shuffleId: Int, partitionId: Int): Int = {
-    val ledger = streams.get(BackpressureStreamKey(shuffleId, partitionId))
+  def retransmitAttempts(key: BackpressureStreamKey): Int = {
+    val ledger = streams.get(key)
     if (ledger == null) 0 else ledger.retransmitAttempts
   }
 
@@ -811,9 +1148,63 @@ private[spark] class BackpressureProtocol(
    * Whether this stream has spent its five replay attempts, so that the next failure must be
    * escalated to a fetch failure rather than retried.
    */
-  def isRetryExhausted(shuffleId: Int, partitionId: Int): Boolean = {
-    val ledger = streams.get(BackpressureStreamKey(shuffleId, partitionId))
+  def isRetryExhausted(key: BackpressureStreamKey): Boolean = {
+    val ledger = streams.get(key)
     ledger != null && ledger.retransmitAttempts >= BackpressureProtocol.MAX_RETRY_ATTEMPTS
+  }
+
+  /**
+   * Asks whether a *retained* block may be replayed now, charging the pacing bucket and the replay
+   * accounting when the answer is yes.
+   *
+   * Deliberately not [[tryAdmit]], and the two differences are both required for correctness.
+   *
+   * No credit is consumed. The bytes being replayed are already inside the unacknowledged window
+   * and therefore already hold their credit, so charging them a second time would count one block
+   * twice against the allowance -- and a consumer that asked to have its entire window replayed
+   * would be refused by the very allowance the window is measured against, stranding a stream that
+   * cannot make progress until the repair lands.
+   *
+   * The volume lands on the replay total rather than the send total. A replay is not new output,
+   * and counting it as production would inflate the producer's measured rate, which in turn makes
+   * the consumer appear to have fallen further behind than it has -- and that ratio is exactly the
+   * quantity the sustained-slowness fallback condition trips on. A stream that spends time
+   * repairing itself must not be able to talk the subsystem into abandoning streaming altogether.
+   *
+   * The bucket is still charged, because a replay occupies the link exactly as an original send
+   * does and the administered bandwidth cap is a property of the link, not of the novelty of the
+   * bytes crossing it.
+   *
+   * @param key identity of the stream being repaired
+   * @param sequenceNumber position of the replayed block
+   * @param bytes encoded size of the replayed block on the wire
+   * @return true if the caller may write the replay now, false if it must hold it and retry
+   */
+  def tryAdmitReplay(
+      key: BackpressureStreamKey,
+      bytes: Long,
+      sequenceNumber: Long): Boolean = {
+    require(sequenceNumber >= 0L,
+      s"The sequence number must be non-negative but was $sequenceNumber.")
+    val ledger = streams.get(key)
+    if (ledger == null) {
+      true
+    } else if (bytes <= 0L) {
+      true
+    } else if (!rateLimiter.tryAcquire(bytes)) {
+      enterThrottled(ledger, BackpressureProtocol.THROTTLE_CAUSE_RATE)
+      false
+    } else {
+      ledger.recordReplay(sequenceNumber, bytes)
+      recordEgress(bytes)
+      true
+    }
+  }
+
+  /** Bytes this stream has replayed to repair losses; zero for an unknown stream. */
+  def replayedBytes(key: BackpressureStreamKey): Long = {
+    val ledger = streams.get(key)
+    if (ledger == null) 0L else ledger.replayedBytes
   }
 
   /**
@@ -830,16 +1221,18 @@ private[spark] class BackpressureProtocol(
    * @param bytes encoded size of the block; a non-positive size records activity but no volume
    */
   def onDataReceived(
-      shuffleId: Int,
-      partitionId: Int,
+      key: BackpressureStreamKey,
       sequenceNumber: Long,
       bytes: Long): Unit = {
     require(sequenceNumber >= 0L,
       s"The sequence number must be non-negative but was $sequenceNumber.")
-    val ledger = streams.get(BackpressureStreamKey(shuffleId, partitionId))
+    val ledger = streams.get(key)
     if (ledger != null) {
       ledger.recordReceived(sequenceNumber, bytes, clock.getTimeMillis())
     }
+    // Recorded whether or not a ledger exists, because the link carried these bytes regardless of
+    // whether this protocol had been told about the stream that carried them.
+    recordIngress(bytes)
   }
 
   /**
@@ -850,8 +1243,8 @@ private[spark] class BackpressureProtocol(
    * not agree on the wall clock and a liveness detector built on a remote reading would mistake
    * skew for a failure.
    */
-  def onHeartbeat(shuffleId: Int, partitionId: Int): Unit = {
-    val ledger = streams.get(BackpressureStreamKey(shuffleId, partitionId))
+  def onHeartbeat(key: BackpressureStreamKey): Unit = {
+    val ledger = streams.get(key)
     if (ledger != null) {
       ledger.recordHeartbeat(clock.getTimeMillis(), BackpressureProtocol.NO_TIMESTAMP)
     }
@@ -863,9 +1256,8 @@ private[spark] class BackpressureProtocol(
    *
    * @param heartbeat the heartbeat received; a null message records nothing
    */
-  def onHeartbeat(heartbeat: HeartbeatMessage): Unit = {
-    if (heartbeat != null) {
-      val key = BackpressureStreamKey(heartbeat.shuffleId(), heartbeat.partitionId())
+  def onHeartbeat(key: BackpressureStreamKey, heartbeat: HeartbeatMessage): Unit = {
+    if (heartbeat != null && addresses(key, heartbeat)) {
       val ledger = streams.get(key)
       if (ledger != null) {
         ledger.recordHeartbeat(clock.getTimeMillis(), heartbeat.timestampMs())
@@ -877,8 +1269,8 @@ private[spark] class BackpressureProtocol(
    * The timestamp the peer stamped into the most recent heartbeat of this stream, or `None` when no
    * heartbeat carrying one has been received. Diagnostic only: no liveness decision reads it.
    */
-  def remoteHeartbeatTimestamp(shuffleId: Int, partitionId: Int): Option[Long] = {
-    val ledger = streams.get(BackpressureStreamKey(shuffleId, partitionId))
+  def remoteHeartbeatTimestamp(key: BackpressureStreamKey): Option[Long] = {
+    val ledger = streams.get(key)
     if (ledger == null) None else ledger.remoteHeartbeatTimestamp
   }
 
@@ -889,8 +1281,8 @@ private[spark] class BackpressureProtocol(
    * A terminated stream is never due: its producer has announced the end of its output, so there is
    * nothing left for a heartbeat to keep alive.
    */
-  def shouldSendHeartbeat(shuffleId: Int, partitionId: Int): Boolean = {
-    val ledger = streams.get(BackpressureStreamKey(shuffleId, partitionId))
+  def shouldSendHeartbeat(key: BackpressureStreamKey): Boolean = {
+    val ledger = streams.get(key)
     ledger != null && !ledger.isTerminated &&
       ledger.isHeartbeatDue(clock.getTimeMillis(), BackpressureProtocol.HEARTBEAT_INTERVAL_MS)
   }
@@ -906,8 +1298,8 @@ private[spark] class BackpressureProtocol(
    *
    * @return the heartbeat to send, or `None` for a stream with no ledger
    */
-  def heartbeatFor(shuffleId: Int, partitionId: Int): Option[HeartbeatMessage] = {
-    val ledger = streams.get(BackpressureStreamKey(shuffleId, partitionId))
+  def heartbeatFor(key: BackpressureStreamKey): Option[HeartbeatMessage] = {
+    val ledger = streams.get(key)
     if (ledger == null) {
       None
     } else {
@@ -915,8 +1307,8 @@ private[spark] class BackpressureProtocol(
       ledger.recordHeartbeatSent(nowMillis)
       // The clock is the caller's contract with the message type, and a wall clock adjusted
       // backwards past the epoch would otherwise construct a heartbeat the type itself rejects.
-      Some(new HeartbeatMessage(shuffleId, partitionId, ledger.heartbeatSequenceNumber,
-        math.max(0L, nowMillis)))
+      Some(new HeartbeatMessage(key.shuffleId, key.mapId, key.partitionId,
+        ledger.heartbeatSequenceNumber, math.max(0L, nowMillis)))
     }
   }
 
@@ -934,17 +1326,17 @@ private[spark] class BackpressureProtocol(
    * @param totalBlocks blocks the producer claims to have sent; must be non-negative, and zero is
    *                    the valid announcement of an empty partition
    */
-  def onStreamTermination(shuffleId: Int, partitionId: Int, totalBlocks: Long): Unit = {
+  def onStreamTermination(key: BackpressureStreamKey, totalBlocks: Long): Unit = {
     require(totalBlocks >= 0L,
       s"The total block count must be non-negative but was $totalBlocks.")
-    val ledger = streams.get(BackpressureStreamKey(shuffleId, partitionId))
+    val ledger = streams.get(key)
     if (ledger != null) {
       ledger.recordTermination(totalBlocks, clock.getTimeMillis())
       // One line per stream at completion is O(reduce partitions), the same order as the
       // coordinator's shuffle-level logging, so it stays inside the log budget with debug off.
       if (debugEnabled) {
-        logDebug(log"Streaming shuffle stream for shuffle ${MDC(SHUFFLE_ID, shuffleId)} " +
-          log"partition ${MDC(PARTITION_ID, partitionId)} terminated after " +
+        logDebug(log"Streaming shuffle stream for shuffle ${MDC(SHUFFLE_ID, key.shuffleId)} " +
+          log"partition ${MDC(PARTITION_ID, key.partitionId)} terminated after " +
           log"${MDC(COUNT, totalBlocks)} block(s)")
       }
     }
@@ -955,16 +1347,17 @@ private[spark] class BackpressureProtocol(
    *
    * @param termination the terminator received; a null message records nothing
    */
-  def onStreamTermination(termination: StreamTerminationMessage): Unit = {
-    if (termination != null) {
-      onStreamTermination(
-        termination.shuffleId(), termination.partitionId(), termination.totalBlocks())
+  def onStreamTermination(
+      key: BackpressureStreamKey,
+      termination: StreamTerminationMessage): Unit = {
+    if (termination != null && addresses(key, termination)) {
+      onStreamTermination(key, termination.totalBlocks())
     }
   }
 
   /** Whether a producer has announced the orderly end of this stream. */
-  def isStreamTerminated(shuffleId: Int, partitionId: Int): Boolean = {
-    val ledger = streams.get(BackpressureStreamKey(shuffleId, partitionId))
+  def isStreamTerminated(key: BackpressureStreamKey): Boolean = {
+    val ledger = streams.get(key)
     ledger != null && ledger.isTerminated
   }
 
@@ -972,8 +1365,8 @@ private[spark] class BackpressureProtocol(
    * Blocks the producer of this stream claims to have sent, or `None` when it has not yet announced
    * the end of the stream. A returned zero is a genuine reading and means the partition was empty.
    */
-  def announcedBlockCount(shuffleId: Int, partitionId: Int): Option[Long] = {
-    val ledger = streams.get(BackpressureStreamKey(shuffleId, partitionId))
+  def announcedBlockCount(key: BackpressureStreamKey): Option[Long] = {
+    val ledger = streams.get(key)
     if (ledger == null) None else ledger.announcedBlockCount
   }
 
@@ -996,25 +1389,25 @@ private[spark] class BackpressureProtocol(
    * @return the type that was applied, or `None` when nothing was
    */
   def onControlMessage(
+      key: BackpressureStreamKey,
       message: StreamingShuffleMessage): Option[StreamingShuffleMessageType] = {
-    if (message == null) {
+    if (message == null || !addresses(key, message)) {
       None
-    } else if (!observeProtocolVersion(
-        message.shuffleId(), message.partitionId(), message.protocolVersion())) {
+    } else if (!observeProtocolVersion(key, message.protocolVersion())) {
       None
     } else {
       message match {
         case ack: AckMessage =>
-          onAck(ack)
+          onAck(key, ack)
           Some(StreamingShuffleMessageType.ACK)
         case heartbeat: HeartbeatMessage =>
-          onHeartbeat(heartbeat)
+          onHeartbeat(key, heartbeat)
           Some(StreamingShuffleMessageType.HEARTBEAT)
         case request: RetransmitRequestMessage =>
-          onRetransmitRequest(request)
+          onRetransmitRequest(key, request)
           Some(StreamingShuffleMessageType.RETRANSMIT_REQUEST)
         case termination: StreamTerminationMessage =>
-          onStreamTermination(termination)
+          onStreamTermination(key, termination)
           Some(StreamingShuffleMessageType.STREAM_TERMINATION)
         case _ =>
           None
@@ -1032,8 +1425,8 @@ private[spark] class BackpressureProtocol(
    * alive by heartbeating alone. A terminated stream never times out: its silence means completion,
    * and treating completion as failure would recompute a stage that had in fact finished.
    */
-  def isProducerTimedOut(shuffleId: Int, partitionId: Int): Boolean = {
-    val ledger = streams.get(BackpressureStreamKey(shuffleId, partitionId))
+  def isProducerTimedOut(key: BackpressureStreamKey): Boolean = {
+    val ledger = streams.get(key)
     ledger != null && isProducerTimedOut(ledger, clock.getTimeMillis())
   }
 
@@ -1046,8 +1439,8 @@ private[spark] class BackpressureProtocol(
    * acknowledge is not slow, it is idle, and reporting it as timed out would make every completed
    * stream look like a failure ten seconds later. A terminated stream is likewise never timed out.
    */
-  def isConsumerTimedOut(shuffleId: Int, partitionId: Int): Boolean = {
-    val ledger = streams.get(BackpressureStreamKey(shuffleId, partitionId))
+  def isConsumerTimedOut(key: BackpressureStreamKey): Boolean = {
+    val ledger = streams.get(key)
     ledger != null && isConsumerTimedOut(ledger, clock.getTimeMillis())
   }
 
@@ -1080,14 +1473,14 @@ private[spark] class BackpressureProtocol(
    * stream. Exposed so that a diagnostic can report how close a stream is to its liveness bound
    * instead of only whether it has crossed it.
    */
-  def millisSinceInbound(shuffleId: Int, partitionId: Int): Option[Long] = {
-    val ledger = streams.get(BackpressureStreamKey(shuffleId, partitionId))
+  def millisSinceInbound(key: BackpressureStreamKey): Option[Long] = {
+    val ledger = streams.get(key)
     if (ledger == null) None else Some(ledger.millisSinceInbound(clock.getTimeMillis()))
   }
 
   /** Milliseconds since this stream's consumer last advanced its position. */
-  def millisSinceAck(shuffleId: Int, partitionId: Int): Option[Long] = {
-    val ledger = streams.get(BackpressureStreamKey(shuffleId, partitionId))
+  def millisSinceAck(key: BackpressureStreamKey): Option[Long] = {
+    val ledger = streams.get(key)
     if (ledger == null) None else Some(ledger.millisSinceAck(clock.getTimeMillis()))
   }
 
@@ -1223,14 +1616,14 @@ private[spark] class BackpressureProtocol(
    * Bytes per second the producer of this stream has sustained since the stream opened, or zero
    * while less than a millisecond has elapsed and for an unknown stream.
    */
-  def producerRateBytesPerSecond(shuffleId: Int, partitionId: Int): Long = {
-    val ledger = streams.get(BackpressureStreamKey(shuffleId, partitionId))
+  def producerRateBytesPerSecond(key: BackpressureStreamKey): Long = {
+    val ledger = streams.get(key)
     if (ledger == null) 0L else ledger.producerRate(clock.getTimeMillis())
   }
 
   /** Bytes per second the consumer of this stream has acknowledged since the stream opened. */
-  def consumerRateBytesPerSecond(shuffleId: Int, partitionId: Int): Long = {
-    val ledger = streams.get(BackpressureStreamKey(shuffleId, partitionId))
+  def consumerRateBytesPerSecond(key: BackpressureStreamKey): Long = {
+    val ledger = streams.get(key)
     if (ledger == null) 0L else ledger.consumerRate(clock.getTimeMillis())
   }
 
@@ -1246,8 +1639,8 @@ private[spark] class BackpressureProtocol(
    * A stream is only judged slow while something is actually outstanding, so a consumer that has
    * caught up completely is never reported as slow, however little it has consumed in total.
    */
-  def isConsumerSlow(shuffleId: Int, partitionId: Int): Boolean = {
-    val ledger = streams.get(BackpressureStreamKey(shuffleId, partitionId))
+  def isConsumerSlow(key: BackpressureStreamKey): Boolean = {
+    val ledger = streams.get(key)
     ledger != null && ledger.isConsumerSlow(BackpressureProtocol.CONSUMER_SLOWNESS_RATIO)
   }
 
@@ -1266,8 +1659,8 @@ private[spark] class BackpressureProtocol(
    * Detection only. Latching the reason is as far as this class goes; the fallback policy decides
    * whether to delegate to the sort-based manager.
    */
-  def isConsumerSustainedSlow(shuffleId: Int, partitionId: Int): Boolean = {
-    val ledger = streams.get(BackpressureStreamKey(shuffleId, partitionId))
+  def isConsumerSustainedSlow(key: BackpressureStreamKey): Boolean = {
+    val ledger = streams.get(key)
     if (ledger == null) {
       false
     } else {
@@ -1282,40 +1675,167 @@ private[spark] class BackpressureProtocol(
     }
   }
 
+  // ==========================================================================================
+  // The executor-wide consumer receive quota.
+  // ==========================================================================================
+
+  /** The whole consumer-side receive budget of this executor, in bytes. */
+  def receiveQuotaBytes: Long = receiveQuotaTotalBytes
+
+  /**
+   * Bytes the consumer side of this executor is holding, for the buffer-utilisation gauge.
+   *
+   * This class is the consumer side's single contributor, exactly as the spill manager's shared
+   * quota is the producer side's. That is a correctness property of the gauge and not a
+   * convenience: the gauge sums its contributors, so a reader registering itself would have N
+   * concurrent reduce tasks report the one executor-wide budget N times and divide by a denominator
+   * nobody configured. Registering this instance instead is idempotent -- the registry is a set,
+   * and every reader on the executor holds the same protocol -- so the consumer side is counted
+   * once however many tasks are reading.
+   */
+  override def contributedBufferedBytes: Long = reservedReceiveQuotaBytes
+
+  /** The consumer-side budget those bytes are measured against. */
+  override def contributedBudgetBytes: Long = receiveQuotaTotalBytes
+
+  /** Bytes of that budget currently held by consumers anywhere on this executor. */
+  def reservedReceiveQuotaBytes: Long = math.max(0L, reservedReceiveBytes.get())
+
+  /** How many reservations have been refused because the executor-wide budget was exhausted. */
+  def receiveQuotaRefusalCount: Long = receiveQuotaRefusals.get()
+
+  /** Whether the executor-wide consumer budget is fully committed right now. */
+  def receiveQuotaExhausted: Boolean = reservedReceiveBytes.get() >= receiveQuotaTotalBytes
+
+  /**
+   * Reserves consumer-side heap for one frame, or refuses it.
+   *
+   * <b>Non-blocking, and necessarily so.</b> Every caller is a Netty event-loop thread admitting a
+   * frame it has just decoded, and parking one of those threads would stall every channel that
+   * shares it -- including the channels whose consumers would have released the very bytes being
+   * waited for. A refusal is therefore returned rather than waited out, and it is the caller's
+   * business to leave the position repairable: the consumer handler does not advance its sequence
+   * cursor for a refused block, so the position is asked for again and no byte is lost.
+   *
+   * <b>Why compare-and-set rather than an unconditional add.</b> An add that overshot and then
+   * subtracted would admit the frame that broke the budget, which is exactly the frame the budget
+   * exists to refuse, and two concurrent admissions could each observe a total that was briefly
+   * larger than either of them caused. The loop admits only what fits.
+   *
+   * A non-positive request is granted without touching the ledger: a control frame carries no
+   * payload, and charging zero would be an atomic operation with no effect on the hot path.
+   *
+   * @param bytes payload bytes the caller is about to retain
+   * @return true when the bytes were charged, false when the executor's budget is exhausted
+   */
+  def tryReserveReceiveQuota(bytes: Long): Boolean = {
+    if (bytes <= 0L) {
+      true
+    } else {
+      var granted = false
+      var settled = false
+      while (!settled) {
+        val current = reservedReceiveBytes.get()
+        val proposed = current + bytes
+        if (proposed > receiveQuotaTotalBytes) {
+          receiveQuotaRefusals.incrementAndGet()
+          // Counted as a throttle rather than latched as a degradation: an exhausted consumer
+          // budget is the backpressure mechanism working as designed, and it becomes a fallback
+          // condition only if allocation keeps failing after a spill, which the producer side
+          // reports on its own account.
+          enterReceiveQuotaThrottle()
+          settled = true
+        } else if (reservedReceiveBytes.compareAndSet(current, proposed)) {
+          granted = true
+          settled = true
+        }
+      }
+      granted
+    }
+  }
+
+  /**
+   * Returns consumer-side heap to the executor's budget.
+   *
+   * Clamped at zero, so a double release -- which a close racing an acknowledgement can produce --
+   * cannot drive the reading negative and hand out budget that was never reserved. A non-positive
+   * argument is ignored for the same reason [[tryReserveReceiveQuota]] grants one.
+   *
+   * @param bytes payload bytes the caller has finished with
+   */
+  def releaseReceiveQuota(bytes: Long): Unit = {
+    if (bytes > 0L) {
+      var settled = false
+      while (!settled) {
+        val current = reservedReceiveBytes.get()
+        val proposed = math.max(0L, current - bytes)
+        settled = reservedReceiveBytes.compareAndSet(current, proposed)
+        if (settled && proposed < receiveQuotaTotalBytes) {
+          // The episode ends here, so the next refusal counts a fresh edge. Clearing on the release
+          // rather than on the next refusal is what makes one episode span a run of refusals.
+          receiveQuotaThrottled.set(false)
+        }
+      }
+    }
+  }
+
+  /**
+   * Counts the edge into an episode of executor-wide consumer budget exhaustion.
+   *
+   * One `shuffle.streaming.backpressureEvents` increment per episode, and one warn line, however
+   * many frames are refused inside it. The compare-and-set is what makes that exact without a lock,
+   * and it is also what bounds the log volume: an operator whose consumers are persistently behind
+   * sees the condition once per episode rather than once per frame a producer chose to retry.
+   */
+  private def enterReceiveQuotaThrottle(): Unit = {
+    if (receiveQuotaThrottled.compareAndSet(false, true)) {
+      throttleTransitions.incrementAndGet()
+      StreamingShuffleMetricsSource.incrementBackpressureEvents(1L)
+      logInfo(log"Streaming shuffle throttled every consumer on this executor: the shared " +
+        log"receive budget of ${MDC(MAX_SIZE, receiveQuotaTotalBytes)} byte(s) is fully " +
+        log"committed after ${MDC(COUNT, receiveQuotaRefusals.get())} refusal(s). Blocks refused " +
+        log"here are asked for again, so nothing is lost; the reduce side is behind its producers")
+    }
+  }
+
   /**
    * Records that a streaming buffer could not be allocated even after spilling, which is the second
    * condition under which streaming steps aside: continuing would risk exhausting the heap rather
    * than merely slowing the job down.
    */
-  def reportBufferAllocationFailure(shuffleId: Int, partitionId: Int): Unit = {
+  def reportBufferAllocationFailure(key: BackpressureStreamKey): Unit = {
     latchDegradation(BackpressureDegradationReason.BufferAllocationFailure)
     if (debugEnabled) {
       logDebug(log"Streaming shuffle buffer allocation failed for shuffle " +
-        log"${MDC(SHUFFLE_ID, shuffleId)} partition ${MDC(PARTITION_ID, partitionId)}")
+        log"${MDC(SHUFFLE_ID, key.shuffleId)} partition ${MDC(PARTITION_ID, key.partitionId)}")
     }
   }
 
   /**
-   * How saturated the administered link is, as a percentage, derived from how depleted the pacing
-   * bucket is.
+   * How saturated the administered link is, as a percentage of the capacity the operator declared.
    *
-   * No operating-system or network counter is available inside the JVM, so the bucket is the honest
-   * proxy: it is refilled at exactly the rate the operator's declared capacity permits, therefore
-   * the fraction of it that has been consumed is the fraction of that permitted rate currently in
-   * use. An unlimited limiter reports zero, because a link with no declared capacity cannot be
-   * saturated relative to one.
+   * Both terms are what they claim to be. The numerator is *measured* link usage -- bytes this
+   * executor actually moved across the wire, divided by the interval they moved over, taken over an
+   * interval long enough for the quotient to mean something. The busier direction is used, so a
+   * saturated link is seen from whichever end this executor happens to be. The denominator is the
+   * capacity declared through `spark.shuffle.streaming.maxBandwidthMBps`.
+   *
+   * Neither term is the pacing bucket, and that is the point. Token scarcity is not link
+   * saturation: a bucket empties whenever a burst briefly outruns its refill rate, which is routine
+   * on an idle link, and it empties persistently on a stream the limiter is pacing exactly as
+   * configured, so reading saturation off the bucket would report correct pacing as a reason to
+   * abandon streaming.
+   *
+   * A link with no declared capacity reports zero, because saturation is a ratio and there is
+   * nothing to take the ratio against.
    */
   def linkSaturationPercent: Long = {
-    if (rateLimiter.isUnlimited) {
+    if (declaredLinkCapacityBytesPerSecond <= 0L) {
       0L
     } else {
-      val capacity = rateLimiter.capacityBytes
-      if (capacity <= 0L) {
-        0L
-      } else {
-        val available = math.max(0L, math.min(rateLimiter.availableTokens, capacity))
-        BackpressureProtocol.percentOf(capacity - available, capacity)
-      }
+      BackpressureProtocol.percentOf(
+        math.max(egressBytesPerSecond, ingressBytesPerSecond),
+        declaredLinkCapacityBytesPerSecond)
     }
   }
 
@@ -1343,7 +1863,7 @@ private[spark] class BackpressureProtocol(
    *
    * @return true if a message stamped with this revision may be applied
    */
-  def observeProtocolVersion(shuffleId: Int, partitionId: Int, version: Byte): Boolean = {
+  def observeProtocolVersion(key: BackpressureStreamKey, version: Byte): Boolean = {
     if (StreamingShuffleMessage.isCompatible(version)) {
       true
     } else {
@@ -1352,13 +1872,13 @@ private[spark] class BackpressureProtocol(
       // peer is refused for the same reason, so repeating the pair of revisions would spend the
       // executor's log budget restating a fact the first line already established.
       if (versionMismatchReported.compareAndSet(false, true)) {
-        logWarning(log"Streaming shuffle message for shuffle ${MDC(SHUFFLE_ID, shuffleId)} " +
-          log"partition ${MDC(PARTITION_ID, partitionId)} was refused because the peer speaks " +
-          log"wire revision ${MDC(COUNT, version)} and this executor speaks " +
+        logWarning(log"Streaming shuffle message for shuffle ${MDC(SHUFFLE_ID, key.shuffleId)} " +
+          log"partition ${MDC(PARTITION_ID, key.partitionId)} was refused because the peer " +
+          log"speaks wire revision ${MDC(COUNT, version)} and this executor speaks " +
           log"${MDC(THRESHOLD, StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION)}")
       } else if (debugEnabled) {
-        logDebug(log"Streaming shuffle message for shuffle ${MDC(SHUFFLE_ID, shuffleId)} " +
-          log"partition ${MDC(PARTITION_ID, partitionId)} was refused at wire revision " +
+        logDebug(log"Streaming shuffle message for shuffle ${MDC(SHUFFLE_ID, key.shuffleId)} " +
+          log"partition ${MDC(PARTITION_ID, key.partitionId)} was refused at wire revision " +
           log"${MDC(COUNT, version)}")
       }
       false
@@ -1415,8 +1935,8 @@ private[spark] class BackpressureProtocol(
    * A stream with no ledger reports `Flowing`, consistent with [[hasCredit]] failing open: a
    * protocol never told about a stream imposes nothing on it and must not describe it as impeded.
    */
-  def streamState(shuffleId: Int, partitionId: Int): BackpressureState = {
-    val ledger = streams.get(BackpressureStreamKey(shuffleId, partitionId))
+  def streamState(key: BackpressureStreamKey): BackpressureState = {
+    val ledger = streams.get(key)
     if (isDegraded) {
       BackpressureState.Degraded
     } else if (isSpillRequired) {
@@ -1432,8 +1952,8 @@ private[spark] class BackpressureProtocol(
   def throttledStreamCount: Int = streams.values().asScala.count(_.isThrottled)
 
   /** Whether this particular stream is currently held back. */
-  def isStreamThrottled(shuffleId: Int, partitionId: Int): Boolean = {
-    val ledger = streams.get(BackpressureStreamKey(shuffleId, partitionId))
+  def isStreamThrottled(key: BackpressureStreamKey): Boolean = {
+    val ledger = streams.get(key)
     ledger != null && ledger.isThrottled
   }
 
@@ -1486,6 +2006,55 @@ private[spark] class BackpressureProtocol(
       }
     }
     changed
+  }
+
+  /**
+   * Records that one stream has entered a throttled state for a reason only its handler can see.
+   *
+   * The consuming side stops reading from its socket when its inbound queue fills or its credit is
+   * spent, and that edge is a backpressure event exactly as a producer-side admission refusal is.
+   * It cannot be inferred from the ledger: [[pollOnce]] confirms a return to flowing but can never
+   * enter a throttled state, so without this entry point consumer-side throttling would be absent
+   * from `shuffle.streaming.backpressureEvents` altogether. Routing it through the same
+   * compare-and-set transition the admission path uses keeps one definition of an episode, and one
+   * place that counts and reports it.
+   *
+   * Does not block, park or sleep, so it is safe to call from a network event-loop thread. An
+   * unknown stream is ignored rather than registered, because a stream the protocol never learned
+   * about has no window to account for.
+   *
+   * @param key identity of the stream that has stopped making progress
+   * @param cause short, non-sensitive description of why, used only in the first report per stream
+   * @return true if this call was the edge, false for a stream already throttled or unknown
+   */
+  def noteThrottled(key: BackpressureStreamKey, cause: String): Boolean = {
+    val ledger = streams.get(key)
+    if (ledger == null || ledger.isThrottled) {
+      false
+    } else {
+      enterThrottled(ledger, cause)
+      true
+    }
+  }
+
+  /**
+   * Records that one stream has resumed, closing the episode [[noteThrottled]] opened.
+   *
+   * Symmetry matters for the counter rather than for the state: an episode that is never closed
+   * would make the next entry invisible, so consecutive throttling episodes on the same stream
+   * would be counted once instead of once each.
+   *
+   * @param key identity of the stream that has resumed
+   * @return true if this call was the edge, false for a stream already flowing or unknown
+   */
+  def noteResumed(key: BackpressureStreamKey): Boolean = {
+    val ledger = streams.get(key)
+    if (ledger == null || !ledger.isThrottled) {
+      false
+    } else {
+      leaveThrottled(ledger)
+      true
+    }
   }
 
   /**
@@ -1542,15 +2111,23 @@ private[spark] class BackpressureProtocol(
     if (ledger.enterThrottled()) {
       throttleTransitions.incrementAndGet()
       StreamingShuffleMetricsSource.incrementBackpressureEvents(1L)
-      // At most one info line per stream for the whole of its life, reported on its first episode
-      // only. Log volume is therefore O(streams) rather than O(episodes), which is what keeps the
-      // subsystem inside its budget when a slow consumer throttles a producer repeatedly.
-      if (ledger.markThrottleReported()) {
-        logInfo(log"Streaming shuffle throttled shuffle ${MDC(SHUFFLE_ID, ledger.key.shuffleId)} " +
-          log"partition ${MDC(PARTITION_ID, ledger.key.partitionId)} because " +
-          log"${MDC(REASON, cause)}, holding ${MDC(NUM_BYTES, ledger.outstandingBytes)} " +
-          log"unacknowledged byte(s)")
-      } else if (debugEnabled) {
+      // Default-level reporting is bounded by a window rather than by stream identity. Reporting
+      // the first episode of every stream would be one line per stream, and a job with five
+      // concurrent shuffles over ten thousand partitions has fifty thousand of them, which is the
+      // executor's whole log budget spent on a condition that flow control exists to handle. The
+      // aggregate names the cause and carries both the episode total and the number of episodes it
+      // stands in for, so no volume information is lost -- only per-stream granularity, which the
+      // streaming debug key restores, once per stream so that it too stays bounded.
+      throttleLogGate.admit(clock.getTimeMillis()) match {
+        case Some(unreportedEpisodes) =>
+          logInfo(log"Streaming shuffle throttled a stream of shuffle " +
+            log"${MDC(SHUFFLE_ID, ledger.key.shuffleId)} because ${MDC(REASON, cause)}, holding " +
+            log"${MDC(NUM_BYTES, ledger.outstandingBytes)} unacknowledged byte(s) " +
+            log"(${MDC(COUNT, throttleTransitions.get())} throttling episode(s) so far, " +
+            log"${MDC(NUM_SKIPPED, unreportedEpisodes)} not reported individually)")
+        case None =>
+      }
+      if (debugEnabled && ledger.markThrottleReported()) {
         logDebug(log"Streaming shuffle throttled shuffle " +
           log"${MDC(SHUFFLE_ID, ledger.key.shuffleId)} partition " +
           log"${MDC(PARTITION_ID, ledger.key.partitionId)} because ${MDC(REASON, cause)}")
@@ -1590,28 +2167,28 @@ private[spark] class BackpressureProtocol(
   }
 
   /**
-   * Whether a producer has been silent past the five-second bound. Shared by the single-stream
-   * predicate and by the whole-set scan so that both apply one definition, including the exemption
-   * that matters most: a terminated stream is complete rather than silent, so the silence that
-   * follows an orderly end of stream is never mistaken for a producer that died.
+   * Whether a producer has been silent for the five-second bound or longer. Shared by the
+   * single-stream predicate and by the whole-set scan so that both apply one definition, including
+   * the exemption that matters most: a terminated stream is complete rather than silent, so the
+   * silence that follows an orderly end of stream is never mistaken for a producer that died.
    */
   private def isProducerTimedOut(
       ledger: BackpressureProtocol.StreamLedger,
       nowMillis: Long): Boolean = {
     !ledger.isTerminated &&
-      ledger.millisSinceInbound(nowMillis) > BackpressureProtocol.ACK_TIMEOUT_MS
+      ledger.millisSinceInbound(nowMillis) >= BackpressureProtocol.ACK_TIMEOUT_MS
   }
 
   /**
-   * Whether a consumer has stopped acknowledging past the ten-second bound. Arms only while bytes
-   * are actually outstanding, because a consumer with nothing to acknowledge is idle rather than
-   * unresponsive.
+   * Whether a consumer has stopped acknowledging for the ten-second bound or longer. Arms only
+   * while bytes are actually outstanding, because a consumer with nothing to acknowledge is idle
+   * rather than unresponsive.
    */
   private def isConsumerTimedOut(
       ledger: BackpressureProtocol.StreamLedger,
       nowMillis: Long): Boolean = {
     !ledger.isTerminated && ledger.outstandingBytes > 0L &&
-      ledger.millisSinceAck(nowMillis) > BackpressureProtocol.CONSUMER_LIVENESS_TIMEOUT_MS
+      ledger.millisSinceAck(nowMillis) >= BackpressureProtocol.CONSUMER_LIVENESS_TIMEOUT_MS
   }
 
   /**
@@ -1682,6 +2259,66 @@ private[spark] object BackpressureProtocol {
 
   /** Milliseconds in one second; every rate this protocol reports is per second. */
   val MILLIS_PER_SECOND: Long = 1000L
+
+  /**
+   * A monotonically accumulating byte counter that publishes a rate once per stable interval.
+   *
+   * The interval has to be *closed* rather than sampled continuously, because a rate computed over
+   * a few milliseconds of a two-megabyte block is meaningless: it reports the instantaneous speed
+   * of one memory copy, not the throughput of a link. Closing it on a fixed interval is what makes
+   * the published figure a property of the link.
+   *
+   * Non-blocking, so it is safe on a Netty event-loop thread. The interval is rolled by exactly one
+   * thread -- the one whose compare-and-set on the opening instant succeeds -- and every other
+   * thread simply keeps accumulating into the total.
+   */
+  private[streaming] final class RateWindow(clock: Clock) {
+
+    private val bytesTotal = new AtomicLong(0L)
+    private val openedMillis = new AtomicLong(clock.getTimeMillis())
+    private val baseBytes = new AtomicLong(0L)
+    private val ratePerSecond = new AtomicLong(0L)
+
+    /** Adds observed bytes, publishing a new rate when the interval has run its length. */
+    def record(bytes: Long): Unit = {
+      if (bytes > 0L) {
+        val total = bytesTotal.addAndGet(bytes)
+        val nowMillis = clock.getTimeMillis()
+        val opened = openedMillis.get()
+        val elapsedMillis = nowMillis - opened
+        if (elapsedMillis >= SATURATION_SAMPLE_WINDOW_MS &&
+            openedMillis.compareAndSet(opened, nowMillis)) {
+          val delta = math.max(0L, total - baseBytes.getAndSet(total))
+          ratePerSecond.set(saturatingMultiply(delta, MILLIS_PER_SECOND) / elapsedMillis)
+        }
+      }
+    }
+
+    /**
+     * The rate published by the last completed interval.
+     *
+     * Decays to zero once the open interval has run to twice its length without closing, which is
+     * what an idle link looks like. Without the decay a burst followed by silence would keep
+     * reporting the burst's rate for as long as nothing else crossed the wire, and a link that had
+     * gone quiet would read as permanently saturated.
+     */
+    def bytesPerSecond: Long = {
+      val elapsedMillis = clock.getTimeMillis() - openedMillis.get()
+      if (elapsedMillis >= 2L * SATURATION_SAMPLE_WINDOW_MS) 0L else ratePerSecond.get()
+    }
+
+    /** Bytes observed since this window was created. */
+    def total: Long = bytesTotal.get()
+  }
+
+  /**
+   * The interval over which link usage is measured before a rate is derived from it.
+   *
+   * One second, which is long enough for the quotient to describe a link rather than the
+   * instantaneous speed of one two-megabyte memcpy, and short enough that a link which really does
+   * saturate is noticed well inside the sixty-second sustained-slowness window.
+   */
+  val SATURATION_SAMPLE_WINDOW_MS: Long = 1000L
 
   /** The pause before the first replay attempt, which each further attempt doubles. */
   val RETRY_BASE_BACKOFF_MS: Long = 1000L
@@ -1784,7 +2421,7 @@ private[spark] object BackpressureProtocol {
    * @param key identity of the stream this ledger belongs to
    * @param creditLimitBytes bytes the producer may hold unacknowledged at once
    * @param openedAtMillis instant the stream opened, from the protocol's clock, and the origin
-   * every                       rate and every liveness interval is measured from
+   *                       every rate and every liveness interval is measured from
    */
   private[streaming] class StreamLedger(
       val key: BackpressureStreamKey,
@@ -1800,7 +2437,19 @@ private[spark] object BackpressureProtocol {
     // atomic read rather than a walk of the window.
     private val outstanding = new AtomicLong(0L)
 
+    // Owners of this ledger. A stream is registered by more than one collaborator on the same
+    // executor -- the writer that produces it and the channel handler that serves it are two -- and
+    // each is entitled to withdraw its own interest without destroying state the other is still
+    // using. Counted rather than assumed, so the ledger lives exactly as long as its last owner.
+    private val owners = new AtomicInteger(1)
+
     private val sentTotal = new AtomicLong(0L)
+
+    // Replayed bytes are counted apart from original output. They are not new data: a stream that
+    // repairs a corrupted block has not produced anything, and folding the repair into the send
+    // total would inflate the producer's measured rate and so make the consumer look slower than it
+    // is -- which is the exact quantity the sustained-slowness fallback trips on.
+    private val replayedTotal = new AtomicLong(0L)
 
     private val acknowledgedTotal = new AtomicLong(0L)
 
@@ -1847,11 +2496,29 @@ private[spark] object BackpressureProtocol {
 
     private val announcedBlocks = new AtomicLong(NO_BLOCK_TOTAL)
 
-    /** Bytes sent and not yet acknowledged. */
+    /** Records one further owner of this ledger, reporting the resulting owner count. */
+    def retain(): Int = owners.incrementAndGet()
+
+    /**
+     * Withdraws one owner, reporting whether that was the last one and the ledger may be discarded.
+     *
+     * Saturating at zero: a duplicated withdrawal reports true a second time rather than driving
+     * the count negative, which keeps the answer honest for a caller that has already removed the
+     * entry.
+     */
+    def release(): Boolean = owners.decrementAndGet() <= 0
+
+    /** Owners currently holding this ledger. */
+    def ownerCount: Int = math.max(0, owners.get())
+
+    /** Bytes charged to this stream and not yet released. */
     def outstandingBytes: Long = outstanding.get()
 
-    /** Bytes sent in total, replays included, which is the numerator of the producer's rate. */
+    /** Bytes of original output sent, replays excluded, which is the producer's true volume. */
     def sentBytes: Long = sentTotal.get()
+
+    /** Bytes re-sent to repair a loss or a corruption, counted apart from original output. */
+    def replayedBytes: Long = replayedTotal.get()
 
     /** Bytes acknowledged in total, which is the numerator of the consumer's rate. */
     def acknowledgedBytes: Long = acknowledgedTotal.get()
@@ -1889,6 +2556,18 @@ private[spark] object BackpressureProtocol {
     def highestReceivedSequenceNumber: Long = highestReceived.get()
 
     /**
+     * The highest position this side has charged to the window, and therefore the highest position
+     * an acknowledgement for this stream can possibly name.
+     *
+     * A producer charges on send and a consumer charges on receive, so on either end this is the
+     * frontier of what exists. Anything beyond it has not been produced or has not arrived, so an
+     * acknowledgement naming it is either a defect or a forgery, and in both cases applying it
+     * would release output nobody has consumed.
+     */
+    def highestChargedSequenceNumber: Long =
+      math.max(highestSent.get(), highestReceived.get())
+
+    /**
      * The position a heartbeat for this stream should carry: how far this side has got, whether it
      * is producing or consuming. Never negative, so the heartbeat message type can never reject it.
      */
@@ -1914,35 +2593,72 @@ private[spark] object BackpressureProtocol {
     }
 
     /**
-     * Records that a block has been sent, charging it to the window and to the credit.
+     * Records that a block of original output has been sent, charging it to the window and to the
+     * credit.
      *
      * Re-recording a block already in the window replaces its size rather than adding a second
-     * entry, so a retransmission of a retained block cannot inflate the outstanding total and
-     * cannot consume credit twice for the same bytes.
+     * entry, so a repeated send of a retained block cannot inflate the outstanding total and cannot
+     * consume credit twice for the same bytes. Use [[recordReplay]] for a retransmission, so that
+     * repaired bytes are not counted as newly produced ones.
      */
     def recordSent(sequenceNumber: Long, bytes: Long): Unit = {
-      val previous =
-        unacknowledged.put(java.lang.Long.valueOf(sequenceNumber), java.lang.Long.valueOf(bytes))
-      if (previous == null) {
-        outstanding.addAndGet(bytes)
-      } else {
-        outstanding.addAndGet(bytes - previous.longValue())
-      }
+      require(sequenceNumber >= 0L,
+        s"The sequence number must be non-negative but was $sequenceNumber.")
+      require(bytes >= 0L, s"The block size must be non-negative but was $bytes.")
+      charge(sequenceNumber, bytes)
       sentTotal.addAndGet(bytes)
       advance(highestSent, sequenceNumber)
     }
 
     /**
-     * Applies an acknowledgement, releasing every retained block at or below the acknowledged
-     * position and returning the bytes that release freed.
+     * Records that a retained block has been re-sent to repair a loss or a corruption.
      *
-     * Monotonic: a position at or below the one already recorded releases nothing, so a duplicate
-     * or a reordered acknowledgement delivered by a network thread is absorbed rather than allowed
-     * to rewind the window. Any acknowledgement, even one that reports no progress at all, still
-     * counts as proof that the consumer is alive.
+     * The window is re-charged exactly as a send would charge it -- the bytes are outstanding again
+     * because they are in flight again -- but the volume lands on the replay total rather than the
+     * send total, so the producer's measured rate continues to describe the output it produced.
      */
-    def applyAck(consumerPosition: Long, nowMillis: Long): Long = {
-      recordInbound(nowMillis)
+    def recordReplay(sequenceNumber: Long, bytes: Long): Unit = {
+      require(sequenceNumber >= 0L,
+        s"The sequence number must be non-negative but was $sequenceNumber.")
+      require(bytes >= 0L, s"The block size must be non-negative but was $bytes.")
+      charge(sequenceNumber, bytes)
+      replayedTotal.addAndGet(bytes)
+      advance(highestSent, sequenceNumber)
+    }
+
+    /**
+     * Applies an acknowledgement, releasing every retained block at or below the acknowledged
+     * position and reporting the bytes that release freed.
+     *
+     * Two invariants guard the transition, and both matter for correctness rather than tidiness.
+     *
+     * A position beyond [[highestChargedSequenceNumber]] is *impossible*: it names output this side
+     * has never charged, so no consumer can have consumed it. Such a position is refused as `None`
+     * rather than absorbed as zero, because the two outcomes demand different responses -- an
+     * acknowledgement that merely repeats a known position is routine, whereas one that claims the
+     * future is either a routing defect or a forged frame, and honouring it would permanently
+     * release output the real consumer has not yet read. The caller is expected to treat `None` as
+     * a protocol violation.
+     *
+     * A position at or below the one already recorded releases nothing and reports zero, so a
+     * duplicate or reordered acknowledgement delivered by a network thread is absorbed rather than
+     * allowed to rewind the window.
+     *
+     * Any acknowledgement that clears both invariants, even one reporting no progress at all,
+     * counts as proof that the peer is alive.
+     *
+     * @return bytes released, or `None` when the position was impossible and nothing was applied
+     */
+    def applyAck(consumerPosition: Long, nowMillis: Long): Option[Long] = {
+      if (consumerPosition > highestChargedSequenceNumber) {
+        None
+      } else {
+        recordInbound(nowMillis)
+        Some(releaseUpTo(consumerPosition, nowMillis))
+      }
+    }
+
+    private def releaseUpTo(consumerPosition: Long, nowMillis: Long): Long = {
       if (consumerPosition < 0L) {
         0L
       } else if (!advance(ackedPosition, consumerPosition)) {
@@ -1991,8 +2707,23 @@ private[spark] object BackpressureProtocol {
     /** Records inbound activity of any kind, which is what keeps a producer judged alive. */
     def recordInbound(nowMillis: Long): Unit = advance(lastInboundMillis, nowMillis)
 
-    /** Records a received block: its volume, its position and the activity it evidences. */
+    /**
+     * Records a received block: its volume, its position, the activity it evidences -- and the
+     * receive credit it consumes.
+     *
+     * Charging the window here is what connects consumer-driven backpressure to the data that
+     * actually arrived. The window, the outstanding total, and therefore [[hasCredit]] and
+     * [[availableCredit]] are one authoritative ledger for both ends of a stream: a producer
+     * charges it on send and a consumer charges it on receive, and in both cases the
+     * acknowledgement that advances the consumer position is what releases it. Recording arrival
+     * without charging it would leave the receiving end reporting full credit no matter how far
+     * behind it had fallen, which is precisely the condition `autoRead` exists to prevent.
+     */
     def recordReceived(sequenceNumber: Long, bytes: Long, nowMillis: Long): Unit = {
+      require(sequenceNumber >= 0L,
+        s"The sequence number must be non-negative but was $sequenceNumber.")
+      require(bytes >= 0L, s"The block size must be non-negative but was $bytes.")
+      charge(sequenceNumber, bytes)
       if (bytes > 0L) {
         receivedTotal.addAndGet(bytes)
       }
@@ -2058,7 +2789,11 @@ private[spark] object BackpressureProtocol {
     /** Replay attempts made since the stream last made progress. */
     def retransmitAttempts: Int = retransmitAttemptCount.get()
 
-    /** Bytes per second this stream's producer has sustained since it opened. */
+    /**
+     * Bytes per second of original output this stream's producer has sustained since it opened.
+     * Replays are excluded, so a stream that spends time repairing does not appear to be producing
+     * faster than it is.
+     */
     def producerRate(nowMillis: Long): Long = ratePerSecond(sentTotal.get(), nowMillis)
 
     /** Bytes per second this stream's consumer has acknowledged since it opened. */
@@ -2125,6 +2860,24 @@ private[spark] object BackpressureProtocol {
     }
 
     /**
+     * Charges one block to the window, keeping the outstanding total exactly equal to the sum of
+     * the window's sizes.
+     *
+     * Idempotent in the size it charges: re-charging a sequence number that is already retained
+     * replaces its entry and adjusts the total by the difference, so neither a repeated send nor a
+     * replay of the same block can be counted twice.
+     */
+    private def charge(sequenceNumber: Long, bytes: Long): Unit = {
+      val previous =
+        unacknowledged.put(java.lang.Long.valueOf(sequenceNumber), java.lang.Long.valueOf(bytes))
+      if (previous == null) {
+        outstanding.addAndGet(bytes)
+      } else {
+        outstanding.addAndGet(bytes - previous.longValue())
+      }
+    }
+
+    /**
      * Drains every retained block at or below `position`, returning the bytes freed.
      *
      * Lock-free and exact under concurrency. Each entry is removed by a two-argument remove that
@@ -2176,4 +2929,3 @@ private[spark] object BackpressureProtocol {
     }
   }
 }
-

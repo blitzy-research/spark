@@ -17,9 +17,8 @@
 
 package org.apache.spark.shuffle.streaming
 
-import java.io.File
+import java.io.{BufferedInputStream, ByteArrayOutputStream, File, FileInputStream, InputStream}
 import java.nio.file.Files
-import java.util.Arrays
 import java.util.concurrent.{ConcurrentHashMap, ScheduledExecutorService, TimeUnit}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong, AtomicReference}
 
@@ -37,7 +36,8 @@ import org.apache.spark.internal.config.{SHUFFLE_FILE_BUFFER_SIZE,
   SHUFFLE_STREAMING_SPILL_THRESHOLD}
 import org.apache.spark.memory.{MemoryConsumer, MemoryMode, TaskMemoryManager}
 import org.apache.spark.network.shuffle.protocol.streaming.DataBlockMessage
-import org.apache.spark.serializer.{DummySerializerInstance, SerializerInstance}
+import org.apache.spark.network.util.LimitedInputStream
+import org.apache.spark.serializer.{DummySerializerInstance, SerializerInstance, SerializerManager}
 import org.apache.spark.storage.{BlockManager, DiskBlockManager, DiskBlockObjectWriter,
   TempShuffleBlockId}
 import org.apache.spark.util.{Clock, SystemClock, ThreadUtils, Utils}
@@ -248,6 +248,18 @@ private[spark] class MemorySpillManager(
   private lazy val diskBlockManager: DiskBlockManager = blockManager.diskBlockManager
 
   /**
+   * The executor's serializer manager, which owns the compression and encryption a spill file is
+   * wrapped in.
+   *
+   * It is read here for one purpose only: a block read back out of a spill segment has to be
+   * unwrapped by exactly the manager, and with exactly the block id, that `DiskBlockObjectWriter`
+   * wrapped it with on the way in. Taking it from the block manager rather than from `SparkEnv`
+   * directly keeps every deferred environment access in this component behind the same single
+   * dereference.
+   */
+  private lazy val serializerManager: SerializerManager = blockManager.serializerManager
+
+  /**
    * The serializer handed to every spill writer, and deliberately the no-op one.
    *
    * Spilled blocks are written as raw bytes through `DiskBlockObjectWriter.write(Array[Byte],
@@ -368,6 +380,26 @@ private[spark] class MemorySpillManager(
   // can read it without contending with a producer; the mutual exclusion that makes it correct
   // comes from `lock`, never from the atomic.
   private val closed = new AtomicBoolean(false)
+
+  // Whether the spill files this instance produced have been handed to the executor-scoped block
+  // resolver. Guarded by `lock`, in the same critical section that decides what [[close]] deletes,
+  // so a hand-off can never race the deletion it exists to prevent.
+  //
+  // This flag is how retained output outlives the task that produced it. Buffered bytes cannot:
+  // they are task-managed execution memory, and the executor frees -- and with
+  // `spark.unsafe.exceptionOnMemoryLeak` enabled, fails the task over -- anything still acquired
+  // when a task completes. Spilled bytes can, because they are ordinary files in the local
+  // directories, so a successful map output makes its unacknowledged window durable and transfers
+  // the files rather than trying to keep memory alive past the platform's own boundary.
+  private var spillFilesDetached = false
+
+  // Bytes reserved for a producer's framing scratch -- the accumulators a serialization stream
+  // writes into before its bytes are cut into blocks. Guarded by `lock`. Held separately from
+  // `bufferedMemoryBytes` on purpose: both are charged to the same executor-wide quota, so the
+  // configured buffer percentage bounds the two together, but only buffered blocks can be evicted,
+  // and mixing scratch into the evictable tally would have the eviction planner promise room it
+  // cannot free.
+  private var scratchReservedBytes = 0L
 
   private val metricsReported = new AtomicBoolean(false)
 
@@ -756,6 +788,169 @@ private[spark] class MemorySpillManager(
   }
 
   /**
+   * Whether one block is still retained in any form, and therefore still replayable.
+   *
+   * This is the cheap eligibility test a producer needs before it promises a replay: it consults
+   * both halves of the retransmission window -- memory and disk -- without materialising a single
+   * byte, so a request spanning a whole range can be validated in full before any part of it is
+   * emitted. Unlike [[bufferedBlock]] it does not count as a use of the partition, because asking
+   * whether a block could be replayed is not the same as replaying it and must not reorder
+   * eviction.
+   *
+   * @param partitionId the reduce partition the block belongs to
+   * @param sequenceNumber the sequence number of the block to test
+   */
+  def retainsBlock(partitionId: Int, sequenceNumber: Long): Boolean = lock.synchronized {
+    partitionBuffers.get(partitionId).exists { buffer =>
+      buffer.memoryBlocks.exists(_.sequenceNumber == sequenceNumber) ||
+        buffer.spillingBlocks.exists(_.sequenceNumber == sequenceNumber) ||
+        buffer.spilledBlockRecords.exists(_.sequenceNumber == sequenceNumber)
+    }
+  }
+
+  /**
+   * The lowest sequence number still retained for one partition, or
+   * [[MemorySpillManager.UNSET_SEQUENCE]] when nothing is retained.
+   *
+   * The retained window of a partition is always a contiguous run, because admission is dense and
+   * retirement always retires a prefix, so this value and [[lastAcceptedSequence]] bound the whole
+   * replayable range. A producer answering a retransmission request compares the request against
+   * these two bounds rather than probing block by block, which is what lets it refuse an
+   * unserviceable range atomically instead of discovering the gap half way through a replay.
+   *
+   * @param partitionId the reduce partition to report on
+   */
+  def lowestRetainedSequence(partitionId: Int): Long = lock.synchronized {
+    partitionBuffers.get(partitionId).map { buffer =>
+      val candidates =
+        buffer.spilledBlockRecords.iterator.map(_.sequenceNumber) ++
+          buffer.spillingBlocks.iterator.map(_.sequenceNumber) ++
+          buffer.memoryBlocks.iterator.map(_.sequenceNumber)
+      if (candidates.isEmpty) UNSET_SEQUENCE else candidates.min
+    }.getOrElse(UNSET_SEQUENCE)
+  }
+
+  /**
+   * The payload bytes of one retained block, read from memory when it is still there and from its
+   * spill segment when it has been evicted.
+   *
+   * This is the single authoritative source of a block's bytes on the producing side, and it exists
+   * so that no other component has to hold a second copy of a payload this manager has already
+   * charged against the buffer budget. A producer framing a block for the wire -- whether for its
+   * first transmission or for a replay -- asks here, so the bytes that leave the executor are
+   * always the bytes the budget admitted.
+   *
+   * The memory path is preferred and refreshes the partition's access stamp through
+   * [[bufferedBlock]], because a partition actively being read is a poor eviction candidate. The
+   * disk path is deliberate about three things. It takes a lease first, so the file cannot be
+   * unlinked underneath the read; it reads exactly the committed segment, because each block was
+   * committed on its own and is therefore independently decodable; and it unwraps the segment
+   * through `SerializerManager` with the block's own id, because that is how
+   * `DiskBlockObjectWriter` wrapped it on the way out, and reading raw bytes from a compressed or
+   * encrypted spill file would return something that is not the payload at all.
+   *
+   * A block that is retained in neither place yields `None`. That is not an error here: it is the
+   * honest answer that the bytes were acknowledged and released, which the caller must translate
+   * into whatever recovery its own protocol prescribes.
+   *
+   * @param partitionId the reduce partition the block belongs to
+   * @param sequenceNumber the sequence number of the block to read
+   * @return the payload bytes, or `None` if the block is no longer retained or could not be read
+   */
+  def retainedPayload(partitionId: Int, sequenceNumber: Long): Option[Array[Byte]] = {
+    bufferedBlock(partitionId, sequenceNumber).map(_.data)
+      .orElse(spilledBlock(partitionId, sequenceNumber).flatMap(readSpilledPayload))
+  }
+
+  /**
+   * Reads one committed spill segment back into its original payload bytes.
+   *
+   * The segment's recorded length is its length *on disk*, which is not the payload's length: with
+   * `spark.shuffle.compress` on -- and it is on by default -- the committed bytes are compressed.
+   * The unwrapped stream is therefore read to its end rather than to a precomputed size, and the
+   * result is bounded by the protocol's own two mebibyte block cap, so a corrupt or mislabelled
+   * segment cannot be turned into an unbounded allocation. The stream is positioned and limited
+   * exactly as `ExternalSorter` positions and limits its own spill segments, so a streaming spill
+   * file is read back by the same idiom as every other Spark spill file.
+   *
+   * The lease is acquired before the file is touched and released in a `finally`, so neither a read
+   * failure nor an eviction racing the read can leave the file pinned. A failure to read is
+   * reported and answered with `None` rather than thrown: the caller's protocol already has to
+   * handle a block that cannot be replayed, and turning an I/O fault into that same outcome keeps
+   * one recovery path instead of two.
+   */
+  private def readSpilledPayload(segment: SpilledBlock): Option[Array[Byte]] = {
+    if (!acquireSpillFileLease(segment.file)) {
+      if (debugEnabled) {
+        logDebug(log"Streaming shuffle cannot lease spill file " +
+          log"${MDC(FILE_NAME, segment.file.getName)} to replay block " +
+          log"${MDC(COUNT, segment.sequenceNumber)} of partition " +
+          log"${MDC(PARTITION_ID, segment.partitionId)}")
+      }
+      None
+    } else {
+      try {
+        val raw = new FileInputStream(segment.file)
+        val payload = try {
+          // Positioned through the channel rather than by skipping, because a skip may legally
+          // move fewer bytes than asked and a partial skip would decode the wrong segment.
+          raw.getChannel().position(segment.offset)
+          val bounded = new BufferedInputStream(
+            new LimitedInputStream(raw, segment.length), fileBufferSizeBytes)
+          val unwrapped = serializerManager.wrapStream(segment.blockId, bounded)
+          try {
+            readBoundedPayload(unwrapped)
+          } finally {
+            unwrapped.close()
+          }
+        } finally {
+          raw.close()
+        }
+        if (debugEnabled) {
+          logDebug(log"Streaming shuffle replayed ${MDC(NUM_BYTES, payload.length)} byte(s) of " +
+            log"partition ${MDC(PARTITION_ID, segment.partitionId)} block " +
+            log"${MDC(COUNT, segment.sequenceNumber)} from spill file " +
+            log"${MDC(FILE_NAME, segment.file.getName)}")
+        }
+        Some(payload)
+      } catch {
+        case NonFatal(e) =>
+          logWarning(log"Streaming shuffle could not replay partition " +
+            log"${MDC(PARTITION_ID, segment.partitionId)} block " +
+            log"${MDC(COUNT, segment.sequenceNumber)} from spill file " +
+            log"${MDC(FILE_NAME, segment.file.getName)}", e)
+          None
+      } finally {
+        releaseSpillFileLease(segment.file)
+      }
+    }
+  }
+
+  /**
+   * Reads a decoded spill segment to its end, refusing anything larger than a protocol block.
+   *
+   * One extra byte beyond the cap is requested deliberately: reaching the cap exactly is legal, and
+   * only a read that still has bytes left at that point proves the segment does not hold a single
+   * block. Refusing is a genuine failure rather than a truncation, because a truncated payload
+   * would fail its checksum at the consumer and be blamed on the network instead of on this file.
+   */
+  private def readBoundedPayload(source: InputStream): Array[Byte] = {
+    val cap = DataBlockMessage.MAX_BLOCK_SIZE_BYTES
+    val collected = new ByteArrayOutputStream(math.min(cap, DEFAULT_REPLAY_BUFFER_BYTES))
+    val chunk = new Array[Byte](DEFAULT_REPLAY_BUFFER_BYTES)
+    var read = source.read(chunk)
+    while (read >= 0) {
+      if (collected.size() + read > cap) {
+        throw new IllegalStateException(s"a streaming shuffle spill segment decoded to more than " +
+          s"the protocol block cap of $cap byte(s), so it does not hold a single block")
+      }
+      collected.write(chunk, 0, read)
+      read = source.read(chunk)
+    }
+    collected.toByteArray
+  }
+
+  /**
    * A diagnostic rendering built only from state this consumer already holds. The derived budget is
    * deliberately absent: reading it would force the lazy memory-manager dereference, and a
    * `toString` -- which a logging framework or a debugger may evaluate anywhere, including on the
@@ -843,13 +1038,14 @@ private[spark] class MemorySpillManager(
           // against a thread holding the task memory manager and waiting for ours.
           val granted = acquireMemory(required)
           if (granted >= required) {
-            // Take ownership before the array becomes reachable from this instance's state, so
-            // nothing that reads it later -- checksum, retransmission or spill -- can observe a
-            // write the caller made after handing the block over. The copy is taken only once the
-            // room for it is secured, so a refused admission never pays for one, and it is exactly
-            // as long as the original, so the charge already reserved stays exact.
-            val owned = Arrays.copyOf(data, data.length)
-            if (commitReservation(partitionId, sequenceNumber, owned, required)) {
+            // The array is adopted, not copied, which is the ownership contract this method
+            // documents. A second copy would be the difference between the configured buffer
+            // percentage being a bound and being half of one: the copy is what the budget charges
+            // for, so the original would be an equal quantity of retained payload that nothing
+            // accounts for. The producer relinquishes the array at this call and the store is from
+            // here on the single owned representation of the block -- egress reads it back through
+            // [[retainedPayload]] rather than holding a reference of its own.
+            if (commitReservation(partitionId, sequenceNumber, data, required)) {
               recordPeakMemory()
               admitted = true
             } else {
@@ -1092,6 +1288,122 @@ private[spark] class MemorySpillManager(
           log"${MDC(MEMORY_SIZE, buffered)} bytes")
       }
       evictAndRelease(math.min(buffered, overage)) > 0L
+    }
+  }
+
+  /**
+   * Reserves budget for a producer's framing scratch, which is memory it holds but cannot spill.
+   *
+   * A streaming producer needs a serialization accumulator per active partition before it has any
+   * block to admit, and those arrays are as real as the blocks cut out of them. Charging them here
+   * is what makes the configured percentage of executor memory a bound on everything the subsystem
+   * holds rather than on the half of it that happens to be evictable: the reservation is taken from
+   * the same executor-wide quota as a buffered block and acquired from the same task memory
+   * manager, so an executor whose scratch alone approaches the budget refuses further blocks
+   * and degrades exactly as it would under block pressure.
+   *
+   * Eviction is attempted before refusing, because scratch and blocks compete for one budget and
+   * the blocks are the half that can be moved to disk.
+   *
+   * @param bytes the reservation being requested; a non-positive request is a no-op that succeeds
+   * @return true when the reservation was granted and the caller may allocate
+   */
+  def reserveScratch(bytes: Long): Boolean = {
+    if (bytes <= 0L) {
+      true
+    } else {
+      var attempt = 0
+      var granted = false
+      var settled = false
+      while (!settled) {
+        attempt += 1
+        val reserved = lock.synchronized {
+          if (closed.get()) {
+            false
+          } else if (quota.tryReserve(bytes)) {
+            scratchReservedBytes += bytes
+            true
+          } else {
+            false
+          }
+        }
+        if (reserved) {
+          // Acquired with no monitor of ours held, for the same reason block admission does it that
+          // way: the task memory manager runs spill callbacks under its own monitor.
+          val acquired = acquireMemory(bytes)
+          if (acquired >= bytes) {
+            granted = true
+          } else {
+            if (acquired > 0L) {
+              freeMemory(acquired)
+            }
+            lock.synchronized {
+              scratchReservedBytes -= bytes
+              quota.release(bytes)
+            }
+            recordMemoryPressure(bytes, acquired)
+          }
+          settled = granted || attempt >= MAX_ADMISSION_ATTEMPTS
+        } else if (attempt >= MAX_ADMISSION_ATTEMPTS || evictAndRelease(bytes) <= 0L) {
+          recordMemoryPressure(bytes, 0L)
+          settled = true
+        }
+      }
+      granted
+    }
+  }
+
+  /**
+   * Returns a scratch reservation. Bounded by what is actually outstanding, so a caller that
+   * releases twice cannot credit the budget with memory it never held.
+   *
+   * @param bytes the reservation being returned
+   * @return the number of bytes actually released
+   */
+  def releaseScratch(bytes: Long): Long = {
+    if (bytes <= 0L) {
+      0L
+    } else {
+      val released = lock.synchronized {
+        val amount = math.min(bytes, scratchReservedBytes)
+        if (amount > 0L) {
+          scratchReservedBytes -= amount
+          quota.release(amount)
+        }
+        amount
+      }
+      if (released > 0L) {
+        freeMemory(released)
+      }
+      released
+    }
+  }
+
+  /** Bytes currently reserved for framing scratch. */
+  def scratchBytes: Long = lock.synchronized(scratchReservedBytes)
+
+  /**
+   * Forces every byte still held in memory out to disk, whatever the utilisation.
+   *
+   * This is not a spill in the flow-control sense and is not driven by the threshold: it is how a
+   * producer makes its unacknowledged window durable before the memory holding it is taken away.
+   * Task-managed execution memory does not survive task completion -- the executor frees it and,
+   * with `spark.unsafe.exceptionOnMemoryLeak` enabled, fails the task over anything still acquired
+   * -- so a block that is only in memory when a map task ends is a block no consumer can ever be
+   * sent again. Writing it to a spill file converts it into something the executor-scoped block
+   * resolver can serve for as long as the shuffle is registered.
+   *
+   * Acknowledged blocks are not written, because retirement has already released them; only what
+   * remains retained is, which is exactly the window a reconnecting consumer may ask for.
+   *
+   * @return bytes moved to disk by this call, which is zero when nothing was held in memory
+   */
+  def spillAllRetained(): Long = {
+    val held = bufferedBytes
+    if (closed.get() || held <= 0L) {
+      0L
+    } else {
+      evictAndRelease(held)
     }
   }
 
@@ -1464,9 +1776,14 @@ private[spark] class MemorySpillManager(
    *
    * Only a registered consumer may acknowledge, and retirement advances only as far as the slowest
    * registered consumer, so registering a consumer that never acknowledges holds the retransmission
-   * window open rather than closing it early. Registration is therefore the point at which a
-   * consumer is trusted, and it belongs to the producer that created this manager -- never to
-   * whatever arrived on the wire.
+   * window open rather than closing it early. That asymmetry is what makes it safe for the egress
+   * handler to admit a consumer as it subscribes: admitting a party can only ever hold the window
+   * open for longer, never release a byte, so no identity a peer chooses for itself can cause its
+   * output to be discarded before the consumers entitled to it have confirmed receipt. Holding the
+   * window open for a consumer that has fallen silent is not a leak either but the specified
+   * behaviour -- the unacknowledged window is retained, spilled under pressure and replayed on
+   * reconnection, and a consumer that never returns is escalated by the producer's own
+   * retransmission budget rather than by discarding its data.
    *
    * Idempotent: re-registering a consumer already present keeps the position it has reached, so a
    * reconnecting consumer does not rewind the window it has already advanced.
@@ -1582,20 +1899,6 @@ private[spark] class MemorySpillManager(
       }
     }
   }
-
-  /**
-   * Acknowledges on behalf of the single default consumer, for a producer streaming to exactly one
-   * consumer and with no need to name it.
-   *
-   * [[MemorySpillManager.DEFAULT_CONSUMER_ID]] enjoys no privilege: it must be registered like any
-   * other consumer before it may acknowledge anything.
-   *
-   * @param partitionId the reduce partition being acknowledged; must be non-negative
-   * @param throughSequenceNumber the highest sequence number the consumer has received
-   * @return the number of bytes released back to the memory manager
-   */
-  def acknowledge(partitionId: Int, throughSequenceNumber: Long): Long =
-    acknowledge(DEFAULT_CONSUMER_ID, partitionId, throughSequenceNumber)
 
   /**
    * Validates an acknowledgement and, if it stands, records the consumer's new position. Must be
@@ -1781,29 +2084,53 @@ private[spark] class MemorySpillManager(
     // and no further eviction can be planned, so the captured tally is final.
     val firstClose = lock.synchronized {
       if (closed.compareAndSet(false, true)) {
-        accountedBytes = bufferedMemoryBytes
+        // Scratch is released with the blocks, and through the same two budgets, so a producer that
+        // failed before returning its accumulators cannot leave the quota short.
+        accountedBytes = bufferedMemoryBytes + scratchReservedBytes
+        scratchReservedBytes = 0L
         admissionsInFlight = inFlightAdmissions
+        // Files are deleted here only while this instance still owns them. Once
+        // [[releaseSpillFileOwnership]] has handed them to the block resolver they must survive,
+        // because the whole reason for the hand-off is that a consumer may still have to be served
+        // from them after the producing task has gone; the resolver unlinks them instead.
+        val ownsFiles = !spillFilesDetached
         partitionBuffers.values.foreach { buffer =>
           buffer.memoryBlocks.clear()
           buffer.spillingBlocks.clear()
-          buffer.spilledBlockRecords.foreach(record => filesToDelete += record.file)
-          buffer.spilledBlockRecords.clear()
+          if (ownsFiles) {
+            buffer.spilledBlockRecords.foreach(record => filesToDelete += record.file)
+            buffer.spilledBlockRecords.clear()
+          }
           buffer.bufferedBytes = 0L
           buffer.spillingBytes = 0L
         }
-        partitionBuffers.clear()
-        spilledRecordCount = 0
+        // In-memory blocks always go, because the memory behind them is being returned. The segment
+        // records survive a detached close, and that is what makes the hand-off worth performing:
+        // the resolver locates a spilled block through this instance's records, so discarding them
+        // would leave files on disk that nothing could name and no consumer could ever be served
+        // from -- the files would outlive the task and be useless, which is the worst of both.
+        if (ownsFiles) {
+          partitionBuffers.clear()
+          spilledRecordCount = 0
+        }
         bufferedMemoryBytes = 0L
-        // Every spill file this instance produced goes, leased or not. A lease is held by a reader
-        // of bytes this task produced, and no such reader may outlive the task, so an outstanding
-        // lease at this point is a bug in the reader rather than a reason to leak a file onto local
-        // disk.
-        filesToDelete ++= spillFileLeases.keys
-        filesToDelete ++= retiredSpillFiles
-        spillFileLeases.clear()
-        retiredSpillFiles.clear()
-        spillFilesByBlockId.clear()
-        spillFileBlockIds.clear()
+        // Every spill file this instance still owns goes, leased or not. A lease is held by
+        // a reader of bytes this task produced, and while this instance owns its files no such
+        // reader may outlive the task, so an outstanding lease at this point is a bug in the reader
+        // rather than a reason to leak a file onto local disk.
+        //
+        // A detached close keeps all four structures instead. Leases, retirements and the two
+        // name indexes are how a spilled block is found and how it is stopped from being unlinked
+        // while it is being read, and those are exactly the operations that must keep working after
+        // this task has gone; the resolver performs the deletion at its own boundary.
+        if (ownsFiles) {
+          filesToDelete ++= spillFileLeases.keys
+          filesToDelete ++= retiredSpillFiles
+          spillFileLeases.clear()
+          retiredSpillFiles.clear()
+          spillFilesByBlockId.clear()
+          spillFileBlockIds.clear()
+        }
         // The consumer registry is this instance's heap too, and once closed no acknowledgement can
         // retire anything, so keeping positions alive would serve nothing but the leak detector.
         consumerPositions.clear()
@@ -1856,6 +2183,38 @@ private[spark] class MemorySpillManager(
   // ----------------------------------------------------------------------------------------------
 
   /**
+   * Hands the spill files this instance produced to the executor-scoped block resolver.
+   *
+   * Called by a producer whose map task succeeded, once its unacknowledged window has been made
+   * durable. From this call onwards [[close]] frees this instance's memory as it always did but
+   * unlinks none of its files, so the resolver can serve them to a consumer that subscribes or
+   * reconnects after the producing task has gone. The resolver owns the deletion from then on and
+   * performs it when the generation is superseded, when the shuffle is unregistered, or when the
+   * resolver itself stops -- which is precisely the "acknowledgement, shuffle unregistration or
+   * generation invalidation" boundary the feature specifies, rather than the arbitrary moment a
+   * producing task happens to finish.
+   *
+   * Idempotent, and safe to call on a closed instance: a second call reports the same file set and
+   * changes nothing. The set is a snapshot of distinct files, so a caller may keep it after this
+   * instance is gone.
+   *
+   * @return every spill file this instance produced, whose deletion the caller now owns
+   */
+  def releaseSpillFileOwnership(): Seq[File] = {
+    lock.synchronized {
+      spillFilesDetached = true
+      // Both maps are consulted, and the retired set with them: a file may hold nothing but
+      // acknowledged segments and still be referenced by an in-flight lease, and one that no record
+      // names is still this instance's to hand over rather than to leak.
+      (spillFileBlockIds.keys.toSeq ++ spillFileLeases.keys.toSeq ++ retiredSpillFiles.toSeq)
+        .distinct
+    }
+  }
+
+  /** Whether the spill files of this instance are now owned by the block resolver. */
+  def spillFilesTransferred: Boolean = lock.synchronized(spillFilesDetached)
+
+  /**
    * Takes a reader lease on a spill file, so that it will not be unlinked while the lease is held.
    *
    * @param file the spill file to lease
@@ -1866,7 +2225,12 @@ private[spark] class MemorySpillManager(
   def acquireSpillFileLease(file: File): Boolean = {
     require(file != null, "file must not be null")
     lock.synchronized {
-      if (closed.get() || retiredSpillFiles.contains(file)) {
+      // A closed instance grants no lease while it still owns its files, because it has already
+      // unlinked them. Once ownership has been handed to the block resolver the files are still
+      // there and serving them is the entire purpose of the hand-off, so a detached close keeps
+      // granting. A retired file is refused in either case: every record in it was acknowledged.
+      val servable = !closed.get() || spillFilesDetached
+      if (!servable || retiredSpillFiles.contains(file)) {
         false
       } else {
         spillFileLeases.update(file, spillFileLeases.getOrElse(file, 0) + 1)
@@ -1892,7 +2256,10 @@ private[spark] class MemorySpillManager(
           false
         case Some(_) =>
           spillFileLeases.remove(file)
-          retiredSpillFiles.contains(file)
+          // A detached file is the resolver's to unlink, at generation invalidation, shuffle
+          // unregistration or resolver shutdown. Deleting it here on the last lease release would
+          // take it away from every consumer that has not asked for it yet.
+          !spillFilesDetached && retiredSpillFiles.contains(file)
         case None =>
           logWarning(log"Streaming shuffle spill file ${MDC(FILE_NAME, file.getName)} was " +
             log"released without an outstanding lease; ignoring")
@@ -2116,11 +2483,14 @@ private[spark] object MemorySpillManager extends Logging {
   val MAX_RETAINED_BLOCKS_PER_PARTITION: Int = 8192
 
   /**
-   * The consumer identity used by the two-argument [[MemorySpillManager.acknowledge]] overload, for
-   * a producer streaming to a single consumer it has no need to name. It carries no privilege: like
-   * any other consumer it must be registered before it may acknowledge.
+   * Transfer buffer used when a spilled block is decoded back into its payload.
+   *
+   * Sixty-four kibibytes is the usual compromise for a streaming copy: large enough that a two
+   * mebibyte block costs a few dozen reads rather than thousands, small enough that the buffer
+   * itself is never a meaningful allocation. It is not configurable, because it is a copy buffer
+   * rather than a budget: nothing about a job's behaviour depends on its size.
    */
-  val DEFAULT_CONSUMER_ID: String = "default"
+  val DEFAULT_REPLAY_BUFFER_BYTES: Int = 64 * 1024
 
   /**
    * The largest reduce partition count this consumer will track, and so the exclusive upper bound

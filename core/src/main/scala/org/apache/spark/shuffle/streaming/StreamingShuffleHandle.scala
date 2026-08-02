@@ -35,11 +35,12 @@ import org.apache.spark.shuffle.BaseShuffleHandle
  * `BypassMergeSortShuffleHandle`, this class is `private[spark]` and extends the
  * `private[spark]` [[BaseShuffleHandle]] rather than the public `ShuffleHandle`.
  *
- * The three pieces of streaming registration state carried here are:
+ * The four pieces of streaming registration state carried here are:
  *
  *  - `numPartitions`, the reduce partition count, captured at registration time from
  *    `dependency.partitioner.numPartitions`. The writer divides its buffer budget by this value
- *    to obtain the per-partition allowance, `(executorMemory * bufferPercent) / numPartitions`.
+ *    to obtain the per-partition allowance,
+ *    `(executorMemory * bufferPercent / 100) / numPartitions`.
  *  - `protocolVersion`, the streaming wire-protocol version that the registering side speaks.
  *    Holding it here gives the consumer a local expectation to compare a peeked message version
  *    against, so a producer/consumer version mismatch is detected by an explicit compatibility
@@ -62,27 +63,10 @@ import org.apache.spark.shuffle.BaseShuffleHandle
  * assertion message without disclosing the credential.
  *
  * `ShuffleHandle` extends `java.io.Serializable` and the handle is shipped to executors inside
- * the serialized task binary, so this class is deliberately an immutable value object whose
- * every added field is a primitive. Nothing live -- no channel, no `SparkConf`, no
+ * the serialized task binary, so this class is deliberately an immutable value object: three
+ * primitives and one immutable credential string. Nothing live -- no channel, no `SparkConf`, no
  * `RpcEndpointRef`, no metric handle, no clock -- may ever be added to it, and it carries no
  * mutable state.
- *
- * Example use, at registration time on the driver and then on an executor:
- *
- * {{{
- *   // In StreamingShuffleManager.registerShuffle, from the coordinator's registration grant:
- *   new StreamingShuffleHandle(shuffleId, dependency,
- *     dependency.partitioner.numPartitions, protocolVersion,
- *     grant.coordinatorEpoch, grant.capabilityToken)
- *
- *   // In StreamingShuffleManager.getWriter, matching without an erasure warning:
- *   handle match {
- *     case h: StreamingShuffleHandle[K @unchecked, V @unchecked, _] =>
- *       new StreamingShuffleWriter(h, mapId, context, metrics)
- *     case other =>
- *       sortShuffleManager.getWriter(other, mapId, context, metrics)
- *   }
- * }}}
  *
  * @tparam K the key type of the shuffle
  * @tparam V the value type of the shuffle

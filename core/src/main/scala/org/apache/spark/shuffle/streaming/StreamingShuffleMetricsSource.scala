@@ -26,13 +26,12 @@ import org.apache.spark.metrics.source.Source
 /**
  * One live owner of streaming shuffle buffer memory, as seen by the buffer-utilisation gauge.
  *
- * An executor runs one buffer owner per concurrently streaming shuffle task, so utilisation is an
- * executor-wide quantity that no single owner can compute on its own. Each owner therefore
+ * Utilisation is an executor-wide quantity that no single owner can compute on its own, so an owner
  * contributes only the two numbers it actually knows -- how many bytes it is holding, and the
  * budget those bytes are measured against -- and the gauge sums the live contributions and derives
  * the percentage itself. That division of labour is what makes the exported value describe the
- * whole executor rather than whichever owner happened to publish last, and it is what lets an
- * owner leave without disturbing the contribution of an owner that is still holding buffers.
+ * whole executor rather than whichever owner happened to publish last, and it is what lets an owner
+ * leave without disturbing the contribution of an owner that is still holding buffers.
  *
  * Both methods are read from the metrics reporting thread, so an implementation must answer
  * without blocking: no lock that a producer can hold across I/O, no allocation proportional to the
@@ -89,20 +88,30 @@ private[spark] trait StreamingShuffleBufferUtilizationContributor {
  * in an individual metric name, which would export a doubled prefix such as
  * `shuffle.streaming.shuffle.streaming.spillCount`.
  *
- * Executor-wide aggregation of buffer utilisation. An executor runs as many streaming shuffle spill
- * managers as it has concurrent streaming tasks, and every one of them has its own share of the
- * buffer budget. A single scalar cell written by each of them in turn would therefore be a
- * last-writer-wins race with an operator-facing consequence rather than a merely cosmetic one: a
- * task holding almost nothing, or one publishing zero as it closes, would erase the reading of a
- * sibling task sitting at the spill threshold, and the gauge would report calm during exactly the
- * condition it exists to expose. Utilisation is therefore not published as a percentage at all.
- * Each manager instead registers itself as a [[StreamingShuffleBufferUtilizationContributor]] and
- * exposes the two quantities it actually knows -- the bytes it is holding and the share of the
- * budget it was apportioned; the gauge sums both quantities over the live contributors and divides
- * once. The reading is consequently the executor's true utilisation of its whole streaming buffer
- * allowance, it is independent of the order in which managers happen to run, and a manager that
- * finishes withdraws its contribution rather than overwriting everybody else's -- so a closing task
- * can no longer drive the gauge to zero while another task is at 80 percent.
+ * Executor-wide aggregation of buffer utilisation. Utilisation is deliberately not published as a
+ * percentage by anyone. A single scalar cell written by each owner in turn would be a
+ * last-writer-wins race with an operator-facing consequence rather than a merely cosmetic one: an
+ * owner holding almost nothing, or one publishing zero as it closes, would erase the reading of a
+ * sibling sitting at the spill threshold, and the gauge would report calm during exactly the
+ * condition it exists to expose.
+ *
+ * What production actually registers is exactly one contributor: the
+ * [[MemorySpillManager.ExecutorBufferQuota]] that every spill manager on the executor shares, whose
+ * numerator is the bytes every producer on the executor is holding and whose denominator is the
+ * whole executor buffer allowance. Registering the shared allowance rather than each spill manager
+ * is what makes the reading executor-wide without counting one budget many times, and it withdraws
+ * when the last spill manager on the executor closes.
+ *
+ * The read side registers nothing, deliberately. The bytes a consumer holds are measured against
+ * the receive quota, which is a different budget from the producer buffer allowance this gauge
+ * reports and the one the spill threshold is evaluated against; mixing the two would put unrelated
+ * bytes in the numerator and unrelated capacity in the denominator, so a producer genuinely at its
+ * spill point would read as roughly half of it the moment one idle reader started.
+ *
+ * The gauge nevertheless sums numerators and sums denominators across every registered contributor
+ * and divides once, rather than reading a single cell, so the reading is independent of the order
+ * owners happen to run in and an owner that finishes withdraws its contribution rather than
+ * overwriting everybody else's.
  *
  * Registration. This source is published through the static source list, which `MetricsSystem`
  * registers when it starts -- on the driver and on every executor alike -- provided static sources
@@ -116,18 +125,23 @@ private[spark] trait StreamingShuffleBufferUtilizationContributor {
  * browser. What this subsystem does guarantee is that it needs no metrics agent, sink or UI surface
  * of its own: once a sink an operator already runs is configured, all four metrics travel over it.
  *
- * Telemetry budget. Every update is lock-free and none of them is per-record or per-block. The
- * counters are backed by Dropwizard's striped adder, so advancing one costs a single uncontended
- * add, and they are advanced on discrete events only -- a spill occurring, a transition into a
- * throttled state, an invalidation being performed. The gauge costs the write path nothing at all:
- * it is computed on the reporting thread by walking a registry that a buffer owner joins once and
- * leaves once, so its cost is borne by the sink at whatever interval the sink samples. This object
- * declares no lock, performs no blocking call and does not sleep, so it is equally safe to call
- * from a task thread and from a network event-loop thread.
+ * Telemetry budget. No update is per-record or per-block, and none of them blocks on another
+ * thread. The counters are backed by Dropwizard's striped adder, so advancing one costs a single
+ * uncontended add, and they are advanced on discrete events only -- a spill occurring, a transition
+ * into a throttled state, an invalidation being performed. The gauge costs the write path nothing
+ * at all: it is computed on the reporting thread by walking a registry that a buffer owner joins
+ * once and leaves once, so its cost is borne by the sink at whatever interval the sink samples.
+ * This object declares no monitor of its own and never sleeps; joining and leaving the contributor
+ * registry enters the concurrent set's own brief per-bin synchronization, which is off every hot
+ * path, so both a task thread and a network event-loop thread may call anything here.
  *
- * As a JVM singleton this object accumulates values for the lifetime of the process. Callers
- * that need a clean baseline, such as tests asserting on absolute metric values, must first
- * call `reset()`.
+ * As a JVM singleton this object accumulates values for the lifetime of the process, so a caller
+ * needing a clean baseline of absolute values must first call `reset()`.
+ *
+ * There is deliberately no setter for the gauge, for the last-writer-wins reason set out above:
+ * `bufferUtilizationPercent` is driven only by registering a contributor. Registration is keyed on
+ * the contributor's identity rather than its value, so two owners reporting the same two counts are
+ * two contributions and both are summed.
  */
 private[spark] object StreamingShuffleMetricsSource extends Source {
 
@@ -151,7 +165,9 @@ private[spark] object StreamingShuffleMetricsSource extends Source {
    * contribution live: an owner adds itself when it starts holding bytes and removes itself when
    * it releases them, so a departing owner subtracts exactly its own contribution and can never
    * zero a peer's. The set is a concurrent one and is only ever added to, removed from and walked,
-   * so publication stays lock-free on the owner's side and the gauge never blocks a producer.
+   * so an owner publishes its contribution without blocking on another thread and the gauge never
+   * blocks a producer; joining and leaving enter the set's own brief per-bin synchronization, which
+   * happens once per owner rather than on any hot path.
    */
   private val bufferUtilizationContributors =
     ConcurrentHashMap.newKeySet[StreamingShuffleBufferUtilizationContributor]()
@@ -307,4 +323,33 @@ private[spark] object StreamingShuffleMetricsSource extends Source {
   // There is deliberately no setter for the utilisation gauge. Buffer utilisation is aggregated
   // exclusively from the registered contributors, because a single shared setter is what allowed
   // one manager to overwrite the executor-wide reading with its own local view.
+
+  /**
+   * A contributor reporting two byte counts that never change.
+   *
+   * This is the supported way to drive [[bufferUtilizationPercent]] to a chosen value, for a caller
+   * that wants a known reading without reaching for a setter that does not exist.
+   *
+   * It is a plain class rather than a case class, and that is a correctness decision rather than a
+   * stylistic one. The contributor registry is a set keyed on the element itself, so equality
+   * decides membership: with value equality, registering two owners that happen to report the same
+   * two counts would keep only one of them and the aggregate would be quietly half of what the
+   * caller asked for. Reference identity makes "two registrations" mean two contributions, which is
+   * what a suite registering several owners relies on.
+   *
+   * Negative arguments are accepted rather than rejected, because the aggregate already defines a
+   * negative contribution as zero and rejecting one here would put a second, different rule in the
+   * same path.
+   *
+   * @param contributedBufferedBytes bytes this owner reports as held
+   * @param contributedBudgetBytes the budget this owner reports those bytes measured against
+   */
+  class FixedBufferUtilization(
+      override val contributedBufferedBytes: Long,
+      override val contributedBudgetBytes: Long)
+    extends StreamingShuffleBufferUtilizationContributor {
+
+    override def toString: String =
+      s"FixedBufferUtilization($contributedBufferedBytes/$contributedBudgetBytes)"
+  }
 }

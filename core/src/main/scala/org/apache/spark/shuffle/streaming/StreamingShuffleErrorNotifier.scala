@@ -90,16 +90,28 @@ import org.apache.spark.shuffle.FetchFailedException
  * arrive, which bounds both the retained heap and the total time any I/O thread spends in that
  * monitor.
  *
+ * <b>Scope: one task attempt, never an executor.</b> A notifier belongs to the single reader or the
+ * single writer that built it, and it must not be shared between tasks. That is a correctness
+ * requirement rather than a preference, and it follows from first-error-wins being permanent: the
+ * root cause is latched for the whole life of the object and [[reset]] is a test affordance, so a
+ * notifier shared across tasks would re-throw the first failure it ever saw at every task that ran
+ * afterwards -- failing readers of unrelated shuffles that are streaming perfectly, failing the
+ * retry attempt of the task that originally failed, and naming a producer and a partition that have
+ * nothing to do with the task being failed, so the scheduler would recompute the wrong upstream
+ * stage. Both production call sites honour this: [[StreamingShuffleReader]] builds one for itself,
+ * and `StreamingShuffleManager` builds one per map task alongside that task's server handler.
+ *
  * Concurrency: first-error publication is a compare-and-set on an atomic reference, and the rest of
- * the state is atomics plus one concurrent set. This class declares no monitor of its own and does
- * not park, sleep or wait, because [[setError]] runs on Netty event-loop threads. It is lock-free
- * as a system -- a thread that loses a compare-and-set retries against a state another thread has
- * already advanced -- which is not the same as a guarantee that an individual caller cannot be made
- * to retry. Once the retention cap is reached, the reporting path is a volatile read, one atomic
- * increment and a return, with no allocation, no hashing and no monitor. The one monitor reachable
- * from here belongs to the JDK, inside `Throwable.addSuppressed`, and it guards a bounded critical
- * section that never waits on another thread's I/O. Every method is safe to call concurrently, any
- * number of times.
+ * the state is atomics plus one concurrent set. This class declares no monitor of its own and never
+ * sleeps, waits on I/O or parks on another thread's progress, because [[setError]] runs on Netty
+ * event-loop threads. It is not, however, lock-free unconditionally: retaining a later failure
+ * calls `Throwable.addSuppressed`, which enters the JDK's own monitor on the root cause, and
+ * joining the concurrent set of already-retained throwables enters that set's brief per-bin
+ * synchronization. Both critical sections are bounded and neither spans I/O, a callback or an
+ * allocation of consequence, so a caller can be made to wait only for the few instructions another
+ * caller holds them for. Past the retention cap even that disappears: the reporting path becomes a
+ * volatile read, one atomic increment and a return, with no allocation, no hashing and no monitor
+ * at all. Every method is safe to call concurrently, any number of times.
  *
  * Log volume: the two diagnostics this class writes describe bookkeeping rather than failure -- the
  * failure itself is reported by whoever re-throws it -- and they are raised once per reported
@@ -178,10 +190,12 @@ private[spark] class StreamingShuffleErrorNotifier(
   /**
    * Records a failure observed anywhere on the streaming shuffle path.
    *
-   * Safe to call from any thread, any number of times. It does not park or block, and it contains
+   * Safe to call from any thread, any number of times. It never sleeps, waits on I/O or parks on
+   * another thread's progress -- the only synchronization it can enter is the bounded monitor
+   * inside `Throwable.addSuppressed`, and past the retention cap it enters none -- and it contains
    * every non-fatal problem it meets while recording, because the callers are Netty event-loop
-   * threads: they must not be parked, and a bookkeeping exception must not escape into them. A
-   * fatal `Error` is not contained and propagates to the caller.
+   * threads and a bookkeeping exception must not escape into them. A fatal `Error` is not contained
+   * and propagates to the caller.
    *
    * The first call establishes the root cause, and no later call ever displaces it. A later call
    * attaches its throwable to that root cause as a suppressed exception provided the throwable is
