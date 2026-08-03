@@ -49,8 +49,11 @@ import org.apache.spark.network.protocol.Encoders;
  *      framing            the body encoded by encode(ByteBuf)
  * </pre>
  *
- * {@link #encodedLength()} is therefore exactly {@code 29 + payload.length}, and a framed message
- * produced by {@link #toByteBuffer()} occupies {@code 30 + payload.length} bytes. The payload is
+ * {@link #encodedLength()} is therefore exactly {@code 37 + payload.length} -- the twenty-five-byte
+ * header, the eight-byte checksum and the four-byte payload length prefix -- and a framed message
+ * produced by {@link #toByteBuffer()} occupies {@code 38 + payload.length} bytes, the extra byte
+ * being the type discriminator the encoder writes outside the body length. Those two figures are
+ * the same arithmetic as the diagram above and as {@link #FRAMING_OVERHEAD_BYTES}. The payload is
  * written with {@code Encoders.ByteArrays}, the same length-prefixed form the sibling
  * block-transfer messages already use for their own byte arrays, rather than a hand-rolled
  * equivalent that could encode the same bytes a slightly different way.

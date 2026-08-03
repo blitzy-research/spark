@@ -17,13 +17,13 @@
 
 package org.apache.spark.shuffle.streaming
 
-import java.io.ByteArrayOutputStream
+import java.io.{ByteArrayInputStream, ByteArrayOutputStream}
 import java.lang.reflect.Modifier
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import java.util.Locale
 import java.util.concurrent.{Callable, CountDownLatch, TimeUnit}
-import java.util.concurrent.atomic.{AtomicInteger, AtomicReference}
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicReference}
 
 import scala.collection.mutable
 import scala.concurrent.Future
@@ -72,6 +72,8 @@ private[streaming] class StreamingShuffleTestProducerStream(
 
   private val deliveredBuffers = mutable.ArrayBuffer.empty[RecordingStreamingManagedBuffer]
 
+  private val crashed = new AtomicBoolean(false)
+
   /**
    * The transport's own dispatcher for an inbound frame, which is what owns the frame's buffer.
    *
@@ -115,6 +117,10 @@ private[streaming] class StreamingShuffleTestProducerStream(
    * @return the counting buffer the frame was delivered in
    */
   def deliver(message: StreamingShuffleMessage): RecordingStreamingManagedBuffer = {
+    assert(!isCrashed,
+      s"The producer of map ${location.mapId} at ${location.hostPort} has been crashed, so it " +
+        s"cannot put another frame on the wire; a case that delivered one would be asserting " +
+        s"against a producer that is not actually gone")
     val framed = message.toByteBuffer()
     val bytes = new Array[Byte](framed.remaining())
     framed.duplicate().get(bytes)
@@ -243,6 +249,20 @@ private[streaming] class StreamingShuffleTestProducerStream(
   def closeChannel(): Unit = {
     channel.close().syncUninterruptibly()
   }
+
+  /**
+   * Loses the executor behind this channel, part way through its write.
+   *
+   * What a consumer can observe of a producer crash is silence: no further block, no orderly end of
+   * stream, and a last-inbound timestamp that stops advancing, so the connection timeout is the
+   * only thing that can discover it. Marking the crash rather than tearing the channel down is what
+   * makes that observable state reachable -- and enforcing it in [[deliver]] is what stops a case
+   * from crashing a producer and then, a few lines later, contradicting itself by sending from it.
+   */
+  def crash(): Unit = crashed.set(true)
+
+  /** Whether the executor behind this channel has been lost. */
+  def isCrashed: Boolean = crashed.get()
 }
 
 private[streaming] object StreamingShuffleTestProducerStream {
@@ -658,6 +678,16 @@ class StreamingShuffleReaderSuite
 
   private val DeclaredMaps = 1
 
+  /**
+   * Map tasks a case declares when it needs more than one producer feeding one reduce partition.
+   *
+   * Two, because the properties that only exist above a single producer -- an invalidation reaching
+   * exactly one generation, a peer's accepted output surviving it, several losses reported as one
+   * fetch failure -- are all fully expressed by two, and a third would add reruns without adding a
+   * distinction.
+   */
+  private val TwoProducers = 2
+
   private val ProducerMapId = 0L
 
   private val ProducerAttemptId = 200L
@@ -669,6 +699,15 @@ class StreamingShuffleReaderSuite
   private val CapabilityToken = "streaming-shuffle-reader-suite-token"
 
   private val StreamedRecords: Seq[(Int, Int)] = (1 to 24).map(value => (value, value * 3))
+
+  /**
+   * The records a second producer streams for the same reduce partition.
+   *
+   * Disjoint from [[StreamedRecords]] in both key and value, so that "the peer's output survived"
+   * cannot be satisfied by bytes belonging to the producer whose output was supposed to be
+   * discarded. A different length as well, so a comparison cannot pass on shape alone.
+   */
+  private val PeerRecords: Seq[(Int, Int)] = (101 to 118).map(value => (value, value * 7))
 
   private val BlockCount = 4
 
@@ -704,7 +743,10 @@ class StreamingShuffleReaderSuite
    * @param numPartitions reduce partitions the shuffle declares
    * @param startPartition first reduce partition this reader reads, inclusive
    * @param endPartition one past the last reduce partition this reader reads
-   * @param numMaps map tasks the stage declared
+   * @param numMaps map tasks the stage declared, which is also how many producer generations the
+   *                rendezvous offers this consumer. One is the shape most cases here want; a case
+   *                about an invalidation reaching exactly one of several producers declares more,
+   *                because the property it asserts does not exist below two
    * @param refusalsBeforeSuccess connection attempts the connector refuses before it succeeds
    * @param lookupAdvanceMillis milliseconds the clock advances inside each rendezvous lookup
    * @param useTaskReporter whether the reader reports to the task's own shuffle-read metrics rather
@@ -782,10 +824,33 @@ class StreamingShuffleReaderSuite
     val readMetrics: ShuffleReadMetricsReporter =
       if (useTaskReporter) context.taskMetrics.createTempShuffleReadMetrics()
       else recordingMetrics
-    val producer: StreamingShuffleProducerLocation = producerLocation(ProducerMapId.toInt)
+    /**
+     * Every producer generation the coordinator offers this consumer, in map-index order.
+     *
+     * One per declared map task, because that is what a reduce task genuinely faces: a partition's
+     * input is the concatenation of one stream per map output, and the properties that only exist
+     * when there is more than one of them -- the credit allowance being split between them, and an
+     * invalidation reaching exactly one of them -- are unreachable from a single-producer fixture.
+     * A fixture that declares one map therefore offers one producer, which is what the majority of
+     * cases here want, and `numMaps` is the one dial that changes it.
+     */
+    val producers: Seq[StreamingShuffleProducerLocation] = {
+      require(numMaps > 0,
+        s"A reader fixture must declare at least one map task but declared $numMaps")
+      (0 until numMaps).map(producerLocation)
+    }
+
+    /**
+     * The first producer in read order, which is the only one a single-producer case has.
+     *
+     * Read order is map-index order, so this is also the producer a multi-producer case reaches
+     * first -- the distinction that decides whether a peer's blocks have been consumed or are still
+     * queued when a loss is reported.
+     */
+    val producer: StreamingShuffleProducerLocation = producers.head
 
     coordinatorRef.answerLookupWith(
-      Some(locationsReply(Seq(producer), completedMapIndexes = completedMaps)))
+      Some(locationsReply(producers, completedMapIndexes = completedMaps)))
 
     val readerContext: StreamingShuffleReaderContext = StreamingShuffleReaderContext(
       coordinatorRef, backpressure, fallbackPolicy, connector, sc.env.serializerManager)
@@ -858,12 +923,18 @@ class StreamingShuffleReaderSuite
      * framing spans blocks.
      *
      * @param records the key-value pairs to stream
+     * @param mapId the producing map task, which is part of the block identity the payload is
+     *              wrapped for. Defaulted to the fixture's first producer, and named explicitly by
+     *              a multi-producer case so that each producer's bytes are wrapped for its own
+     *              block rather than all of them borrowing one producer's identity
      * @return the wrapped bytes
      */
-    def encodePartition(records: Seq[(Int, Int)]): Array[Byte] = {
+    def encodePartition(
+        records: Seq[(Int, Int)],
+        mapId: Long = ProducerMapId): Array[Byte] = {
       val bytes = new ByteArrayOutputStream()
       val wrapped = sc.env.serializerManager.wrapStream(
-        ShuffleBlockId(shuffleId, ProducerMapId, partitionId), bytes)
+        ShuffleBlockId(shuffleId, mapId, partitionId), bytes)
       val serialized = dependency.serializer.newInstance().serializeStream(wrapped)
       records.foreach { record =>
         serialized.writeKey(record._1)
@@ -873,20 +944,67 @@ class StreamingShuffleReaderSuite
       bytes.toByteArray
     }
 
-    def dataBlocksOf(payload: Array[Byte], blocks: Int = 1): Seq[DataBlockMessage] = {
+    /**
+     * Cuts one producer's partition payload into the run of blocks it would put on the wire.
+     *
+     * @param payload the wrapped partition bytes
+     * @param blocks how many blocks to cut the payload into
+     * @param mapId the producing map task each block is stamped with, and therefore the identity
+     *              its CRC32C binds it to. A block stamped with the wrong map id is refused by the
+     *              consumer handler bound to that producer, so this has to travel with the payload
+     * @return the blocks, in sequence order
+     */
+    def dataBlocksOf(
+        payload: Array[Byte],
+        blocks: Int = 1,
+        mapId: Long = ProducerMapId): Seq[DataBlockMessage] = {
       assert(payload.nonEmpty, "A partition payload must carry bytes to be cut into blocks")
       assert(blocks > 0, s"A partition must be cut into at least one block but was $blocks")
       val chunkSize = math.max(1, (payload.length + blocks - 1) / blocks)
       payload.grouped(chunkSize).toSeq.zipWithIndex.map { chunk =>
-        dataBlock(shuffleId, ProducerMapId, partitionId, chunk._2.toLong, chunk._1)
+        dataBlock(shuffleId, mapId, partitionId, chunk._2.toLong, chunk._1)
       }
     }
 
-    def terminator(totalBlocks: Long): StreamTerminationMessage =
-      streamTermination(shuffleId, ProducerMapId, partitionId, totalBlocks)
+    def terminator(totalBlocks: Long, mapId: Long = ProducerMapId): StreamTerminationMessage =
+      streamTermination(shuffleId, mapId, partitionId, totalBlocks)
 
     def consumerLedgerKey: Option[BackpressureStreamKey] =
       backpressure.registeredStreams.find(key => key.partitionId == partitionId)
+
+    /**
+     * The credit ledgers this reader holds for one producer generation.
+     *
+     * A ledger's identity includes the producing generation, so a multi-producer read holds one per
+     * producer per partition. Selecting by map id is what lets a case assert that a peer's
+     * allowance was left alone while a lost producer's was released -- an assertion
+     * [[consumerLedgerKey]] cannot make, because it matches on the partition alone and every
+     * producer of this fixture feeds the same one.
+     *
+     * @param mapId the producing map task whose ledgers to select
+     * @return the registered consumer ledgers of that producer
+     */
+    def consumerLedgerKeysOf(mapId: Long): Seq[BackpressureStreamKey] =
+      backpressure.registeredStreams.filter(key =>
+        key.partitionId == partitionId && key.mapId == mapId)
+
+    /**
+     * The open channel to one producer, identified by the map index it produces.
+     *
+     * Channels are opened in map-index order, but selecting by position would make every assertion
+     * depend on that order holding; selecting by the producer the channel actually reaches states
+     * what the assertion means and fails loudly if the reader ever opened none.
+     *
+     * @param mapIndex map index of the producer whose channel is wanted
+     * @return the channel to that producer
+     */
+    def streamOf(mapIndex: Int): StreamingShuffleTestProducerStream = {
+      val open = connector.streams.filter(_.location.mapIndex == mapIndex)
+      assert(open.size == 1,
+        s"Expected exactly one open channel to the producer of map index $mapIndex but found " +
+          s"${open.size} among ${connector.streams.map(_.location.mapIndex).mkString(", ")}")
+      open.head
+    }
 
     /**
      * A second reader over the same collaborators, for the construction guards.
@@ -1037,6 +1155,89 @@ class StreamingShuffleReaderSuite
    */
   private def diagnosisOf(failure: FetchFailedException): Seq[Throwable] =
     Option(failure.getCause).toSeq ++ failure.getSuppressed.toSeq
+
+  /**
+   * The records still readable from what one producer's handler is holding.
+   *
+   * This is the strongest available statement of "this producer's accepted data survived". It does
+   * not ask the handler whether it still holds bytes; it turns those bytes back into the
+   * records the producer sent, through `SerializerManager.wrapStream` for the same
+   * `ShuffleBlockId` the reader itself would have used, and re-verifies every block's CRC32C on
+   * the way. A block whose payload had been released, truncated or half discarded by another
+   * producer's invalidation could not survive that round trip -- so a case that recovers the
+   * exact records has proved the invalidation did not reach into this producer, rather than
+   * merely proved a counter did not move.
+   *
+   * Polling drains the hand-off queue, so a case that also asserts on the queue's depth or byte
+   * accounting must read those before calling this.
+   *
+   * @param fixture the read whose producer channel is being examined
+   * @param mapIndex map index of the producer to read
+   * @return the records, in the order the producer sent them
+   */
+  private def readableRecordsOf(fixture: ReaderFixture, mapIndex: Int): Seq[(Int, Int)] = {
+    val stream = fixture.streamOf(mapIndex)
+    val mapId = stream.location.mapId
+    val payload = new ByteArrayOutputStream()
+    var blocksRead = 0
+    var event = stream.handler.poll()
+    while (event.isDefined) {
+      event.get match {
+        case StreamingShuffleClientHandler.BlockReceived(block) =>
+          assert(block.verifyChecksum(),
+            s"A surviving producer's block at sequence ${block.sequenceNumber()} must still " +
+              s"match the checksum it arrived with")
+          assert(block.mapId == mapId && block.partitionId == fixture.partitionId,
+            s"A block held for map $mapId partition ${fixture.partitionId} must belong to it, " +
+              s"but named map ${block.mapId} partition ${block.partitionId}")
+          payload.write(block.copyPayload())
+          blocksRead += 1
+        case _ => ()
+      }
+      event = stream.handler.poll()
+    }
+    assert(blocksRead > 0,
+      s"The producer of map index $mapIndex is holding no block, so there is nothing to prove " +
+        s"readable")
+    val wrapped = sc.env.serializerManager.wrapStream(
+      ShuffleBlockId(fixture.shuffleId, mapId, fixture.partitionId),
+      new ByteArrayInputStream(payload.toByteArray))
+    fixture.dependency.serializer.newInstance().deserializeStream(wrapped).asKeyValueIterator
+      .map(record => (record._1.asInstanceOf[Int], record._2.asInstanceOf[Int])).toSeq
+  }
+
+  /**
+   * Loses several producers of one shuffle at the same instant, through the shared fault injector.
+   *
+   * The injector owns the decision and the arithmetic: [[
+   * StreamingShuffleFaultInjector.crashProducersConcurrently]] arms exactly as many triggers as
+   * there are producers to lose, and each seam consumes one, so the count of producers that
+   * actually went away is a fact the injector reports rather than one this suite asserts about
+   * itself. That is what makes "multiple concurrent producer failures" a scenario driven by the
+   * feature's own fault-injection vocabulary instead of by an ad-hoc flag.
+   *
+   * @param injector the fault injector sharing the fixture's clock
+   * @param streams the producer channels to lose, all of them
+   * @return the channels that took the fault, in the order given
+   */
+  private def crashProducersTogether(
+      injector: StreamingShuffleFaultInjector,
+      streams: Seq[StreamingShuffleTestProducerStream])
+    : Seq[StreamingShuffleTestProducerStream] = {
+    assert(streams.size > 1,
+      s"Concurrent producer failure needs more than one producer to be concurrent, but " +
+        s"${streams.size} was offered")
+    injector.crashProducersConcurrently(streams.size)
+    val lost = streams.filter(_ =>
+      injector.shouldFail(StreamingShuffleFaultScenario.ConcurrentProducerFailures))
+    assert(lost.size == streams.size,
+      s"The injector must lose every producer it was armed for, but lost ${lost.size} of " +
+        s"${streams.size}")
+    assert(!injector.isArmed(StreamingShuffleFaultScenario.ConcurrentProducerFailures),
+      "The arming budget must be exactly spent, so no later seam in this test can take the fault")
+    lost.foreach(_.crash())
+    lost
+  }
 
 
   test("in progress block request and partial consumption") {
@@ -1463,6 +1664,272 @@ class StreamingShuffleReaderSuite
       s"A reader must close only the channels it opened and never the executor-scoped connector, " +
         s"but the connector was closed ${fixture.connector.closeCallCount} time(s)")
   }
+
+  test("a lost producer invalidates only its own partial read and leaves a peer's blocks intact") {
+    startContext()
+    // Two producers feeding one reduce partition, which is the shape the isolation property needs:
+    // a reduce task's input is the concatenation of one stream per map output, and "invalidation is
+    // atomic AND per producer" has no content below two of them. Both map indexes are reported
+    // complete, so this is a read of retained output -- the same state as the single-producer
+    // invalidation case above -- and the only difference under test is the producer count.
+    val fixture = new ReaderFixture(numMaps = TwoProducers, completedMaps = Set(0, 1))
+    val lostProducer = fixture.producers.head
+    val survivingProducer = fixture.producers.last
+    assert(lostProducer.mapIndex == 0 && survivingProducer.mapIndex == 1,
+      s"The lost producer must be the first in read order -- read order is map-index order -- so " +
+        s"that the peer's blocks are still queued rather than already consumed when the loss is " +
+        s"reported, but the offered indexes were " +
+        s"${fixture.producers.map(_.mapIndex).mkString(", ")}")
+    assert(lostProducer.blockManagerId != survivingProducer.blockManagerId &&
+        lostProducer.mapId != survivingProducer.mapId &&
+        lostProducer.taskAttemptId != survivingProducer.taskAttemptId,
+      "The two producers must be distinguishable in every field a fetch failure names, or an " +
+        "assertion that only one of them was named proves nothing")
+
+    val lostPayload = fixture.encodePartition(StreamedRecords, lostProducer.mapId)
+    val lostBlocks = fixture.dataBlocksOf(lostPayload, BlockCount, lostProducer.mapId)
+    // A payload of its own for the peer, so that recovering the peer's records later cannot be
+    // satisfied by bytes that came from the producer whose data was supposed to be discarded.
+    val survivingPayload = fixture.encodePartition(PeerRecords, survivingProducer.mapId)
+    val survivingBlocks =
+      fixture.dataBlocksOf(survivingPayload, BlockCount, survivingProducer.mapId)
+
+    val records = fixture.reader.read()
+    assert(fixture.connector.streams.size == TwoProducers,
+      s"A reader offered ${TwoProducers} producers must open a channel to each of them before it " +
+        s"consumes anything, but opened ${fixture.connector.streams.size}")
+    val lostStream = fixture.streamOf(lostProducer.mapIndex)
+    val survivingStream = fixture.streamOf(survivingProducer.mapIndex)
+    assert(fixture.consumerLedgerKeysOf(lostProducer.mapId).size == 1 &&
+        fixture.consumerLedgerKeysOf(survivingProducer.mapId).size == 1,
+      s"Each producer generation must hold a credit ledger of its own, but the lost producer " +
+        s"holds ${fixture.consumerLedgerKeysOf(lostProducer.mapId).size} and the peer " +
+        s"${fixture.consumerLedgerKeysOf(survivingProducer.mapId).size}")
+
+    // The producer that is about to be lost delivers its whole partition and then goes silent: no
+    // orderly end of stream, so there is a genuine partial read to invalidate.
+    lostBlocks.foreach(block => lostStream.deliver(block))
+    assert(lostStream.handler.acceptedBlockCount(fixture.partitionId) == lostBlocks.size.toLong,
+      s"Every block of the producer about to be lost must have been accepted, but only " +
+        s"${lostStream.handler.acceptedBlockCount(fixture.partitionId)} of ${lostBlocks.size} were")
+
+    // The clock advances past the connection timeout FIRST, and only then does the peer deliver.
+    // That ordering is what makes exactly one producer silent: liveness is measured per channel
+    // from that channel's own last inbound frame, so the peer's delivery resets its own clock
+    // reading to zero while the lost producer's stays at the full timeout.
+    advancePastProducerTimeout(fixture.clock)
+    survivingBlocks.foreach(block => survivingStream.deliver(block))
+    assert(lostStream.handler.isProducerSilent(fixture.partitionId),
+      s"The producer that stopped sending must be reported silent after " +
+        s"${ProducerConnectionTimeoutMillis} ms")
+    assert(!survivingStream.handler.isProducerSilent(fixture.partitionId),
+      s"The peer must not be reported silent: it delivered at this instant, and its channel " +
+        s"reads ${survivingStream.handler.millisSinceInbound(fixture.partitionId)} ms of " +
+        s"silence")
+    val survivingQueuedEvents = survivingStream.handler.queuedEventCount
+    val survivingQueuedBytes = survivingStream.handler.queuedByteCount
+    val survivingAccepted = survivingStream.handler.acceptedBlockCount(fixture.partitionId)
+    assert(survivingAccepted == survivingBlocks.size.toLong && survivingQueuedBytes > 0L,
+      s"The peer must be holding all ${survivingBlocks.size} of its accepted blocks and their " +
+        s"bytes before the loss, but holds ${survivingAccepted} block(s) and " +
+        s"${survivingQueuedBytes} byte(s)")
+
+    // Observed at the one instant that can see the discard and the peer together: while the
+    // invalidation ask is in flight, which is after the lost producer has been emptied and before
+    // the fetch failure has been thrown.
+    val lostQueuedAtInvalidation = new AtomicReference[Option[Int]](None)
+    val lostClosedAtInvalidation = new AtomicReference[Option[Boolean]](None)
+    val peerQueuedAtInvalidation = new AtomicReference[Option[Int]](None)
+    val peerBytesAtInvalidation = new AtomicReference[Option[Long]](None)
+    val peerClosedAtInvalidation = new AtomicReference[Option[Boolean]](None)
+    val countedAtInvalidation = new AtomicReference[Option[Long]](None)
+    fixture.coordinatorRef.observeInvalidation { _ =>
+      lostQueuedAtInvalidation.set(Some(lostStream.handler.queuedEventCount))
+      lostClosedAtInvalidation.set(Some(lostStream.handler.isClosed))
+      peerQueuedAtInvalidation.set(Some(survivingStream.handler.queuedEventCount))
+      peerBytesAtInvalidation.set(Some(survivingStream.handler.queuedByteCount))
+      peerClosedAtInvalidation.set(Some(survivingStream.handler.isClosed))
+      countedAtInvalidation.set(Some(observedPartialReadInvalidations()))
+    }
+
+    val failure = intercept[FetchFailedException] {
+      withTaskContext(fixture.context) {
+        readRecords(records)
+      }
+    }
+
+    // The discard reached the lost producer completely...
+    assert(lostQueuedAtInvalidation.get().contains(0),
+      s"No block from the lost producer may remain reachable when the loss is reported, but " +
+        s"${lostQueuedAtInvalidation.get()} event(s) were still queued")
+    assert(lostClosedAtInvalidation.get().contains(true),
+      s"The lost producer's channel must be shut before the loss is reported, but its state at " +
+        s"that moment was ${lostClosedAtInvalidation.get()}")
+
+    // ...and stopped exactly there. This is the property the whole case exists for: an invalidation
+    // is scoped to the producer that was lost, so a peer that is streaming perfectly well does not
+    // have its accepted output thrown away because a sibling map task died.
+    assert(peerQueuedAtInvalidation.get().contains(survivingQueuedEvents),
+      s"The peer's queued blocks must be untouched by another producer's invalidation: " +
+        s"${survivingQueuedEvents} were queued before it and " +
+        s"${peerQueuedAtInvalidation.get()} at the instant it was reported")
+    assert(peerBytesAtInvalidation.get().contains(survivingQueuedBytes),
+      s"The peer's retained bytes must be untouched by another producer's invalidation: " +
+        s"${survivingQueuedBytes} before it and ${peerBytesAtInvalidation.get()} at the instant " +
+        s"it was reported")
+    assert(peerClosedAtInvalidation.get().contains(false),
+      s"The peer's channel must stay open through another producer's invalidation, but its state " +
+        s"at that moment was ${peerClosedAtInvalidation.get()}")
+
+    // Counted once, for the one producer that was lost -- not once per producer of the shuffle.
+    assert(countedAtInvalidation.get().contains(1L),
+      s"The partial read invalidation must be counted before the coordinator is told, but the " +
+        s"counter read ${countedAtInvalidation.get()} at that moment")
+    assert(observedPartialReadInvalidations() == 1L,
+      s"Exactly one partial read invalidation must be recorded when one of two producers is " +
+        s"lost, but ${observedPartialReadInvalidations()} were recorded")
+    val sent = fixture.coordinatorRef.invalidationsSent
+    assert(sent.size == 1,
+      s"Exactly one producer generation may be invalidated, but ${sent.size} were: " +
+        s"${sent.map(_.generation).mkString(", ")}")
+    assert(sent.head.generation == lostProducer.generation,
+      s"The invalidation must name the lost generation, but named ${sent.head.generation}")
+    assert(sent.head.generation != survivingProducer.generation,
+      "The peer's generation must never be invalidated, or the recomputation would discard a map " +
+        "output that is intact and still streaming")
+
+    // The fetch failure names the lost producer and nothing else, which is what makes
+    // MapOutputTracker remove that one dead map output rather than the peer's live one.
+    val reason = fetchFailedReasonOf(failure)
+    assert(reason.shuffleId == fixture.shuffleId && reason.reduceId == fixture.partitionId,
+      s"The fetch failure must name the shuffle and reduce partition being read, but named " +
+        s"shuffle ${reason.shuffleId} partition ${reason.reduceId}")
+    assert(reason.mapId == lostProducer.mapId && reason.mapIndex == lostProducer.mapIndex,
+      s"The fetch failure must name the lost map output, but named map ${reason.mapId} index " +
+        s"${reason.mapIndex}")
+    assert(reason.bmAddress == lostProducer.blockManagerId,
+      s"The fetch failure must carry the lost producer's own MapStatus address, without which " +
+        s"MapOutputTracker removes nothing, but carried ${reason.bmAddress}")
+    assert(reason.mapId != survivingProducer.mapId &&
+        reason.mapIndex != survivingProducer.mapIndex &&
+        reason.bmAddress != survivingProducer.blockManagerId,
+      s"The fetch failure must not name the peer in any field, or the scheduler would " +
+        s"recompute a map task whose output never failed, but it named map ${reason.mapId} " +
+        s"index ${reason.mapIndex} at ${reason.bmAddress}")
+    assert(fixture.context.fetchFailed.contains(failure),
+      "The task context must carry the fetch failure, which is what makes the executor report a " +
+        "FetchFailed reason and the unmodified DAG scheduler resubmit the upstream stage")
+
+    // The peer's credit ledger is still held, so its receive window was not released along with the
+    // lost producer's; the reader's own cleanup owns that, and it has not run.
+    assert(fixture.consumerLedgerKeysOf(survivingProducer.mapId).size == 1,
+      s"The peer's credit ledger must survive another producer's invalidation, but " +
+        s"${fixture.consumerLedgerKeysOf(survivingProducer.mapId).size} remain registered")
+
+    // And the decisive form of the statement: the peer's accepted blocks are not merely still
+    // counted, they still deserialize -- through the same wrapping the reader uses -- into exactly
+    // the records the peer sent, every one of them still matching the checksum it arrived with.
+    assert(readableRecordsOf(fixture, survivingProducer.mapIndex) == PeerRecords,
+      "The peer's accepted blocks must still be readable in full after a sibling producer was " +
+        "invalidated, or the invalidation was not per producer at all")
+    assert(fixture.connector.closeCallCount == 0,
+      s"A reader must close only the channels it opened and never the executor-scoped connector, " +
+        s"but the connector was closed ${fixture.connector.closeCallCount} time(s)")
+  }
+
+  test("several producers lost together are one fetch failure counted exactly once") {
+    startContext()
+    // The feature's ninth enumerated failure scenario: multiple concurrent producer failures. Both
+    // producers of the shuffle die at the same instant, each having already delivered part of its
+    // output, so there are two partial reads outstanding and only one of them can be reported --
+    // the reader reaches producers in map-index order and the first loss it meets ends the read.
+    val fixture = new ReaderFixture(numMaps = TwoProducers, completedMaps = Set(0, 1))
+    val injector = newFaultInjector(fixture.clock)
+    val firstProducer = fixture.producers.head
+    val secondProducer = fixture.producers.last
+
+    val payloads = fixture.producers.map(producer =>
+      producer -> fixture.encodePartition(StreamedRecords, producer.mapId))
+    val records = fixture.reader.read()
+    payloads.foreach { case (producer, payload) =>
+      val stream = fixture.streamOf(producer.mapIndex)
+      fixture.dataBlocksOf(payload, BlockCount, producer.mapId)
+        .foreach(block => stream.deliver(block))
+      assert(stream.handler.acceptedBlockCount(fixture.partitionId) == BlockCount.toLong,
+        s"Producer index ${producer.mapIndex} must have delivered a partial read to invalidate, " +
+          s"but only ${stream.handler.acceptedBlockCount(fixture.partitionId)} block(s) landed")
+    }
+
+    // Both producers go at once, and the injector is what decides so: it is armed for exactly the
+    // number of producers offered and each seam consumes one trigger, so the two losses are one
+    // event rather than two independent ones a test happened to stage in sequence.
+    val lost = crashProducersTogether(injector, fixture.producers.map(producer =>
+      fixture.streamOf(producer.mapIndex)))
+    assert(injector.fireCount(StreamingShuffleFaultScenario.ConcurrentProducerFailures) ==
+        TwoProducers,
+      s"The concurrent-producer-failure scenario must have fired once per producer, but fired " +
+        s"${injector.fireCount(StreamingShuffleFaultScenario.ConcurrentProducerFailures)} time(s)")
+    assert(injector.networkPartitioned,
+      "Losing several producers together must also make them unreachable, or the consumer would " +
+        "still be able to talk to executors that are gone")
+    assert(lost.forall(_.isCrashed),
+      "Every producer the injector lost must be unable to put another frame on the wire")
+
+    // One advance of the shared clock is all it takes now: neither channel has received anything
+    // since, so both are past the connection timeout at the same reading.
+    advancePastProducerTimeout(fixture.clock)
+    assert(lost.forall(_.handler.isProducerSilent(fixture.partitionId)),
+      s"Every lost producer must be reported silent after ${ProducerConnectionTimeoutMillis} ms")
+
+    val failure = intercept[FetchFailedException] {
+      withTaskContext(fixture.context) {
+        readRecords(records)
+      }
+    }
+
+    // One loss is reported, not two. A reduce task has exactly one input and exactly one failure to
+    // report about it; the recomputation of the upstream stage that this failure triggers is what
+    // restores every dead map output, including the second one, so reporting the second here would
+    // inflate the telemetry without recovering anything the first does not already recover.
+    assert(observedPartialReadInvalidations() == 1L,
+      s"Two producers lost together must be reported as one partial read invalidation, but " +
+        s"${observedPartialReadInvalidations()} were recorded")
+    val sent = fixture.coordinatorRef.invalidationsSent
+    assert(sent.size == 1,
+      s"Exactly one producer generation may be invalidated for one fetch failure, but " +
+        s"${sent.size} were: ${sent.map(_.generation).mkString(", ")}")
+    assert(sent.head.generation == firstProducer.generation,
+      s"The reported loss must be the first producer in read order, which is the one the reader " +
+        s"reached, but it named ${sent.head.generation}")
+    assert(sent.head.reason == StreamingShuffleInvalidationReason.ConnectionTimeout,
+      s"A producer lost to silence must be invalidated as a connection timeout, but the reason " +
+        s"was ${sent.head.reason}")
+
+    val reason = fetchFailedReasonOf(failure)
+    assert(reason.mapId == firstProducer.mapId && reason.mapIndex == firstProducer.mapIndex &&
+        reason.bmAddress == firstProducer.blockManagerId,
+      s"The single fetch failure must name the producer the reader reached, but named map " +
+        s"${reason.mapId} index ${reason.mapIndex} at ${reason.bmAddress}")
+    assert(reason.mapId != secondProducer.mapId,
+      s"One fetch failure must name one map output, but it named the second producer's map " +
+        s"${reason.mapId} as well")
+    assert(fixture.context.fetchFailed.contains(failure),
+      "The task context must carry the one fetch failure, which is what makes the unmodified DAG " +
+        "scheduler recompute the upstream stage and restore both dead map outputs")
+
+    // No byte of either partial read is still reachable through the producer the reader reached,
+    // which is what "zero data loss" requires of the discard side: a recomputed producer's output
+    // is never concatenated onto a survivor of the failure.
+    assert(fixture.streamOf(firstProducer.mapIndex).handler.queuedEventCount == 0 &&
+        fixture.streamOf(firstProducer.mapIndex).handler.queuedByteCount == 0L,
+      s"The reported producer's partial read must be discarded in full, but " +
+        s"${fixture.streamOf(firstProducer.mapIndex).handler.queuedEventCount} event(s) and " +
+        s"${fixture.streamOf(firstProducer.mapIndex).handler.queuedByteCount} byte(s) remain")
+    assert(fixture.streamOf(firstProducer.mapIndex).handler.isClosed,
+      "The reported producer's channel must be shut, or a block arriving after the discard could " +
+        "be mixed into the recomputed input")
+  }
+
 
   test("checksum validation and retransmission") {
     startContext()
