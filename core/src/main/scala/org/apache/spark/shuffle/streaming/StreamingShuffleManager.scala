@@ -847,7 +847,13 @@ private[spark] class StreamingShuffleManager(conf: SparkConf, isDriver: Boolean)
             fallbackPolicy = fallbackPolicy,
             errorNotifier = notifier,
             coordinatorGateway = gateway)
-          new StreamingShuffleWriter[K, V, C](handle, mapId, context, metrics, conf, components)
+          // The sort-based writer is supplied as a factory rather than built here, so it is
+          // constructed only in the one case that needs it: a producer whose framing reservation
+          // cannot be met, which degrades the whole attempt before its first record and therefore
+          // loses nothing. Building it eagerly would register a map task with the delegate's own
+          // bookkeeping for every streaming shuffle that never uses it.
+          new StreamingShuffleWriter[K, V, C](handle, mapId, context, metrics, conf, components,
+            () => sortShuffleManager.getWriter[K, V](handle, mapId, context, metrics))
         } catch {
           case NonFatal(e) =>
             withdrawAnnouncedProducer(gateway, serverHandler, handle, mapId, context,

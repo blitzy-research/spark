@@ -19,7 +19,7 @@ package org.apache.spark.shuffle.streaming
 
 import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.{AtomicLong, AtomicReference}
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong, AtomicReference}
 
 import org.apache.spark.SparkConf
 import org.apache.spark.internal.{config, Logging, MessageWithContext}
@@ -324,6 +324,7 @@ private[spark] class StreamingShuffleFallbackPolicy(
   private val shuffleFallbacks = new ConcurrentHashMap[Int, StreamingShuffleFallbackState]()
 
   logConstruction()
+  logSaturationCoverage()
 
   // The decision surface. Hot path: lock-free, allocation-free, clock-free.
 
@@ -953,6 +954,36 @@ private[spark] class StreamingShuffleFallbackPolicy(
   }
 
   /**
+   * Tells the operator, once, when one of the four fallback conditions cannot be evaluated at all.
+   *
+   * Network saturation is defined relative to an administered link capacity, and
+   * `spark.shuffle.streaming.maxBandwidthMBps` has no default -- absence means unlimited. So on a
+   * default configuration there is no capacity to measure utilisation against, and the saturation
+   * condition is not merely untripped but unevaluable: three of the four conditions are live and
+   * the fourth is inert. That is a legitimate configuration and not a fault, which is why this is a
+   * notice rather than a warning, but leaving it visible only under the debug key means the
+   * operator most likely to rely on the condition is the one least likely to know it is absent.
+   *
+   * Emitted at most once per JVM, latched in the companion object rather than in this instance: the
+   * notice describes the configuration of the whole executor, so a second manager instantiated in
+   * the same JVM -- which local and local-cluster runs do -- must not repeat it, and nothing on any
+   * task path reaches this method at all.
+   */
+  private def logSaturationCoverage(): Unit = {
+    if (streamingEnabled && administeredCapacityBytesPerSecond.isEmpty &&
+      saturationNoticeEmitted.compareAndSet(false, true)) {
+      logInfo(log"Streaming shuffle is enabled with no " +
+        log"${MDC(CONFIG, config.SHUFFLE_STREAMING_MAX_BANDWIDTH_MBPS.key)}, so the link has no " +
+        log"administered capacity to measure utilisation against and the network saturation " +
+        log"fallback condition above " +
+        log"${MDC(PERCENT, SATURATION_TRIP_PERCENT)}% cannot be evaluated and will never " +
+        log"trip. The consumer slowness, memory pressure and protocol version conditions are " +
+        log"unaffected; set that property to a link capacity in MB/s to " +
+        log"make the saturation condition active")
+    }
+  }
+
+  /**
    * One shuffle's producer and consumer rates, plus how long its consumer has been behind.
    *
    * Guarded by its own monitor rather than by atomics, because arming the sustained-slowness timer
@@ -1093,6 +1124,14 @@ private[spark] object StreamingShuffleFallbackPolicy {
    * streaming stops altogether. Two different numbers doing two different jobs.
    */
   val SATURATION_TRIP_PERCENT: Long = 90L
+
+  /**
+   * Whether the notice about an unevaluable saturation condition has already been emitted.
+   *
+   * Process wide rather than per instance, so an executor that constructs a second policy -- which
+   * a local or local-cluster run does -- states the fact once rather than once per construction.
+   */
+  private[streaming] val saturationNoticeEmitted = new AtomicBoolean(false)
 
   /** [[SATURATION_TRIP_PERCENT]] as a fraction, which is the form the comparison actually uses. */
   val SATURATION_TRIP_RATIO: Double = SATURATION_TRIP_PERCENT.toDouble / 100.0d

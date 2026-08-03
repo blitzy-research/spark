@@ -2673,7 +2673,13 @@ private[spark] class NettyStreamingShuffleProducerConnector(
    */
   private val clients = new ConcurrentHashMap[String, TransportClient]()
 
-  /** Channels whose frames arrived before any handler was bound to them. Diagnostic only. */
+  /**
+   * Received data frames that arrived on a channel no handler could be found for. Diagnostic only.
+   *
+   * Lifecycle callbacks are deliberately not counted here: a channel becoming active before its
+   * handler is published is the transport's ordinary ordering, not a frame anybody lost, so
+   * counting it would leave this non-zero on every healthy run and say nothing about frame loss.
+   */
   private val unboundFrames = new AtomicLong(0L)
 
   /** Channels that were still open when the shutdown deadline passed. Zero until [[close]] runs. */
@@ -2890,8 +2896,34 @@ private[spark] class NettyStreamingShuffleProducerConnector(
     dispatchTo(client)(_.receive(client, message, callback))
   }
 
+  /**
+   * Forwards a channel becoming active, and stays quiet when there is nothing to forward it to.
+   *
+   * This callback is the one transport event that is *expected* to arrive before a handler can be
+   * reached, and it is not a lost frame. The pipeline raises it on the transport's own event loop
+   * as soon as the socket is up, which is earlier than [[connect]] resuming on the connecting
+   * thread to publish the handler, so on that ordering neither [[handlers]] nor the connecting
+   * thread local can answer for the channel. Nothing is lost by it: [[connect]] announces the
+   * subscription itself once the binding completes, the producer treats a repeat announcement as a
+   * no-op, so the in-progress request is issued exactly once per connection either way.
+   *
+   * Counting this as an unbound frame is what made every enabled run report a warning about a frame
+   * nobody had lost, so it is recorded only under the streaming debug key -- while a *data* frame
+   * with no handler keeps its warning in [[dispatchTo]], because that one really would be a frame
+   * the sequence-gap repair has to ask for again.
+   */
   override def channelActive(client: TransportClient): Unit = {
-    dispatchTo(client)(_.channelActive(client))
+    handlerFor(client) match {
+      case Some(handler) =>
+        handler.channelActive(client)
+      case None =>
+        if (debugEnabled) {
+          logDebug(log"A streaming shuffle channel to " +
+            log"${MDC(HOST_PORT, String.valueOf(client.getSocketAddress()))} became active " +
+            log"before its consumer handler was published; the connecting thread announces the " +
+            log"subscription itself once the binding completes")
+        }
+    }
   }
 
   /**
@@ -2907,27 +2939,59 @@ private[spark] class NettyStreamingShuffleProducerConnector(
     handler.foreach(_.channelInactive(client))
   }
 
+  /**
+   * Forwards a channel level failure, and stays quiet when there is nothing to forward it to.
+   *
+   * An unreachable handler here is never the only report of the failure. Before the binding, the
+   * failure is what makes `createUnmanagedClient` throw, and [[connect]] logs it with its cause;
+   * after [[channelInactive]], the channel has already been released and its reader already told.
+   * Either way this callback would be a second voice describing a fault that is reported elsewhere
+   * with more of the story, so it is recorded only under the streaming debug key.
+   */
   override def exceptionCaught(cause: Throwable, client: TransportClient): Unit = {
-    dispatchTo(client)(_.exceptionCaught(cause, client))
+    handlerFor(client) match {
+      case Some(handler) =>
+        handler.exceptionCaught(cause, client)
+      case None =>
+        if (debugEnabled) {
+          logDebug(log"A streaming shuffle channel to " +
+            log"${MDC(HOST_PORT, String.valueOf(client.getSocketAddress()))} failed with " +
+            log"${MDC(ERROR, cause.getMessage)} with no consumer handler bound to it; the " +
+            log"connect path or the channel's own release reports this failure")
+        }
+    }
   }
 
   /**
-   * Routes one transport callback to the handler that owns the channel it arrived on.
+   * The handler that owns one channel, if that channel can still be answered for.
    *
-   * A callback for a channel with no handler is counted rather than raised. It can only happen if a
+   * The registration is consulted first and the connecting thread local second, which is what makes
+   * a channel routable from the instant it exists rather than from the instant it is published.
+   */
+  private def handlerFor(client: TransportClient): Option[StreamingShuffleClientHandler] =
+    Option(handlers.get(channelKeyOf(client))).orElse(currentlyConnecting)
+
+  /**
+   * Routes one received frame to the handler that owns the channel it arrived on.
+   *
+   * A frame for a channel with no handler is counted rather than raised. It can only happen if a
    * producer sends before this consumer has subscribed, which the producer side does not do, and
    * the consequence is a frame the sequence-gap repair will ask for again -- whereas raising here
    * would fail a reduce task over a frame nobody asked for.
+   *
+   * Only *received frames* reach this method. The lifecycle callbacks route themselves, because for
+   * them an unreachable handler is an ordinary ordering rather than a loss, and counting them here
+   * both cost the counter its meaning and put a warning in every enabled run's log.
    */
   private def dispatchTo(client: TransportClient)(
       action: StreamingShuffleClientHandler => Unit): Unit = {
-    Option(handlers.get(channelKeyOf(client))).orElse(currentlyConnecting) match {
+    handlerFor(client) match {
       case Some(handler) =>
         action(handler)
       case None =>
         val unbound = unboundFrames.incrementAndGet()
         if (unbound == 1L) {
-          logWarning(log"A streaming shuffle frame arrived from " +
+          logWarning(log"A streaming shuffle data frame arrived from " +
             log"${MDC(HOST_PORT, String.valueOf(client.getSocketAddress()))} on a channel " +
             log"with no consumer handler bound to it. Further occurrences are counted but " +
             log"not logged")

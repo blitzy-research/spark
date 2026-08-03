@@ -171,6 +171,33 @@ private[spark] trait StreamingShuffleRouteRegistry {
  * optional SSL and its keep-alive without a single edit to any shared transport class. Every
  * streaming frame travels as the body of a one-way RPC.
  *
+ * =Why a healthy shuffle can put nothing on the wire=
+ *
+ * Stated here because this handler is where the evidence shows up, and it reads like a fault when
+ * it is not one. At an ordinary stage boundary this handler will report every block as enqueued and
+ * held -- "egress is paced, no consumer has subscribed, or no channel is writable" -- and finish
+ * with zero bytes on the wire, having streamed nothing live to anyone.
+ *
+ * That is the expected reading, and the reason is structural rather than local. Whether a consumer
+ * exists while a producer runs is decided by task submission, which belongs to the DAG scheduler
+ * and the task scheduler -- absolute preservation zones for this feature, which may not be modified
+ * at all -- and the unmodified scheduler submits a stage only once every parent stage reports its
+ * output available. So for a map stage whose tasks each run once, the reduce tasks are submitted
+ * after the last of them has finished: no consumer can be subscribed while this handler is offered
+ * blocks, every block is retained, made durable at the writer's stop, and served afterwards from
+ * the executor-scoped [[StreamingShuffleBlockResolver]] instead. What the streaming path removes in
+ * that configuration is the index-and-fetch round trip and the reduce side's whole-partition
+ * materialisation; the producer/consumer overlap is capability rather than outcome.
+ *
+ * Live egress through this handler is therefore exercised where a consumer really is attached -- a
+ * reduce attempt reading while a superseded or speculative map attempt still produces, a replay
+ * requested by a reconnecting consumer -- and would be exercised throughout under a scheduler that
+ * submitted consumers earlier. Nothing in this file assumes either case: the accounting of bytes on
+ * the wire is kept exact precisely so the difference is measurable rather than assumed, and
+ * `StreamingShuffleWriter`'s own class documentation carries the same statement from the producing
+ * side. Do not read a zero as a defect in egress, and do not add a warning for it: it is the
+ * scheduler's submission order, visible from here.
+ *
  * @param conf the executor's configuration, read exactly once during construction
  * @param shuffleId the shuffle whose partitions this handler streams
  * @param mapId the map output whose partitions this handler streams
@@ -417,6 +444,9 @@ private[spark] class StreamingShuffleServerHandler(
     new MemorySpillManager.LogAggregationGate(MemorySpillManager.LOG_AGGREGATION_WINDOW_MS)
   private val subscriptionRefusals = new AtomicLong(0L)
   private val subscriptionRefusalLogGate =
+    new MemorySpillManager.LogAggregationGate(MemorySpillManager.LOG_AGGREGATION_WINDOW_MS)
+  private val lossyChannelClosures = new AtomicLong(0L)
+  private val lossyChannelLogGate =
     new MemorySpillManager.LogAggregationGate(MemorySpillManager.LOG_AGGREGATION_WINDOW_MS)
 
   /**
@@ -1815,20 +1845,49 @@ private[spark] class StreamingShuffleServerHandler(
    * belong to the retained store and stay there -- the consumer's acknowledged position is recorded
    * against its identity in that store, so its next connection resumes from exactly where this one
    * stopped. Releasing output is [[releaseAll]]'s job alone.
+   *
+   * '''Why the ordinary close is not a warning.''' A reduce task closes its channel when it has
+   * finished reading, so one close per consumer is the expected end of every healthy shuffle, and
+   * the count of them is `numMaps * numReduces` for the application as a whole. Reporting each at
+   * warning level put an executor's log volume in direct proportion to the width of its shuffles --
+   * a thousand-by-a-thousand shuffle produces hundreds of thousands of lines, one to two orders of
+   * magnitude past the volume this feature is allowed -- and every one of them described a clean
+   * teardown as a lost channel, which trains an operator to ignore the subsystem's warnings.
+   *
+   * So the two cases are separated by what the close actually leaves behind. A session that owes
+   * its consumer nothing -- nothing written and unacknowledged, nothing still queued -- has
+   * completed its work and is reported only under the streaming debug key. A session that closes
+   * still owing bytes is the condition the failure protocol exists for, and that keeps its warning,
+   * bounded through the same aggregation window as every other recurring condition here so a storm
+   * of dead consumers cannot spend the whole log budget either. The per-session figures are used
+   * rather than the handler-wide totals, because what this channel left owed is the fact reported.
    */
   override def channelInactive(client: TransportClient): Unit = {
     guard {
       val session = sessions.remove(sessionKeyOf(client))
       if (session != null) {
+        // Sampled before the ledgers are released, because releasing them is what zeroes them.
+        val owedBytes = session.unacknowledgedBytes
+        val queuedBytes = session.pendingBytes
         // The ledgers describe a flow over this channel and end with it; the consumer's cursor in
         // the retained store does not, which is what its next connection resumes against.
         releaseConsumerLedgers(session)
         sessionsByConsumer.remove(session.consumerId, session)
         session.close()
-        logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} lost its egress channel " +
-          log"to consumer ${MDC(SESSION_ID, session.consumerId)} at " +
-          log"${MDC(HOST_PORT, client.getSocketAddress())} with " +
-          log"${MDC(NUM_BYTES, unacknowledgedBytes)} unacknowledged byte(s) retained for replay")
+        if (owedBytes == 0L && queuedBytes == 0L) {
+          if (debugEnabled) {
+            logDebug(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} closed its egress " +
+              log"channel to consumer ${MDC(SESSION_ID, session.consumerId)} at " +
+              log"${MDC(HOST_PORT, client.getSocketAddress())} with nothing owed to it")
+          }
+        } else {
+          reportBounded(lossyChannelLogGate, lossyChannelClosures,
+            log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} lost its egress channel to " +
+              log"consumer ${MDC(SESSION_ID, session.consumerId)} at " +
+              log"${MDC(HOST_PORT, client.getSocketAddress())} with " +
+              log"${MDC(NUM_BYTES, owedBytes)} unacknowledged and " +
+              log"${MDC(MAX_SIZE, queuedBytes)} undelivered byte(s) retained for replay")
+        }
       }
       reportPeerLoss()
     }
@@ -2482,6 +2541,17 @@ private[spark] class StreamingShuffleServerHandler(
 
   /** Channels closed for attempting to change the consumer identity of a live session. */
   def identityConflictCount: Long = identityConflicts.get()
+
+  /**
+   * Egress channels that closed while still owing their consumer bytes, either unacknowledged or
+   * undelivered.
+   *
+   * Counted separately from an ordinary close, which every healthy consumer performs once and which
+   * is therefore not a condition worth an operator's attention. This is the figure the producing
+   * task reports in its own summary, so the total survives even when the individual warnings are
+   * suppressed by their aggregation window.
+   */
+  def lossyChannelClosureCount: Long = lossyChannelClosures.get()
 
   /** How many channels have been refused because the session ceiling was already reached. */
   def refusedSessionCount: Long = refusedSessions.get()

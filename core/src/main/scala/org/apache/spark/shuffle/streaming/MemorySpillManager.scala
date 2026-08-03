@@ -25,13 +25,13 @@ import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong, At
 import scala.collection.mutable
 import scala.util.control.NonFatal
 
-import org.apache.spark.{SparkConf, SparkEnv, TaskContext}
+import org.apache.spark.{SparkConf, SparkContext, SparkEnv, TaskContext}
 import org.apache.spark.executor.ShuffleWriteMetrics
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.LogKeys.{BLOCK_ID, BYTE_SIZE, CLASS_NAME, COUNT, DURATION,
-  FILE_NAME, MAX_SIZE, MEMORY_SIZE, NUM_BYTES, NUM_PARTITIONS, NUM_SKIPPED, PARTITION_ID, PATH,
-  REASON, THRESHOLD}
-import org.apache.spark.internal.config.{SHUFFLE_FILE_BUFFER_SIZE,
+  FILE_NAME, MAX_SIZE, MEMORY_SIZE, NUM_BYTES, NUM_EVENTS, NUM_PARTITIONS, NUM_SKIPPED,
+  PARTITION_ID, PATH, REASON, THRESHOLD}
+import org.apache.spark.internal.config.{CPUS_PER_TASK, EXECUTOR_CORES, SHUFFLE_FILE_BUFFER_SIZE,
   SHUFFLE_STREAMING_BUFFER_SIZE_PERCENT, SHUFFLE_STREAMING_DEBUG,
   SHUFFLE_STREAMING_SPILL_THRESHOLD}
 import org.apache.spark.memory.{MemoryConsumer, MemoryMode, TaskMemoryManager}
@@ -243,6 +243,16 @@ private[spark] class MemorySpillManager(
 
   private val debugEnabled: Boolean = conf.get(SHUFFLE_STREAMING_DEBUG)
 
+  /**
+   * Map tasks that can run at once in this JVM, which is the second divisor of a producer's framing
+   * share. See [[MemorySpillManager.executorTaskSlots]] for why the buffer arithmetic needs it: the
+   * allowance is executor wide, so a share sized for one task is claimed once per task slot.
+   *
+   * Read from the configuration at construction and held immutably, so it is a constant for the
+   * life of the executor rather than a reading that moves with load.
+   */
+  val concurrentTaskSlots: Int = MemorySpillManager.executorTaskSlots(conf)
+
   // Matches the sizing the sort-based spill path uses for its own disk writers, so streaming spill
   // files are buffered identically to every other spill file this executor produces.
   private val fileBufferSizeBytes: Int = conf.get(SHUFFLE_FILE_BUFFER_SIZE).toInt * 1024
@@ -324,6 +334,13 @@ private[spark] class MemorySpillManager(
   // Whether an eviction is between its select-and-detach stage and its publish-or-re-attach stage.
   // Guarded by `lock`. Only one eviction runs at a time, so a second caller observing this simply
   // declines rather than planning an overlapping eviction of partitions already being written.
+  //
+  // A caller that needs room, or that needs every byte out of memory, must *wait* for that eviction
+  // rather than conclude from it that nothing can be freed: the detached bytes have already left
+  // every partition's own tally, so nothing is selectable while it runs, yet they are still counted
+  // in the aggregate until the publish stage lands. `lock.notifyAll()` in the publish stage and
+  // [[awaitEvictionQuiescence]] on this side are what turn that window from a false "budget
+  // exhausted" verdict into a short wait for the reclamation that is already under way.
   private var evictionInProgress = false
 
   // Outstanding reader leases per spill file, and the set of files whose last record has been
@@ -375,6 +392,15 @@ private[spark] class MemorySpillManager(
   private val diskBytesSpilledTotal = new AtomicLong(0L)
 
   private val spillCountTotal = new AtomicLong(0L)
+
+  // End-of-stream durability flushes, counted apart from threshold-driven evictions. See
+  // [[durabilityFlushCount]] for why the two must not share a counter.
+  private val durabilityFlushTotal = new AtomicLong(0L)
+
+  // Blocks written straight to disk because the allowance could not admit them to memory. Counted
+  // apart from both eviction counters: nothing was reclaimed and no threshold was crossed, so this
+  // is neither a spill event nor a durability flush. See [[durableAdmissionCount]].
+  private val durableAdmissionTotal = new AtomicLong(0L)
 
   private val spillFailureTotal = new AtomicLong(0L)
 
@@ -432,6 +458,8 @@ private[spark] class MemorySpillManager(
   // Each gate is independent, so a flood of one condition never masks the first occurrence of
   // another, and every gate is driven by the injected clock so the bound is deterministic in tests.
   private val spillLogGate = new LogAggregationGate(LOG_AGGREGATION_WINDOW_MS)
+
+  private val durabilityFlushLogGate = new LogAggregationGate(LOG_AGGREGATION_WINDOW_MS)
 
   private val spillFailureLogGate = new LogAggregationGate(LOG_AGGREGATION_WINDOW_MS)
 
@@ -642,8 +670,46 @@ private[spark] class MemorySpillManager(
     if (reserved <= 0L) 0L else reserved * PERCENT_SCALE / quota.totalBytes
   }
 
-  /** Number of eviction events performed, counted once per event and not once per partition. */
+  /**
+   * Number of '''threshold or pressure driven''' eviction events, counted once per event and not
+   * once per partition. This is exactly the figure published to `shuffle.streaming.spillCount`.
+   *
+   * The end-of-stream durability flush is deliberately '''not''' counted here, and separating the
+   * two is what makes this metric mean anything. Every successful streaming map task ends by making
+   * its retained window durable, so a shared counter advanced once per task whatever the
+   * utilisation: an operator watching it saw a spill on every healthy task at a fraction of a
+   * percent of the budget, could not tell that from genuine pressure, and could not measure a spill
+   * rate against the configured threshold at all. This counter now advances only when the budget
+   * actually forced an eviction -- the threshold was met, an admission needed room, or the task
+   * memory manager asked for memory back -- which is the condition the metric documents.
+   * [[durabilityFlushCount]] reports the other event.
+   */
   def spillCount: Long = spillCountTotal.get()
+
+  /**
+   * Number of end-of-stream durability flushes performed, counted once per flush.
+   *
+   * A flush is not a spill in the flow-control sense: it is how a producer converts the window a
+   * consumer has not yet acknowledged into something the executor-scoped block resolver can still
+   * serve after the task's memory has gone. It happens once per successful streaming map task,
+   * independently of utilisation, and its volume reaches the ordinary spill accumulators on
+   * [[org.apache.spark.executor.TaskMetrics]] exactly as an eviction's does -- the bytes really did
+   * reach local disk. Only the *event count* is kept apart, so that `shuffle.streaming.spillCount`
+   * remains a pressure signal.
+   */
+  def durabilityFlushCount: Long = durabilityFlushTotal.get()
+
+  /**
+   * Number of blocks admitted straight to local disk by [[admitDurably]] because the buffer
+   * allowance could not hold them.
+   *
+   * A non-zero reading says a producer met the allowance's ceiling and spilled rather than failing,
+   * which is the specified behaviour and not an error -- but it is also the signal that the framing
+   * arithmetic and the configured percentage are tight for the shuffle's width, so it is in
+   * the producing task's summary. Kept out of `shuffle.streaming.spillCount` because no eviction
+   * happened and no memory was reclaimed; the volume reaches `diskBytesSpilled` all the same.
+   */
+  def durableAdmissionCount: Long = durableAdmissionTotal.get()
 
   /**
    * Number of eviction attempts that failed, for instance because the local disk rejected the
@@ -1125,7 +1191,7 @@ private[spark] class MemorySpillManager(
             }
             rollbackReservation(partitionId, sequenceNumber, previousSequence, required)
             recordMemoryPressure(required, granted)
-            if (attempt >= MAX_ADMISSION_ATTEMPTS || evictAndRelease(required) <= 0L) {
+            if (attempt >= MAX_ADMISSION_ATTEMPTS || !reclaimRoom(required)) {
               settled = true
             }
           }
@@ -1134,7 +1200,7 @@ private[spark] class MemorySpillManager(
           // Transient: the budget is full right now. Evict and re-evaluate. A final refusal raises
           // the memory-pressure signal, because a producer that cannot buffer is precisely the
           // condition under which the fallback policy must route the shuffle to sort-based shuffle.
-          if (attempt >= MAX_ADMISSION_ATTEMPTS || evictAndRelease(required) <= 0L) {
+          if (attempt >= MAX_ADMISSION_ATTEMPTS || !reclaimRoom(required)) {
             recordMemoryPressure(required, 0L)
             settled = true
           }
@@ -1158,6 +1224,164 @@ private[spark] class MemorySpillManager(
       }
     }
     admitted
+  }
+
+  /**
+   * Admits one block by writing it straight to local disk, charging the buffer budget nothing.
+   *
+   * '''Why this exists.''' The buffer allowance is a bound, and a bound that is reached has to have
+   * an answer other than failure. [[bufferBlock]] evicts, waits out a concurrent eviction and
+   * retries, but every one of those routes reclaims memory *this* producer occupies -- and the
+   * occupant may be the framing scratch of the other tasks sharing the executor, which no eviction
+   * this task can run will ever return. A producer in that position has framed a block it must
+   * account for and cannot buffer, and the specification's answer is to spill rather than to fail:
+   * every path has to terminate in a working shuffle. So the block skips memory altogether and goes
+   * to the same temporary shuffle block, through the same writer, as an evicted one.
+   *
+   * '''Why the result is indistinguishable from an eviction.''' The record published here is the
+   * record eviction publishes, registered in the same spilled store under the same lock, so every
+   * read path -- [[retainsBlock]], [[retainedPayload]], [[retainedPayloadLength]],
+   * [[lowestRetainedSequence]], [[spilledBlock]] and the resolver behind them -- answers for it
+   * exactly as it answers for a block that was buffered first and evicted later. A consumer cannot
+   * tell the difference, which is the property that makes this safe: the map output stays complete
+   * and stays reassemblable, so no hybrid of streamed and sort-written output is ever produced.
+   *
+   * '''What is still refused.''' Everything that no amount of disk can fix. Closure, a partition
+   * outside the admissible domain, a payload outside the protocol's framing rules, and both
+   * retained-metadata ceilings are checked exactly as [[bufferBlock]] checks them, because each of
+   * those bounds something other than memory. What is *not* checked is the per-partition allowance
+   * and the executor-wide quota -- being unable to satisfy them is precisely the condition this
+   * method answers. An out-of-order sequence is still a programming error and still raises, so the
+   * gap-free ascending run every consumer depends on is enforced on this path too.
+   *
+   * @param partitionId the reduce partition the block belongs to
+   * @param sequenceNumber the block's position in that partition's gap-free ascending run
+   * @param data the framed payload, adopted rather than copied for the duration of the write
+   * @return true when the block is durably retained and servable; false when it was refused or the
+   *         write failed, in which case nothing was published and the sequence is unclaimed
+   */
+  def admitDurably(partitionId: Int, sequenceNumber: Long, data: Array[Byte]): Boolean = {
+    require(partitionId >= 0, s"partitionId must be non-negative, but was $partitionId")
+    require(sequenceNumber >= 0L, s"sequenceNumber must be non-negative, but was $sequenceNumber")
+    require(data != null, "A streaming shuffle block payload must not be null")
+    require(data.length > 0,
+      s"A streaming shuffle block payload must not be empty, but partition $partitionId " +
+        s"sequence $sequenceNumber carried none")
+    require(data.length <= MAX_BLOCK_PAYLOAD_BYTES,
+      s"A streaming shuffle block payload may not exceed $MAX_BLOCK_PAYLOAD_BYTES bytes, but " +
+        s"partition $partitionId sequence $sequenceNumber carried ${data.length} bytes")
+
+    lock.synchronized(claimDurableSequenceLocked(partitionId, sequenceNumber)) match {
+      case None =>
+        false
+      case Some(previousSequence) =>
+        // Written with no monitor held: the write is a filesystem operation of unbounded duration,
+        // and holding `lock` across it would stall every admission, acknowledgement and eviction on
+        // the executor for as long as the disk took.
+        val block = BufferedBlock(partitionId, sequenceNumber, data)
+        spillPartitionBlocks(partitionId, Seq(block)) match {
+          case Some(records) =>
+            val committedBytes = lock.synchronized {
+              publishDurableAdmissionLocked(partitionId, records)
+            }
+            diskBytesSpilledTotal.addAndGet(committedBytes)
+            durableAdmissionTotal.incrementAndGet()
+            true
+          case None =>
+            // `spillPartitionBlocks` has already reported the failure, rolled the file back and
+            // unlinked it. All that is left is to unclaim the sequence, so the producer's own
+            // recovery -- or a later attempt at the same block -- is not rejected as a duplicate.
+            lock.synchronized {
+              rollbackDurableSequenceLocked(partitionId, sequenceNumber, previousSequence)
+            }
+            false
+        }
+    }
+  }
+
+  /**
+   * Claims one sequence number for a durable admission, or declines it. Must hold `lock`.
+   *
+   * Returns the sequence the partition had accepted before this claim, which is what a failed write
+   * restores. Every check here bounds something a disk cannot supply; the two allowance checks of
+   * [[reserveLocked]] are deliberately absent.
+   */
+  private def claimDurableSequenceLocked(
+      partitionId: Int,
+      sequenceNumber: Long): Option[Long] = {
+    val existing = partitionBuffers.get(partitionId)
+    val lastAccepted = existing.map(_.lastAcceptedSequence).getOrElse(UNSET_SEQUENCE)
+    val expected = if (lastAccepted == UNSET_SEQUENCE) sequenceNumber else lastAccepted + 1L
+    if (closed.get() || partitionId >= partitionDomainBound) {
+      None
+    } else if (sequenceNumber != expected) {
+      throw new IllegalArgumentException(
+        s"Streaming shuffle blocks for one partition must form a gap-free ascending run, so " +
+          s"partition $partitionId expected sequence $expected but was offered $sequenceNumber " +
+          "for a durable admission")
+    } else if (spilledRecordCount >= MAX_RETAINED_SPILL_RECORDS_TOTAL) {
+      None
+    } else if (existing.exists(_.retainedBlockCount >= MAX_RETAINED_BLOCKS_PER_PARTITION)) {
+      None
+    } else {
+      val buffer = partitionBuffers.getOrElseUpdate(partitionId, new PartitionBuffer(partitionId))
+      buffer.lastAcceptedSequence = sequenceNumber
+      Some(lastAccepted)
+    }
+  }
+
+  /**
+   * Publishes the records of a completed durable admission and reports their committed length.
+   * Must hold `lock`.
+   *
+   * Deliberately identical to the published half of [[publishEvictionLocked]] minus everything to
+   * do with memory: no buffered tally moves, because these bytes were never in the tally, and
+   * `memoryBytesSpilled` is not advanced, because no memory was freed by writing them. Their volume
+   * is real disk output and reaches `diskBytesSpilled` like every other spilled byte.
+   *
+   * A partition whose buffer vanished while the write was in flight -- only closure does that --
+   * cannot publish, so the files are retired rather than left unnameable on local disk.
+   */
+  private def publishDurableAdmissionLocked(
+      partitionId: Int,
+      records: Seq[SpilledBlock]): Long = {
+    partitionBuffers.get(partitionId) match {
+      case Some(buffer) if !closed.get() =>
+        buffer.spilledBlockRecords ++= records
+        spilledRecordCount += records.size
+        records.foreach { record =>
+          spillFilesByBlockId.update(record.blockId, record.file)
+          spillFileBlockIds.update(record.file, record.blockId)
+        }
+        buffer.lastAccessTimeMs = clock.getTimeMillis()
+        records.foldLeft(0L)((acc, record) => acc + record.length)
+      case _ =>
+        records.map(_.file).distinct.foreach { file =>
+          if (retireSpillFileLocked(file)) {
+            deleteSpillFile(file)
+          }
+        }
+        0L
+    }
+  }
+
+  /**
+   * Restores the accepted sequence of a partition after a durable admission failed to write. Must
+   * hold `lock`.
+   *
+   * Conditional, exactly as [[rollbackReservation]] is: the watermark is restored only while it
+   * still names this attempt, so a concurrent admission that has already moved it past this one is
+   * never clobbered.
+   */
+  private def rollbackDurableSequenceLocked(
+      partitionId: Int,
+      sequenceNumber: Long,
+      previousSequence: Long): Unit = {
+    partitionBuffers.get(partitionId).foreach { buffer =>
+      if (buffer.lastAcceptedSequence == sequenceNumber) {
+        buffer.lastAcceptedSequence = previousSequence
+      }
+    }
   }
 
   /**
@@ -1402,7 +1626,7 @@ private[spark] class MemorySpillManager(
             recordMemoryPressure(bytes, acquired)
           }
           settled = granted || attempt >= MAX_ADMISSION_ATTEMPTS
-        } else if (attempt >= MAX_ADMISSION_ATTEMPTS || evictAndRelease(bytes) <= 0L) {
+        } else if (attempt >= MAX_ADMISSION_ATTEMPTS || !reclaimRoom(bytes)) {
           recordMemoryPressure(bytes, 0L)
           settled = true
         }
@@ -1457,12 +1681,30 @@ private[spark] class MemorySpillManager(
    * @return bytes moved to disk by this call, which is zero when nothing was held in memory
    */
   def spillAllRetained(): Long = {
-    val held = bufferedBytes
-    if (closed.get() || held <= 0L) {
-      0L
-    } else {
-      evictAndRelease(held)
+    var moved = 0L
+    var passes = 0
+    var held = bufferedBytes
+    // Repeated until memory is empty rather than attempted once. A single pass leaves bytes behind
+    // in two ordinary situations, and in both the caller would report a retained window as
+    // unreachable while it was in fact being written to disk: a reclamation started by the
+    // threshold poller is mid-flight, so nothing is selectable and the aggregate still counts its
+    // bytes; or a
+    // consumer's acknowledgement retired blocks between the tally being read and the plan being
+    // built. `evictAndRelease` waits out the former, and this loop re-reads the tally so the latter
+    // simply converges. Bounded by a pass count so a device that keeps failing its writes ends the
+    // loop instead of spinning on it.
+    while (!closed.get() && held > 0L && passes < MAX_DURABILITY_FLUSH_PASSES) {
+      passes += 1
+      val freed = evictAndRelease(held, durabilityFlush = true)
+      moved += freed
+      held = bufferedBytes
+      if (freed <= 0L && held > 0L) {
+        // Nothing left memory and nothing is being reclaimed, so another pass would plan the same
+        // empty eviction. Stop and let the caller report what is still resident.
+        passes = MAX_DURABILITY_FLUSH_PASSES
+      }
     }
+    moved
   }
 
   /**
@@ -1481,7 +1723,7 @@ private[spark] class MemorySpillManager(
    */
   override def spill(size: Long, trigger: MemoryConsumer): Long = {
     if (trigger != this && taskMemoryManager.getTungstenMemoryMode == MemoryMode.ON_HEAP) {
-      val freed = evictToDisk(size)
+      val freed = evictToDisk(size, durabilityFlush = false)
       if (freed <= 0L) {
         0L
       } else {
@@ -1496,13 +1738,96 @@ private[spark] class MemorySpillManager(
     }
   }
 
-  /** Evicts to disk and then hands the freed bytes back to both budgets. */
-  private def evictAndRelease(bytesToFree: Long): Long = {
-    val freed = evictToDisk(bytesToFree)
+  /**
+   * Evicts to disk and then hands the freed bytes back to both budgets.
+   *
+   * '''Why a nil result is retried rather than believed.''' Exactly one eviction runs at a time,
+   * and the threshold poller runs on a thread of its own, so a caller that needs room can arrive
+   * while a reclamation is already in flight. In that window nothing is selectable -- the detached
+   * bytes have left every partition's own tally -- so a single pass returns zero, which callers
+   * read as "the budget is exhausted": a refused admission, a refused scratch reservation, and a
+   * retained window reported as not durable although it was being written to disk as the report was
+   * made. Waiting for the reclamation that is already under way and then re-planning turns that
+   * false verdict into the short wait it always was. The wait is bounded, so a genuinely exhausted
+   * budget still refuses, and a genuinely slow device still refuses rather than blocking forever.
+   *
+   * Never called from [[spill]]: that callback runs with the task memory manager's own monitor held
+   * by this thread, and parking there could hold it against a thread this one is waiting for.
+   *
+   * @param bytesToFree the number of bytes the caller needs to leave memory
+   * @return the number of bytes that actually left memory, across every pass this call made
+   */
+  private def evictAndRelease(bytesToFree: Long, durabilityFlush: Boolean = false): Long = {
+    var freed = evictToDisk(bytesToFree, durabilityFlush)
+    var passes = 1
+    while (freed <= 0L && passes < MAX_EVICTION_PASSES && !closed.get() &&
+        awaitEvictionQuiescence() && bufferedBytes > 0L) {
+      passes += 1
+      freed = evictToDisk(bytesToFree, durabilityFlush)
+    }
     if (freed > 0L) {
       releaseReclaimedBytes(freed)
     }
     freed
+  }
+
+  /**
+   * Waits, bounded, for any eviction in flight to publish what it wrote.
+   *
+   * Bounded by a slice count rather than by a deadline, so the wait terminates on a held clock as
+   * well as on a running one -- this class takes its clock by injection precisely so that a suite
+   * can stop it, and a loop that only consulted the clock would never end there. The monitor is
+   * released by `wait`, which is what lets the evicting thread reach its publish stage; that stage
+   * wakes every waiter, so the common case costs one notification rather than the whole budget.
+   *
+   * An interrupt ends the wait immediately and is re-asserted rather than swallowed: the task
+   * thread is the usual caller and Spark cancels a task by interrupting it.
+   *
+   * @return true when no eviction is in flight any more, false when one outlasted the wait
+   */
+  private def awaitEvictionQuiescence(): Boolean = lock.synchronized {
+    var slices = 0
+    while (evictionInProgress && !closed.get() && slices < EVICTION_QUIESCENCE_SLICES) {
+      slices += 1
+      try {
+        lock.wait(EVICTION_QUIESCENCE_SLICE_MS)
+      } catch {
+        case _: InterruptedException =>
+          Thread.currentThread().interrupt()
+          slices = EVICTION_QUIESCENCE_SLICES
+      }
+    }
+    !evictionInProgress
+  }
+
+  /**
+   * Whether a reclamation is between its detach stage and its publish stage right now.
+   *
+   * Published so that a producer deciding whether to defer a refused admission can consult the fact
+   * itself instead of inferring it from which partitions happen to be selectable.
+   */
+  def evictionInFlight: Boolean = lock.synchronized(evictionInProgress)
+
+  /**
+   * Tries to make `bytesToFree` bytes of room, and reports whether retrying a reservation is worth
+   * it.
+   *
+   * '''Why this is not just "did I free anything".''' The budget is executor wide and reclamation
+   * is concurrent, so room can appear without this call having freed a byte -- the threshold
+   * poller's
+   * eviction publishes, or a sibling producer's acknowledgement retires its window. Answering "no
+   * progress" in that situation is precisely how a reservation came to be refused at the moment the
+   * budget was being freed, so the shared allowance is sampled either side of the attempt and a
+   * reduction anywhere in it counts as progress just as this instance's own eviction does.
+   *
+   * @param bytesToFree the room the caller needs
+   * @return true when room was reclaimed, by this call or by another party, and the caller should
+   *         re-attempt its reservation
+   */
+  private def reclaimRoom(bytesToFree: Long): Boolean = {
+    val reservedBefore = quota.reservedBytes
+    val freed = evictAndRelease(bytesToFree)
+    freed > 0L || quota.reservedBytes < reservedBefore
   }
 
   /**
@@ -1529,8 +1854,16 @@ private[spark] class MemorySpillManager(
    * The caller, not this method, returns the freed bytes to the memory manager. Keeping the two
    * separate is what lets the [[spill]] callback report the released amount to `TaskMemoryManager`
    * while still performing the release outside this class's own monitor.
+   *
+   * @param bytesToFree the number of bytes the caller needs to leave memory
+   * @param durabilityFlush whether this eviction is the end-of-stream flush that makes a retained
+   *                        window durable rather than a reclamation the budget forced. The
+   *                        mechanics are identical; what differs is the event counter it advances,
+   *                        and
+   *                        therefore whether it appears in the `shuffle.streaming.spillCount`
+   *                        pressure signal. See [[spillCount]] and [[durabilityFlushCount]]
    */
-  private def evictToDisk(bytesToFree: Long): Long = {
+  private def evictToDisk(bytesToFree: Long, durabilityFlush: Boolean): Long = {
     if (bytesToFree <= 0L) {
       0L
     } else {
@@ -1555,42 +1888,86 @@ private[spark] class MemorySpillManager(
         val result = lock.synchronized(publishEvictionLocked(written))
         result.filesToDelete.foreach(deleteSpillFile)
         if (result.freedBytes > 0L) {
+          // The volumes are accounted the same way whichever event this was, because the bytes
+          // really did leave memory for local disk in both cases and the feature specifies that
+          // they appear on the existing spill accumulators. Only the event count is split.
           memoryBytesSpilledTotal.addAndGet(result.freedBytes)
           diskBytesSpilledTotal.addAndGet(result.committedDiskBytes)
-          spillCountTotal.incrementAndGet()
-          // One increment per eviction event, never one per partition and never one per block,
-          // which is what keeps the telemetry cost off the data path.
-          StreamingShuffleMetricsSource.incrementSpillCount(1L)
           val elapsedMs = clock.getTimeMillis() - startTimeMs
           lastSpillMs.set(elapsedMs)
-          // Spilling is a recurring condition, not an incident: once a workload is over its budget
-          // every eviction would produce a line, and a producer can evict many times a second. The
-          // default-level record is therefore bounded to one line per aggregation window and
-          // carries the cumulative totals plus how many evictions it stands in for, so an operator
-          // loses no information about volume -- only the per-event granularity, which the
-          // streaming debug key restores. This is what keeps the executor inside its log-volume
-          // budget without ever going silent about spilling.
-          spillLogGate.admit(clock.getTimeMillis()) match {
-            case Some(unreportedEvents) =>
-              logInfo(log"Streaming shuffle evicted " +
-                log"${MDC(NUM_PARTITIONS, result.evictedPartitions)} buffered partitions holding " +
-                log"${MDC(BYTE_SIZE, Utils.bytesToString(result.freedBytes))} to local disk in " +
-                log"${MDC(DURATION, elapsedMs)} ms, committing " +
-                log"${MDC(NUM_BYTES, result.committedDiskBytes)} bytes " +
-                log"(${MDC(COUNT, spillCountTotal.get())} evictions and " +
-                log"${MDC(MEMORY_SIZE, memoryBytesSpilledTotal.get())} bytes spilled so far, " +
-                log"${MDC(NUM_SKIPPED, unreportedEvents)} evictions not reported individually)")
-            case None =>
-              if (debugEnabled) {
-                logInfo(log"Streaming shuffle evicted " +
-                  log"${MDC(NUM_PARTITIONS, result.evictedPartitions)} buffered partitions " +
-                  log"holding ${MDC(BYTE_SIZE, Utils.bytesToString(result.freedBytes))} to local " +
-                  log"disk in ${MDC(DURATION, elapsedMs)} ms")
-              }
+          if (durabilityFlush) {
+            durabilityFlushTotal.incrementAndGet()
+            reportDurabilityFlush(result, elapsedMs)
+          } else {
+            spillCountTotal.incrementAndGet()
+            // One increment per eviction event, never one per partition and never one per block,
+            // which is what keeps the telemetry cost off the data path.
+            StreamingShuffleMetricsSource.incrementSpillCount(1L)
+            reportThresholdEviction(result, elapsedMs)
           }
         }
         result.freedBytes
       }
+    }
+  }
+
+  /**
+   * Reports one reclamation the budget forced, through its own aggregation window.
+   *
+   * Spilling under pressure is a recurring condition, not an incident: once a workload is over its
+   * budget every eviction would produce a line, and a producer can evict many times a second. The
+   * default-level record is therefore bounded to one line per aggregation window and carries the
+   * cumulative totals plus how many evictions it stands in for, so an operator loses no information
+   * about volume -- only the per-event granularity, which the streaming debug key restores. This is
+   * what keeps the executor inside its log-volume budget without ever going silent about spilling.
+   */
+  private def reportThresholdEviction(result: EvictionResult, elapsedMs: Long): Unit = {
+    spillLogGate.admit(clock.getTimeMillis()) match {
+      case Some(unreportedEvents) =>
+        logInfo(log"Streaming shuffle evicted " +
+          log"${MDC(NUM_PARTITIONS, result.evictedPartitions)} buffered partitions holding " +
+          log"${MDC(BYTE_SIZE, Utils.bytesToString(result.freedBytes))} to local disk in " +
+          log"${MDC(DURATION, elapsedMs)} ms, committing " +
+          log"${MDC(NUM_BYTES, result.committedDiskBytes)} bytes " +
+          log"(${MDC(COUNT, spillCountTotal.get())} evictions and " +
+          log"${MDC(MEMORY_SIZE, memoryBytesSpilledTotal.get())} bytes spilled so far, " +
+          log"${MDC(NUM_SKIPPED, unreportedEvents)} evictions not reported individually)")
+      case None =>
+        if (debugEnabled) {
+          logInfo(log"Streaming shuffle evicted " +
+            log"${MDC(NUM_PARTITIONS, result.evictedPartitions)} buffered partitions " +
+            log"holding ${MDC(BYTE_SIZE, Utils.bytesToString(result.freedBytes))} to local " +
+            log"disk in ${MDC(DURATION, elapsedMs)} ms")
+        }
+    }
+  }
+
+  /**
+   * Reports one end-of-stream durability flush, through a window of its own.
+   *
+   * Worded as what it is -- retained output being made durable so a consumer can still be served
+   * after this task's memory has gone -- rather than as a spill, because describing a routine step
+   * of every successful map task as memory pressure is what made the spill signal unreadable. A
+   * window of its own so that a burst of flushes cannot silence the first genuine eviction, or the
+   * reverse.
+   */
+  private def reportDurabilityFlush(result: EvictionResult, elapsedMs: Long): Unit = {
+    durabilityFlushLogGate.admit(clock.getTimeMillis()) match {
+      case Some(unreportedEvents) =>
+        logInfo(log"Streaming shuffle made the retained output of " +
+          log"${MDC(NUM_PARTITIONS, result.evictedPartitions)} partitions durable, moving " +
+          log"${MDC(BYTE_SIZE, Utils.bytesToString(result.freedBytes))} to local disk in " +
+          log"${MDC(DURATION, elapsedMs)} ms and committing " +
+          log"${MDC(NUM_BYTES, result.committedDiskBytes)} bytes " +
+          log"(${MDC(COUNT, durabilityFlushTotal.get())} flushes so far, " +
+          log"${MDC(NUM_SKIPPED, unreportedEvents)} not reported individually)")
+      case None =>
+        if (debugEnabled) {
+          logInfo(log"Streaming shuffle made the retained output of " +
+            log"${MDC(NUM_PARTITIONS, result.evictedPartitions)} partitions durable, moving " +
+            log"${MDC(BYTE_SIZE, Utils.bytesToString(result.freedBytes))} to local disk in " +
+            log"${MDC(DURATION, elapsedMs)} ms")
+        }
     }
   }
 
@@ -1709,6 +2086,12 @@ private[spark] class MemorySpillManager(
       }
     }
     evictionInProgress = false
+    // Woken with the monitor held, which is the only safe moment: a waiter re-tests
+    // `evictionInProgress` under the same monitor, so it cannot miss this transition and cannot
+    // observe a half-published eviction. This is what lets a producer that needs room, or a
+    // producer making its retained window durable, wait out an eviction another thread is running
+    // instead of reading the aggregate tally mid-flight and declaring the budget exhausted.
+    lock.notifyAll()
     EvictionResult(freedBytes, committedDiskBytes, evictedPartitions, filesToDelete.toSeq)
   }
 
@@ -2244,7 +2627,8 @@ private[spark] class MemorySpillManager(
       reportTaskMetrics(context)
       if (debugEnabled) {
         logInfo(log"Released streaming shuffle buffers after " +
-          log"${MDC(COUNT, spillCountTotal.get())} evictions totalling " +
+          log"${MDC(COUNT, spillCountTotal.get())} evictions and " +
+          log"${MDC(NUM_EVENTS, durabilityFlushTotal.get())} durability flushes totalling " +
           log"${MDC(BYTE_SIZE, Utils.bytesToString(memoryBytesSpilledTotal.get()))}")
       }
     }
@@ -2543,6 +2927,45 @@ private[spark] object MemorySpillManager extends Logging {
    * path.
    */
   val MAX_ADMISSION_ATTEMPTS: Int = 2
+
+  /**
+   * Eviction passes one reclamation request makes before it accepts that nothing can be freed.
+   *
+   * More than one is needed because exactly one eviction runs at a time and the threshold poller
+   * runs on its own thread: a request that arrives mid-reclamation plans nothing, and believing
+   * that first empty plan is what turned a reclamation in progress into a refused reservation. Two
+   * is
+   * enough -- the second pass runs after the first has waited the in-flight eviction out -- and a
+   * bound is what keeps a device that fails every write from being retried forever.
+   */
+  val MAX_EVICTION_PASSES: Int = 2
+
+  /**
+   * Passes the end-of-stream durability flush makes before it reports what is still resident.
+   *
+   * Each pass re-reads the live tally, so a flush converges past both a reclamation that was
+   * already in flight and an acknowledgement that retired blocks between the tally being read and
+   * the plan
+   * being built. Four passes covers those interleavings with room to spare while still terminating.
+   */
+  val MAX_DURABILITY_FLUSH_PASSES: Int = 4
+
+  /**
+   * One wait slice, in milliseconds, spent waiting for an eviction in flight to publish.
+   *
+   * Short, because the wait ends on a notification in the ordinary case and the slice only bounds
+   * how long a lost notification could cost.
+   */
+  val EVICTION_QUIESCENCE_SLICE_MS: Long = 10L
+
+  /**
+   * Slices a caller waits for an eviction in flight before giving up on it.
+   *
+   * Counted rather than timed so the wait terminates under an injected clock that does not advance.
+   * Fifty slices of ten milliseconds bounds the wait at half a second, which is far longer than a
+   * spill write of the sizes this budget admits and far shorter than any task timeout.
+   */
+  val EVICTION_QUIESCENCE_SLICES: Int = 50
 
   /**
    * Hard bound on the blocks one partition may retain in memory, mid-eviction and on disk together.
@@ -2853,6 +3276,58 @@ private[spark] object MemorySpillManager extends Logging {
       StreamingShuffleMetricsSource.registerBufferUtilizationContributor(sharedQuota)
     }
     sharedQuota
+  }
+
+  /**
+   * The number of map tasks that can run at once in this JVM, floored at one.
+   *
+   * '''Why the streaming buffer arithmetic needs this.''' The buffer allowance is executor wide,
+   * and a producer's framing scratch -- one serialization accumulator per active partition -- is
+   * the half of that allowance which cannot be spilled. Dividing the allowance by the partition
+   * count alone therefore bounds what *one* task holds and not what the executor holds in total:
+   * `slots` tasks each framing to a share sized for a single task will between them claim `slots`
+   * times that share, and at an entirely ordinary four task slots that is the whole allowance with
+   * no room left for a single buffered block. Sizing the framing share per slot is what makes the
+   * configured percentage a bound on the executor rather than on one task of it.
+   *
+   * '''Where the answer comes from, and why three sources are needed.''' Two configuration keys
+   * carry it, and neither covers every master: `spark.executor.cores` is set when a profile
+   * or an operator declares it, while a plain `local[n]` master encodes the count in the master
+   * string and leaves that key at its default of one. The larger of the two is taken so that
+   * whichever one is authoritative wins, and the result is divided by `spark.task.cpus`, which is
+   * what actually converts cores into concurrent tasks.
+   *
+   * A coarse-grained executor can carry neither. Its true core count arrives as the `numCores`
+   * *argument* to `SparkEnv.createExecutorEnv` -- passed on from the backend's `--cores` -- and is
+   * handed to the memory manager as a plain constructor parameter that nothing exposes, so it is
+   * unreadable from here; meanwhile `spark.executor.cores` stays at its default and the master is
+   * not a local pattern, which between them read as a single task slot. Believing that is what
+   * makes the framing share four times too large on such an executor, and four concurrent tasks
+   * then claim the whole allowance -- the exact failure this arithmetic exists to prevent.
+   *
+   * So when the configuration is silent, the processor count is used instead. That is not a guess
+   * invented here: it is precisely what Spark's own `MemoryManager` does with the identical unknown
+   * when it sizes the default page -- `if (numCores > 0) numCores else availableProcessors` -- and
+   * coarse-grained executor is normally given the cores of the machine it was placed on. The
+   * substitution is applied only when neither key spoke, so a declared count is never overridden,
+   * and over-estimating is the safe direction: a larger divisor reserves less framing scratch,
+   * which costs block size rather than correctness, while under-estimating exhausts the allowance.
+   *
+   * Read once per component and held immutably, like every other configuration value in this
+   * subsystem, so a configuration change takes effect on executor restart and nowhere else.
+   *
+   * @param conf the configuration to derive the count from
+   */
+  def executorTaskSlots(conf: SparkConf): Int = {
+    val cpusPerTask = math.max(1, conf.get(CPUS_PER_TASK))
+    val declaredExecutorCores =
+      if (conf.contains(EXECUTOR_CORES.key)) math.max(0, conf.get(EXECUTOR_CORES)) else 0
+    val localTaskThreads = math.max(0,
+      SparkContext.numDriverCores(conf.get("spark.master", "local"), conf))
+    val declaredCores = math.max(declaredExecutorCores, localTaskThreads)
+    val cores =
+      if (declaredCores > 0) declaredCores else Runtime.getRuntime.availableProcessors()
+    math.max(1, math.max(1, cores) / cpusPerTask)
   }
 
   /**

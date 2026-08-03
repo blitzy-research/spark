@@ -946,6 +946,17 @@ private[spark] case class StreamingShuffleState(
  * address. It also supplies `numConcurrentShuffles`, the divisor of the token-bucket refill rate
  * `maxBandwidthMBps * 1 MiB / numConcurrentShuffles`, which no existing Spark API reports.
  *
+ * What "while the map stage is in flight" does and does not promise. This endpoint answers a lookup
+ * against producers that are merely *registered*, so a consumer asking during production is
+ * answered rather than made to wait -- but when a consumer asks is decided by task submission,
+ * which belongs to the DAG scheduler and is an absolute preservation zone for this feature. Under
+ * the unmodified scheduler a reduce stage is submitted only once its map stage reports available
+ * output, so at an ordinary stage boundary the lookups this endpoint serves name producers that
+ * have already finished, and their retained output is served from the resolver. The reply also
+ * carries the completion set, so a reader records which of the two actually happened instead of
+ * assuming the overlap. See `StreamingShuffleWriter` and `StreamingShuffleServerHandler` for the
+ * same statement from the producing side.
+ *
  * Coexistence with the classic path. This registry is entirely separate from map-output tracking
  * and shares no state with it. Sort-based shuffle remains the default and the fallback, and
  * nothing here is reachable unless
