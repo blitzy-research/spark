@@ -1233,6 +1233,28 @@ This is the component with the largest amount of instrumented metrics
   - generatedMethodSize (histogram)
   - sourceCodeSize (histogram)
 
+- namespace=shuffle.streaming
+  - **note:** these metrics are conditional to a configuration parameter:
+    `spark.metrics.staticSources.enabled` (default is true)
+  - **note:** the source is registered automatically on both the driver and every executor when
+    the metrics system starts, and reaches an operator through the sinks configured in
+    `metrics.properties`, such as `JmxSink`, in the same way as every other Spark metric. The
+    metrics are only updated while streaming shuffle is active, which requires
+    `spark.shuffle.manager=streaming` together with `spark.shuffle.streaming.enabled=true`
+    (default is false), and they report 0 otherwise.
+    See [Streaming Shuffle](streaming-shuffle.html) for details.
+  - bufferUtilizationPercent (gauge): executor-wide utilization of the streaming shuffle buffer
+    budget, as a percentage. A value approaching `spark.shuffle.streaming.spillThreshold`
+    (default is 80) predicts spilling; the value is not clamped, so a momentarily over-budget
+    executor reads above 100.
+  - spillCount (counter): number of spill events performed to keep buffer utilization within
+    `spark.shuffle.streaming.spillThreshold`, counted once per spill event rather than once per
+    evicted partition
+  - backpressureEvents (counter): number of transitions into a throttled state, whether caused by
+    exhausted consumer credit or by a refused rate-limiter acquisition, counted once per transition
+  - partialReadInvalidations (counter): number of atomic, per-producer partial read invalidations
+    performed after a producer failure, each of which is recovered by ordinary stage recomputation
+
 - namespace=DAGScheduler
   - job.activeJobs
   - job.allJobs
@@ -1437,6 +1459,28 @@ These metrics are exposed by Spark executors.
   - generatedClassSize (histogram)
   - generatedMethodSize (histogram)
   - sourceCodeSize (histogram)
+
+- namespace=shuffle.streaming
+  - **note:** these metrics are conditional to a configuration parameter:
+    `spark.metrics.staticSources.enabled` (default is true)
+  - **note:** the source is registered automatically on both the driver and every executor when
+    the metrics system starts, and reaches an operator through the sinks configured in
+    `metrics.properties`, such as `JmxSink`, in the same way as every other Spark metric. The
+    metrics are only updated while streaming shuffle is active, which requires
+    `spark.shuffle.manager=streaming` together with `spark.shuffle.streaming.enabled=true`
+    (default is false), and they report 0 otherwise.
+    See [Streaming Shuffle](streaming-shuffle.html) for details.
+  - bufferUtilizationPercent (gauge): executor-wide utilization of the streaming shuffle buffer
+    budget, as a percentage. A value approaching `spark.shuffle.streaming.spillThreshold`
+    (default is 80) predicts spilling; the value is not clamped, so a momentarily over-budget
+    executor reads above 100.
+  - spillCount (counter): number of spill events performed to keep buffer utilization within
+    `spark.shuffle.streaming.spillThreshold`, counted once per spill event rather than once per
+    evicted partition
+  - backpressureEvents (counter): number of transitions into a throttled state, whether caused by
+    exhausted consumer credit or by a refused rate-limiter acquisition, counted once per transition
+  - partialReadInvalidations (counter): number of atomic, per-producer partial read invalidations
+    performed after a producer failure, each of which is recovered by ordinary stage recomputation
 
 - namespace=plugin.\<Plugin Class Name>
   - Optional namespace(s). Metrics in this namespace are defined by user-supplied code, and

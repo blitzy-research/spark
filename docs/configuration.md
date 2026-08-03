@@ -1420,6 +1420,67 @@ Apart from these, the following properties are also available, and may be useful
   <td>3.2.0</td>
 </tr>
 <tr>
+  <td><code>spark.shuffle.streaming.enabled</code></td>
+  <td>false</td>
+  <td>
+    Whether the streaming shuffle behavior is active. This property only takes effect when
+    <code>spark.shuffle.manager</code> is set to <code>streaming</code>, which selects the streaming
+    shuffle manager. When this property is false, the streaming shuffle manager delegates every
+    service-provider call to the sort-based shuffle manager, so behavior is indistinguishable from
+    the default sort-based shuffle; this acts as a runtime kill switch that does not require
+    changing the shuffle manager. Changing this value requires an executor restart. See
+    <a href="streaming-shuffle.html">Streaming Shuffle</a> for details.
+  </td>
+  <td>4.2.0</td>
+</tr>
+<tr>
+  <td><code>spark.shuffle.streaming.bufferSizePercent</code></td>
+  <td>20</td>
+  <td>
+    Percentage of executor memory reserved across all streaming shuffle buffers. The per-partition
+    allowance is that aggregate budget divided by the number of partitions, that is
+    <code>(executorMemory * bufferSizePercent) / numPartitions</code>. Must be in the range 1 to 50;
+    values outside that range are rejected when the configuration is read. Only takes effect when
+    streaming shuffle is enabled.
+  </td>
+  <td>4.2.0</td>
+</tr>
+<tr>
+  <td><code>spark.shuffle.streaming.spillThreshold</code></td>
+  <td>80</td>
+  <td>
+    Buffer utilization percentage at which the streaming shuffle spills the largest buffered
+    partitions to local disk in LRU order. Must be in the range 50 to 95; values outside that range
+    are rejected when the configuration is read. Only takes effect when streaming shuffle is
+    enabled.
+  </td>
+  <td>4.2.0</td>
+</tr>
+<tr>
+  <td><code>spark.shuffle.streaming.maxBandwidthMBps</code></td>
+  <td>(none)</td>
+  <td>
+    When set, declares the administered network link capacity, in MB/s, against which streaming
+    shuffle egress is paced on one executor. This declares the capacity of the link rather than the
+    rate streaming is permitted to reach: streaming holds itself to 80% of the declared capacity and
+    divides that allowance evenly across the shuffles the executor is serving, so each shuffle's
+    token bucket refills at <code>(0.8 * maxBandwidthMBps) / numConcurrentShuffles</code> MB/s. Must
+    be positive. When unset, streaming shuffle egress is uncapped and no pacing is applied at all.
+    Changing this value requires an executor restart. Only takes effect when streaming shuffle is
+    enabled.
+  </td>
+  <td>4.2.0</td>
+</tr>
+<tr>
+  <td><code>spark.shuffle.streaming.debug</code></td>
+  <td>false</td>
+  <td>
+    Whether verbose streaming shuffle debug logging is emitted for the streaming shuffle subsystem.
+    Off by default to keep log volume bounded. Only takes effect when streaming shuffle is enabled.
+  </td>
+  <td>4.2.0</td>
+</tr>
+<tr>
   <td><code>spark.shuffle.service.fetch.rdd.enabled</code></td>
   <td>false</td>
   <td>
