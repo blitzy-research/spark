@@ -46,19 +46,13 @@ import org.apache.spark.shuffle.{ShuffleReadMetricsReporter, ShuffleWriteMetrics
 import org.apache.spark.util.{Clock, ManualClock, SystemClock, ThreadUtils, Utils}
 
 /**
- * ScalaTest tag carried by the long-running streaming shuffle stress workload.
+ * ScalaTest tag carried by the five-minute streaming shuffle stress workload.
  *
- * The workload the tag marks runs for five minutes by design, which is well inside the twenty
- * minute per-test ceiling `SparkFunSuite` imposes but far too long for a fast verification pass.
- * Declaring the tag here rather than in the shared tags module keeps the whole feature additive:
- * nothing outside this folder changes, and no build file changes either, because the exclusion
- * wiring already exists. Sbt maps `-Dtest.exclude.tags` onto ScalaTest's `-l`, and Maven surfaces
- * the same property through its excluded-groups and tags-to-exclude settings. The tag is not a
- * member of the build's default exclusion list, so a full run INCLUDES the stress workload and
- * only a run that names this tag explicitly leaves it out.
- *
- * The tag string is the fully qualified name of this object, which is the convention ScalaTest
- * expects and which keeps the value unambiguous when it appears on a command line.
+ * Declared here rather than in the shared tags module so the feature stays additive: the exclusion
+ * wiring already exists, and sbt's `-Dtest.exclude.tags` and Maven's excluded-groups settings both
+ * accept this tag's name. It is not a member of the build's default exclusion list, so a full run
+ * includes the workload and only a run naming this tag leaves it out. The tag string is this
+ * object's fully qualified name, which is the convention ScalaTest expects.
  */
 object StreamingShuffleStressTest
   extends Tag("org.apache.spark.shuffle.streaming.StreamingShuffleStressTest")
@@ -67,23 +61,14 @@ object StreamingShuffleStressTest
  * A `ShuffleWriteMetricsReporter` that accumulates every reported figure so a test can assert on
  * what the streaming write path actually reported.
  *
- * Two properties of the reporter contract shape this class.
+ * All five members of the reporter are implemented, each re-declaring the `private[spark]` modifier
+ * the trait carries on the method itself, because a partial implementation would not compile.
  *
- * First, every method of `ShuffleWriteMetricsReporter` carries the `private[spark]` visibility
- * modifier on the method itself, not merely on the trait, so every override here must re-declare
- * it. That is by design upstream: the modifier exists precisely so a public, concrete
- * implementation can exist while the individual methods stay internal.
- *
- * Second, the reporter contract states that all methods are called from a single thread, so an
- * implementation need not synchronize. The streaming shuffle has genuine concurrency -- Netty
- * event-loop threads produce and consume frames while the task thread runs the writer -- so this
- * class does not merely assume the contract, it makes adherence OBSERVABLE. Every call records the
- * calling thread; the first caller becomes the owner, and any later call from a different thread
- * increments a foreign-thread counter that a test can assert is zero. That turns "Netty threads
- * only enqueue, the task thread reports" from a comment into a checkable property.
- *
- * Counters are `AtomicLong` so that a foreign-thread call is still counted accurately enough to be
- * reported rather than lost to a data race, which would defeat the purpose of detecting it.
+ * The contract promises single-threaded use, so an implementation need not synchronize. The
+ * streaming write path has Netty event-loop threads alongside the task thread, so this class makes
+ * adherence observable rather than assuming it: the first caller becomes the owner, and any later
+ * call from another thread increments a foreign-thread counter a test can assert is zero. Counters
+ * are `AtomicLong` so such a call is reported rather than lost to the race that hid it.
  */
 class RecordingStreamingShuffleWriteMetrics extends ShuffleWriteMetricsReporter {
 
@@ -112,22 +97,16 @@ class RecordingStreamingShuffleWriteMetrics extends ShuffleWriteMetricsReporter 
     add(recordsDecrementedTotal, v)
   }
 
-  /** Net bytes reported written, that is increments less decrements. */
   def bytesWritten: Long = bytesWrittenTotal.get()
 
-  /** Net records reported written, that is increments less decrements. */
   def recordsWritten: Long = recordsWrittenTotal.get()
 
-  /** Total write time reported, in the unit the caller used. */
   def writeTime: Long = writeTimeTotal.get()
 
-  /** Gross bytes withdrawn through `decBytesWritten`, useful when asserting rollback behaviour. */
   def bytesDecremented: Long = bytesDecrementedTotal.get()
 
-  /** Gross records withdrawn through `decRecordsWritten`. */
   def recordsDecremented: Long = recordsDecrementedTotal.get()
 
-  /** Number of reporter calls of any kind, so a test can assert the path reported at all. */
   def callCount: Long = callTotal.get()
 
   /**
@@ -139,10 +118,8 @@ class RecordingStreamingShuffleWriteMetrics extends ShuffleWriteMetricsReporter 
    */
   def foreignThreadCallCount: Long = foreignThreadCallTotal.get()
 
-  /** The thread that made the first reporter call, or `None` if nothing has been reported. */
   def reportingThread: Option[Thread] = Option(owningThread.get())
 
-  /** Returns every accumulator to its initial state, including the observed reporting thread. */
   def reset(): Unit = {
     bytesWrittenTotal.set(0L)
     recordsWrittenTotal.set(0L)
@@ -172,15 +149,11 @@ class RecordingStreamingShuffleWriteMetrics extends ShuffleWriteMetricsReporter 
  * A `ShuffleReadMetricsReporter` that accumulates every reported figure so a test can assert on
  * what the streaming read path actually reported.
  *
- * `ShuffleReadMetricsReporter` declares SEVENTEEN members, not the handful the read path of a
- * simple shuffle happens to touch, and every one of them carries `private[spark]` on the method
- * itself. All seventeen are implemented here, each re-declaring the modifier, because a partial
- * implementation would not compile.
- *
- * The thread-observation machinery mirrors [[RecordingStreamingShuffleWriteMetrics]], and for the
- * same reason: the reporter contract promises single-threaded use, the streaming reader consumes
- * from an asynchronous channel, and a fixture that silently tolerated a report from a Netty thread
- * would hide precisely the defect worth catching.
+ * All seventeen members of the reporter are implemented, each re-declaring the `private[spark]`
+ * modifier the trait carries on the method itself, because a partial implementation would not
+ * compile. The thread-observation machinery mirrors [[RecordingStreamingShuffleWriteMetrics]] for
+ * the same reason: the reader consumes from an asynchronous channel, and a fixture that tolerated a
+ * report from a Netty thread would hide the defect worth catching.
  */
 class RecordingStreamingShuffleReadMetrics extends ShuffleReadMetricsReporter {
 
@@ -252,67 +225,44 @@ class RecordingStreamingShuffleReadMetrics extends ShuffleReadMetricsReporter {
   private[spark] override def incRemoteMergedReqsDuration(v: Long): Unit =
     add(remoteMergedReqsDurationTotal, v)
 
-  /** Remote blocks reported fetched. Streaming counts each delivered data block here. */
   def remoteBlocksFetched: Long = remoteBlocksFetchedTotal.get()
 
-  /** Local blocks reported fetched. */
   def localBlocksFetched: Long = localBlocksFetchedTotal.get()
 
-  /** Remote bytes reported read, which is where streamed payload bytes are accounted. */
   def remoteBytesRead: Long = remoteBytesReadTotal.get()
 
-  /** Remote bytes reported spilled straight to disk rather than held in memory. */
   def remoteBytesReadToDisk: Long = remoteBytesReadToDiskTotal.get()
 
-  /** Local bytes reported read. */
   def localBytesRead: Long = localBytesReadTotal.get()
 
-  /** Total time the reader reported waiting for data to arrive. */
   def fetchWaitTime: Long = fetchWaitTimeTotal.get()
 
-  /** Records reported read, the figure a data-completeness assertion compares against. */
   def recordsRead: Long = recordsReadTotal.get()
 
-  /** Corrupt merged chunks reported. Push-based merge is not used by streaming, so expect zero. */
   def corruptMergedBlockChunks: Long = corruptMergedBlockChunksTotal.get()
 
-  /** Merged-fetch fallbacks reported. Expect zero on the streaming path. */
   def mergedFetchFallbackCount: Long = mergedFetchFallbackTotal.get()
 
-  /** Remote merged blocks reported fetched. Expect zero on the streaming path. */
   def remoteMergedBlocksFetched: Long = remoteMergedBlocksFetchedTotal.get()
 
-  /** Local merged blocks reported fetched. Expect zero on the streaming path. */
   def localMergedBlocksFetched: Long = localMergedBlocksFetchedTotal.get()
 
-  /** Remote merged chunks reported fetched. Expect zero on the streaming path. */
   def remoteMergedChunksFetched: Long = remoteMergedChunksFetchedTotal.get()
 
-  /** Local merged chunks reported fetched. Expect zero on the streaming path. */
   def localMergedChunksFetched: Long = localMergedChunksFetchedTotal.get()
 
-  /** Remote merged bytes reported read. Expect zero on the streaming path. */
   def remoteMergedBytesRead: Long = remoteMergedBytesReadTotal.get()
 
-  /** Local merged bytes reported read. Expect zero on the streaming path. */
   def localMergedBytesRead: Long = localMergedBytesReadTotal.get()
 
-  /** Cumulative duration of remote requests reported. */
   def remoteReqsDuration: Long = remoteReqsDurationTotal.get()
 
-  /** Cumulative duration of remote merged requests reported. */
   def remoteMergedReqsDuration: Long = remoteMergedReqsDurationTotal.get()
 
-  /** Number of reporter calls of any kind. */
   def callCount: Long = callTotal.get()
 
-  /**
-   * Number of calls that arrived on a thread other than the first one seen. Zero is the value a
-   * reader that enqueues from its I/O threads and reports from the task thread produces.
-   */
   def foreignThreadCallCount: Long = foreignThreadCallTotal.get()
 
-  /** The thread that made the first reporter call, or `None` if nothing has been reported. */
   def reportingThread: Option[Thread] = Option(owningThread.get())
 
   /**
@@ -329,7 +279,6 @@ class RecordingStreamingShuffleReadMetrics extends ShuffleReadMetricsReporter {
       remoteMergedReqsDurationTotal.get()
   }
 
-  /** Returns every accumulator to its initial state, including the observed reporting thread. */
   def reset(): Unit = {
     remoteBlocksFetchedTotal.set(0L)
     localBlocksFetchedTotal.set(0L)
@@ -369,22 +318,37 @@ class RecordingStreamingShuffleReadMetrics extends ShuffleReadMetricsReporter {
 
 
 /**
- * Wrapper for a managed buffer that keeps track of how many times retain and release are called.
+ * Wrapper for a managed buffer that counts retain and release calls.
  *
- * This class is defined here rather than obtained from a mocking library because `NioManagedBuffer`
- * is final and a final class cannot be spied on, which is the same reason the sort-path reader
- * suite in the parent package defines its own equivalent.
+ * Defined here rather than taken from a mocking library because `NioManagedBuffer` is final and a
+ * final class cannot be spied on, which is the same reason the sort-path reader suite in the parent
+ * package defines its own equivalent.
  *
- * The streaming reader takes a reference on every frame it accepts and drops it once the frame's
- * records have been surfaced, so the property worth proving is not "release was called" but
- * "release was called EXACTLY once for each retain". [[releasedExactlyOnce]] states that property
- * directly, and [[outstandingReferences]] reports the imbalance when it does not hold, which is
- * what turns a leak into a diagnosable number instead of a hung task.
+ * The streaming reader copies a decoded payload and retains no transport buffer, so what these
+ * counts audit is that nothing takes a reference without dropping it: [[releasedExactlyOnce]]
+ * states the balanced case directly, and [[outstandingReferences]] reports the imbalance when it
+ * does not hold, which turns a stray reference into a diagnosable number instead of a hung task.
+ *
+ * ==Why the counters are atomic==
+ *
+ * A frame is accepted on a Netty event-loop thread and any reference it takes is dropped by
+ * whichever thread surfaces the records -- ordinarily the task thread -- so both counters are
+ * written from more than one thread and read from a third. Plain `var`s would make an increment a
+ * read-modify-write with no memory barrier: a lost increment reads as a leak that never happened,
+ * and a stale read reads as a release that never happened, and in both directions the failure would
+ * be an intermittent one in a suite whose whole premise is determinism. `AtomicInteger` removes the
+ * possibility rather than making it unlikely.
  */
 class RecordingStreamingManagedBuffer(underlyingBuffer: NioManagedBuffer) extends ManagedBuffer {
 
-  var callsToRetain = 0
-  var callsToRelease = 0
+  private val retainCalls = new AtomicInteger(0)
+  private val releaseCalls = new AtomicInteger(0)
+
+  /** How many times anything took a reference on this buffer. */
+  def callsToRetain: Int = retainCalls.get()
+
+  /** How many times anything dropped a reference on this buffer. */
+  def callsToRelease: Int = releaseCalls.get()
 
   override def size(): Long = underlyingBuffer.size()
   override def nioByteBuffer(): ByteBuffer = underlyingBuffer.nioByteBuffer()
@@ -393,35 +357,38 @@ class RecordingStreamingManagedBuffer(underlyingBuffer: NioManagedBuffer) extend
   override def convertToNettyForSsl(): AnyRef = underlyingBuffer.convertToNettyForSsl()
 
   override def retain(): ManagedBuffer = {
-    callsToRetain += 1
+    retainCalls.incrementAndGet()
     underlyingBuffer.retain()
   }
 
   override def release(): ManagedBuffer = {
-    callsToRelease += 1
+    releaseCalls.incrementAndGet()
     underlyingBuffer.release()
   }
 
   /** True when the buffer was taken at least once and each take was matched by one drop. */
-  def releasedExactlyOnce: Boolean = callsToRetain > 0 && callsToRetain == callsToRelease
+  def releasedExactlyOnce: Boolean = {
+    // Read once each, in this order, so the verdict describes one observation rather than two: a
+    // retain that lands between the two reads can only make the pair look unbalanced, never
+    // balanced, so this cannot report success for a buffer that is in fact leaking.
+    val retained = retainCalls.get()
+    val released = releaseCalls.get()
+    retained > 0 && retained == released
+  }
 
   /**
    * Retains still outstanding. Positive means a leak, negative means an over-release; either is a
    * defect, and reporting the signed difference says which one happened.
    */
-  def outstandingReferences: Int = callsToRetain - callsToRelease
+  def outstandingReferences: Int = retainCalls.get() - releaseCalls.get()
 }
 
 /**
  * A buffer-utilisation contributor whose reported numerator and denominator are fixed by the test.
  *
- * `StreamingShuffleMetricsSource` exposes `bufferUtilizationPercent` as a gauge computed on read
- * from a registry of contributors rather than as a value a caller can set, because in service the
- * numerator and the denominator both have to come from the one object that owns the buffer budget.
- * That is the right production design and it leaves a test with no way to pin the gauge -- so this
- * class supplies one: register an instance, and the gauge reports exactly the percentage these two
- * numbers imply. It is the deterministic equivalent of a setter without asking the production
- * source to grow one.
+ * `StreamingShuffleMetricsSource` computes `bufferUtilizationPercent` on read from its registry of
+ * contributors and deliberately exposes no setter, so registering an instance of this is how a test
+ * pins the gauge without asking the production source to grow one.
  *
  * @param bufferedBytes bytes to report as currently buffered, the gauge's numerator
  * @param budgetBytes bytes to report as the total allowance, the gauge's denominator
@@ -436,76 +403,51 @@ class FixedBufferUtilizationContributor(bufferedBytes: Long, budgetBytes: Long)
 
   override def contributedBudgetBytes: Long = budget.get()
 
-  /**
-   * Moves the reported numerator, so one registered contributor can drive the gauge across a
-   * sequence of utilisation levels without being unregistered and replaced.
-   *
-   * @param bytes new buffered-byte figure to report
-   */
   def setBufferedBytes(bytes: Long): Unit = buffered.set(bytes)
 
-  /**
-   * Moves the reported denominator.
-   *
-   * @param bytes new budget figure to report
-   */
   def setBudgetBytes(bytes: Long): Unit = budget.set(bytes)
 }
 
 /**
  * One of the ten failure scenarios the streaming shuffle must survive without losing data.
  *
- * The set is closed and is enumerated by [[StreamingShuffleFaultScenario.all]], so a suite can
- * iterate the scenarios instead of restating them and cannot silently omit one.
+ * The set is closed and is enumerated by [[StreamingShuffleFaultScenario.all]], so a suite cannot
+ * silently omit one.
  *
- * @param faultName stable, human-readable identifier used in assertion messages
+ * @param faultName stable identifier used in assertion messages
  */
 sealed abstract class StreamingShuffleFaultScenario(val faultName: String)
 
-/**
- * The closed set of failure scenarios, in the order the specification enumerates them.
- */
 object StreamingShuffleFaultScenario {
 
-  /** Producer executor dies part way through writing its map output. */
   case object ProducerCrashDuringWrite
     extends StreamingShuffleFaultScenario("producerCrashDuringWrite")
 
-  /** Consumer executor dies part way through reading a partition. */
   case object ConsumerCrashDuringRead
     extends StreamingShuffleFaultScenario("consumerCrashDuringRead")
 
-  /** Producer and consumer are both alive but cannot reach each other. */
   case object NetworkPartition extends StreamingShuffleFaultScenario("networkPartition")
 
-  /** A buffer allocation cannot be granted, which is the OOM-risk fallback condition. */
   case object MemoryExhaustionOnAllocation
     extends StreamingShuffleFaultScenario("memoryExhaustionOnAllocation")
 
-  /** The local disk refuses the write a spill needs to make. */
   case object DiskFailureDuringSpill extends StreamingShuffleFaultScenario("diskFailureDuringSpill")
 
-  /** A block arrives whose CRC32C does not match the value the producer stamped on it. */
   case object ChecksumMismatchOnReceive
     extends StreamingShuffleFaultScenario("checksumMismatchOnReceive")
 
-  /** A transfer stalls long enough for the five second connection timeout to expire. */
   case object ConnectionTimeoutDuringTransfer
     extends StreamingShuffleFaultScenario("connectionTimeoutDuringTransfer")
 
-  /** The JVM stops for a collection pause long enough to look like a liveness failure. */
   case object ExecutorGarbageCollectionPause
     extends StreamingShuffleFaultScenario("executorGarbageCollectionPause")
 
-  /** Several producers for the same shuffle fail at once. */
   case object ConcurrentProducerFailures
     extends StreamingShuffleFaultScenario("concurrentProducerFailures")
 
-  /** A consumer returns after being away long enough for its acknowledgements to lapse. */
   case object ConsumerReconnectAfterDowntime
     extends StreamingShuffleFaultScenario("consumerReconnectAfterDowntime")
 
-  /** All ten scenarios, in specification order. */
   val all: Seq[StreamingShuffleFaultScenario] = Seq(
     ProducerCrashDuringWrite,
     ConsumerCrashDuringRead,
@@ -523,27 +465,20 @@ object StreamingShuffleFaultScenario {
 /**
  * Deterministic fault-injection controller for the streaming shuffle suites.
  *
- * Every fault this class injects is driven by one of exactly two mechanisms: an armed flag that a
- * cooperating seam consults, or an advance of the injected [[ManualClock]]. Neither mechanism
- * sleeps, and that is the whole point. A timeout test that sleeps is a test that is slow when it
- * passes and flaky when the machine is loaded; a timeout test that advances a manual clock is
- * instant and exact, and can assert that a timer does NOT fire one millisecond early, which a
- * sleeping test cannot do at all.
+ * Every fault is driven either by an armed flag a cooperating seam consults or by an advance of the
+ * injected [[ManualClock]]. Neither sleeps, which is what makes a timeout assertion instant and
+ * exact and lets a suite prove a timer does NOT fire one millisecond early.
  *
  * The armed-flag engine is a fixed map built once from the closed scenario set, so arming and
- * firing need no lock and no map mutation: each scenario owns two counters, one for the arming
- * budget and one for the number of times the fault was actually taken. A test arms a scenario for
- * a bounded number of triggers, the seam calls [[shouldFail]] where the fault belongs, and the
- * budget is consumed atomically. Bounding the budget is what makes "fail the first attempt, then
- * succeed" expressible, which is exactly the shape a retry or a reconnection test needs.
+ * firing need no lock: each scenario owns an arming budget and a fired count, and the budget is
+ * consumed atomically. Bounding the budget is what makes "fail the first attempt, then succeed"
+ * expressible, which is the shape a retry or a reconnection test needs.
  *
- * @param clock the manual clock the component under test was constructed with; every time-based
- *              fault is expressed as an advance of this clock, so the component and the fault
- *              share one notion of now
+ * @param clock the manual clock the component under test was constructed with, so the component
+ *              and the fault share one notion of now
  */
 class StreamingShuffleFaultInjector(val clock: ManualClock) {
 
-  /** Per-scenario arming budget and fire tally. */
   private class FaultState {
     val remainingTriggers = new AtomicInteger(0)
     val fireTally = new AtomicInteger(0)
@@ -563,10 +498,6 @@ class StreamingShuffleFaultInjector(val clock: ManualClock) {
         s"Unknown streaming shuffle fault scenario: ${scenario.faultName}"))
   }
 
-  /**
-   * Records that a scenario's fault was taken, for the scenarios whose injection is an action the
-   * injector performs itself rather than a decision a cooperating seam asks it to make.
-   */
   private def tally(scenario: StreamingShuffleFaultScenario): Unit = {
     stateOf(scenario).fireTally.incrementAndGet()
     ()
@@ -584,46 +515,25 @@ class StreamingShuffleFaultInjector(val clock: ManualClock) {
     stateOf(scenario).remainingTriggers.set(triggers)
   }
 
-  /**
-   * Arms a scenario so that it fires on every subsequent check until disarmed.
-   *
-   * @param scenario the scenario to arm indefinitely
-   */
   def armIndefinitely(scenario: StreamingShuffleFaultScenario): Unit = {
     stateOf(scenario).remainingTriggers.set(Int.MaxValue)
   }
 
-  /**
-   * Withdraws any remaining arming budget for a scenario, leaving its fire tally intact.
-   *
-   * @param scenario the scenario to disarm
-   */
   def disarm(scenario: StreamingShuffleFaultScenario): Unit = {
     stateOf(scenario).remainingTriggers.set(0)
   }
 
-  /** Withdraws every arming budget and heals the simulated partition. Fire tallies are kept. */
   def disarmAll(): Unit = {
     StreamingShuffleFaultScenario.all.foreach(disarm)
     partitioned.set(false)
     grantedAllocationBytes.set(Long.MaxValue)
   }
 
-  /**
-   * @param scenario the scenario to inspect
-   * @return true while the scenario still has arming budget left
-   */
   def isArmed(scenario: StreamingShuffleFaultScenario): Boolean =
     stateOf(scenario).remainingTriggers.get() > 0
 
-  /**
-   * @param scenario the scenario to inspect
-   * @return how many times the fault was actually taken, which is what an assertion checks to
-   *         prove the seam was reached rather than merely armed
-   */
   def fireCount(scenario: StreamingShuffleFaultScenario): Int = stateOf(scenario).fireTally.get()
 
-  /** Total faults taken across all scenarios, useful for a stress-run summary assertion. */
   def totalFireCount: Int =
     StreamingShuffleFaultScenario.all.map(fireCount).sum
 
@@ -685,7 +595,6 @@ class StreamingShuffleFaultInjector(val clock: ManualClock) {
     partitioned.set(true)
   }
 
-  /** Simulates the loss of a consumer executor part way through its read. */
   def crashConsumer(): Unit = {
     armIndefinitely(StreamingShuffleFaultScenario.ConsumerCrashDuringRead)
     partitioned.set(true)
@@ -703,19 +612,16 @@ class StreamingShuffleFaultInjector(val clock: ManualClock) {
     partitioned.set(true)
   }
 
-  /** Severs reachability between producer and consumer without either of them dying. */
   def partitionNetwork(): Unit = {
     armIndefinitely(StreamingShuffleFaultScenario.NetworkPartition)
     partitioned.set(true)
   }
 
-  /** Restores reachability, which is the precondition for the reconnection scenario. */
   def healNetwork(): Unit = {
     disarm(StreamingShuffleFaultScenario.NetworkPartition)
     partitioned.set(false)
   }
 
-  /** True while the simulated link is severed. A transport seam consults this before sending. */
   def networkPartitioned: Boolean = partitioned.get()
 
   /**
@@ -730,19 +636,11 @@ class StreamingShuffleFaultInjector(val clock: ManualClock) {
     grantedAllocationBytes.set(grantableBytes)
   }
 
-  /** Restores an unbounded allocation grant. */
   def restoreAllocation(): Unit = {
     disarm(StreamingShuffleFaultScenario.MemoryExhaustionOnAllocation)
     grantedAllocationBytes.set(Long.MaxValue)
   }
 
-  /**
-   * Reports what a simulated allocator would grant for a request, so a test can feed the pair
-   * straight into the fallback policy's allocation-grant observation.
-   *
-   * @param requestedBytes bytes the caller asked for
-   * @return bytes the simulated allocator grants, which is less than the request under exhaustion
-   */
   def grantAllocation(requestedBytes: Long): Long = {
     require(requestedBytes >= 0L, s"requestedBytes must be non-negative but was $requestedBytes")
     if (isArmed(StreamingShuffleFaultScenario.MemoryExhaustionOnAllocation)) {
@@ -753,28 +651,53 @@ class StreamingShuffleFaultInjector(val clock: ManualClock) {
   }
 
   /**
-   * Makes a directory refuse writes, which is how a spill-time disk failure is produced.
+   * Makes one directory refuse writes for the duration of a scope, and always restores it.
    *
-   * Some filesystems and some privilege levels ignore the permission change; the boolean result
-   * says whether it took effect, so a suite can skip rather than pass vacuously.
+   * '''Why this is a scoped resource rather than a pair of calls.''' A read-only directory and an
+   * armed fault scenario are both process-wide state that survives the test that created them, and
+   * the earlier shape of this facility -- arm, then hand the caller a boolean, then rely on the
+   * caller to call a separate restore -- got all three of the resulting hazards wrong:
    *
-   * @param directory the spill directory to make read-only
-   * @return true when the directory is genuinely no longer writable
+   *  - it armed the scenario '''before''' discovering whether the permission change had taken
+   *    effect, so on a filesystem or at a privilege level that ignores the change the injector was
+   *    left armed for a fault that could never occur, and every later case in the JVM inherited it;
+   *  - it accepted any `File`, so a mistyped path could make a directory the suite does not own --
+   *    a shared spill root, or a parent of it -- read-only for the rest of the run;
+   *  - restoration was a second call the caller had to remember, which a failing assertion between
+   *    the two skips entirely. A directory left read-only by a failing test makes every subsequent
+   *    test that spills fail for a reason that has nothing to do with what it was testing.
+   *
+   * So this takes no directory at all. It '''creates''' the one it makes read-only, inside a
+   * temporary root, which is what makes "suite-owned" a property of construction rather than of a
+   * path check -- and a path check is exactly what cannot distinguish a directory the suite created
+   * from Spark's own local scratch root, since in a test JVM both live under the same temporary
+   * parent. A caller that needs a component to spill into the failing directory points that
+   * component's configuration at [[ScopedDiskFault.directory]].
+   *
+   * The fault is then verified before it is armed, and the whole thing is an `AutoCloseable` whose
+   * `close` restores the permission, disarms the scenario and removes the directory, whatever
+   * happened in between. Callers use it through
+   * [[StreamingShuffleTestHelper.withFailingDiskWrites]], which closes it in a `finally`.
+   *
+   * @return the armed fixture, whose `close()` the caller owns. Whether the permission change took
+   *         effect at all is reported by `isEffective`, because a JVM running as root or a
+   *         filesystem that ignores the bit cannot produce the fault and a caller must cancel
+   *         rather than assert a write failure that will not happen
    */
-  def failDiskWrites(directory: File): Boolean = {
-    armIndefinitely(StreamingShuffleFaultScenario.DiskFailureDuringSpill)
-    directory.setWritable(false) && !directory.canWrite
-  }
-
-  /**
-   * Restores write permission on a directory previously made read-only.
-   *
-   * @param directory the spill directory to restore
-   * @return true when the directory is writable again
-   */
-  def restoreDiskWrites(directory: File): Boolean = {
-    disarm(StreamingShuffleFaultScenario.DiskFailureDuringSpill)
-    directory.setWritable(true) && directory.canWrite
+  def failDiskWrites(): ScopedDiskFault = {
+    val directory = Utils.createTempDir(namePrefix = "streaming-shuffle-disk-fault")
+    // The permission change first and the arming only if it took effect, so a scenario is never
+    // left armed for a fault this environment cannot produce.
+    val applied = directory.setWritable(false)
+    val effective = applied && !directory.canWrite
+    if (effective) {
+      armIndefinitely(StreamingShuffleFaultScenario.DiskFailureDuringSpill)
+    } else if (applied) {
+      // The call was accepted but the directory is still writable -- running as root, or on a
+      // filesystem that ignores the bit. Undo it so nothing is left half-changed.
+      directory.setWritable(true)
+    }
+    new ScopedDiskFault(directory, effective, this)
   }
 
   /**
@@ -827,19 +750,11 @@ class StreamingShuffleFaultInjector(val clock: ManualClock) {
     clock.advance(pauseMillis)
   }
 
-  /**
-   * Advances the clock past the five second producer connection timeout, so a reader watching for
-   * a lapsed producer observes exactly that.
-   */
   def expireProducerConnection(): Unit = {
     tally(StreamingShuffleFaultScenario.ConnectionTimeoutDuringTransfer)
     clock.advance(StreamingShuffleTestHelper.ProducerConnectionTimeoutMillis)
   }
 
-  /**
-   * Advances the clock past the ten second consumer liveness window, so a writer watching for a
-   * silent consumer observes exactly that.
-   */
   def expireConsumerLiveness(): Unit = {
     clock.advance(StreamingShuffleTestHelper.ConsumerLivenessTimeoutMillis)
   }
@@ -865,137 +780,287 @@ class StreamingShuffleFaultInjector(val clock: ManualClock) {
   }
 }
 
+/**
+ * One suite-owned directory made read-only for the duration of a scope, removed when it ends.
+ *
+ * Created by [[StreamingShuffleFaultInjector.failDiskWrites]] and normally used through
+ * [[StreamingShuffleTestHelper.withFailingDiskWrites]], which closes it in a `finally` so that a
+ * failing assertion cannot leave a directory unwritable, a scenario armed, or a directory behind
+ * for every later case in the JVM.
+ *
+ * `close` is idempotent, and does the three things a scope end owes in the order that makes each
+ * possible: disarm the scenario, restore the write permission, then remove the directory -- the
+ * removal needs the permission back to succeed.
+ *
+ * @param directory the directory whose write permission is suspended, created by and owned by this
+ *                  fixture, which is why nothing else in the JVM can be affected by it
+ * @param isEffective whether the permission change actually took effect in this environment. False
+ *                    on a filesystem or at a privilege level that ignores it -- notably as root --
+ *                    in which case nothing was armed and a caller must cancel rather than assert a
+ *                    write failure that cannot happen
+ * @param injector the injector whose scenario was armed, and which `close` disarms
+ */
+class ScopedDiskFault(
+    val directory: File,
+    val isEffective: Boolean,
+    injector: StreamingShuffleFaultInjector) extends AutoCloseable {
+
+  private val closed = new AtomicBoolean(false)
+
+  /** Disarms the scenario, restores write permission and removes the directory, exactly once. */
+  override def close(): Unit = {
+    if (closed.compareAndSet(false, true)) {
+      if (isEffective) {
+        injector.disarm(StreamingShuffleFaultScenario.DiskFailureDuringSpill)
+      }
+      directory.setWritable(true)
+      Utils.deleteRecursively(directory)
+    }
+  }
+}
+
+
+/**
+ * Carries one fallback condition to an executor and drives it there, mid-write.
+ *
+ * <b>Why a serializable holder rather than a closure over a value.</b> Two facts have to be true at
+ * once. The condition must be driven on the EXECUTOR, because the policy every writer consults is
+ * executor scoped and a driver-side instance is a different object. And the shuffle id must be
+ * known to the closure, because the throughput recorders are per shuffle -- yet the id does not
+ * exist until the shuffled RDD has been defined, which is after the upstream map was written. A
+ * mutable holder resolves the ordering: the field is set once the graph exists and before the
+ * action submits it, and task closures are serialized at submission rather than at definition.
+ *
+ * <b>Why each condition is driven through its own recorder.</b> Driving them uniformly through a
+ * fabricated verdict would test one code path four times. Each recorder here is the one the
+ * production code calls for that condition, so the trip is the trip the feature specifies rather
+ * than a stand-in for it. None of them waits: the two that depend on elapsed time take the instant
+ * as an argument, so sixty seconds of sustained slowness is two calls rather than a minute of
+ * sleeping.
+ *
+ * @param reason the condition to drive on the executor
+ */
+private[spark] class MidWriteTripHolder(val reason: StreamingShuffleFallbackReason)
+  extends Serializable {
+
+  /**
+   * The shuffle whose producers are to stand down. Set by the driver after the shuffled RDD exists
+   * and before the job is submitted; negative until then, which the trip treats as nothing to do.
+   */
+  @volatile var shuffleId: Int = -1
+
+  /**
+   * Drives this holder's condition against the running executor's own fallback policy.
+   *
+   * A no-op when this JVM is not running the streaming manager, or when the shuffle id has not been
+   * supplied, so the holder is safe to invoke from a workload that may legitimately be running on
+   * the sort-based path.
+   */
+  def trip(): Unit = {
+    SparkEnv.get.shuffleManager match {
+      case manager: StreamingShuffleManager if shuffleId >= 0 =>
+        StreamingShuffleTestHelper.driveFallbackReason(
+          manager.streamingFallbackPolicy, reason, shuffleId)
+      case _ =>
+    }
+  }
+}
 
 /**
  * Constants and pure helpers shared by every streaming shuffle suite and by the benchmark.
  *
- * A deliberate choice governs this object: wherever the production code already owns a constant,
- * the value here is DERIVED from it rather than restated as a literal. Restating would create two
- * sources of truth that can drift apart silently, and a test whose expected value drifted away from
- * the implementation's is worse than no test at all -- it passes while the behaviour is wrong, or
- * fails while the behaviour is right. Deriving means a suite asserting on the two megabyte cap is
- * asserting on the same number the encoder enforces, by construction.
+ * Two opposite policies govern this object, and which one applies depends on whether the value is a
+ * '''contract with a peer''' or an '''internal threshold'''.
  *
- * Only values that exist nowhere in the production code are written as literals here: the
- * configuration bounds (which live inside validator closures rather than as named constants), the
- * off-by-one boundary values that exist purely so a suite can prove a timer does not fire early,
- * and the stress-workload shape.
+ * ==Wire-protocol values are INDEPENDENT LITERALS==
+ *
+ * Every byte count, field order and cap of the wire format is written here as a literal, spelled as
+ * the sum of its parts, and is deliberately '''not''' read from the encoder that enforces it. The
+ * reason is that a constant taken from production can only ever agree with production: it restates
+ * the implementation instead of specifying it, so an accidental change to the layout is silently
+ * adopted by every assertion that consumes it and nothing fails. A wire format is a contract with a
+ * peer that may be running a different build, so it needs an oracle, and the literal is that
+ * oracle. [[verifyWireContractAgainstEncoder]] is the single place the two are compared, and the
+ * suites that touch the wire call it, so a drift fails a test with a message naming exactly which
+ * field moved.
+ *
+ * ==Internal thresholds are DERIVED==
+ *
+ * Timeouts, intervals, budget percentages and retry ladders are internal to this subsystem: nothing
+ * outside the JVM depends on them, and a suite asserting on the ten second consumer window is
+ * asserting that the writer and the protocol agree with each other rather than with a peer. Those
+ * values are therefore derived from the component that owns them, so a suite cannot fall behind a
+ * deliberate change to a threshold.
+ *
+ * The remaining literals are values that exist nowhere in the production code: the configuration
+ * bounds (which live inside validator closures rather than as named constants), the off-by-one
+ * boundary values that exist purely so a suite can prove a timer does not fire early, and the
+ * stress-workload shape.
  */
 object StreamingShuffleTestHelper {
 
-  // ---------------------------------------------------------------------------------------------
-  // Memory budget and spill.
-  // ---------------------------------------------------------------------------------------------
-
-  /** Default share of executor memory reserved across all streaming buffers. */
   val DefaultBufferSizePercent: Int = 20
 
-  /** Smallest value the buffer-percent configuration validator accepts. */
   val MinBufferSizePercent: Int = 1
 
-  /** Largest value the buffer-percent configuration validator accepts. */
   val MaxBufferSizePercent: Int = 50
 
-  /** Default buffer utilisation at which the largest buffered partitions are spilled. */
   val DefaultSpillThresholdPercent: Int = 80
 
-  /** Smallest value the spill-threshold configuration validator accepts. */
   val MinSpillThresholdPercent: Int = 50
 
-  /** Largest value the spill-threshold configuration validator accepts. */
   val MaxSpillThresholdPercent: Int = 95
 
-  /** Denominator the streaming shuffle uses for every percentage it computes. */
   val PercentScale: Long = MemorySpillManager.PERCENT_SCALE
 
-  /** Cadence at which buffer utilisation is compared against the spill threshold. */
   val SpillPollIntervalMillis: Long = MemorySpillManager.POLL_INTERVAL_MS
 
-  /** Bound within which a producer buffer must be reclaimed after an acknowledgement. */
   val ReclamationDeadlineMillis: Long = MemorySpillManager.RECLAMATION_DEADLINE_MS
 
-  /** Records after which the sort-path disk writer refreshes its byte count. */
   val DiskWriterRecordUpdateInterval: Int = 16384
 
   // ---------------------------------------------------------------------------------------------
-  // Wire protocol. Every value below is taken from the encoder that enforces it.
+  // Wire protocol.
+  //
+  // INDEPENDENT LITERALS. Nothing in this block reads the encoder it describes: a value copied
+  // from the encoder agrees with it by construction and therefore specifies nothing, so a change to
+  // the layout would be adopted silently by every assertion built on it. These literals are the
+  // oracle for the format; verifyWireContractAgainstEncoder() is the one place they are compared
+  // with the production constants, and it names the field that moved when they disagree.
   // ---------------------------------------------------------------------------------------------
 
   /** The protocol revision a compatible peer must present. */
-  val ProtocolVersion: Byte = StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION
+  val ProtocolVersion: Byte = 1
 
   /**
    * Bytes occupied by the header every streaming message carries.
    *
-   * The header is protocol version, shuffle id, map id, partition id and sequence number, which is
-   * one plus four plus eight plus four plus eight bytes. The map id is part of the header because a
-   * speculative copy or a retry of the same map task is a separate flow that must be told apart
-   * from the attempt it supersedes.
+   * The normative field order is protocol version (1), shuffle id (4), map id (8), partition id (4)
+   * and sequence number (8), so the header is 1 + 4 + 8 + 4 + 8 = 25 bytes.
+   *
+   * The map id is a header field, and not merely descriptive. A producer executor serves many map
+   * outputs at once and a consumer channel carries frames for whichever of them that reduce task is
+   * reading, so the producer-side registry demultiplexes an inbound frame by peeking the shuffle id
+   * and the map id out of the header before the frame is decoded. It is also what tells a
+   * speculative copy or a retry of the same map task apart from the attempt it supersedes.
    */
-  val HeaderEncodedLength: Int = StreamingShuffleMessage.HEADER_ENCODED_LENGTH
+  val HeaderEncodedLength: Int = 25
 
   /** Bytes the framing layer prepends to carry the message-type discriminator. */
-  val FrameTypePrefixLength: Int = StreamingShuffleMessage.FRAME_TYPE_PREFIX_LENGTH
+  val FrameTypePrefixLength: Int = 1
 
   /** Largest payload a single data block may carry, which is the two megabyte pipelining cap. */
-  val MaxBlockSizeBytes: Int = DataBlockMessage.MAX_BLOCK_SIZE_BYTES
+  val MaxBlockSizeBytes: Int = 2 * 1024 * 1024
+
+  /**
+   * Bytes a data block spends on framing over and above its payload: the type discriminator (1),
+   * the shared header (25), the CRC32C checksum (8) and the payload length prefix (4).
+   */
+  val DataBlockFramingOverheadBytes: Int = 1 + 25 + 8 + 4
 
   /** Largest framed data block, that is a maximum payload plus header, checksum and framing. */
-  val MaxEncodedFrameBytes: Int = DataBlockMessage.MAX_ENCODED_FRAME_BYTES
-
-  /** Bytes a data block spends on framing over and above its payload. */
-  val DataBlockFramingOverheadBytes: Int = DataBlockMessage.FRAMING_OVERHEAD_BYTES
+  val MaxEncodedFrameBytes: Int = 2 * 1024 * 1024 + 38
 
   /**
    * Encoded length of the three fixed-size messages: acknowledgement, retransmission request and
-   * stream termination. Each adds one eight-byte field to the shared header and nothing else.
+   * stream termination. Each adds one eight-byte field to the 25-byte header and nothing else.
    *
-   * All three are the same size, which is precisely why a decoder must never discriminate on
-   * length. The framing type byte is the discriminator; [[messageTypeOf]] reads the concrete class
-   * instead, which is the same decision expressed in Scala.
-   *
-   * The heartbeat is deliberately NOT in this set. It carries a length-prefixed consumer identity
-   * as well as its timestamp, so its size varies with that identity -- see
-   * [[heartbeatEncodedLength]]. Assuming otherwise is the mistake a length-based discriminator
-   * makes, in miniature.
+   * All four are the same size, which is precisely why a decoder must never discriminate on length.
+   * The framing type byte is the discriminator; [[messageTypeOf]] reads the concrete class instead,
+   * which is the same decision expressed in Scala.
    */
-  val FixedMessageEncodedLength: Int = HeaderEncodedLength + java.lang.Long.BYTES
+  val FixedMessageEncodedLength: Int = 25 + 8
 
   /**
    * Bytes a heartbeat's body occupies before its consumer identity: an eight-byte timestamp and a
-   * four-byte length prefix. Expressed structurally so it states what it is rather than a number.
+   * four-byte length prefix, so 12.
+   *
+   * The identity is on the wire rather than derived from the channel because a consumer that
+   * reconnects arrives on a new channel and must be recognised as the same consumer, which is what
+   * lets the producer resume its unacknowledged window instead of forcing a recomputation.
    */
-  val HeartbeatFixedBodyLength: Int = java.lang.Long.BYTES + java.lang.Integer.BYTES
+  val HeartbeatFixedBodyLength: Int = 8 + 4
 
-  /** Encoded length of a heartbeat that names no consumer. */
-  val HeartbeatBaseEncodedLength: Int = HeaderEncodedLength + HeartbeatFixedBodyLength
+  /** Encoded length of a heartbeat that names no consumer: the header plus the fixed body. */
+  val HeartbeatBaseEncodedLength: Int = 25 + 12
 
   /** Longest consumer identifier a heartbeat may carry, in encoded bytes. */
-  val MaxConsumerIdEncodedBytes: Int = HeartbeatMessage.MAX_CONSUMER_ID_ENCODED_BYTES
+  val MaxConsumerIdEncodedBytes: Int = 256
 
   /** Sentinel a consumer sends before it has consumed anything. */
-  val NothingConsumedPosition: Long = AckMessage.NOTHING_CONSUMED
+  val NothingConsumedPosition: Long = -1L
 
   /** Largest window a single retransmission request may span, in blocks. */
-  val MaxRequestedBlocks: Long = RetransmitRequestMessage.MAX_REQUESTED_BLOCKS
+  val MaxRequestedBlocks: Long = 4096L
 
   /** Checksum algorithm every streaming block is stamped with. */
-  val ChecksumAlgorithm: String = StreamingShuffleChecksum.ALGORITHM
+  val ChecksumAlgorithm: String = "CRC32C"
 
-  // ---------------------------------------------------------------------------------------------
-  // Failure detection and retry timing.
-  // ---------------------------------------------------------------------------------------------
+  /**
+   * Compares every wire-format literal above with the constant the encoder actually enforces.
+   *
+   * This is the coupling the independent literals deliberately lack, isolated into one method so
+   * that it is impossible to consume a wire constant from this object and accidentally consume
+   * production's value instead. A suite that touches the wire calls this once; a layout change then
+   * fails here, with a message naming the field that moved, rather than being absorbed by whichever
+   * assertion happened to be built on the drifted value.
+   *
+   * Every message's total is checked as well as every field width, because a header change and a
+   * body change can cancel out in a total while still being an incompatible format.
+   */
+  def verifyWireContractAgainstEncoder(): Unit = {
+    val mismatches = new mutable.ArrayBuffer[String]()
+    def check(field: String, expected: Any, actual: Any): Unit = {
+      if (expected != actual) {
+        mismatches += s"$field: this suite's contract says $expected, the encoder says $actual"
+      }
+    }
+    check("protocol version", ProtocolVersion, StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION)
+    check("header encoded length", HeaderEncodedLength,
+      StreamingShuffleMessage.HEADER_ENCODED_LENGTH)
+    check("frame type prefix length", FrameTypePrefixLength,
+      StreamingShuffleMessage.FRAME_TYPE_PREFIX_LENGTH)
+    check("max block payload", MaxBlockSizeBytes, DataBlockMessage.MAX_BLOCK_SIZE_BYTES)
+    check("data block framing overhead", DataBlockFramingOverheadBytes,
+      DataBlockMessage.FRAMING_OVERHEAD_BYTES)
+    check("max encoded frame", MaxEncodedFrameBytes, DataBlockMessage.MAX_ENCODED_FRAME_BYTES)
+    check("max consumer id bytes", MaxConsumerIdEncodedBytes,
+      HeartbeatMessage.MAX_CONSUMER_ID_ENCODED_BYTES)
+    check("nothing consumed sentinel", NothingConsumedPosition, AckMessage.NOTHING_CONSUMED)
+    check("max requested blocks", MaxRequestedBlocks, RetransmitRequestMessage.MAX_REQUESTED_BLOCKS)
+    check("checksum algorithm", ChecksumAlgorithm, StreamingShuffleChecksum.ALGORITHM)
+    // Totals, taken from real messages so that a body change is caught as well as a header change.
+    val payload = Array[Byte](1, 2, 3, 4)
+    val payloadChecksum = StreamingShuffleChecksum.computeBlock(1, 2L, 3, 4L, payload)
+    check("acknowledgement encoded length", FixedMessageEncodedLength,
+      new AckMessage(1, 2L, 3, 4L, 5L).encodedLength())
+    check("retransmission request encoded length", FixedMessageEncodedLength,
+      new RetransmitRequestMessage(1, 2L, 3, 4L, 5L).encodedLength())
+    // A terminator has to sit at exactly the position following the blocks it announces, so its two
+    // sequence values are the same number rather than two arbitrary ones.
+    check("stream termination encoded length", FixedMessageEncodedLength,
+      new StreamTerminationMessage(1, 2L, 3, 4L, 4L).encodedLength())
+    check("heartbeat encoded length naming no consumer", HeartbeatBaseEncodedLength,
+      new HeartbeatMessage(1, 2L, 3, 4L, 5L).encodedLength())
+    check("heartbeat encoded length naming a consumer", HeartbeatBaseEncodedLength + 6,
+      new HeartbeatMessage(1, 2L, 3, 4L, 5L, "abcdef").encodedLength())
+    check("data block encoded length", HeaderEncodedLength + 8 + 4 + payload.length,
+      new DataBlockMessage(1, 2L, 3, 4L, payloadChecksum, payload).encodedLength())
+    // Reported through an assertion rather than a thrown Error, which is both what the project's
+    // style gate requires of test code and the right shape here: the caller is a test, and the
+    // message names every field that moved.
+    assert(mismatches.isEmpty,
+      "The streaming shuffle wire format has drifted from the contract these suites assert " +
+        "against. Either the encoder changed and every peer of a different build must be " +
+        "considered, or the change was unintended: " + mismatches.mkString("; ") + ".")
+  }
 
-  /** Silence after which a reader declares its producer lost. */
   val ProducerConnectionTimeoutMillis: Long = BackpressureProtocol.ACK_TIMEOUT_MS
 
-  /** Interval on which liveness is signalled while a stream is otherwise quiet. */
   val HeartbeatIntervalMillis: Long = BackpressureProtocol.HEARTBEAT_INTERVAL_MS
 
-  /** Acknowledgement silence after which a writer declares its consumer absent. */
   val ConsumerLivenessTimeoutMillis: Long = BackpressureProtocol.CONSUMER_LIVENESS_TIMEOUT_MS
 
-  /** Window over which consumer slowness must persist before it trips the fallback. */
   val SustainedSlownessWindowMillis: Long = BackpressureProtocol.SUSTAINED_SLOWNESS_WINDOW_MS
 
   /**
@@ -1007,19 +1072,14 @@ object StreamingShuffleTestHelper {
    */
   val SustainedSlownessTripMillis: Long = SustainedSlownessWindowMillis + 1L
 
-  /** One millisecond short of the producer timeout, for proving the timer does not fire early. */
   val JustBeforeProducerTimeoutMillis: Long = ProducerConnectionTimeoutMillis - 1L
 
-  /** One millisecond short of the consumer liveness window. */
   val JustBeforeConsumerLivenessMillis: Long = ConsumerLivenessTimeoutMillis - 1L
 
-  /** One millisecond short of the sustained-slowness window. */
   val JustBeforeSustainedSlownessMillis: Long = SustainedSlownessWindowMillis - 1L
 
-  /** First delay in the retransmission backoff ladder. */
   val RetryBaseBackoffMillis: Long = BackpressureProtocol.RETRY_BASE_BACKOFF_MS
 
-  /** Number of retransmission attempts before a failure is escalated. */
   val MaxRetryAttempts: Int = BackpressureProtocol.MAX_RETRY_ATTEMPTS
 
   /**
@@ -1036,16 +1096,12 @@ object StreamingShuffleTestHelper {
   // constants serving different purposes, and conflating them is the easiest mistake to make here.
   // ---------------------------------------------------------------------------------------------
 
-  /** Share of the declared link capacity the token bucket permits itself to use. */
   val BandwidthCeilingPercent: Long = TokenBucketRateLimiter.BANDWIDTH_CEILING_PERCENT
 
-  /** Link utilisation above which network saturation trips the fallback. */
   val LinkSaturationTripPercent: Long = BackpressureProtocol.LINK_SATURATION_PERCENT
 
-  /** Bytes in one mebibyte, the unit the bandwidth configuration is expressed in. */
   val BytesPerMebibyte: Long = TokenBucketRateLimiter.BYTES_PER_MIB
 
-  /** Multiple by which a consumer must lag a producer for slowness to count. */
   val ConsumerSlownessRatio: Double = StreamingShuffleFallbackPolicy.CONSUMER_SLOWNESS_RATIO
 
   /**
@@ -1056,26 +1112,16 @@ object StreamingShuffleTestHelper {
    */
   val MinTokenBucketCapacityBytes: Long = MaxBlockSizeBytes.toLong
 
-  /** Transport module name that gives streaming its own independent tuning namespace. */
   val TransportModuleName: String = "shuffle-streaming"
 
-  // ---------------------------------------------------------------------------------------------
-  // Telemetry.
-  // ---------------------------------------------------------------------------------------------
-
-  /** Metrics namespace the four streaming shuffle metrics live under. */
   val MetricsSourceName: String = StreamingShuffleMetricsSource.sourceName
 
-  /** Registry name of the buffer utilisation gauge. */
   val BufferUtilizationMetricName: String = "bufferUtilizationPercent"
 
-  /** Registry name of the spill counter. */
   val SpillCountMetricName: String = "spillCount"
 
-  /** Registry name of the backpressure event counter. */
   val BackpressureEventsMetricName: String = "backpressureEvents"
 
-  /** Registry name of the partial read invalidation counter. */
   val PartialReadInvalidationsMetricName: String = "partialReadInvalidations"
 
   /**
@@ -1090,44 +1136,34 @@ object StreamingShuffleTestHelper {
     BackpressureEventsMetricName,
     PartialReadInvalidationsMetricName)
 
-  // ---------------------------------------------------------------------------------------------
-  // Workload shape, benchmark targets and stress-run parameters.
-  // ---------------------------------------------------------------------------------------------
+  // Workload shape and stress-run parameters. The latency reduction bounds below are the acceptance
+  // targets the benchmark reports against, not thresholds any automated gate asserts.
 
-  /** Partition count the integration and benchmark scenarios are specified against. */
   val DefaultPartitionCount: Int = 10
 
-  /** Total dataset size the headline latency scenario shuffles, one hundred mebibytes. */
   val TargetDatasetBytes: Long = 100L * 1024L * 1024L
 
-  /** Length in characters of a generated record's value. */
   val RecordValueLength: Int = 256
 
-  /** Duration of the continuous stress workload. */
   val StressDurationMillis: Long = 5L * 60L * 1000L
 
-  /** Concurrent tasks the stress workload runs. */
   val StressConcurrentTasks: Int = 10
 
-  /** Concurrent shuffles the stress workload drives. */
   val StressConcurrentShuffles: Int = 5
 
-  /** Share of stress-workload tasks that are made to fail at random. */
   val StressFailureInjectionPercent: Int = 10
 
-  /** Throughput degradation the stress workload is permitted to show. */
   val MaxThroughputDegradationPercent: Int = 5
 
-  /** Lower bound of the latency reduction the benchmark reports against. */
+  /** Lower bound of the reported latency reduction. */
   val MinLatencyReductionPercent: Int = 30
 
-  /** Upper bound of the latency reduction the benchmark reports against. */
+  /** Upper bound of the reported latency reduction. */
   val MaxLatencyReductionPercent: Int = 50
 
   /** Per-test ceiling the base suite imposes, in minutes. Everything here must fit inside it. */
   val PerTestTimeoutMinutes: Int = 20
 
-  /** Default bound on any blocking wait a helper performs, generous but never unbounded. */
   val DefaultAwaitTimeoutMillis: Long = 30000L
 
   /** Starting time of a manual clock, chosen non-zero so a bug that reads zero stands out. */
@@ -1138,7 +1174,51 @@ object StreamingShuffleTestHelper {
   // ---------------------------------------------------------------------------------------------
 
   /**
-   * The per-partition buffer allowance, computed exactly as the specification states it.
+   * The aggregate buffer allowance, computed exactly as the specification states it and
+   * independently of how production computes it.
+   *
+   * ==Why `BigInt` and not `Long`==
+   *
+   * The specified quantity is `(executorMemory * bufferPercent) / 100`. Written in `Long`
+   * arithmetic that expression can overflow, so any `Long` implementation of it has to be
+   * rearranged -- and once it is rearranged, an expectation written the same way is a transcription
+   * of the implementation rather than a check on it: both orderings agree with themselves, so a
+   * fixture that copies production's ordering passes whichever ordering production uses. `BigInt`
+   * needs no rearrangement. It evaluates the specified expression literally, in one obvious step,
+   * and truncates once at the end, which makes this an independent statement of the contract that a
+   * divide-before-multiply implementation fails for any memory figure that is not a clean multiple
+   * of a hundred.
+   *
+   * @param executorMemoryBytes size of the memory region the budget is carved from
+   * @param bufferPercent share of that region reserved for streaming buffers
+   * @return bytes the executor-wide streaming buffer allowance holds
+   */
+  def aggregateBudgetBytes(executorMemoryBytes: Long, bufferPercent: Int): Long = {
+    require(executorMemoryBytes >= 0L,
+      s"executorMemoryBytes must be non-negative but was $executorMemoryBytes")
+    require(bufferPercent >= MinBufferSizePercent && bufferPercent <= MaxBufferSizePercent,
+      s"bufferPercent must be in [$MinBufferSizePercent, $MaxBufferSizePercent] " +
+        s"but was $bufferPercent")
+    (BigInt(executorMemoryBytes) * BigInt(bufferPercent) / BigInt(PercentScale)).toLong
+  }
+
+  /**
+   * The share of a quantity a whole-number percentage names, computed exactly and independently of
+   * production, for the same reason [[aggregateBudgetBytes]] is.
+   *
+   * @param value the quantity to take a percentage of
+   * @param percent the percentage to take
+   * @return the exact share, truncated once
+   */
+  def exactPercentageOf(value: Long, percent: Int): Long = {
+    require(value >= 0L, s"value must be non-negative but was $value")
+    require(percent >= 0, s"percent must be non-negative but was $percent")
+    (BigInt(value) * BigInt(percent) / BigInt(PercentScale)).toLong
+  }
+
+  /**
+   * The per-partition buffer allowance, computed exactly as the specification states it: the
+   * aggregate allowance from [[aggregateBudgetBytes]] divided by the reduce partition count.
    *
    * @param executorMemoryBytes size of the memory region the budget is carved from
    * @param bufferPercent share of that region reserved for streaming buffers
@@ -1149,13 +1229,8 @@ object StreamingShuffleTestHelper {
       executorMemoryBytes: Long,
       bufferPercent: Int,
       numPartitions: Int): Long = {
-    require(executorMemoryBytes >= 0L,
-      s"executorMemoryBytes must be non-negative but was $executorMemoryBytes")
-    require(bufferPercent >= MinBufferSizePercent && bufferPercent <= MaxBufferSizePercent,
-      s"bufferPercent must be in [$MinBufferSizePercent, $MaxBufferSizePercent] " +
-        s"but was $bufferPercent")
     require(numPartitions > 0, s"numPartitions must be positive but was $numPartitions")
-    executorMemoryBytes / PercentScale * bufferPercent.toLong / numPartitions.toLong
+    aggregateBudgetBytes(executorMemoryBytes, bufferPercent) / numPartitions.toLong
   }
 
   /**
@@ -1182,24 +1257,16 @@ object StreamingShuffleTestHelper {
     applyBandwidthCeiling(
       TokenBucketRateLimiter.perShuffleBytesPerSecond(maxBandwidthMBps, numConcurrentShuffles))
 
-  /**
-   * Encoded length of a data block carrying the given payload.
-   *
-   * @param payloadLength bytes of payload
-   * @return encoded length, exclusive of the one-byte framing discriminator
-   */
   def dataBlockEncodedLength(payloadLength: Int): Int = {
     require(payloadLength >= 0, s"payloadLength must be non-negative but was $payloadLength")
     DataBlockFramingOverheadBytes - FrameTypePrefixLength + payloadLength
   }
 
   /**
-   * Encoded length of a heartbeat naming a consumer whose identity is the given number of UTF-8
-   * bytes. Pass zero for a heartbeat that names no consumer.
+   * Encoded length of a heartbeat naming a consumer whose identity occupies the given bytes.
    *
-   * @param consumerIdByteLength UTF-8 bytes of the consumer identity, at most
-   *                             [[MaxConsumerIdEncodedBytes]]
-   * @return encoded length, exclusive of the one-byte framing discriminator
+   * @param consumerIdByteLength encoded bytes of the consumer identity, zero when none is named
+   * @return bytes the heartbeat encodes to
    */
   def heartbeatEncodedLength(consumerIdByteLength: Int): Int = {
     require(consumerIdByteLength >= 0 && consumerIdByteLength <= MaxConsumerIdEncodedBytes,
@@ -1273,6 +1340,81 @@ object StreamingShuffleTestHelper {
       prefix + filler.toString * (RecordValueLength - prefix.length)
     }
   }
+
+  // ---------------------------------------------------------------------------------------------
+  // Error conditions this feature is authorized to add to the central catalogue.
+  //
+  // The set is closed at three, and all three describe a WIRE fault. A degradation is deliberately
+  // absent: standing streaming down is reported through a boolean and a value from a sealed set, so
+  // it needs no condition. Naming the authorized set here rather than inside one suite is what lets
+  // any suite compare the catalogue against it instead of against the absence of a throw.
+  // ---------------------------------------------------------------------------------------------
+
+  /** Prefix carried by every error condition this feature is authorized to add. */
+  val StreamingShuffleConditionPrefix: String = "STREAMING_SHUFFLE_"
+
+  /**
+   * SQLSTATE every streaming shuffle condition carries.
+   *
+   * `XXKST` is the class Spark already uses for shuffle checksum verification, which is the closest
+   * precedent this feature has: an internal, unrecoverable integrity fault.
+   */
+  val StreamingShuffleSqlState: String = "XXKST"
+
+  /** Every error condition this feature is authorized to add, and no others. */
+  val AuthorizedErrorConditions: Set[String] = Set(
+    s"${StreamingShuffleConditionPrefix}CHECKSUM_VERIFY_FAILED",
+    s"${StreamingShuffleConditionPrefix}INVALID_SEQUENCE_NUMBER",
+    s"${StreamingShuffleConditionPrefix}UNEXPECTED_MESSAGE_TYPE")
+
+  /**
+   * Trips one of the four documented degradation conditions on a policy, deterministically.
+   *
+   * One place where each condition is driven, shared by every caller, so a suite that trips a
+   * condition on a policy held by a live [[StreamingShuffleManager]] does it in exactly the way a
+   * suite that trips one from inside a running map task does. Two sources of truth for "how is
+   * memory pressure provoked" would let the two drift until one of them stopped provoking anything
+   * and its assertions started passing for the wrong reason.
+   *
+   * Every condition is driven through the policy's own public recording surface, and every instant
+   * is SUPPLIED rather than read from a clock, so the sixty-second sustained-slowness window is
+   * crossed without waiting a minute and without the policy needing an injected clock. That is what
+   * makes this usable against the policy a real manager built for itself, whose clock is the
+   * system's.
+   *
+   * @param policy the policy to trip, which must not have tripped already -- the latch is monotone,
+   *               so a second condition driven at a tripped policy would be recorded and ignored
+   * @param reason which of the four conditions to provoke
+   * @param shuffleId the shuffle the throughput samples belong to. Only consumer slowness reads it,
+   *                  because only it is measured per shuffle
+   */
+  def driveFallbackReason(
+      policy: StreamingShuffleFallbackPolicy,
+      reason: StreamingShuffleFallbackReason,
+      shuffleId: Int): Unit = {
+    reason match {
+      case StreamingShuffleFallbackReason.ConsumerTooSlow =>
+        // A consumer held at a quarter of the producer's rate, sampled twice so that the second
+        // sample lies strictly beyond the sustained window.
+        val openedAtMillis = 0L
+        val beyondWindowMillis = openedAtMillis + SustainedSlownessWindowMillis + 1L
+        policy.recordProducerThroughput(shuffleId, 4000.0d, openedAtMillis)
+        policy.recordConsumerThroughput(shuffleId, 1000.0d, openedAtMillis)
+        policy.recordProducerThroughput(shuffleId, 4000.0d, beyondWindowMillis)
+        policy.recordConsumerThroughput(shuffleId, 1000.0d, beyondWindowMillis)
+      case StreamingShuffleFallbackReason.MemoryPressure =>
+        // A reservation for one whole block granted nothing at all, which is the OOM risk the
+        // condition names rather than a merely tight budget.
+        policy.recordAllocationGrant(MaxBlockSizeBytes.toLong, 0L)
+      case StreamingShuffleFallbackReason.NetworkSaturation =>
+        // Ninety-nine percent of the administered link, which is strictly above the trip share.
+        policy.recordLinkUtilization(99.0d, 100.0d)
+      case StreamingShuffleFallbackReason.ProtocolVersionMismatch =>
+        // A version one beyond the one this build speaks, detected by the explicit compatibility
+        // check rather than inferred from a parse failure.
+        policy.checkProtocolVersion((ProtocolVersion + 1).toByte)
+    }
+  }
 }
 
 
@@ -1280,44 +1422,27 @@ object StreamingShuffleTestHelper {
  * Shared fixtures, deterministic barriers and fault-injection hooks for the streaming shuffle
  * suites and benchmark.
  *
- * This is a plain trait, just like the checksum test helper in the parent package: it declares no
- * self-type and extends no suite base class, so a suite mixes it in with `with` and the trait stays
- * usable from a benchmark, which is not a suite at all. That is why every method that needs a live
- * `SparkContext`, `SparkEnv` or `MetricsSystem` takes it as a parameter rather than reaching for an
- * inherited field.
- *
- * The trait lives in `org.apache.spark.shuffle.streaming`, the same package as the fifteen
- * production types. That single fact is what grants access to types the production code declares
- * `private[spark]` without asking any of them to widen its visibility, which in turn is what keeps
+ * A plain trait, like the checksum test helper in the parent package: it declares no self-type and
+ * extends no suite base class, so it stays usable from a benchmark, which is not a suite at all.
+ * That is why every method needing a live `SparkContext`, `SparkEnv` or `MetricsSystem` takes it as
+ * a parameter. Living in the same package as the production types grants access to what they
+ * declare `private[spark]` without asking any of them to widen its visibility, which is what keeps
  * the binary compatibility gate passing with no exclusion entries.
  *
- * Three disciplines run through everything below, and each one exists to make a specific class of
- * flakiness impossible rather than merely unlikely.
- *
- *  - Nothing sleeps. Waits are expressed as barriers with a bounded timeout, and elapsed time is
- *    expressed as an advance of an injected [[ManualClock]]. A sleeping test is slow when it passes
- *    and flaky when the machine is busy, and it cannot assert that a timer does NOT fire early;
- *    a clock-driven test is instant, exact, and can.
- *  - Nothing is random unless it is seeded. Every generator here is reproducible from its inputs,
- *    so a failure can be replayed rather than chased.
- *  - Nothing shares mutable global state silently. The metrics source is a JVM singleton whose
- *    counters outlive a test, so [[resetStreamingShuffleMetrics]] exists and its consequences are
- *    documented where they are not obvious.
+ * Three disciplines run through everything below, each making a class of flakiness impossible
+ * rather than merely unlikely: nothing sleeps, because a wait is a bounded barrier and elapsed time
+ * is an advance of an injected [[ManualClock]]; nothing is random unless it is seeded, so a failure
+ * can be replayed rather than chased; and nothing shares mutable global state silently, which is
+ * why [[resetStreamingShuffleMetrics]] exists for the JVM-singleton metrics source.
  */
 trait StreamingShuffleTestHelper {
 
   import StreamingShuffleTestHelper._
 
-  // ---------------------------------------------------------------------------------------------
-  // 1. Configuration fixtures.
-  //
-  // Every value is set through its typed ConfigEntry, never through a raw string key. Typed entries
-  // carry their own validators, so a fixture that would violate a documented range fails at the
-  // point the fixture is built rather than deep inside the component under test. The entries
-  // themselves are consumed here and never re-declared: each key may be declared exactly once in
-  // the JVM, and a second declaration would either shadow the first or throw during class
-  // initialisation.
-  // ---------------------------------------------------------------------------------------------
+  // Configuration fixtures. Every value is set through its typed ConfigEntry rather than a raw
+  // string key, so a fixture that would violate a documented range fails where the fixture is built
+  // instead of deep inside the component under test. The entries are consumed here and never
+  // re-declared: each key may be declared exactly once in the JVM.
 
   /**
    * A configuration that selects the streaming shuffle manager and leaves streaming behaviour off.
@@ -1336,12 +1461,6 @@ trait StreamingShuffleTestHelper {
       .set(SHUFFLE_STREAMING_ENABLED, false)
   }
 
-  /**
-   * A configuration that selects the streaming shuffle manager and opens the behaviour gate.
-   *
-   * @param loadDefaults whether to pick up ambient `spark.*` system properties
-   * @return a configuration on which the streaming path is fully active
-   */
   def streamingConf(loadDefaults: Boolean = false): SparkConf = {
     gatedOffStreamingConf(loadDefaults).set(SHUFFLE_STREAMING_ENABLED, true)
   }
@@ -1366,6 +1485,15 @@ trait StreamingShuffleTestHelper {
    * that passed `Some(0)` would be rejected by the entry's own positivity validator, which is the
    * behaviour a suite should be asserting rather than working around.
    *
+   * `None` is therefore made absent rather than merely left unset. With `loadDefaults` enabled a
+   * `SparkConf` imports every ambient `spark.*` system property, so a JVM that happens to carry
+   * `spark.shuffle.streaming.maxBandwidthMBps` -- a property another suite set, or one an operator
+   * passed to the test JVM -- would hand this builder a capped fixture while its caller had asked
+   * for an uncapped one, and a rate-limiting assertion would then be measuring a cap it never
+   * chose. Removing the key is what makes `None` mean uncapped unconditionally, and it is a
+   * removal rather than an assertion because a fixture's job is to establish the state its caller
+   * named, not to fail because the environment disagreed.
+   *
    * @param bufferSizePercent share of executor memory reserved for buffers, in one to fifty
    * @param spillThreshold utilisation at which spill triggers, in fifty to ninety-five
    * @param maxBandwidthMBps declared link capacity, or `None` for uncapped egress
@@ -1387,21 +1515,13 @@ trait StreamingShuffleTestHelper {
       .set(SHUFFLE_STREAMING_BUFFER_SIZE_PERCENT, bufferSizePercent)
       .set(SHUFFLE_STREAMING_SPILL_THRESHOLD, spillThreshold)
       .set(SHUFFLE_STREAMING_DEBUG, debug)
-    maxBandwidthMBps.foreach(cap => conf.set(SHUFFLE_STREAMING_MAX_BANDWIDTH_MBPS, cap))
+    maxBandwidthMBps match {
+      case Some(cap) => conf.set(SHUFFLE_STREAMING_MAX_BANDWIDTH_MBPS, cap)
+      case None => conf.remove(SHUFFLE_STREAMING_MAX_BANDWIDTH_MBPS)
+    }
     conf
   }
 
-  /**
-   * Adds the app name and master a fixture needs before it can build a `SparkContext`.
-   *
-   * Kept separate from the configuration builders above so the same builders serve both the unit
-   * fixtures, which never start a context, and the integration fixtures, which do.
-   *
-   * @param conf the configuration to complete, modified in place and returned for chaining
-   * @param appName application name to record
-   * @param master master URL to run against
-   * @return the same configuration, now startable
-   */
   def withLocalMaster(
       conf: SparkConf,
       appName: String = "streaming-shuffle-test",
@@ -1409,16 +1529,8 @@ trait StreamingShuffleTestHelper {
     conf.setAppName(appName).setMaster(master)
   }
 
-  // ---------------------------------------------------------------------------------------------
-  // 2. Partitioners and workload construction.
-  // ---------------------------------------------------------------------------------------------
-
   /**
    * A partitioner that spreads keys by hash across the requested number of partitions.
-   *
-   * Both members carry an explicit result type. The nearest precedent in the sort-path writer suite
-   * omits them, but the style checker requires a result type on every public method and new code
-   * has no reason to inherit an existing blemish. That precedent is left exactly as it is.
    *
    * @param partitions number of partitions to spread across
    * @return the partitioner
@@ -1476,13 +1588,6 @@ trait StreamingShuffleTestHelper {
       .dependencies.head.asInstanceOf[ShuffleDependency[Int, Int, Int]]
   }
 
-  /**
-   * The simplest end-to-end shuffle a suite can run: group a handful of pairs by key.
-   *
-   * @param sc live context to build on
-   * @param numPartitions partitions to group into
-   * @return the grouped RDD, not yet computed
-   */
   def groupByKeyWorkload(
       sc: SparkContext,
       numPartitions: Int = DefaultPartitionCount): RDD[(Int, Iterable[String])] = {
@@ -1490,6 +1595,41 @@ trait StreamingShuffleTestHelper {
     sc.parallelize(pairs, numPartitions).groupByKey(numPartitions)
   }
 
+  /**
+   * The same grouping workload, with a mid-write fallback trip wired into its map side.
+   *
+   * <b>Why the trip has to live inside a map function.</b> A streaming writer pulls records from
+   * the iterator it was handed, so a transformation upstream of the shuffle executes WHILE the
+   * writer is streaming. Tripping the executor's live policy from there is therefore a genuine
+   * mid-write trip against the very instance the writer consults at its next block boundary --
+   * which no driver-side fixture can reproduce, because the policy is executor scoped.
+   *
+   * The trip fires once per map partition, on the first record, so it is observed after records
+   * have been framed and before the iterator is exhausted. It is deterministic: no clock is waited
+   * on and no rate is hoped for, because every condition is driven through a recorder that takes
+   * the observation as an argument.
+   *
+   * @param sc live context to build on
+   * @param numPartitions partitions to group into
+   * @param holder carries the condition to drive and, once the caller has set it, the shuffle id
+   * @return the grouped RDD, not yet computed
+   */
+  def midWriteTrippingWorkload(
+      sc: SparkContext,
+      numPartitions: Int,
+      holder: MidWriteTripHolder): RDD[(Int, Iterable[String])] = {
+    val pairs = Seq((1, "one"), (2, "two"), (3, "three"), (4, "four"), (5, "five"))
+    sc.parallelize(pairs, numPartitions)
+      .mapPartitions { records =>
+        records.zipWithIndex.map { case (record, index) =>
+          if (index == 0) {
+            holder.trip()
+          }
+          record
+        }
+      }
+      .groupByKey(numPartitions)
+  }
   /**
    * A dataset of approximately [[TargetDatasetBytes]] spread evenly over `numPartitions`.
    *
@@ -1520,16 +1660,6 @@ trait StreamingShuffleTestHelper {
     }
   }
 
-  /**
-   * Records per partition [[largeDataset]] will generate for a given shape.
-   *
-   * Exposed so a suite can state its expected record count without re-deriving the arithmetic and
-   * drifting from it.
-   *
-   * @param numPartitions partitions the dataset is spread across
-   * @param totalBytes approximate total size of the generated values
-   * @return records each partition contributes
-   */
   def recordsPerPartitionFor(
       numPartitions: Int = DefaultPartitionCount,
       totalBytes: Long = TargetDatasetBytes): Int = {
@@ -1538,15 +1668,6 @@ trait StreamingShuffleTestHelper {
     math.max(1, (totalBytes / numPartitions.toLong / RecordValueLength.toLong).toInt)
   }
 
-  /**
-   * A reproducible sequence of integer key-value records for driver-side unit fixtures.
-   *
-   * @param numRecords records to produce
-   * @param seed value that fixes the sequence
-   * @param keySpace exclusive upper bound on generated keys, so collisions can be forced by
-   *                 narrowing it and avoided by widening it
-   * @return the records, in generation order
-   */
   def deterministicRecords(
       numRecords: Int,
       seed: Long = 0L,
@@ -1563,53 +1684,20 @@ trait StreamingShuffleTestHelper {
     records.toSeq
   }
 
-  /**
-   * A reproducible payload, delegating to the pure helper so a suite has one obvious place to look.
-   *
-   * @param seed value that fixes the byte sequence
-   * @param length bytes to produce
-   * @return the payload
-   */
   def payloadOfLength(seed: Long, length: Int): Array[Byte] = deterministicPayload(seed, length)
 
-  /**
-   * A payload of exactly the maximum permitted block size.
-   *
-   * The encoder accepts exactly the maximum and rejects one byte more, so this is the value a
-   * boundary test needs on the accepting side.
-   *
-   * @param seed value that fixes the byte sequence
-   * @return a payload of [[MaxBlockSizeBytes]] bytes
-   */
   def maximumSizedPayload(seed: Long = 0L): Array[Byte] =
     deterministicPayload(seed, MaxBlockSizeBytes)
 
-  /**
-   * A payload one byte over the maximum permitted block size.
-   *
-   * @param seed value that fixes the byte sequence
-   * @return a payload of [[MaxBlockSizeBytes]] plus one bytes, which the encoder must refuse
-   */
   def oversizedPayload(seed: Long = 0L): Array[Byte] =
     deterministicPayload(seed, MaxBlockSizeBytes + 1)
 
 
-  // ---------------------------------------------------------------------------------------------
-  // 3. Deterministic barriers.
-  //
-  // No helper below sleeps, and none of them waits without a bound. An unbounded wait turns a
-  // deadlock into a twenty minute timeout with no diagnosis attached; a bounded wait that asserts
-  // on expiry names the barrier that never opened. Waits on futures go through the sanctioned
-  // ThreadUtils wrappers, which exist precisely so that a caller never reaches for the raw
-  // scala.concurrent entry points that the style checker forbids by name.
-  // ---------------------------------------------------------------------------------------------
+  // Deterministic barriers. Nothing below sleeps and nothing waits without a bound: an unbounded
+  // wait turns a deadlock into a twenty minute timeout with no diagnosis attached, while a bounded
+  // wait that asserts on expiry names the barrier that never opened. Waits on futures go through
+  // the sanctioned ThreadUtils wrappers, which the style checker requires by name.
 
-  /**
-   * A latch that opens after the given number of countdowns.
-   *
-   * @param count countdowns required to open the latch
-   * @return the latch
-   */
   def newLatch(count: Int): CountDownLatch = {
     require(count >= 0, s"count must be non-negative but was $count")
     new CountDownLatch(count)
@@ -1644,13 +1732,6 @@ trait StreamingShuffleTestHelper {
     new Semaphore(permits)
   }
 
-  /**
-   * Waits for a latch to open, and fails with a named diagnosis if it does not.
-   *
-   * @param latch latch to wait on
-   * @param description what the latch represents, quoted back in the failure message
-   * @param timeoutMillis bound on the wait
-   */
   def awaitLatch(
       latch: CountDownLatch,
       description: String = "latch",
@@ -1661,14 +1742,6 @@ trait StreamingShuffleTestHelper {
         s"${latch.getCount} countdown(s) never arrived")
   }
 
-  /**
-   * Waits at a barrier for every other party to arrive.
-   *
-   * @param barrier barrier to wait at
-   * @param description what the barrier represents, quoted back in the failure message
-   * @param timeoutMillis bound on the wait
-   * @return the arrival index this party was given, which orders the participants deterministically
-   */
   def awaitBarrier(
       barrier: CyclicBarrier,
       description: String = "barrier",
@@ -1683,13 +1756,6 @@ trait StreamingShuffleTestHelper {
     }
   }
 
-  /**
-   * Acquires one permit, and fails with a named diagnosis if none becomes available.
-   *
-   * @param semaphore semaphore to acquire from
-   * @param description what the permit represents, quoted back in the failure message
-   * @param timeoutMillis bound on the wait
-   */
   def acquirePermit(
       semaphore: Semaphore,
       description: String = "permit",
@@ -1698,42 +1764,16 @@ trait StreamingShuffleTestHelper {
     assert(acquired, s"Timed out after $timeoutMillis ms acquiring $description")
   }
 
-  /**
-   * Waits for a Java future to produce its value, through the sanctioned wrapper.
-   *
-   * @param future future to wait on
-   * @param timeoutMillis bound on the wait
-   * @tparam T the future's value type
-   * @return the value
-   */
   def awaitJavaFuture[T](future: JFuture[T], timeoutMillis: Long = DefaultAwaitTimeoutMillis): T = {
     ThreadUtils.awaitResult(future, Duration(timeoutMillis, TimeUnit.MILLISECONDS))
   }
 
-  /**
-   * Waits for a Scala awaitable to produce its value, through the sanctioned wrapper.
-   *
-   * @param awaitable awaitable to wait on
-   * @param timeoutMillis bound on the wait
-   * @tparam T the awaitable's value type
-   * @return the value
-   */
   def awaitValue[T](
       awaitable: Awaitable[T],
       timeoutMillis: Long = DefaultAwaitTimeoutMillis): T = {
     ThreadUtils.awaitResult(awaitable, Duration(timeoutMillis, TimeUnit.MILLISECONDS))
   }
 
-  /**
-   * Waits for a Scala awaitable to complete without unwrapping its value, through the sanctioned
-   * wrapper. Useful when the assertion is about completion, or about a failure the caller wants to
-   * inspect itself rather than have rethrown.
-   *
-   * @param awaitable awaitable to wait on
-   * @param timeoutMillis bound on the wait
-   * @tparam T the awaitable's value type
-   * @return the same awaitable, now complete
-   */
   def awaitCompletion[T](
       awaitable: Awaitable[T],
       timeoutMillis: Long = DefaultAwaitTimeoutMillis): awaitable.type = {
@@ -1781,22 +1821,13 @@ trait StreamingShuffleTestHelper {
     }
   }
 
-  // ---------------------------------------------------------------------------------------------
-  // 4. Injected clocks.
-  //
-  // Every streaming shuffle component accepts a Clock, and every one of them defaults it to a
-  // system clock in service and is handed a ManualClock in test. That is the single most important
-  // determinism mechanism in this subsystem: it turns a five second timeout into one method call.
-  //
-  // ManualClock's setTime and advance both call notifyAll, and waitTillTime waits on the same
-  // monitor, so a thread parked in waitTillTime is released by an advance on another thread. That
-  // makes the clock a legitimate cross-thread rendezvous, not merely a value holder -- and it is
-  // still not sleeping.
-  //
-  // Helpers come in pairs. One advances far enough for a timer to fire; its counterpart advances to
-  // one millisecond short of the deadline, because "the timer fired" and "the timer did not fire
-  // early" are two different assertions and a suite owes both.
-  // ---------------------------------------------------------------------------------------------
+  // Injected clocks. Every streaming shuffle component accepts a Clock, defaulted to a system clock
+  // in service and handed a ManualClock in test, which turns a five second timeout into one method
+  // call. ManualClock's setTime and advance both notifyAll and waitTillTime waits on the same
+  // monitor, so an advance on one thread releases a thread parked on another -- a legitimate
+  // cross-thread rendezvous that is still not sleeping. Helpers come in pairs: one advances far
+  // enough for a timer to fire, its counterpart to one millisecond short of the deadline, because
+  // "the timer fired" and "the timer did not fire early" are two assertions and a suite owes both.
 
   /**
    * A manual clock starting at a deliberately non-zero epoch.
@@ -1811,6 +1842,35 @@ trait StreamingShuffleTestHelper {
     new ManualClock(initialTimeMillis)
 
   /**
+   * Runs a body with one directory made read-only, restoring it whatever the body does.
+   *
+   * The only supported way to use [[StreamingShuffleFaultInjector.failDiskWrites]]. Both pieces of
+   * state a disk fault involves -- the directory's permission bit and the injector's armed scenario
+   * -- outlive the case that created them, so restoration belongs in a `finally` rather than in a
+   * call the caller has to remember to make after assertions that may not be reached.
+   *
+   * The body receives the fixture rather than nothing for two reasons: the directory it must write
+   * into is the fixture's own, and whether the fault took effect is a property of the environment.
+   * As root, or on a filesystem that ignores the permission bit, the change is not effective and a
+   * case that asserted a write failure anyway would fail for the wrong reason; a body that needs
+   * the fault to be real guards on `fault.isEffective`.
+   *
+   * @param injector the fault injector whose scenario is armed for the scope
+   * @param body the assertions to run while writes into the fixture's directory fail
+   * @tparam T whatever the body returns
+   * @return the body's result
+   */
+  def withFailingDiskWrites[T](injector: StreamingShuffleFaultInjector)(
+      body: ScopedDiskFault => T): T = {
+    val fault = injector.failDiskWrites()
+    try {
+      body(fault)
+    } finally {
+      fault.close()
+    }
+  }
+
+  /**
    * A real system clock, for the rare fixture that genuinely needs wall time.
    *
    * Provided so that reaching for wall time is an explicit, visible decision rather than an
@@ -1820,52 +1880,20 @@ trait StreamingShuffleTestHelper {
    */
   def wallClock(): Clock = new SystemClock
 
-  /**
-   * Advances by one spill poll interval, which is also the buffer reclamation deadline.
-   *
-   * @param clock clock to advance
-   */
   def advanceOneSpillPoll(clock: ManualClock): Unit = clock.advance(SpillPollIntervalMillis)
 
-  /**
-   * Advances by exactly the reclamation deadline, so a suite can assert a buffer that was
-   * acknowledged is released within it and that overrunning it is detected.
-   *
-   * @param clock clock to advance
-   */
   def advanceReclamationDeadline(clock: ManualClock): Unit =
     clock.advance(ReclamationDeadlineMillis)
 
-  /**
-   * Advances past the five second producer connection timeout.
-   *
-   * @param clock clock to advance
-   */
   def advancePastProducerTimeout(clock: ManualClock): Unit =
     clock.advance(ProducerConnectionTimeoutMillis)
 
-  /**
-   * Advances to one millisecond short of the producer connection timeout, for asserting the timer
-   * has NOT fired.
-   *
-   * @param clock clock to advance
-   */
   def advanceJustBeforeProducerTimeout(clock: ManualClock): Unit =
     clock.advance(JustBeforeProducerTimeoutMillis)
 
-  /**
-   * Advances past the ten second consumer liveness window.
-   *
-   * @param clock clock to advance
-   */
   def advancePastConsumerLivenessTimeout(clock: ManualClock): Unit =
     clock.advance(ConsumerLivenessTimeoutMillis)
 
-  /**
-   * Advances to one millisecond short of the consumer liveness window.
-   *
-   * @param clock clock to advance
-   */
   def advanceJustBeforeConsumerLivenessTimeout(clock: ManualClock): Unit =
     clock.advance(JustBeforeConsumerLivenessMillis)
 
@@ -1880,11 +1908,6 @@ trait StreamingShuffleTestHelper {
   def advancePastSustainedSlownessWindow(clock: ManualClock): Unit =
     clock.advance(SustainedSlownessTripMillis)
 
-  /**
-   * Advances to one millisecond short of the sustained-slowness window.
-   *
-   * @param clock clock to advance
-   */
   def advanceJustBeforeSustainedSlownessWindow(clock: ManualClock): Unit =
     clock.advance(JustBeforeSustainedSlownessMillis)
 
@@ -1916,29 +1939,12 @@ trait StreamingShuffleTestHelper {
   def awaitClockReading(clock: ManualClock, targetTimeMillis: Long): Long =
     clock.waitTillTime(targetTimeMillis)
 
-  // ---------------------------------------------------------------------------------------------
-  // 5. Task context and memory fixtures.
-  //
-  // Two fixtures, and the second is not a convenience. The shared one hardcodes attempt number
-  // zero, so it cannot express the flush-ordering case in which a speculative attempt is ordered
-  // behind the original; the direct builder can, because the remaining TaskContextImpl parameters
-  // all carry defaults that exist for exactly this purpose.
-  //
-  // Both are safe from a test body. On the driver, the shuffle manager is initialised BEFORE the
-  // memory manager, so SparkEnv.get.memoryManager is null while a shuffle manager's constructor
-  // runs -- but by the time a test body executes, the context is fully built and both fixtures find
-  // a live memory manager.
-  // ---------------------------------------------------------------------------------------------
+  // Task context and memory fixtures. The shared fixture hardcodes attempt number zero, so it
+  // cannot express the flush-ordering case in which a speculative attempt is ordered behind the
+  // original; the direct builder can, because the remaining TaskContextImpl parameters all default.
+  // Both are safe from a test body: a shuffle manager's constructor runs before the driver's memory
+  // manager exists, but by the time a test body executes both fixtures find a live one.
 
-  /**
-   * The shared task context fixture.
-   *
-   * Its declared type is `TaskContext`, an upcast, so members specific to the implementation are
-   * not reachable through it. When a suite needs those, it wants [[newTaskContext]] instead.
-   *
-   * @param sc live context whose environment supplies the memory manager and metrics system
-   * @return a task context suitable for constructing a writer or reader
-   */
   def fakeTaskContext(sc: SparkContext): TaskContext = MemoryTestingUtils.fakeTaskContext(sc.env)
 
   /**
@@ -1993,21 +1999,10 @@ trait StreamingShuffleTestHelper {
     new TaskMemoryManager(env.memoryManager, taskAttemptId)
 
 
-  // ---------------------------------------------------------------------------------------------
-  // 6. Wire protocol fixtures.
-  //
-  // Every message factory here supplies the timestamp, the sequence number and the checksum from
-  // its arguments rather than reading a clock or hashing implicitly. That mirrors the encoder's own
-  // design -- a heartbeat has no timestamp-less constructor and reads no clock -- and it is what
-  // makes clock injection possible throughout the subsystem instead of merely convenient.
-  // ---------------------------------------------------------------------------------------------
+  // Wire protocol fixtures. Every message factory takes its timestamp, sequence number and checksum
+  // from its arguments rather than reading a clock or hashing implicitly, which mirrors the
+  // encoder's own design and is what makes clock injection possible throughout the subsystem.
 
-  /**
-   * A managed buffer over the given bytes, wrapped so retains and releases are counted.
-   *
-   * @param payload bytes the buffer exposes
-   * @return the counting buffer
-   */
   def recordingBuffer(payload: Array[Byte]): RecordingStreamingManagedBuffer =
     new RecordingStreamingManagedBuffer(new NioManagedBuffer(ByteBuffer.wrap(payload)))
 
@@ -2151,16 +2146,6 @@ trait StreamingShuffleTestHelper {
     new StreamTerminationMessage(shuffleId, mapId, partitionId, totalBlocks, totalBlocks)
   }
 
-  /**
-   * The correct CRC32C for a block, identity included.
-   *
-   * @param shuffleId shuffle the block belongs to
-   * @param mapId producing map task
-   * @param partitionId partition the block belongs to
-   * @param sequenceNumber position of the block within its partition's stream
-   * @param payload block payload
-   * @return the checksum a producer would stamp
-   */
   def blockChecksum(
       shuffleId: Int,
       mapId: Long,
@@ -2169,33 +2154,13 @@ trait StreamingShuffleTestHelper {
       payload: Array[Byte]): Long =
     StreamingShuffleChecksum.computeBlock(shuffleId, mapId, partitionId, sequenceNumber, payload)
 
-  /**
-   * The message type a decoded message would be framed with, determined from its class.
-   *
-   * @param message the message to classify
-   * @return its discriminator
-   */
   def typeOf(message: StreamingShuffleMessage): StreamingShuffleMessageType = messageTypeOf(message)
 
-  // ---------------------------------------------------------------------------------------------
-  // 7. Telemetry seams.
-  //
-  // The metrics source is an object, so its counters are JVM-global and survive from one test into
-  // the next. Every suite that asserts on a counter therefore has to reset first, and that is what
-  // the helper below is for.
-  //
-  // One consequence of reset is worth stating because it is not obvious: reset also empties the
-  // registry of buffer-utilisation contributors, which detaches whatever was reporting the gauge --
-  // including the executor-wide buffer quota, if one has already been created in this JVM. That is
-  // harmless in a test and is why production code never calls reset in service, but it does mean
-  // a suite asserting on the gauge should install its own contributor AFTER resetting, not before.
-  // ---------------------------------------------------------------------------------------------
+  // Telemetry seams. The metrics source is an object, so its counters are JVM-global and survive
+  // from one test into the next; a suite asserting on one resets first. Reset also empties the
+  // registry of buffer-utilisation contributors, which detaches whatever was reporting the gauge,
+  // so a suite asserting on the gauge installs its own contributor AFTER resetting, not before.
 
-  /**
-   * Returns the four streaming shuffle metrics to their initial state.
-   *
-   * @return unit; called for its effect on the JVM-global metric registry
-   */
   def resetStreamingShuffleMetrics(): Unit = StreamingShuffleMetricsSource.reset()
 
   /**
@@ -2217,11 +2182,6 @@ trait StreamingShuffleTestHelper {
     contributor
   }
 
-  /**
-   * Detaches a previously installed contributor.
-   *
-   * @param contributor the contributor to detach
-   */
   def removeBufferUtilization(contributor: FixedBufferUtilizationContributor): Unit =
     StreamingShuffleMetricsSource.unregisterBufferUtilizationContributor(contributor)
 
@@ -2238,20 +2198,9 @@ trait StreamingShuffleTestHelper {
   def streamingShuffleSources(metricsSystem: MetricsSystem): Seq[Source] =
     metricsSystem.getSourcesByName(MetricsSourceName)
 
-  /**
-   * Every metric name the streaming shuffle namespace currently publishes.
-   *
-   * @return the registry's names, as a set, for comparison against [[MetricNames]]
-   */
   def streamingShuffleMetricNames(): Set[String] =
     StreamingShuffleMetricsSource.metricRegistry.getNames.asScala.toSet
 
-  /**
-   * A counter from the streaming shuffle registry, by its bare name.
-   *
-   * @param name one of the three counter names
-   * @return the counter
-   */
   def streamingShuffleCounter(name: String): Counter = {
     val counters = StreamingShuffleMetricsSource.metricRegistry.getCounters
     val counter = counters.get(name)
@@ -2278,34 +2227,16 @@ trait StreamingShuffleTestHelper {
     gauge.asInstanceOf[Gauge[Long]]
   }
 
-  /** Current spill count as an operator would observe it. */
   def observedSpillCount(): Long = streamingShuffleCounter(SpillCountMetricName).getCount
 
-  /** Current backpressure event count as an operator would observe it. */
   def observedBackpressureEvents(): Long =
     streamingShuffleCounter(BackpressureEventsMetricName).getCount
 
-  /** Current partial read invalidation count as an operator would observe it. */
   def observedPartialReadInvalidations(): Long =
     streamingShuffleCounter(PartialReadInvalidationsMetricName).getCount
 
-  /** Current buffer utilisation percentage as an operator would observe it. */
   def observedBufferUtilizationPercent(): Long = bufferUtilizationGauge().getValue
 
-  // ---------------------------------------------------------------------------------------------
-  // 8. Fault injection.
-  // ---------------------------------------------------------------------------------------------
-
-  /**
-   * A fault injector bound to the given clock.
-   *
-   * Binding the injector to the same clock the component under test was given is what makes a
-   * time-based fault visible to that component: there is one notion of now, and the injector moves
-   * it.
-   *
-   * @param clock the clock the component under test reads
-   * @return the injector
-   */
   def newFaultInjector(clock: ManualClock): StreamingShuffleFaultInjector =
     new StreamingShuffleFaultInjector(clock)
 
@@ -2340,27 +2271,11 @@ trait StreamingShuffleTestHelper {
     selected.toSet
   }
 
-  // ---------------------------------------------------------------------------------------------
-  // 9. Sort-based baseline and data-loss assertions.
-  //
-  // "Zero data loss" is not an opinion about a log line: it is the statement that the set of
+  // Sort-based baseline and data-loss assertions. "Zero data loss" is the statement that the set of
   // records a streaming shuffle produces equals the set sort-based shuffle produces from the same
-  // input.
-  // A set rather than a sequence, because a shuffle makes no promise about ordering within a
-  // partition and comparing sequences would fail for a reason that is not a defect.
-  // ---------------------------------------------------------------------------------------------
+  // input -- a set rather than a sequence, because a shuffle makes no promise about ordering within
+  // a partition and comparing sequences would fail for a reason that is not a defect.
 
-  /**
-   * Runs the grouping workload on an existing context and returns its output as a set.
-   *
-   * Whether the run exercises the streaming path or the sort path is decided entirely by the
-   * configuration the given context was built with, so the same method produces both sides of a
-   * comparison.
-   *
-   * @param sc live context to run on
-   * @param numPartitions partitions to group into
-   * @return each key with its grouped values, the values sorted so the comparison is order-free
-   */
   def groupedOutputAsSet(
       sc: SparkContext,
       numPartitions: Int = DefaultPartitionCount): Set[(Int, Seq[String])] = {
@@ -2417,20 +2332,50 @@ trait StreamingShuffleTestHelper {
   }
 
   /**
-   * Asserts that every buffer taken was dropped exactly once.
+   * Asserts that every buffer was taken exactly the expected number of times and dropped exactly as
+   * often as it was taken.
+   *
+   * ==Why the exact count and not merely a balance==
+   *
+   * Balance alone is not the contract. A buffer retained twice and released twice is balanced, and
+   * it is also a component that took a second reference it was never entitled to -- an extra
+   * reference means the frame is pinned for longer than its records are needed, which is precisely
+   * the retention this accounting exists to rule out, and it would sail through a "nonzero and
+   * equal" check. So the take count is asserted against the documented lifecycle, which for a
+   * streaming frame is one: the consumer takes a reference when it accepts the frame and drops it
+   * once the frame's records have been surfaced.
+   *
+   * The three ways the lifecycle can be wrong are reported separately, because they have different
+   * causes and different fixes: never taken (the accounting proves nothing, so the fixture is not
+   * measuring the path it claims to), taken more than the documented number of times (over
+   * retention), and dropped a different number of times than taken (a leak or an over release).
    *
    * @param buffers the counting buffers a run handed out
+   * @param expectedTakesPerBuffer references the component under test is documented to take on each
+   *                               buffer, which is one for an ordinary streaming frame
    */
   def assertBuffersReleasedExactlyOnce(
-      buffers: Seq[RecordingStreamingManagedBuffer]): Unit = {
-    val leaked = buffers.filter(buffer => buffer.outstandingReferences != 0)
-    assert(leaked.isEmpty,
-      s"${leaked.size} of ${buffers.size} managed buffer(s) were not released exactly once; " +
-        s"outstanding reference counts ${leaked.map(_.outstandingReferences).mkString(", ")}")
+      buffers: Seq[RecordingStreamingManagedBuffer],
+      expectedTakesPerBuffer: Int = 1): Unit = {
+    require(expectedTakesPerBuffer >= 1,
+      s"A documented lifecycle takes at least one reference, but $expectedTakesPerBuffer was " +
+        "given.")
     val untouched = buffers.filter(buffer => buffer.callsToRetain == 0)
     assert(untouched.isEmpty,
       s"${untouched.size} of ${buffers.size} managed buffer(s) were never retained, so their " +
         "release accounting proves nothing")
+    val overRetained = buffers.filter(buffer => buffer.callsToRetain != expectedTakesPerBuffer)
+    assert(overRetained.isEmpty,
+      s"${overRetained.size} of ${buffers.size} managed buffer(s) were retained a number of " +
+        s"times other than the documented $expectedTakesPerBuffer; retain counts " +
+        s"${overRetained.map(_.callsToRetain).mkString(", ")}. An extra reference pins a frame " +
+        "for longer than its records are needed, which a balanced count alone would hide")
+    val unbalanced = buffers.filter(buffer => buffer.outstandingReferences != 0)
+    assert(unbalanced.isEmpty,
+      s"${unbalanced.size} of ${buffers.size} managed buffer(s) were not released exactly as " +
+        s"often as they were retained; outstanding reference counts " +
+        s"${unbalanced.map(_.outstandingReferences).mkString(", ")} (positive is a leak, " +
+        "negative is an over release)")
   }
 
   /**
@@ -2468,13 +2413,6 @@ trait StreamingShuffleTestHelper {
         s"${notifier.error.map(_.toString).getOrElse("<none>")}")
   }
 
-  /**
-   * Asserts that a failure of the expected kind reached the task thread.
-   *
-   * @param notifier the notifier a component under test was given
-   * @param description what was being exercised, quoted back in the failure message
-   * @tparam T the throwable type expected
-   */
   def assertPublishedFailure[T <: Throwable](
       notifier: StreamingShuffleErrorNotifier,
       description: String)(implicit tag: scala.reflect.ClassTag[T]): Unit = {
@@ -2485,4 +2423,3 @@ trait StreamingShuffleTestHelper {
         s"${tag.runtimeClass.getName} was expected: ${published.getMessage}")
   }
 }
-

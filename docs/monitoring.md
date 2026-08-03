@@ -1238,20 +1238,44 @@ This is the component with the largest amount of instrumented metrics
     `spark.metrics.staticSources.enabled` (default is true)
   - **note:** the source is registered automatically on both the driver and every executor when
     the metrics system starts, and reaches an operator through the sinks configured in
-    `metrics.properties`, such as `JmxSink`, in the same way as every other Spark metric. The
-    metrics are only updated while streaming shuffle is active, which requires
-    `spark.shuffle.manager=streaming` together with `spark.shuffle.streaming.enabled=true`
-    (default is false), and they report 0 otherwise.
-    See [Streaming Shuffle](streaming-shuffle.html) for details.
+    `metrics.properties`, such as `JmxSink`, in the same way as every other Spark metric.
+    Registering the source is not the same as exporting it: every sink is opt-in, and `JmxSink`
+    ships commented out in `conf/metrics.properties.template`, so it has to be enabled there before
+    these metrics appear in an MBean browser. The metrics are only updated while streaming shuffle
+    is active, which requires `spark.shuffle.manager=streaming` together with
+    `spark.shuffle.streaming.enabled=true` (default is false), so a JVM whose configuration never
+    activates streaming records no streaming events at all and reports 0 for every one of these
+    metrics. Updates also stop once streaming shuffle becomes inactive, whether because the kill
+    switch was turned off or because a job fell back to sort-based shuffle; the source stays
+    registered through all of those.
+  - **note:** the four metrics do not share one lifetime. `bufferUtilizationPercent` is a live
+    reading of buffer occupancy at the moment the sink samples it, and returns to 0 once the
+    buffers are released. The other three are counters that accumulate for the lifetime of the
+    JVM: they retain the events already counted and do not return to 0 when a shuffle finishes,
+    when a shuffle falls back to the sort-based shuffle, or when the executor stops streaming, so
+    a non-zero reading may describe streaming activity that has already ended; read them as
+    running totals and difference successive samples to obtain a rate.
   - bufferUtilizationPercent (gauge): executor-wide utilization of the streaming shuffle buffer
     budget, as a percentage. A value approaching `spark.shuffle.streaming.spillThreshold`
-    (default is 80) predicts spilling; the value is not clamped, so a momentarily over-budget
-    executor reads above 100.
+    (default is 80) predicts spilling. The value is reported as measured and is not clamped, so it
+    may briefly read above 100 while an allocation is over the budget set by
+    `spark.shuffle.streaming.bufferSizePercent`; that is deliberate, because masking an over-budget
+    executor would hide the condition this gauge exists to expose.
   - spillCount (counter): number of spill events performed to keep buffer utilization within
     `spark.shuffle.streaming.spillThreshold`, counted once per spill event rather than once per
-    evicted partition
-  - backpressureEvents (counter): number of transitions into a throttled state, whether caused by
-    exhausted consumer credit or by a refused rate-limiter acquisition, counted once per transition
+    evicted partition. Two kinds of disk write are counted, because both mean the buffer allowance
+    was not enough for what a producer was holding: an eviction the threshold or memory pressure
+    forced, and a block written straight to local disk because the allowance could not admit it to
+    memory at all. The end-of-stream flush that makes a producer's retained output durable is not
+    counted, because it happens once per successful streaming map task regardless of utilization;
+    the bytes it writes still reach `diskBytesSpilled` on the task's metrics, as the bytes of every
+    counted event do.
+  - backpressureEvents (counter): number of transitions into a throttled state, counted once per
+    episode rather than once per block held back. A producer opens an episode when consumer credit
+    is exhausted or when a rate-limiter acquisition is refused, including for a retransmission; a
+    consumer opens one when it stops reading from its socket because its own credit is spent,
+    because the executor's shared receive budget is fully committed, or because its inbound
+    hand-off queue reached its high-water mark
   - partialReadInvalidations (counter): number of atomic, per-producer partial read invalidations
     performed after a producer failure, each of which is recovered by ordinary stage recomputation
 
@@ -1465,20 +1489,44 @@ These metrics are exposed by Spark executors.
     `spark.metrics.staticSources.enabled` (default is true)
   - **note:** the source is registered automatically on both the driver and every executor when
     the metrics system starts, and reaches an operator through the sinks configured in
-    `metrics.properties`, such as `JmxSink`, in the same way as every other Spark metric. The
-    metrics are only updated while streaming shuffle is active, which requires
-    `spark.shuffle.manager=streaming` together with `spark.shuffle.streaming.enabled=true`
-    (default is false), and they report 0 otherwise.
-    See [Streaming Shuffle](streaming-shuffle.html) for details.
+    `metrics.properties`, such as `JmxSink`, in the same way as every other Spark metric.
+    Registering the source is not the same as exporting it: every sink is opt-in, and `JmxSink`
+    ships commented out in `conf/metrics.properties.template`, so it has to be enabled there before
+    these metrics appear in an MBean browser. The metrics are only updated while streaming shuffle
+    is active, which requires `spark.shuffle.manager=streaming` together with
+    `spark.shuffle.streaming.enabled=true` (default is false), so a JVM whose configuration never
+    activates streaming records no streaming events at all and reports 0 for every one of these
+    metrics. Updates also stop once streaming shuffle becomes inactive, whether because the kill
+    switch was turned off or because a job fell back to sort-based shuffle; the source stays
+    registered through all of those.
+  - **note:** the four metrics do not share one lifetime. `bufferUtilizationPercent` is a live
+    reading of buffer occupancy at the moment the sink samples it, and returns to 0 once the
+    buffers are released. The other three are counters that accumulate for the lifetime of the
+    JVM: they retain the events already counted and do not return to 0 when a shuffle finishes,
+    when a shuffle falls back to the sort-based shuffle, or when the executor stops streaming, so
+    a non-zero reading may describe streaming activity that has already ended; read them as
+    running totals and difference successive samples to obtain a rate.
   - bufferUtilizationPercent (gauge): executor-wide utilization of the streaming shuffle buffer
     budget, as a percentage. A value approaching `spark.shuffle.streaming.spillThreshold`
-    (default is 80) predicts spilling; the value is not clamped, so a momentarily over-budget
-    executor reads above 100.
+    (default is 80) predicts spilling. The value is reported as measured and is not clamped, so it
+    may briefly read above 100 while an allocation is over the budget set by
+    `spark.shuffle.streaming.bufferSizePercent`; that is deliberate, because masking an over-budget
+    executor would hide the condition this gauge exists to expose.
   - spillCount (counter): number of spill events performed to keep buffer utilization within
     `spark.shuffle.streaming.spillThreshold`, counted once per spill event rather than once per
-    evicted partition
-  - backpressureEvents (counter): number of transitions into a throttled state, whether caused by
-    exhausted consumer credit or by a refused rate-limiter acquisition, counted once per transition
+    evicted partition. Two kinds of disk write are counted, because both mean the buffer allowance
+    was not enough for what a producer was holding: an eviction the threshold or memory pressure
+    forced, and a block written straight to local disk because the allowance could not admit it to
+    memory at all. The end-of-stream flush that makes a producer's retained output durable is not
+    counted, because it happens once per successful streaming map task regardless of utilization;
+    the bytes it writes still reach `diskBytesSpilled` on the task's metrics, as the bytes of every
+    counted event do.
+  - backpressureEvents (counter): number of transitions into a throttled state, counted once per
+    episode rather than once per block held back. A producer opens an episode when consumer credit
+    is exhausted or when a rate-limiter acquisition is refused, including for a retransmission; a
+    consumer opens one when it stops reading from its socket because its own credit is spent,
+    because the executor's shared receive budget is fully committed, or because its inbound
+    hand-off queue reached its high-water mark
   - partialReadInvalidations (counter): number of atomic, per-producer partial read invalidations
     performed after a producer failure, each of which is recovered by ordinary stage recomputation
 

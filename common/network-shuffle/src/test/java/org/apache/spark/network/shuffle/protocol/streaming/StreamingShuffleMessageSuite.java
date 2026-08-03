@@ -185,6 +185,93 @@ public class StreamingShuffleMessageSuite {
   }
 
   @Test
+  public void testHeartbeatConsumerIdentityRejectsRecordSeparators() {
+    // A consumer identity is chosen by a remote peer and written into the producer executor's log
+    // records, which are line-oriented artefacts read by operators and parsed by log pipelines. An
+    // identity carrying a record separator therefore ends a record early and starts one whose whole
+    // content the peer chose, which is how a peer forges log entries naming anything it likes. The
+    // length bound does not address that at all, so the character domain is bounded as well.
+    String[] hostile = {
+        "consumer\r\ninjected FATAL forged log record",  // CRLF, the canonical injection
+        "consumer\rcarriage-return-only",
+        "consumer\nline-feed-only",
+        "consumer\tindented",                            // tab, a field separator in many formats
+        "consumer\u0000truncating-nul",
+        "consumer\bbackspace",
+        "consumer\u001bescape-sequence",                 // rewrites what a terminal displays
+        "consumer\u001funit-separator",                  // top of the C0 block
+        "consumer\u007fdelete",
+        "consumer\u0085next-line",                       // C1 NEL, a line break to many readers
+        "consumer\u009fc1-top",
+        "consumer\u2028unicode-line-separator",
+        "consumer\u2029unicode-paragraph-separator",
+    };
+    for (String identity : hostile) {
+      // Refused in memory, so no sender can build one.
+      IllegalArgumentException constructed = assertThrows(IllegalArgumentException.class,
+          () -> new HeartbeatMessage(
+              SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, TIMESTAMP_MS, identity),
+          "A heartbeat must refuse the consumer identity " + describe(identity));
+      assertTrue(constructed.getMessage().contains("forbidden character"),
+          constructed.getMessage());
+      // The diagnostic must not echo the character it is refusing: this message becomes a log
+      // record of its own, so echoing would reproduce the very injection being refused.
+      assertFalse(constructed.getMessage().contains(identity), constructed.getMessage());
+
+      // And refused off the wire, which is the path that actually matters: a hostile peer does not
+      // use our constructors. The bytes are written by hand for exactly that reason.
+      byte[] encoded = identity.getBytes(StandardCharsets.UTF_8);
+      ByteBuf raw = Unpooled.buffer();
+      writeHeader(raw, SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER);
+      raw.writeLong(TIMESTAMP_MS);
+      raw.writeInt(encoded.length);
+      raw.writeBytes(encoded);
+      assertThrows(IllegalArgumentException.class, () -> HeartbeatMessage.decode(raw),
+          "A heartbeat decoded from the wire must refuse the consumer identity " +
+              describe(identity));
+    }
+
+    // The bound is a character-domain bound and not an alphabet: every character a legitimate Spark
+    // identity is composed of stays acceptable, including the multi-byte ones and the punctuation
+    // an executor id and a socket address are joined by.
+    for (String legitimate : new String[] {
+        HeartbeatMessage.NO_CONSUMER_ID,
+        "app-20260803120000-0007/3@10.0.0.17:7337",
+        "executor-1@[2001:db8::1]:7337",
+        "consumer-\u00e9\u00e9",             // two e-acutes, a two-byte UTF-8 character
+        "consumer \u00a0with-nbsp",
+        " leading-and-trailing ",
+    }) {
+      assertDoesNotThrow(() -> new HeartbeatMessage(
+          SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, TIMESTAMP_MS, legitimate),
+          "A heartbeat must accept the legitimate consumer identity " + describe(legitimate));
+      HeartbeatMessage decoded = (HeartbeatMessage) roundTrip(new HeartbeatMessage(
+          SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, TIMESTAMP_MS, legitimate));
+      assertEquals(legitimate, decoded.consumerId());
+    }
+  }
+
+  /**
+   * Renders an identity so that a failed assertion names it without pasting its control characters
+   * into the build log -- which would be the same injection the assertion exists to prevent.
+   *
+   * @param identity the identity to describe
+   * @return the identity with every character outside the printable ASCII range escaped
+   */
+  private static String describe(String identity) {
+    StringBuilder described = new StringBuilder(identity.length() + 8).append('"');
+    for (int index = 0; index < identity.length(); index++) {
+      char candidate = identity.charAt(index);
+      if (candidate >= 0x20 && candidate < 0x7f) {
+        described.append(candidate);
+      } else {
+        described.append(String.format("\\u%04X", (int) candidate));
+      }
+    }
+    return described.append('"').toString();
+  }
+
+  @Test
   public void testHeartbeatConsumerIdentityLengthIsBoundedOnDecode() {
     // A length prefix is the classic unbounded-allocation lever, so it is refused before it is
     // used to allocate: negative, beyond the ceiling, and beyond the bytes the frame carries.

@@ -17,54 +17,47 @@
 
 package org.apache.spark.shuffle.streaming
 
+import java.io.File
+import java.io.IOException
 import java.util.Locale
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong}
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong, AtomicReference}
 
 import scala.collection.mutable
 
 import org.scalatest.matchers.should.Matchers
 
-import org.apache.spark.{SharedSparkContext, SparkConf, SparkFunSuite, SparkIllegalArgumentException, TaskContext, TaskContextImpl}
-import org.apache.spark.executor.TaskMetrics
-import org.apache.spark.internal.config.{SHUFFLE_STREAMING_BUFFER_SIZE_PERCENT, SHUFFLE_STREAMING_SPILL_THRESHOLD}
+import org.apache.spark.{SharedSparkContext, SparkConf, SparkEnv, SparkFunSuite, SparkIllegalArgumentException, TaskContext, TaskContextImpl}
+import org.apache.spark.executor.{ShuffleWriteMetrics, TaskMetrics}
+import org.apache.spark.internal.config.{CPUS_PER_TASK, EXECUTOR_CORES, SHUFFLE_STREAMING_BUFFER_SIZE_PERCENT, SHUFFLE_STREAMING_SPILL_THRESHOLD}
 import org.apache.spark.memory.{MemoryConsumer, MemoryMode, TaskMemoryManager}
-import org.apache.spark.storage.{BlockId, TempShuffleBlockId, UnrecognizedBlockId}
-import org.apache.spark.util.Clock
+import org.apache.spark.serializer.{SerializerInstance, SerializerManager}
+import org.apache.spark.shuffle.ShuffleWriteMetricsReporter
+import org.apache.spark.storage.{BlockId, DiskBlockObjectWriter, TempShuffleBlockId, UnrecognizedBlockId}
+import org.apache.spark.util.{Clock, Utils}
 
 /**
- * Unit coverage of [[MemorySpillManager]], the bounded and spillable buffer budget that the
- * streaming shuffle producer holds its unacknowledged window in.
+ * Unit coverage of [[MemorySpillManager]], the bounded and spillable buffer budget the streaming
+ * shuffle producer holds its unacknowledged window in.
  *
- * Four behaviours are contracted for this component and every one of them is time sensitive: the
- * 100 ms threshold polling cadence, the order in which buffered partitions are evicted, the 100 ms
- * bound a consumer acknowledgement's reclamation is held to, and the spill accounting that has to
- * land on Spark's own task accumulators rather than on counters of its own. Nothing in this suite
- * sleeps and nothing waits on wall time: every timing assertion is made by injecting a clock the
- * test body controls, which is what makes a 100 ms cadence assertable in microseconds and -- the
- * part a sleeping test cannot do at all -- lets the suite prove that a timer does NOT fire one
- * millisecond early.
+ * All four contracted behaviours are time sensitive -- the 100 ms threshold polling cadence, the
+ * eviction order, the 100 ms bound on reclamation after an acknowledgement, and the spill
+ * accounting that must land on Spark's own task accumulators. Nothing here sleeps or waits on wall
+ * time: the clock is injected, which makes a 100 ms cadence assertable in microseconds and lets the
+ * suite prove a timer does NOT fire one millisecond early. Every manager is built with the
+ * executor's shared threshold ticker withheld, because that daemon thread drives the very method
+ * these tests drive by hand and would make the cadence a race rather than a measurement.
  *
- * Two fixtures carry the whole suite, and both derive the buffer allowance from an injected
- * executor-memory figure rather than from the host JVM's heap. That is deliberate: the production
- * budget is a percentage of the executor's on-heap unified memory region, so a suite that let the
- * real region decide would assert against whatever heap the test runner happened to be given.
- * Passing an explicit figure makes every arithmetic assertion below exact on any machine.
- *
- *  - the roomy fixture has enough allowance that admission never refuses, which is what the
- *    eviction-order, accounting, plumbing and lifecycle cases need;
- *  - the tight fixture admits exactly one block per partition and reaches the spill trigger on the
- *    last of them, so the threshold is met with no slack to reason about.
- *
- * Every manager is built with the executor's shared threshold ticker withheld. The ticker is a
- * daemon thread that drives the very method these tests drive by hand, and leaving it running would
- * make the cadence a race rather than a measurement.
+ * Both fixtures derive the buffer allowance from an injected executor-memory figure rather than
+ * from the host JVM's heap, so every arithmetic assertion is exact on any machine: the roomy
+ * fixture has enough allowance that admission never refuses, and the tight one admits exactly one
+ * block per partition and reaches the spill trigger on the last of them.
  *
  * The zero-leak requirement is machine checked rather than asserted by inspection. Each test gets
- * its own task memory manager, and `afterEach` closes the consumer and then asks that memory
- * manager how much execution memory the task still holds: a non-zero answer is a leak in the
- * component under test. This is the same property the test JVM enforces globally through
- * `spark.unsafe.exceptionOnMemoryLeak`, made local so that a failure names the test that caused it.
+ * its own task memory manager, and `afterEach` closes the consumer and then asks that manager how
+ * much execution memory the task still holds: a non-zero answer is a leak in the component under
+ * test. That is the property `spark.unsafe.exceptionOnMemoryLeak` enforces globally, made local so
+ * a failure names the test that caused it.
  */
 class MemorySpillManagerSuite
   extends SparkFunSuite
@@ -72,9 +65,11 @@ class MemorySpillManagerSuite
     with Matchers
     with StreamingShuffleTestHelper {
 
-  // The two injected executor-memory figures. Chosen so that the derived budgets are exact
-  // integers: the production arithmetic divides by a hundred before multiplying by the percentage,
-  // so a figure that is a clean multiple of a hundred loses nothing to truncation.
+  // The injected executor-memory figures. The first two are clean multiples of a hundred, so their
+  // derived budgets are round numbers a reader can check by eye; the third deliberately is not, and
+  // exists because a round figure cannot tell `(memory * percent) / 100` apart from
+  // `memory / 100 * percent` -- both give the same answer -- so a suite built only on round figures
+  // would pass whichever of the two the implementation used.
   //
   // Roomy: 4,000,000 -> allowance 800,000 bytes, spill trigger 640,000, per-partition 100,000.
   private val roomyMemoryBytes: Long = 4000000L
@@ -83,6 +78,12 @@ class MemorySpillManagerSuite
   // them), per-partition 1,487 (one). The eighth admitted block therefore meets the threshold
   // exactly, which is the cheapest possible way to arm it.
   private val tightMemoryBytes: Long = 59500L
+
+  // Awkward: 4,000,037, which leaves a remainder of 37 when divided by a hundred. The specified
+  // allowance is 800,007 bytes; dividing before multiplying would give 800,000, and the spill
+  // trigger derived from it 640,005 against 640,000. Seven bytes is not the point -- the point is
+  // that the two orderings now disagree, so the assertions below can tell them apart.
+  private val awkwardMemoryBytes: Long = 4000037L
 
   private val reducePartitions: Int = 8
 
@@ -110,8 +111,6 @@ class MemorySpillManagerSuite
 
   private val consumerId: String = "streaming-shuffle-consumer"
 
-  // Consumers and task memory managers opened by the test currently running. Cleared in beforeEach
-  // and drained in afterEach, so one test can never be charged for another's memory.
   private val openManagers = new mutable.ArrayBuffer[MemorySpillManager]()
 
   private val openMemoryManagers = new mutable.ArrayBuffer[TaskMemoryManager]()
@@ -151,18 +150,6 @@ class MemorySpillManagerSuite
     }
   }
 
-  // -----------------------------------------------------------------------------------------------
-  // Fixtures.
-  // -----------------------------------------------------------------------------------------------
-
-  /**
-   * A buffer allowance over an injected executor-memory figure.
-   *
-   * @param executorMemoryBytes size of the memory region the allowance is carved from
-   * @param bufferSizePercent share of that region the allowance occupies
-   * @param spillThresholdPercent share of the allowance at which eviction is triggered
-   * @return the allowance, unregistered with any metrics gauge and unshared with any other test
-   */
   private def newQuota(
       executorMemoryBytes: Long,
       bufferSizePercent: Int = bufferPercent,
@@ -188,30 +175,10 @@ class MemorySpillManagerSuite
     context
   }
 
-  /**
-   * The memory manager of a task context, taken through the interface that declares the accessor so
-   * that the call site does not depend on how the implementation happens to expose it.
-   *
-   * @param context the context to read
-   * @return that task's memory manager
-   */
   private def memoryManagerOf(context: TaskContext): TaskMemoryManager = context.taskMemoryManager()
 
-  /**
-   * The task metrics of a task context, taken through the interface that declares the accessor.
-   *
-   * @param context the context to read
-   * @return that task's metrics, carrying the accumulators the streaming path reports on
-   */
   private def metricsOf(context: TaskContext): TaskMetrics = context.taskMetrics()
 
-  /**
-   * The attempt identifier of a task context, taken through the interface that declares it. This is
-   * the generation a producer registers its spill files under.
-   *
-   * @param context the context to read
-   * @return that task's attempt identifier
-   */
   private def attemptIdOf(context: TaskContext): Long = context.taskAttemptId()
 
   /**
@@ -238,6 +205,32 @@ class MemorySpillManagerSuite
   }
 
   /**
+   * A spill manager over the '''production''' executor allowance, with no injected quota.
+   *
+   * Every other fixture in this suite injects an allowance, so that each arithmetic assertion is
+   * exact on any machine. This one deliberately does not: withholding the override is what makes
+   * the lazy derivation run [[MemorySpillManager.executorQuota]], which reads the live memory
+   * manager and registers the resulting allowance with the metrics source. That is the wiring
+   * an operator's gauge depends on, and it is only exercised on this path.
+   *
+   * The threshold ticker is still withheld, for the same reason as everywhere else in this suite.
+   *
+   * @param context the task the consumer's memory and cleanup belong to
+   * @param conf the configuration the executor-wide allowance derives its percentages from
+   * @return the manager, already told its reduce partition count and registered for cleanup
+   */
+  private def newProductionManager(
+      context: TaskContextImpl,
+      conf: SparkConf = streamingConfWithOverrides()): MemorySpillManager = {
+    val manager = new MemorySpillManager(
+      memoryManagerOf(context), conf, newManualClock(), quotaOverride = None, autoPoll = false)
+    manager.registerPartitionCount(reducePartitions)
+    manager.registerCleanup(context)
+    openManagers += manager
+    manager
+  }
+
+  /**
    * Buffers blocks into one partition, continuing that partition's gap-free ascending run.
    *
    * @param manager the consumer to admit into
@@ -257,12 +250,6 @@ class MemorySpillManagerSuite
     }
   }
 
-  /**
-   * Every spill file a consumer currently retains, de-duplicated.
-   *
-   * @param manager the consumer to inspect
-   * @return the distinct backing files of its retained spill records
-   */
   private def spillFilesOf(manager: MemorySpillManager): Seq[java.io.File] =
     manager.allSpilledBlocks.map(record => record.file).distinct
 
@@ -312,18 +299,10 @@ class MemorySpillManagerSuite
 
     private val grantCeiling = new AtomicLong(Long.MaxValue)
 
-    /**
-     * Caps what every subsequent acquisition may obtain, which is how a partial grant is produced
-     * without having to exhaust the host JVM's heap.
-     *
-     * @param bytes the most any single acquisition may be granted
-     */
     def capGrantsAt(bytes: Long): Unit = grantCeiling.set(bytes)
 
-    /** How many times the inherited acquisition was called, from anywhere. */
     def acquisitionCount: Int = acquisitions.get()
 
-    /** How many of those calls came from inside the spill callback. Must always be zero. */
     def acquisitionsDuringSpill: Int = acquisitionsInsideSpill.get()
 
     override def acquireMemory(size: Long): Long = {
@@ -366,12 +345,6 @@ class MemorySpillManagerSuite
 
     override def waitTillTime(targetTime: Long): Long = current.get()
   }
-
-  // -----------------------------------------------------------------------------------------------
-  // Configuration and budget arithmetic. The five streaming keys are CONSUMED through their typed
-  // entries here and never re-declared: each key may be declared exactly once in the JVM, and the
-  // validators that police their documented ranges belong to those declarations.
-  // -----------------------------------------------------------------------------------------------
 
   test("the streaming spill keys carry their specified defaults") {
     val defaults = new SparkConf(false)
@@ -462,10 +435,15 @@ class MemorySpillManagerSuite
   test("the buffer allowance divides the configured share of executor memory by partitions") {
     val manager = newManager(newTrackedTaskContext(), newManualClock(), newQuota(roomyMemoryBytes))
 
-    val expectedTotal = roomyMemoryBytes / percentScale * bufferPercent
+    // Every expectation is computed by the helper, which evaluates the specified expression in
+    // `BigInt` rather than rearranging it into `Long` arithmetic -- so it is an independent
+    // statement of the contract and not a transcription of the implementation's own ordering.
+    val expectedTotal = StreamingShuffleTestHelper.aggregateBudgetBytes(
+      roomyMemoryBytes, bufferPercent)
     assert(manager.totalBudgetBytes === expectedTotal,
       s"The aggregate allowance must be $bufferPercent percent of the injected region")
-    assert(manager.spillThresholdBytes === expectedTotal / percentScale * spillPercent,
+    assert(manager.spillThresholdBytes ===
+        StreamingShuffleTestHelper.exactPercentageOf(expectedTotal, spillPercent),
       s"Eviction must trigger at $spillPercent percent of the aggregate allowance")
     assert(manager.numPartitions === reducePartitions,
       "The registered reduce partition count must be the divisor of the per-partition allowance")
@@ -482,11 +460,67 @@ class MemorySpillManagerSuite
     assert(manager.bufferUtilizationPercent === 0L, "An idle producer reports zero utilisation")
   }
 
+  test("the buffer allowance takes the product before the division, not after") {
+    // The same contract as the test above, driven from a memory figure that is not a clean multiple
+    // of a hundred -- which is the only kind of figure that can tell the two orderings apart.
+    val expectedTotal = StreamingShuffleTestHelper.aggregateBudgetBytes(
+      awkwardMemoryBytes, bufferPercent)
+    val expectedTrigger = StreamingShuffleTestHelper.exactPercentageOf(expectedTotal, spillPercent)
+
+    // Anti-vacuity guards. If either of these ever held, the fixture would have stopped being able
+    // to discriminate and every assertion below would pass under both orderings.
+    val dividedFirstTotal = awkwardMemoryBytes / percentScale * bufferPercent
+    assert(expectedTotal !== dividedFirstTotal,
+      s"The awkward fixture must make the two orderings disagree, yet both give $expectedTotal; " +
+        s"pick a memory figure whose remainder modulo $percentScale is non-zero")
+    val dividedFirstTrigger = expectedTotal / percentScale * spillPercent
+    assert(expectedTrigger !== dividedFirstTrigger,
+      s"The derived trigger must also distinguish the orderings, yet both give $expectedTrigger")
+
+    val manager =
+      newManager(newTrackedTaskContext(), newManualClock(), newQuota(awkwardMemoryBytes))
+    assert(manager.totalBudgetBytes === expectedTotal,
+      s"The aggregate allowance must be the specified ($awkwardMemoryBytes * $bufferPercent) / " +
+        s"$percentScale = $expectedTotal, not the $dividedFirstTotal a division taken first " +
+        s"would give, yet it was ${manager.totalBudgetBytes}")
+    assert(manager.spillThresholdBytes === expectedTrigger,
+      s"The spill trigger must be the specified $spillPercent percent of that allowance, " +
+        s"$expectedTrigger, not $dividedFirstTrigger, yet it was ${manager.spillThresholdBytes}")
+    assert(manager.perPartitionBudgetBytes === expectedTotal / reducePartitions,
+      s"and the per-partition allowance must divide the exact aggregate, yet it was " +
+        s"${manager.perPartitionBudgetBytes}")
+
+    // The production helper the arithmetic now goes through is total and exact across the whole
+    // configurable percentage range, including both of its endpoints and a zero input.
+    assert(MemorySpillManager.percentageOf(awkwardMemoryBytes, 0) === 0L,
+      "Zero percent of anything is zero")
+    assert(MemorySpillManager.percentageOf(0L, bufferPercent) === 0L,
+      "Any percentage of nothing is nothing")
+    Seq(StreamingShuffleTestHelper.MinBufferSizePercent,
+        bufferPercent,
+        StreamingShuffleTestHelper.MaxBufferSizePercent,
+        spillPercent,
+        percentScale.toInt).foreach { percent =>
+      assert(MemorySpillManager.percentageOf(awkwardMemoryBytes, percent) ===
+          StreamingShuffleTestHelper.exactPercentageOf(awkwardMemoryBytes, percent),
+        s"percentageOf must be exact at $percent percent of $awkwardMemoryBytes")
+    }
+    // And it cannot overflow, which is the reason the expression is rearranged at all. The product
+    // of these two would wrap in `Long` arithmetic; the exact result still fits.
+    assert(MemorySpillManager.percentageOf(Long.MaxValue, StreamingShuffleTestHelper
+        .MaxBufferSizePercent) ===
+        StreamingShuffleTestHelper.exactPercentageOf(Long.MaxValue,
+          StreamingShuffleTestHelper.MaxBufferSizePercent),
+      "The largest representable region must still yield its exact percentage")
+    assert(MemorySpillManager.percentageOf(Long.MaxValue,
+        StreamingShuffleTestHelper.MaxBufferSizePercent) > 0L,
+      "A wrapped product would report a negative allowance, which reads as permanent pressure")
+  }
+
   // -----------------------------------------------------------------------------------------------
   // The 100 ms threshold polling cadence. Driven entirely by advancing an injected manual clock, so
   // every assertion below is exact and none of them takes a hundred milliseconds to make.
   // -----------------------------------------------------------------------------------------------
-
   test("threshold polling evaluates buffer utilisation on a 100 ms cadence") {
     val clock = newManualClock()
     val manager = newManager(newTrackedTaskContext(), clock, newQuota(tightMemoryBytes))
@@ -504,7 +538,6 @@ class MemorySpillManagerSuite
       "The tight fixture must land the reservation exactly on the spill trigger")
     assert(manager.spillCount === 0L, "Buffering alone must never evict")
 
-    // The first poll of a manager's life is always due, because no poll has been taken yet.
     assert(manager.pollOnce(), "The first poll taken at the threshold must evict")
     assert(manager.spillCount === 1L, "One poll at the threshold is one eviction event")
     assert(manager.executorReservedBytes < manager.spillThresholdBytes,
@@ -518,12 +551,10 @@ class MemorySpillManagerSuite
       s"A tie in footprint and access time must be broken by ascending partition id, but " +
         s"the drained partitions were $drained")
 
-    // Back to the threshold, continuing the drained partition's sequence run.
     bufferBlocks(manager, drained.head, 1)
     assert(manager.executorReservedBytes === manager.spillThresholdBytes,
       "The refill must put the reservation back on the trigger")
 
-    // Not due: no time at all has passed since the poll above.
     assert(!manager.pollOnce(), "A poll taken with no time elapsed must be suppressed")
     assert(manager.spillCount === 1L, "A suppressed poll must not evict")
 
@@ -533,7 +564,6 @@ class MemorySpillManagerSuite
     assert(!manager.pollOnce(), "A poll one millisecond short of the cadence must be suppressed")
     assert(manager.spillCount === 1L, "A suppressed poll must not evict")
 
-    // Due on the interval exactly.
     clock.advance(1L)
     assert(manager.pollOnce(), "A poll on the cadence boundary must evaluate the threshold")
     assert(manager.spillCount === 2L, "The second due poll at the threshold is a second event")
@@ -544,7 +574,6 @@ class MemorySpillManagerSuite
     val manager = newManager(newTrackedTaskContext(), clock, newQuota(tightMemoryBytes))
     (0 until reducePartitions).foreach(partitionId => bufferBlocks(manager, partitionId, 1))
 
-    // Consume the cadence, then arm the threshold again without letting the clock move.
     assert(manager.pollOnce(), "The first poll at the threshold must evict")
     val drained = (0 until reducePartitions).filter(id => manager.bufferedBytesFor(id) == 0L)
     bufferBlocks(manager, drained.head, 1)
@@ -576,15 +605,8 @@ class MemorySpillManagerSuite
     assert(manager.allSpilledBlocks.isEmpty, "Nothing may reach local disk below the threshold")
   }
 
-  // -----------------------------------------------------------------------------------------------
-  // Eviction order: largest buffered footprint first, ties broken least recently used first and
-  // then by ascending partition id. The order is published, so it is asserted directly rather than
-  // inferred from which partitions happen to end up on disk.
-  // -----------------------------------------------------------------------------------------------
-
   test("eviction considers the largest buffered partitions first") {
     val manager = newManager(newTrackedTaskContext(), newManualClock(), newQuota(roomyMemoryBytes))
-    // Distinct footprints, so the footprint alone decides and neither tie-break can interfere.
     bufferBlocks(manager, 5, 1)
     bufferBlocks(manager, 3, 3)
     bufferBlocks(manager, 7, 2)
@@ -620,16 +642,44 @@ class MemorySpillManagerSuite
   }
 
   test("eviction breaks footprint and access-time ties by ascending partition id") {
-    val manager = newManager(newTrackedTaskContext(), newManualClock(), newQuota(roomyMemoryBytes))
-    // The clock never moves, so every partition carries the same access stamp and the same
-    // footprint. The identifier is the only discriminator left, and it is what makes the order
-    // total and therefore reproducible from one run to the next.
+    val clock = newManualClock()
+    val manager = newManager(newTrackedTaskContext(), clock, newQuota(roomyMemoryBytes))
+    // The clock never moves while the blocks are admitted, so every partition carries the same
+    // access stamp and the same footprint. The identifier is the only discriminator left, and it is
+    // what makes the order total and therefore reproducible from one run to the next.
     Seq(7, 1, 4).foreach(partitionId => bufferBlocks(manager, partitionId, 2))
 
-    assert(manager.spillSelectionOrder === Seq(1, 4, 7),
+    val captured = manager.spillSelectionOrder
+    assert(captured === Seq(1, 4, 7),
       "A tie in both footprint and access time must be broken by ascending partition id")
-    assert(manager.spillSelectionOrder === manager.spillSelectionOrder,
-      "The published order must be stable across reads, so a diagnostic cannot perturb it")
+
+    // Stability across reads, stated as a comparison of a captured order against a later one rather
+    // than of the order against itself -- which would hold however unstable the order was. Between
+    // the two reads the clock moves and every diagnostic accessor the component documents as a pure
+    // read is called, because the claim is precisely that observing the store does not reorder it.
+    // `retainedPayload` is deliberately absent: reading a block back counts as a use of its
+    // partition and is documented to move it, so including it would be asserting the opposite.
+    clock.advance(pollIntervalMs)
+    val diagnostics = Seq(
+      manager.bufferedBytes,
+      manager.bufferedBytesFor(4),
+      manager.bufferUtilizationPercent,
+      manager.spillCount,
+      manager.diskBytesSpilled,
+      manager.memoryBytesSpilled,
+      manager.retainedBlockCount(4).toLong,
+      manager.allSpilledBlocks.size.toLong,
+      manager.executorReservedBytes,
+      manager.peakMemoryBytes)
+    assert(diagnostics.forall(_ >= 0L),
+      s"Every diagnostic accessor must answer a sane figure, yet they reported $diagnostics")
+    assert(manager.spillSelectionOrder === captured,
+      s"The published order must be unchanged by a clock advance and by ten diagnostic reads, " +
+        s"yet it moved from $captured to ${manager.spillSelectionOrder}")
+    // And one further read of the order itself must not move it either, which is what makes the
+    // accessor safe to use twice in one assertion elsewhere in this suite.
+    assert(manager.spillSelectionOrder === captured,
+      "Reading the order must not be a use of the partitions it names")
   }
 
   test("the spill callback evicts in the published selection order") {
@@ -645,8 +695,6 @@ class MemorySpillManagerSuite
     assert(manager.spillSelectionOrder === Seq(5, 6, 2),
       "The order must be largest buffered footprint first")
 
-    // Ask for one block's worth. Whole partitions are evicted, so the first candidate goes in full
-    // and nothing behind it is touched.
     val freed = manager.spill(blockCharge, trigger)
     assert(freed === 3L * blockCharge,
       "The callback must report exactly the bytes that left memory, which is a whole partition")
@@ -657,6 +705,144 @@ class MemorySpillManagerSuite
     assert(manager.bufferedBytesFor(2) === blockCharge, "The last candidate must be untouched")
     assert(manager.spillSelectionOrder === Seq(6, 2),
       "A partition with nothing left in memory must drop out of the order")
+  }
+
+  test("a block the allowance cannot hold is admitted straight to disk instead") {
+    // The specified answer to a full buffer is to spill, not to fail, so a producer that cannot
+    // reserve for a block writes it through: the map output stays complete and the shuffle keeps
+    // the streaming path it is already committed to. `admitDurably` is that write-through, and it
+    // is reached from the writer's admission recovery loop once the loop has exhausted its rounds.
+    val context = newTrackedTaskContext()
+    val manager = newManager(context, newManualClock(), newQuota(roomyMemoryBytes))
+    assert(manager.durableAdmissionCount === 0L, "Nothing may have bypassed the buffer yet")
+
+    val payload = payloadOfLength(41L, payloadBytes)
+    assert(manager.admitDurably(0, 0L, payload),
+      "A block the producer could not buffer must still be admitted, on disk")
+    assert(manager.durableAdmissionCount === 1L,
+      "The write-through must be counted, so an operator sees the allowance was met and spilled " +
+        "past rather than silently absorbed")
+    assert(manager.bufferedBytes === 0L,
+      "A written-through block occupies no memory at all, which is the whole point of it")
+    assert(manager.diskBytesSpilled > 0L, "and its payload must have reached local disk")
+    assert(manager.spillCount === 1L,
+      "and it must be counted as the spill event it is: the allowance could not hold the block " +
+        "and the block went to local disk, which is the condition the pressure signal reports. " +
+        "Publishing the volume without the event would let an operator watch disk spilling climb " +
+        "while the spill count stayed at zero")
+    assert(manager.retainedBlockCount(0) === 1,
+      "It is still part of the retransmission window, because a consumer may yet ask for it")
+    assert(manager.spilledBlocks(0).map(_.sequenceNumber) === Seq(0L),
+      "and it must be recorded under exactly the sequence number it was offered under")
+    assert(manager.retainedPayload(0, 0L).map(_.toSeq) === Some(payload.toSeq),
+      "A written-through block must read back byte for byte, or a retransmission would corrupt")
+
+    // The numbering it advances is the same one buffering advances, so the two paths cannot produce
+    // a gap or a duplicate between them.
+    assert(manager.lastAcceptedSequence(0) === 0L,
+      "A write-through must advance the partition's numbering exactly as a buffered block does")
+    bufferBlocks(manager, 0, 1)
+    assert(manager.lastAcceptedSequence(0) === 1L,
+      "and the next buffered block must continue that same run")
+    assert(manager.bufferedBytes === blockCharge,
+      "That next block is a buffered one, so it is the only thing charged to the allowance")
+
+    // The run has to stay gap free and ascending across BOTH paths, which is what the reader
+    // reassembles on. A sequence already accepted, and a sequence beyond the next one, are both
+    // protocol violations and are raised rather than silently accepted.
+    val replayed = intercept[IllegalArgumentException](manager.admitDurably(0, 1L, payload))
+    assert(replayed.getMessage.contains("gap-free ascending run"),
+      s"A sequence already accepted must be refused as a numbering violation, not ${replayed}")
+    val skipped = intercept[IllegalArgumentException](manager.admitDurably(0, 3L, payload))
+    assert(skipped.getMessage.contains("expected sequence 2"),
+      s"A skipped sequence must name the position it expected, yet it said ${skipped.getMessage}")
+
+    // A refused payload is refused before anything is claimed, so the numbering is untouched by
+    // either of the three refusals above.
+    intercept[IllegalArgumentException](manager.admitDurably(0, 2L, Array.emptyByteArray))
+    assert(manager.lastAcceptedSequence(0) === 1L,
+      "A rejected offer must leave the partition's numbering exactly where it was")
+    assert(manager.durableAdmissionCount === 1L,
+      "and must not be counted as a write-through")
+
+    // The next legitimate position is still accepted, so a refusal is a refusal and not a wedge.
+    assert(manager.admitDurably(0, 2L, payload),
+      "The partition must still accept its next sequence after three refused offers")
+    assert(manager.durableAdmissionCount === 2L, "which is the second real write-through")
+    assert(manager.retainedBlockCount(0) === 3,
+      "and the window must now hold all three blocks, however each of them got there")
+  }
+
+  test("an eviction under way is published rather than left to be inferred") {
+    // A producer whose reservation was refused needs to know whether the budget is exhausted or
+    // merely busy being reclaimed, because the two call for opposite responses -- degrade, or wait.
+    // The flag is what tells it apart, and it must be false at rest and false again afterwards, so
+    // a producer cannot be left waiting on a reclamation that has already finished.
+    val context = newTrackedTaskContext()
+    val manager = newManager(context, newManualClock(), newQuota(roomyMemoryBytes))
+    val trigger = new NoopMemoryConsumer(memoryManagerOf(context))
+    assert(!manager.evictionInFlight, "An idle store has no eviction under way")
+
+    bufferBlocks(manager, 0, 2)
+    assert(!manager.evictionInFlight, "Nor has one that is merely holding blocks")
+    assert(manager.spill(Long.MaxValue, trigger) === 2L * blockCharge,
+      "The pressure callback must evict what it holds")
+    assert(!manager.evictionInFlight,
+      "and must publish the flag as clear once the write has landed, so a deferring producer is " +
+        "never left waiting on a reclamation that has already completed")
+    assert(manager.spillCount === 1L, "Exactly one eviction event must have been counted")
+  }
+
+  test("the executor task-slot count is read from the configuration, never from the machine") {
+    // The slot count is the second divisor of a producer's framing share, so a value that moved
+    // with the machine would make every framing capacity machine dependent. It is derived from
+    // declared configuration, and only falls back to the processor count when nothing is declared.
+    val declared = streamingConfWithOverrides()
+      .set(EXECUTOR_CORES, 8)
+      .set(CPUS_PER_TASK, 2)
+    assert(MemorySpillManager.executorTaskSlots(declared) === 4,
+      "Eight declared cores at two CPUs per task is four slots")
+
+    val localMaster = streamingConfWithOverrides().set("spark.master", "local[6]")
+    assert(MemorySpillManager.executorTaskSlots(localMaster) === 6,
+      "A local master's thread count is the declared core count for this purpose")
+
+    val bothDeclared = streamingConfWithOverrides()
+      .set("spark.master", "local[6]")
+      .set(EXECUTOR_CORES, 3)
+    assert(MemorySpillManager.executorTaskSlots(bothDeclared) === 6,
+      "The larger of the two declarations wins, so neither can understate the concurrency")
+
+    val oversubscribed = streamingConfWithOverrides()
+      .set(EXECUTOR_CORES, 1)
+      .set(CPUS_PER_TASK, 4)
+    assert(MemorySpillManager.executorTaskSlots(oversubscribed) === 1,
+      "A task wider than the executor still leaves one slot, never zero, because zero would " +
+        "divide by nothing when the framing share is derived")
+
+    // A configuration with no master at all reads as the default "local", which declares one thread
+    // and therefore one slot. This is the case every unit fixture in this package builds, which is
+    // what makes their framing capacities the same on every machine.
+    val undeclared = streamingConfWithOverrides()
+    assert(!undeclared.contains("spark.master") && !undeclared.contains(EXECUTOR_CORES.key),
+      "The fixture must declare neither a master nor a core count for this case to be the one " +
+        "being exercised")
+    assert(MemorySpillManager.executorTaskSlots(undeclared) === 1,
+      "An undeclared master reads as local, which is one thread and therefore one slot")
+
+    // Only a cluster master, which declares no local thread count, falls back to the processor
+    // count -- and even then the fallback is floored at one.
+    val cluster = streamingConfWithOverrides().set("spark.master", "spark://host:7077")
+    assert(MemorySpillManager.executorTaskSlots(cluster) ===
+        math.max(1, Runtime.getRuntime.availableProcessors()),
+      "With a cluster master and no declared cores the processor count is the only estimate left")
+
+    // And the value a live manager holds is that same figure, sampled once at construction so it is
+    // a constant of the executor rather than a reading that moves with load.
+    val manager = newManager(newTrackedTaskContext(), newManualClock(), newQuota(roomyMemoryBytes),
+      conf = declared)
+    assert(manager.concurrentTaskSlots === 4,
+      "A manager must hold the slot count its own configuration implies")
   }
 
   test("the spill callback declines a reclamation it triggered itself") {
@@ -672,12 +858,6 @@ class MemorySpillManagerSuite
     assert(manager.spillCount === 0L, "A declined request is not an eviction event")
   }
 
-  // -----------------------------------------------------------------------------------------------
-  // Reclamation latency. An acknowledgement is what frees producer memory, and it is contracted to
-  // do so within 100 ms. The bound is measured on the injected clock, so a frozen clock has to
-  // produce exactly zero and a clock that moves has to produce a whole number of its own steps.
-  // -----------------------------------------------------------------------------------------------
-
   test("an acknowledgement reclaims buffered memory within the 100 ms bound") {
     val manager = newManager(newTrackedTaskContext(), newManualClock(), newQuota(roomyMemoryBytes))
     assert(manager.registerConsumer(consumerId), "A live producer must admit a consumer")
@@ -686,7 +866,6 @@ class MemorySpillManagerSuite
     assert(manager.executorReservedBytes === manager.bufferedBytes,
       "Held bytes and reserved bytes must agree, so admission and the allowance cannot drift")
 
-    // Acknowledging through sequence one retires a prefix of exactly two blocks and no more.
     val releasedPrefix = manager.acknowledge(consumerId, 4, 1L)
     assert(releasedPrefix === 2L * blockCharge,
       "An acknowledgement must release exactly the prefix it covers")
@@ -741,7 +920,6 @@ class MemorySpillManagerSuite
     val files = spillFilesOf(manager)
     assert(files.nonEmpty, "An eviction must produce at least one spill file")
 
-    // A third block, still in memory, so the acknowledgement spans both halves of the window.
     bufferBlocks(manager, 0, 1)
     val released = manager.acknowledge(consumerId, 0, 2L)
     assert(released === blockCharge,
@@ -791,7 +969,6 @@ class MemorySpillManagerSuite
     assert(manager.consumerPosition(slowConsumerId, 0).isEmpty,
       "The slow consumer must have acknowledged nothing")
 
-    // Once the laggard catches up the whole prefix becomes retirable in one step.
     assert(manager.acknowledge(slowConsumerId, 0, 1L) === 2L * blockCharge,
       "The last consumer to confirm receipt is the one whose acknowledgement releases the memory")
     assert(manager.bufferedBytes === 0L, "The confirmed prefix must be released in full")
@@ -830,8 +1007,6 @@ class MemorySpillManagerSuite
     assert(metrics.peakExecutionMemory === manager.peakMemoryBytes,
       "The peak reservation must be reported on TaskMetrics.peakExecutionMemory")
 
-    // Closing again must not double count. These are cumulative accumulators, so a second report
-    // would overstate every surface that reads them.
     manager.close()
     assert(metrics.memoryBytesSpilled === manager.memoryBytesSpilled,
       "A second close must not report spilled memory twice")
@@ -850,7 +1025,6 @@ class MemorySpillManagerSuite
         "would make the streaming path invisible to every existing surface, but found " +
         s"$streamingSpecific")
 
-    // The three accumulators the streaming path does report on are the ones that already exist.
     Seq("memoryBytesSpilled", "diskBytesSpilled", "peakExecutionMemory").foreach { accessor =>
       assert(accessors.contains(accessor),
         s"TaskMetrics must expose $accessor, which is the accumulator the streaming path reuses")
@@ -876,11 +1050,6 @@ class MemorySpillManagerSuite
     assert(metricsOf(context).diskBytesSpilled > 0L,
       "The spilled volume must still be visible, on the accumulator that means exactly that")
   }
-
-  // -----------------------------------------------------------------------------------------------
-  // The two MemoryConsumer clauses that are only observable from inside the inherited operations:
-  // spill must never acquire, and a partial grant must be surfaced rather than tolerated.
-  // -----------------------------------------------------------------------------------------------
 
   test("the spill callback releases memory without ever acquiring any") {
     val context = newTrackedTaskContext()
@@ -944,14 +1113,10 @@ class MemorySpillManagerSuite
     assert(manager.lastAcceptedSequence(0) === MemorySpillManager.UNSET_SEQUENCE,
       "A rolled back reservation must leave the partition's sequence run unclaimed")
 
-    // Clearing re-arms the signal for a policy that has already acted on it, without erasing the
-    // cumulative history that same policy may still audit.
     manager.clearMemoryPressure()
     assert(!manager.memoryPressureDetected, "Clearing must re-arm the sticky signal")
     assert(manager.memoryPressureEvents >= 1L, "Clearing must not erase the cumulative tally")
 
-    // With the cap lifted the very same block is admitted, so the refusal really was the budget's
-    // doing and not a defect in the block.
     manager.capGrantsAt(Long.MaxValue)
     assert(manager.bufferBlock(0, 0L, payloadOfLength(0L, payloadBytes)),
       "The same block must be admitted once the allocator can satisfy it in full")
@@ -1079,8 +1244,6 @@ class MemorySpillManagerSuite
         s"${record.blockId.name} must parse back as a temporary shuffle block")
     }
 
-    // A name outside the existing namespace is not parseable, which is what "no new subtype" means
-    // in practice: the block manager's storage interface contract is left exactly as it was.
     intercept[UnrecognizedBlockId] {
       BlockId("streaming_shuffle_0_0_0")
     }
@@ -1104,8 +1267,6 @@ class MemorySpillManagerSuite
     assert(manager.getUsed() === 2L * blockCharge, "The in-memory blocks must still be charged")
     assert(!manager.spillFilesTransferred, "This consumer must still own its files")
 
-    // A failed task completes too, and the listener is registered precisely so that the release
-    // happens whatever the outcome.
     context.markTaskCompleted(Some(new IllegalStateException("injected task failure")))
     assert(manager.isClosed, "Task completion must close the consumer")
     assert(manager.bufferedBytes === 0L, "Every buffered byte must be released")
@@ -1249,11 +1410,9 @@ class MemorySpillManagerSuite
     assert(manager.durabilityFlushCount === 0L,
       "A reclamation forced by the budget is not an end-of-stream durability flush")
 
-    // Volume, on the component's own tallies as well as on the accumulators.
     assert(manager.memoryBytesSpilled === freed, "The volume that left memory must be reported")
     assert(manager.diskBytesSpilled > 0L, "The volume committed to local disk must be reported")
 
-    // Latency, measured on the injected clock: a held clock has to produce exactly zero.
     assert(manager.lastSpillDurationMs === 0L,
       "Spill latency must be measured on the injected clock rather than on wall time")
   }
@@ -1275,6 +1434,132 @@ class MemorySpillManagerSuite
       "The bytes really did reach local disk, so the volume is reported as an eviction's is")
     assert(manager.memoryBytesSpilled === moved, "The volume that left memory must be reported")
     assert(manager.bufferedBytes === 0L, "Nothing may be left in memory after a flush")
+  }
+
+  test("a block written straight to disk under buffer pressure is counted as a spill event") {
+    val partitionId = 3
+    val context = newTrackedTaskContext()
+    // The tight allowance is the production shape of this condition: `bufferBlock` cannot admit the
+    // block, eviction cannot free room another task is holding, and the producer's only remaining
+    // answer -- the specified one -- is to write it straight to local disk. `admitDurably` is that
+    // answer, driven directly here so the accounting is asserted without starving the host JVM.
+    val manager = newManager(context, newManualClock(), newQuota(tightMemoryBytes))
+    assert(observedSpillCount() === 0L, "The reset in beforeEach must leave a clean baseline")
+    val payload = payloadOfLength(7L, payloadBytes)
+
+    assert(manager.admitDurably(partitionId, 0L, payload),
+      "A block the allowance cannot hold must still be retained, on local disk")
+
+    // The event. A direct admission IS a spill: the configured buffer percentage was not enough for
+    // what this producer was holding, so bytes went to disk to keep the bound -- the same condition
+    // an eviction answers and the same condition the published counter exists to report.
+    assert(manager.spillCount === 1L,
+      "A pressure-induced direct-to-disk admission must be counted as one spill event")
+    assert(observedSpillCount() === 1L,
+      s"The published counter must advance with it, but read ${observedSpillCount()}")
+    assert(manager.durableAdmissionCount === 1L,
+      "The breakdown must record that the event took the direct-to-disk route")
+    assert(manager.durabilityFlushCount === 0L,
+      "A pressure admission is not an end-of-stream durability flush")
+
+    // The volume, asserted in the same case as the event. Disk bytes with no spill event behind
+    // them is precisely the inconsistency an operator cannot diagnose: neither a spill rate nor an
+    // average spill size can be computed from a series that misses one of its producers.
+    val committedBytes = manager.allSpilledBlocks.map(record => record.length).sum
+    assert(committedBytes > 0L, "The block must have been committed to local disk")
+    assert(manager.diskBytesSpilled === committedBytes,
+      "The committed segment must be reported as disk spill volume")
+    assert(manager.memoryBytesSpilled === 0L,
+      "Nothing left memory, because these bytes were never charged to it")
+    assert(manager.bufferedBytes === 0L, "A direct admission must charge the buffer budget nothing")
+
+    // Servable exactly as an evicted block is, which is what makes counting it as a spill honest
+    // rather than merely convenient: a consumer cannot tell the two routes apart.
+    assert(manager.retainsBlock(partitionId, 0L), "The block must be retained and servable")
+    assert(manager.retainedPayloadLength(partitionId, 0L).contains(payload.length),
+      "A directly admitted block must be readable at its full payload length")
+
+    // And the volume reaches Spark's own accumulator, so the event on the streaming counter and the
+    // bytes on the standard one describe the same spill.
+    val metrics = metricsOf(context)
+    context.markTaskCompleted(None)
+    assert(metrics.diskBytesSpilled === committedBytes,
+      "The same volume must reach TaskMetrics.diskBytesSpilled")
+    assert(metrics.memoryBytesSpilled === 0L,
+      "No memory volume may be manufactured by a write that never occupied memory")
+  }
+
+  test("recurring-condition log records are bounded per executor, not per manager instance") {
+    // Two managers, which is what an executor running two streaming map tasks has. The log-volume
+    // budget this subsystem is held to -- under 10 MB an hour per executor with debug off -- is
+    // measured per executor, so a bound that each instance evaluates for itself is not the bound at
+    // all: every task would contribute its own first default-level record and the volume would
+    // scale with the stage's task count. Both managers here share the executor's aggregation
+    // window, and a manual clock held inside it makes the boundary assertable rather than raced.
+    val firstClock = newManualClock()
+    val secondClock = newManualClock()
+    val firstContext = newTrackedTaskContext()
+    val secondContext = newTrackedTaskContext()
+    val first = newManager(firstContext, firstClock, newQuota(roomyMemoryBytes))
+    val second = newManager(secondContext, secondClock, newQuota(roomyMemoryBytes))
+    val flushes = MemorySpillManager.durabilityFlushLogAggregator
+    assert(flushes.occurrenceCount === 0L,
+      "The reset in beforeEach must leave the executor's aggregation window clean")
+
+    // The end-of-stream durability flush is the condition that makes this matter: it happens once
+    // per SUCCESSFUL map task, so a per-instance bound would put one line in the log for every task
+    // of every streaming map stage.
+    bufferBlocks(first, 0, 2)
+    assert(first.spillAllRetained() === 2L * blockCharge,
+      "The first task's flush must move every retained byte to local disk")
+    assert(flushes.occurrenceCount === 1L, "The first flush must be recorded on the executor")
+    assert(flushes.unreportedCount === 0L,
+      "The first occurrence is the one that reports, so nothing is yet standing unreported")
+
+    bufferBlocks(second, 0, 3)
+    assert(second.spillAllRetained() === 3L * blockCharge,
+      "The second task's flush must move every retained byte to local disk")
+    assert(flushes.occurrenceCount === 2L,
+      "A second manager's flush must be recorded on the SAME executor-wide aggregation")
+    assert(flushes.unreportedCount === 1L,
+      "Inside the window the second task's flush must be aggregated rather than reported, which " +
+        "is exactly what a per-instance gate could not do")
+    assert(second.durabilityFlushCount === 1L,
+      "Each manager still counts its own flushes; only the reporting is shared")
+
+    // The quoted totals are executor-wide too, so a record standing in for several tasks does not
+    // describe whichever task happened to win the gate.
+    assert(flushes.volumeBytes === 5L * blockCharge,
+      s"The aggregation must carry both tasks' volume, but carried ${flushes.volumeBytes}")
+
+    // Past the window the next occurrence reports again and clears what it stood in for, so the
+    // bound is one record per window rather than one record ever.
+    secondClock.advance(MemorySpillManager.LOG_AGGREGATION_WINDOW_MS)
+    bufferBlocks(second, 1, 1)
+    assert(second.spillAllRetained() === blockCharge, "The refilled partition must flush again")
+    assert(flushes.occurrenceCount === 3L, "The third flush must be recorded")
+    assert(flushes.unreportedCount === 0L,
+      "A record admitted past the window must clear the occurrences it accounted for")
+
+    // Every condition has a window of its own, so a flood of one never silences another's first
+    // occurrence. A threshold eviction is a different condition and must still be free to report.
+    val evictions = MemorySpillManager.spillLogAggregator
+    assert(evictions.occurrenceCount === 0L,
+      "No eviction has occurred, so the eviction aggregation must be untouched by the flushes")
+    val trigger = new NoopMemoryConsumer(memoryManagerOf(firstContext))
+    bufferBlocks(first, 1, 2)
+    assert(first.spill(blockCharge, trigger) > 0L, "The partition must leave memory")
+    assert(evictions.occurrenceCount === 1L, "The eviction must be recorded on its own aggregation")
+    assert(evictions.unreportedCount === 0L,
+      "An independent condition's first occurrence must report, whatever the flushes did")
+
+    // And the reset seam really does clear it, which is what keeps one suite from inheriting
+    // another's open window.
+    MemorySpillManager.resetSharedStateForTesting()
+    assert(flushes.occurrenceCount === 0L && flushes.unreportedCount === 0L,
+      "The shared-state reset must return the executor's aggregation to its initial state")
+    assert(evictions.occurrenceCount === 0L,
+      "Every aggregation must be reset, not only the one a test happened to name")
   }
 
   test("spill latency is measured on the injected clock") {
@@ -1305,7 +1590,10 @@ class MemorySpillManagerSuite
       "This fixture must stay below the threshold, so utilisation must read below it too")
 
     // The published gauge is computed on read from whatever allowances are registered with it, so a
-    // contributor installed here reports exactly what an operator would observe over JMX.
+    // contributor installed here pins its arithmetic exactly: a quarter-full allowance reads 25,
+    // which is what an operator sees through a configured sink, including JMX once JmxSink is
+    // enabled. What a stand-in cannot show is that the allowance production registers is the one a
+    // real manager draws on, which the case below covers instead.
     val contributor = installBufferUtilization(blockCharge, blockCharge * 4L)
     try {
       assert(observedBufferUtilizationPercent() === 25L,
@@ -1314,6 +1602,352 @@ class MemorySpillManagerSuite
     } finally {
       removeBufferUtilization(contributor)
     }
+  }
+
+  test("the published utilisation gauge is fed by the production executor allowance") {
+    // The case above pins the gauge's arithmetic with a stand-in contributor. What this one pins is
+    // the WIRING: that the single contributor production registers is the executor-scoped allowance
+    // a real manager draws on, so an operator reading this gauge over a sink is reading the bytes
+    // real producers hold rather than something a test installed. Nothing here injects an allowance
+    // and nothing here installs a contributor.
+    assert(StreamingShuffleMetricsSource.bufferUtilizationContributorCount === 0,
+      "beforeEach resets the source and discards the shared allowance, so nothing is registered")
+    assert(observedBufferUtilizationPercent() === 0L,
+      "With no contributor registered the gauge must read zero rather than throw or guess")
+
+    // Withholding the quota override is what makes the lazy derivation run the production
+    // `executorQuota` path: the budget comes from the live memory manager and the allowance
+    // registers itself with the metrics source.
+    val conf = streamingConfWithOverrides()
+    val manager = newProductionManager(newTrackedTaskContext(), conf)
+    bufferBlocks(manager, 0, 1)
+    assert(StreamingShuffleMetricsSource.bufferUtilizationContributorCount === 1,
+      "The production path must register exactly one contributor: the shared executor allowance")
+
+    // `executorQuota` memoises, so this is the very object the gauge walks -- not a copy of it.
+    val quota = MemorySpillManager.executorQuota(conf)
+    assert(quota.totalBytes === manager.totalBudgetBytes,
+      "The manager and the gauge must measure against one budget rather than two")
+    assert(quota.contributedBudgetBytes === manager.totalBudgetBytes,
+      "The gauge's denominator must be that same executor-wide budget")
+    assert(manager.executorReservedBytes >= blockCharge,
+      "A buffered block must be visible in the shared reservation the gauge reads")
+    assert(quota.contributedBufferedBytes === manager.executorReservedBytes,
+      "The gauge's numerator must be the bytes the executor's producers are actually holding")
+    assert(observedBufferUtilizationPercent() === manager.bufferUtilizationPercent,
+      "The published gauge and the manager must report one utilisation from one allowance")
+
+    // And the flow is live. A quarter of the derived allowance is reserved on the registered
+    // contributor itself, which is what a producer does, and the published gauge must follow with
+    // no notification and no second contributor. The expectation is computed with the production
+    // arithmetic rather than written as a literal, because dividing before multiplying truncates:
+    // "a quarter" reads 25 for a budget divisible by four and 24 for one that is not, and both are
+    // correct. Sizing the reservation as a fraction of the derived budget is what keeps this exact
+    // on whatever heap the test JVM is given.
+    val reservedBefore = quota.reservedBytes
+    val utilisationBefore = observedBufferUtilizationPercent()
+    val heldBytes = quota.totalBytes / 4L - reservedBefore
+    assert(heldBytes > 0L,
+      s"The derived allowance of ${quota.totalBytes} bytes must be roomy enough to lend a quarter")
+    assert(quota.tryReserve(heldBytes), "A quarter of a near-empty allowance must be reservable")
+    try {
+      val expected = quota.reservedBytes * percentScale / quota.totalBytes
+      assert(observedBufferUtilizationPercent() === expected,
+        s"The gauge must report the registered allowance's own arithmetic: expected $expected " +
+          s"but read ${observedBufferUtilizationPercent()}")
+      assert(observedBufferUtilizationPercent() > utilisationBefore,
+        "Lending out a quarter of the allowance must move the published gauge upwards")
+      assert(StreamingShuffleMetricsSource.bufferUtilizationContributorCount === 1,
+        "Reserving must not add a contributor; the allowance was already the one being counted")
+    } finally {
+      quota.release(heldBytes)
+    }
+    assert(observedBufferUtilizationPercent() === utilisationBefore,
+      "Releasing must return the gauge to the reservation the producers still hold")
+
+    // The allowance withdraws when the executor's shared state is discarded, which is what stops a
+    // departed contributor from reporting bytes nobody holds any more.
+    manager.close()
+    MemorySpillManager.resetSharedStateForTesting()
+    assert(StreamingShuffleMetricsSource.bufferUtilizationContributorCount === 0,
+      "Discarding the shared allowance must unregister it from the gauge")
+    assert(observedBufferUtilizationPercent() === 0L,
+      "With the allowance withdrawn the gauge must read zero again")
+  }
+
+  /**
+   * A spill writer that succeeds for a fixed number of blocks and then fails the device.
+   *
+   * The one thing a healthy device cannot produce, and the one thing the rollback path exists for:
+   * a failure part way through an eviction, after blocks have been committed and after every block
+   * of the batch has already been detached from memory. Failing at the first write would exercise a
+   * simpler branch -- nothing committed, nothing to revert -- so the count is a parameter.
+   *
+   * `revertPartialWritesAndClose` is observed rather than inferred, because it is the specific
+   * production call that makes a partially written file unservable, and a rollback that deleted the
+   * file without reverting it would leave the assertion on deletion satisfied while the discipline
+   * it stands for had been lost.
+   *
+   * @param failAfterWrites how many raw-byte writes succeed before the device fails
+   */
+  private class FailingSpillWriter(
+      file: java.io.File,
+      serializerManager: SerializerManager,
+      serializerInstance: SerializerInstance,
+      bufferSize: Int,
+      writeMetrics: ShuffleWriteMetricsReporter,
+      blockId: BlockId,
+      failAfterWrites: Int)
+    extends DiskBlockObjectWriter(file, serializerManager, serializerInstance, bufferSize,
+      syncWrites = false, writeMetrics, blockId) {
+
+    private val writesAttempted = new AtomicInteger(0)
+    private val reverted = new AtomicBoolean(false)
+
+    override def write(kvBytes: Array[Byte], offs: Int, len: Int): Unit = {
+      if (writesAttempted.incrementAndGet() > failAfterWrites) {
+        throw new IOException(
+          s"Simulated device failure writing block ${writesAttempted.get()} of $blockId")
+      }
+      super.write(kvBytes, offs, len)
+    }
+
+    override def revertPartialWritesAndClose(): java.io.File = {
+      reverted.set(true)
+      super.revertPartialWritesAndClose()
+    }
+
+    /** Whether the production rollback path reverted this writer. */
+    def wasReverted: Boolean = reverted.get()
+
+    /** Raw-byte writes this writer was asked to perform, successful or not. */
+    def writeAttempts: Int = writesAttempted.get()
+  }
+
+  /**
+   * A spill manager whose spill files are written through a device that fails part way through.
+   *
+   * Substitutes the one production seam that decides which writer an eviction is performed with,
+   * and nothing else: every other step of the eviction -- selection, detachment, temporary block
+   * allocation, commit, rollback, deletion and accounting -- is the production implementation.
+   *
+   * @param failAfterWrites how many blocks are committed before the device fails
+   */
+  private class FailingDeviceSpillManager(
+      taskMemoryManager: TaskMemoryManager,
+      conf: SparkConf,
+      clock: Clock,
+      quota: MemorySpillManager.ExecutorBufferQuota,
+      failAfterWrites: Int)
+    extends MemorySpillManager(taskMemoryManager, conf, clock, Some(quota), autoPoll = false) {
+
+    private val writers = new mutable.ArrayBuffer[FailingSpillWriter]()
+
+    override private[streaming] def newSpillWriter(
+        blockId: TempShuffleBlockId,
+        file: java.io.File,
+        serializer: SerializerInstance,
+        bufferSizeBytes: Int,
+        metrics: ShuffleWriteMetrics): DiskBlockObjectWriter = synchronized {
+      val writer = new FailingSpillWriter(file, SparkEnv.get.serializerManager, serializer,
+        bufferSizeBytes, metrics, blockId, failAfterWrites)
+      writers += writer
+      writer
+    }
+
+    /** Every writer this manager opened, in the order the evictions opened them. */
+    def openedWriters: Seq[FailingSpillWriter] = synchronized(writers.toSeq)
+  }
+
+  test("the scoped disk fault owns the directory it breaks and always cleans up after itself") {
+    // A test fixture whose failure mode is to leave process-wide state behind is worth testing in
+    // its own right, because what it leaves behind is charged to whichever case runs next. Three
+    // pieces of state are involved -- a directory's write permission, the injector's armed
+    // scenario, and the directory itself -- and all three outlive the case that created them.
+    //
+    // Every documented property is asserted here: the fixture can only ever break a directory it
+    // created, it does not arm a fault it could not actually produce, it cleans up even when the
+    // body raises, and closing twice costs nothing.
+    val injector = new StreamingShuffleFaultInjector(newManualClock())
+    try {
+      // 1. It cannot be pointed at a directory the suite does not own, because it takes no
+      //    directory: it creates the one it breaks. Asserted structurally, because that is the
+      //    strongest available form of the statement -- there is no argument through which a shared
+      //    spill root could be supplied. A path check would not do: in a test JVM the block
+      //    manager's own local directories live under the same temporary parent as anything the
+      //    suite creates, so no path predicate can tell the two apart.
+      val faultMethods = classOf[StreamingShuffleFaultInjector].getMethods
+        .filter(_.getName == "failDiskWrites")
+      assert(faultMethods.length === 1,
+        "the fixture must offer exactly one way to arm a disk fault, but offers " +
+          faultMethods.map(_.toString).mkString(", "))
+      assert(faultMethods.head.getParameterCount === 0,
+        "arming a disk fault must take no argument, so it can only ever break its own directory, " +
+          s"but takes ${faultMethods.head.getParameterCount}")
+      val sparkLocalDirs = sc.env.blockManager.diskBlockManager.localDirs.map(_.getCanonicalPath)
+
+      // 2. It arms only a fault it could actually produce. The equality is the assertion, and it
+      //    holds in both environments: where the permission bit is honoured the scenario is armed
+      //    and a write really fails, and where it is ignored -- notably when the test JVM runs as
+      //    root -- nothing is armed, which is exactly the leak the previous shape of this fixture
+      //    left behind for every later case in the JVM.
+      val brokenDirectory = withFailingDiskWrites(injector) { fault =>
+        assert(fault.directory.isDirectory,
+          s"${fault.directory.getAbsolutePath} must exist for the duration of the scope")
+        assert(!sparkLocalDirs.exists(local =>
+            fault.directory.getCanonicalPath.startsWith(local)),
+          s"${fault.directory.getCanonicalPath} must not be inside one of Spark's own local " +
+            s"directories ${sparkLocalDirs.mkString(", ")}")
+        assert(fault.isEffective ===
+            injector.isArmed(StreamingShuffleFaultScenario.DiskFailureDuringSpill),
+          "the scenario must be armed if and only if the permission change took effect")
+        if (fault.isEffective) {
+          assert(!fault.directory.canWrite,
+            "an effective fault must leave its directory unwritable")
+          val blocked = new java.io.File(fault.directory, "spill-attempt")
+          val created = try {
+            blocked.createNewFile()
+          } catch {
+            case _: java.io.IOException => false
+          }
+          assert(!created,
+            s"an effective fault must make ${blocked.getAbsolutePath} impossible to create")
+        }
+        fault.directory
+      }
+      assert(!brokenDirectory.exists(),
+        s"${brokenDirectory.getAbsolutePath} must be removed once the scope has ended")
+      assert(!injector.isArmed(StreamingShuffleFaultScenario.DiskFailureDuringSpill),
+        "the scenario must be disarmed once the scope has ended")
+
+      // 3. Cleanup happens even when the body raises, which is the case a separate restore call
+      //    skips and the reason this is a scoped resource at all.
+      var directoryFromFailedBody: java.io.File = null
+      val raised = intercept[IllegalStateException] {
+        withFailingDiskWrites(injector) { fault =>
+          directoryFromFailedBody = fault.directory
+          throw new IllegalStateException("the body failed part way through")
+        }
+      }
+      assert(raised.getMessage.contains("the body failed part way through"),
+        "the body's own failure must propagate rather than being replaced by a cleanup failure")
+      assert(directoryFromFailedBody != null && !directoryFromFailedBody.exists(),
+        s"${directoryFromFailedBody} must be removed after a body that raised")
+      assert(!injector.isArmed(StreamingShuffleFaultScenario.DiskFailureDuringSpill),
+        "the scenario must be disarmed after a body that raised")
+
+      // 4. Closing twice is a no-op rather than a second teardown of a directory whose name may by
+      //    then have been reused.
+      val fault = injector.failDiskWrites()
+      val reused = fault.directory
+      fault.close()
+      assert(!reused.exists(), "the first close must remove the directory")
+      assert(reused.mkdirs(), "the name must be free for something else to take")
+      fault.close()
+      assert(reused.isDirectory,
+        s"a second close must not remove ${reused.getAbsolutePath} a second time")
+      Utils.deleteRecursively(reused)
+      assert(!injector.isArmed(StreamingShuffleFaultScenario.DiskFailureDuringSpill),
+        "no scenario may remain armed once every fixture has been closed")
+    } finally {
+      injector.disarmAll()
+    }
+  }
+
+  test("a spill that fails part way through reverts, deletes and keeps every block servable") {
+    // The rollback path, which is a correctness guarantee rather than a nicety: an eviction
+    // detaches every block of a partition from memory before it writes any of them, so a device
+    // failure part way through leaves blocks that exist in neither place unless the failure
+    // restores them. A test that spills successfully and then asserts the failure counters are zero
+    // establishes only that a healthy device is healthy -- it never reaches the catch block, never
+    // reaches the rollback in the finally block, and would pass unchanged if both were deleted.
+    //
+    // So the device is made to fail after two of three blocks have been committed. Everything
+    // except the writer is the production implementation.
+    val context = newTrackedTaskContext()
+    val clock = newManualClock()
+    val committedBeforeFailure = 2
+    val blockCount = 3
+    val manager = new FailingDeviceSpillManager(memoryManagerOf(context),
+      streamingConfWithOverrides(), clock, newQuota(roomyMemoryBytes), committedBeforeFailure)
+    manager.registerPartitionCount(reducePartitions)
+    manager.registerCleanup(context)
+    openManagers += manager
+    val trigger = new NoopMemoryConsumer(memoryManagerOf(context))
+
+    bufferBlocks(manager, 0, blockCount)
+    val payloads = (0L until blockCount.toLong).map { sequence =>
+      sequence -> manager.retainedPayload(0, sequence).getOrElse(
+        fail(s"block $sequence must be buffered before the eviction"))
+    }.toMap
+    val sequenceClaimBefore = manager.lastAcceptedSequence(0)
+    val bufferedBefore = manager.bufferedBytes
+    assert(bufferedBefore > 0L, "the partition must hold bytes for the eviction to detach")
+    assert(sequenceClaimBefore === (blockCount - 1).toLong,
+      s"the partition's sequence claim must stand at ${blockCount - 1} but is $sequenceClaimBefore")
+
+    // The eviction. It reports nothing reclaimed, because a spill that could not be written has
+    // reclaimed nothing -- reporting bytes it had failed to move would tell the memory manager it
+    // had room it does not have.
+    val reclaimed = manager.spill(Long.MaxValue, trigger)
+    assert(reclaimed === 0L,
+      s"a failed eviction must report no reclaimed bytes, but reported $reclaimed")
+
+    // The failure was counted, once, and attributed as a spill failure rather than as a deletion
+    // failure or a silent success.
+    assert(manager.spillFailureCount === 1L,
+      s"exactly one spill failure must be counted, but ${manager.spillFailureCount} were")
+    assert(manager.spillCount === 0L,
+      s"a failed eviction must not be counted as a spill, but ${manager.spillCount} were")
+
+    // The writer really failed part way through: blocks were committed before it did, which is what
+    // makes this the partial-write case rather than the allocation-failure case.
+    val writers = manager.openedWriters
+    assert(writers.size === 1, s"exactly one writer must have been opened, not ${writers.size}")
+    val writer = writers.head
+    assert(writer.writeAttempts === committedBeforeFailure + 1,
+      s"the device must have failed on write ${committedBeforeFailure + 1}, but was asked for " +
+        s"${writer.writeAttempts}")
+    assert(writer.wasReverted,
+      "the production rollback must revert the partially written file rather than merely close it")
+
+    // Nothing partially written survives. A file left behind would be unreferenced local storage at
+    // best, and at worst a file a later lookup could serve a truncated block out of.
+    assert(spillFilesOf(manager).isEmpty,
+      s"no spill record may survive a failed eviction, but ${spillFilesOf(manager).size} did")
+    assert(!writer.file.exists(),
+      s"the partially written spill file ${writer.file.getAbsolutePath} must be deleted")
+    assert(manager.spillFileDeletionFailures === 0L,
+      "the rollback's own deletion must not have failed")
+    assert(manager.retainedSpillRecordCount === 0,
+      s"no spilled record may be published, but ${manager.retainedSpillRecordCount} were")
+
+    // And every block is still servable, byte for byte, from memory. This is the assertion the
+    // whole case exists for: the eviction detached all three blocks before writing any of them, so
+    // a rollback that failed to restore them would lose output a consumer is entitled to and could
+    // never ask for again.
+    payloads.foreach { case (sequence, expected) =>
+      assert(manager.retainsBlock(0, sequence),
+        s"block $sequence must still be retained after the failed eviction")
+      assert(manager.spilledBlock(0, sequence).isEmpty,
+        s"block $sequence must not be recorded as spilled after the failed eviction")
+      val readBack = manager.retainedPayload(0, sequence)
+      assert(readBack.isDefined, s"block $sequence must still be readable")
+      assert(java.util.Arrays.equals(expected, readBack.get),
+        s"block $sequence read back different bytes after the failed eviction")
+    }
+    assert(manager.bufferedBytes === bufferedBefore,
+      s"every detached byte must be back in memory: $bufferedBefore before the failure, " +
+        s"${manager.bufferedBytes} after")
+    assert(manager.lastAcceptedSequence(0) === sequenceClaimBefore,
+      s"the partition's sequence claim must be restored to $sequenceClaimBefore, but is " +
+        manager.lastAcceptedSequence(0))
+
+    // The partition is still usable afterwards: a failed eviction must not have poisoned the run,
+    // or the producing task would fail on its next block for a reason the device no longer has.
+    val nextSequence = sequenceClaimBefore + 1L
+    assert(manager.bufferBlock(0, nextSequence, payloadOfLength(nextSequence, payloadBytes)),
+      s"the partition must still admit sequence $nextSequence after the failed eviction")
   }
 
   test("a spill failure is never observed on a healthy device and nothing is left behind") {
@@ -1336,5 +1970,429 @@ class MemorySpillManagerSuite
     }
     assert(manager.retainedSpillRecordCount === 3,
       "Every evicted block must be counted against the retained-record bound")
+  }
+
+  // -----------------------------------------------------------------------------------------------
+  // Durable direct admission. The buffer allowance is a bound, and a bound that is reached has to
+  // have an answer other than failure: a block that cannot be buffered goes straight to local disk
+  // and stays servable, so every path terminates in a working shuffle.
+  // -----------------------------------------------------------------------------------------------
+
+  test("a block the buffer allowance cannot hold is admitted straight to local disk") {
+    val manager = newManager(newTrackedTaskContext(), newManualClock(), newQuota(tightMemoryBytes))
+    val allowance = manager.maxAdmissiblePayloadBytes
+    val oversized = payloadOfLength(0L, allowance.toInt + 1)
+    // The same payload buffered: refused permanently, because no eviction can make it fit.
+    assert(!manager.bufferBlock(0, 0L, oversized),
+      "A payload beyond the per-partition allowance must be refused by the buffering path, or " +
+        "the durable path below would not be the only way to admit it")
+    manager.clearMemoryPressure()
+    val spillsBefore = manager.spillCount
+    val memoryBefore = manager.memoryBytesSpilled
+    val diskBefore = manager.diskBytesSpilled
+    val bufferedBefore = manager.bufferedBytes
+
+    assert(manager.admitDurably(0, 0L, oversized),
+      "A block the allowance cannot hold must be admitted straight to disk rather than refused")
+
+    assert(manager.durableAdmissionCount === 1L,
+      s"The direct admission must be counted apart from an eviction, but the count was " +
+        s"${manager.durableAdmissionCount}")
+    assert(manager.spillCount === spillsBefore + 1L,
+      s"The allowance could not hold the block and the block reached local disk, which is the " +
+        s"same condition an eviction answers, so the pressure signal must advance with it -- but " +
+        s"spillCount went from ${spillsBefore} to ${manager.spillCount}")
+    assert(manager.memoryBytesSpilled === memoryBefore,
+      s"Nothing left memory, so memoryBytesSpilled must not move, but it went from " +
+        s"${memoryBefore} to ${manager.memoryBytesSpilled}")
+    val committed = manager.spilledBlock(0, 0L).map(_.length).getOrElse(0L)
+    assert(committed >= oversized.length.toLong,
+      s"The committed segment must be at least the payload it carries -- the disk writer's own " +
+        s"wrapping accounts for the difference -- but ${committed} was recorded for " +
+        s"${oversized.length} byte(s)")
+    assert(manager.diskBytesSpilled === diskBefore + committed,
+      s"The bytes really did reach local disk, so diskBytesSpilled must carry exactly the " +
+        s"committed segment, but it went from ${diskBefore} to ${manager.diskBytesSpilled} for a " +
+        s"segment of ${committed}")
+    assert(manager.bufferedBytes === bufferedBefore,
+      s"A durably admitted block charges the buffer budget nothing, but the buffered tally went " +
+        s"from ${bufferedBefore} to ${manager.bufferedBytes}")
+
+    // Indistinguishable from a block that was buffered and later evicted: every read path answers
+    // for it identically, which is what keeps the map output complete and reassemblable.
+    assert(manager.retainsBlock(0, 0L), "The block must be retained and servable")
+    assert(manager.spilledBlock(0, 0L).isDefined,
+      "The block must be published in the spilled store, exactly as an evicted one is")
+    assert(manager.retainedPayload(0, 0L).map(_.toSeq) === Some(oversized.toSeq),
+      "The block must read back byte for byte, or a consumer could not reassemble the partition")
+    assert(manager.retainedPayloadLength(0, 0L) === Some(oversized.length),
+      "The retained length must be the payload's own length")
+    assert(manager.lastAcceptedSequence(0) === 0L,
+      s"The sequence must be claimed by the admission, but the run stopped at " +
+        s"${manager.lastAcceptedSequence(0)}")
+    assert(manager.servesRetainedOutput,
+      "A producer holding a durably admitted block serves retained output")
+
+    // The gap-free ascending run is enforced on this path too: a duplicate would be charged twice
+    // and a gap would let a later acknowledgement retire bytes that were never charged.
+    intercept[IllegalArgumentException] {
+      manager.admitDurably(0, 0L, oversized)
+    }
+    intercept[IllegalArgumentException] {
+      manager.admitDurably(0, 2L, oversized)
+    }
+    assert(manager.durableAdmissionCount === 1L,
+      "A refused admission must not be counted as a durable admission")
+    assert(manager.retainedBlockCount(0) === 1,
+      s"Only the one legitimate block may be retained, but ${manager.retainedBlockCount(0)} were")
+  }
+
+  test("a durable admission whose write fails publishes nothing and unclaims its sequence") {
+    val manager = newManager(newTrackedTaskContext(), newManualClock(), newQuota(roomyMemoryBytes))
+    val payload = payloadOfLength(7L, payloadBytes)
+    val diskBefore = manager.diskBytesSpilled
+    val bufferedBefore = manager.bufferedBytes
+
+    // Local storage is made unusable for the duration of the attempt, by moving each local
+    // directory aside and leaving a regular file in its place: a subdirectory can then neither be
+    // created nor opened through, whatever privileges the test JVM runs with. This is the only way
+    // to reach the write-failure branch from a suite that shares one live executor environment, and
+    // it is undone in the `finally` below before any other case can observe it.
+    val localDirs = sc.env.blockManager.diskBlockManager.localDirs
+    val displaced = localDirs.map(dir => (dir, new File(dir.getPath + ".displaced")))
+    try {
+      displaced.foreach { case (dir, aside) =>
+        assert(dir.renameTo(aside), s"The suite must be able to move ${dir} aside")
+        assert(aside.isDirectory, s"${aside} must be the real local directory")
+        java.nio.file.Files.write(dir.toPath, Array[Byte](0))
+        assert(dir.isFile, s"${dir} must now be a regular file so no subdirectory can exist")
+      }
+
+      assert(!manager.admitDurably(0, 0L, payload),
+        "A durable admission that cannot reach local disk must report failure rather than " +
+          "claiming to have retained anything")
+    } finally {
+      displaced.foreach { case (dir, aside) =>
+        if (dir.isFile) {
+          assert(dir.delete(), s"The placeholder at ${dir} must be removable")
+        }
+        assert(aside.renameTo(dir), s"The real local directory must be restored to ${dir}")
+      }
+    }
+    assert(sc.env.blockManager.diskBlockManager.localDirs.forall(_.isDirectory),
+      "Local storage must be intact again before anything else runs")
+
+    assert(manager.spillFailureCount === 1L,
+      s"The failure must be counted, but ${manager.spillFailureCount} were")
+    assert(manager.durableAdmissionCount === 0L,
+      "A failed write is not a durable admission and must not be counted as one")
+    assert(manager.diskBytesSpilled === diskBefore,
+      s"Nothing reached disk, so diskBytesSpilled must not move, but it went from ${diskBefore} " +
+        s"to ${manager.diskBytesSpilled}")
+    assert(manager.bufferedBytes === bufferedBefore,
+      "A failed durable admission must charge the buffer budget nothing")
+    assert(!manager.retainsBlock(0, 0L),
+      "Nothing may be published for a block whose write failed")
+    assert(manager.retainedBlockCount(0) === 0,
+      s"No record may be retained, but ${manager.retainedBlockCount(0)} were")
+    assert(manager.lastAcceptedSequence(0) === MemorySpillManager.UNSET_SEQUENCE,
+      s"The sequence must be unclaimed by the rollback, but the run reported " +
+        s"${manager.lastAcceptedSequence(0)}")
+
+    // The sequence being unclaimed is what makes the producer's own recovery possible: the very
+    // same block may be offered again, and on a healthy device it is admitted rather than rejected
+    // as a duplicate.
+    assert(manager.admitDurably(0, 0L, payload),
+      "The same block must be admissible again once local storage is healthy")
+    assert(manager.durableAdmissionCount === 1L,
+      "The retry must be counted exactly once")
+    assert(manager.retainedPayload(0, 0L).map(_.toSeq) === Some(payload.toSeq),
+      "The retried block must read back byte for byte")
+  }
+
+  test("the framing share is sized per task slot") {
+    // Two configuration keys carry the count and neither covers every master, so the larger is
+    // taken and then divided by the CPUs a task claims. Table driven, because each row is a
+    // different way for an executor to describe the same thing.
+    val processors = Runtime.getRuntime.availableProcessors()
+    val cases: Seq[(String, SparkConf, Int)] = Seq(
+      ("a declared core count", new SparkConf(false).set("spark.executor.cores", "4"), 4),
+      ("a declared count with two cpus per task",
+        new SparkConf(false).set("spark.executor.cores", "4").set("spark.task.cpus", "2"), 2),
+      ("a local master, which leaves the core key at its default",
+        new SparkConf(false).set("spark.master", "local[3]"), 3),
+      ("a local master with two cpus per task",
+        new SparkConf(false).set("spark.master", "local[4]").set("spark.task.cpus", "2"), 2),
+      ("both sources, where the larger wins",
+        new SparkConf(false).set("spark.master", "local[5]").set("spark.executor.cores", "2"), 5),
+      ("a coarse-grained executor, whose true count is unreadable from configuration",
+        new SparkConf(false).set("spark.master", "spark://host:7077"), processors),
+      ("more cpus per task than cores, which must still leave one slot",
+        new SparkConf(false).set("spark.executor.cores", "1").set("spark.task.cpus", "4"), 1))
+    cases.foreach { case (description, conf, expected) =>
+      assert(MemorySpillManager.executorTaskSlots(conf) === expected,
+        s"With $description the divisor must be $expected, but was " +
+          s"${MemorySpillManager.executorTaskSlots(conf)}")
+    }
+
+    // And the derivation is what the component actually holds: sizing the framing share per slot is
+    // what makes the configured percentage a bound on the executor rather than on one task of it.
+    val fourSlots = streamingConfWithOverrides().set("spark.executor.cores", "4")
+    val oneSlot = streamingConfWithOverrides().set("spark.executor.cores", "1")
+    val wide = newManager(newTrackedTaskContext(), newManualClock(),
+      newQuota(roomyMemoryBytes), fourSlots)
+    val narrow = newManager(newTrackedTaskContext(), newManualClock(),
+      newQuota(roomyMemoryBytes), oneSlot)
+    assert(wide.concurrentTaskSlots === 4 && narrow.concurrentTaskSlots === 1,
+      s"Each manager must hold the count derived from its own configuration, but they held " +
+        s"${wide.concurrentTaskSlots} and ${narrow.concurrentTaskSlots}")
+    assert(wide.maxAdmissiblePayloadBytes <= narrow.maxAdmissiblePayloadBytes,
+      s"An executor believing it runs four concurrent tasks must not admit a larger block than " +
+        s"one believing it runs a single task, but it admitted " +
+        s"${wide.maxAdmissiblePayloadBytes} against ${narrow.maxAdmissiblePayloadBytes}")
+  }
+
+  test("an eviction is in flight only between detaching and publishing") {
+    // The publish stage reads the injected clock while the eviction is still in flight and the
+    // monitor is still held, which is the one instant from which the flag can be observed
+    // deterministically -- no sleep, no second thread and no race.
+    val observations = new mutable.ArrayBuffer[Boolean]()
+    val managerRef = new AtomicReference[MemorySpillManager](null)
+    val observingClock = new Clock {
+      private val current = new AtomicLong(clockEpochMs)
+      override def getTimeMillis(): Long = {
+        val manager = managerRef.get()
+        if (manager != null) {
+          observations.synchronized {
+            observations += manager.evictionInFlight
+          }
+        }
+        current.get()
+      }
+      override def nanoTime(): Long = TimeUnit.MILLISECONDS.toNanos(current.get())
+      override def waitTillTime(targetTime: Long): Long = current.get()
+    }
+    val context = newTrackedTaskContext()
+    val manager = newManager(context, observingClock, newQuota(roomyMemoryBytes))
+    managerRef.set(manager)
+    bufferBlocks(manager, 0, 3)
+    assert(!manager.evictionInFlight,
+      "No eviction may be in flight before one is asked for")
+    observations.synchronized(observations.clear())
+
+    val trigger = new NoopMemoryConsumer(memoryManagerOf(context))
+    assert(manager.spill(Long.MaxValue, trigger) > 0L, "The partition must leave memory")
+
+    assert(observations.synchronized(observations.contains(true)),
+      s"The flag must read true while the reclamation is between its detach and publish stages, " +
+        s"but every reading inside it was false: " +
+        s"${observations.synchronized(observations.mkString("[", ", ", "]"))}")
+    assert(!manager.evictionInFlight,
+      "The flag must be cleared by the publish stage, so a later producer is not made to wait " +
+        "for an eviction that has finished")
+    assert(manager.spillCount === 1L,
+      s"Exactly one eviction event may be counted, but ${manager.spillCount} were")
+  }
+
+  test("concurrent reclamation accounts every byte exactly once") {
+    // Reclamation is genuinely concurrent -- the threshold poller, an acknowledgement and a
+    // producer needing room can all reach it at once -- so what is asserted is the invariant that
+    // survives any interleaving: every byte leaves memory once, reaches disk once, and is retained
+    // once. Overlapping evictions decline rather than planning the same partition twice, and a
+    // double count would show up here as a doubled tally.
+    val context = newTrackedTaskContext()
+    val manager = newManager(context, newManualClock(), newQuota(roomyMemoryBytes))
+    val partitions = 4
+    val blocksPerPartition = 6
+    (0 until partitions).foreach(partitionId =>
+      bufferBlocks(manager, partitionId, blocksPerPartition))
+    val totalBlocks = partitions * blocksPerPartition
+    val chargedBytes = totalBlocks.toLong * blockCharge
+    assert(manager.bufferedBytes === chargedBytes,
+      s"The fixture must have charged ${chargedBytes} bytes, but held ${manager.bufferedBytes}")
+
+    val racers = (1 to 3).map { index =>
+      val thread = new Thread(new Runnable {
+        override def run(): Unit = {
+          var attempts = 0
+          while (attempts < 50 && manager.bufferedBytes > 0L) {
+            attempts += 1
+            manager.maybeSpill()
+          }
+        }
+      }, s"streaming-shuffle-spill-racer-$index")
+      thread.setDaemon(true)
+      thread
+    }
+    racers.foreach(_.start())
+    val flushed = manager.spillAllRetained()
+    racers.foreach(_.join(TimeUnit.SECONDS.toMillis(60L)))
+    racers.foreach(thread =>
+      assert(!thread.isAlive, s"${thread.getName} must have finished rather than being left alive"))
+
+    assert(manager.bufferedBytes === 0L,
+      s"Every buffered byte must have left memory, but ${manager.bufferedBytes} remained")
+    assert(manager.memoryBytesSpilled === chargedBytes,
+      s"Exactly the bytes that were charged may be reported as spilled from memory -- no more, " +
+        s"which would be a double count, and no less -- but ${manager.memoryBytesSpilled} of " +
+        s"${chargedBytes} was reported")
+    assert(flushed + manager.bufferedBytes <= chargedBytes,
+      s"No reclamation may report freeing more than was ever charged, but the durability flush " +
+        s"alone reported ${flushed} of ${chargedBytes}")
+    val payloadsOnDisk = manager.allSpilledBlocks.map(_.payloadLength.toLong).sum
+    val committedOnDisk = manager.allSpilledBlocks.map(_.length).sum
+    assert(payloadsOnDisk === totalBlocks.toLong * payloadBytes.toLong,
+      s"Every payload must reach disk exactly once, but ${payloadsOnDisk} byte(s) of payload " +
+        s"recorded for ${totalBlocks} block(s) of ${payloadBytes}")
+    assert(manager.diskBytesSpilled === committedOnDisk,
+      s"Disk accounting must be exactly the committed segments, with nothing counted twice, but " +
+        s"${manager.diskBytesSpilled} was reported against ${committedOnDisk} committed")
+    assert(manager.retainedSpillRecordCount === totalBlocks,
+      s"Every block must be retained exactly once, but ${manager.retainedSpillRecordCount} " +
+        s"record(s) exist for ${totalBlocks} block(s)")
+    assert(manager.spillFailureCount === 0L,
+      s"No reclamation may have failed, but ${manager.spillFailureCount} did")
+    (0 until partitions).foreach { partitionId =>
+      assert(manager.retainedBlockCount(partitionId) === blocksPerPartition,
+        s"Partition $partitionId must retain ${blocksPerPartition} block(s), but retained " +
+          s"${manager.retainedBlockCount(partitionId)}")
+      (0 until blocksPerPartition).foreach { sequence =>
+        assert(manager.retainsBlock(partitionId, sequence.toLong),
+          s"Partition $partitionId sequence $sequence must still be servable")
+      }
+    }
+    assert(!manager.evictionInFlight,
+      "No eviction may be left in flight once every racer has finished")
+  }
+
+  // -----------------------------------------------------------------------------------------------
+  // Negative validation. Every guard is a boundary a caller can reach, so each is asserted to
+  // refuse AND to leave nothing behind: a guard that threw after mutating state would be worse than
+  // no guard at all, because the caller would be told nothing happened when something had.
+  // -----------------------------------------------------------------------------------------------
+
+  test("every block admission guard refuses without changing any state") {
+    val manager = newManager(newTrackedTaskContext(), newManualClock(), newQuota(roomyMemoryBytes))
+    bufferBlocks(manager, 0, 1)
+    val payload = payloadOfLength(1L, payloadBytes)
+    val oversized = payloadOfLength(2L, maxBlockPayloadBytes + 1)
+
+    val bufferedBefore = manager.bufferedBytes
+    val reservedBefore = manager.executorReservedBytes
+    val retainedBefore = manager.retainedBlockCount(0)
+    val cursorBefore = manager.lastAcceptedSequence(0)
+    val diskBefore = manager.diskBytesSpilled
+    val filesBefore = spillFilesOf(manager).size
+    val durableBefore = manager.durableAdmissionCount
+    val spillsBefore = manager.spillCount
+
+    val refusals: Seq[(String, () => Any)] = Seq(
+      ("a negative partition id offered to the buffering path", () => manager.bufferBlock(-1, 1L,
+        payload)),
+      ("a negative sequence number offered to the buffering path", () => manager.bufferBlock(0, -1L,
+        payload)),
+      ("a null payload offered to the buffering path", () => manager.bufferBlock(0, 1L, null)),
+      ("an empty payload offered to the buffering path", () => manager.bufferBlock(0, 1L,
+        Array.emptyByteArray)),
+      ("a payload past the protocol's block size offered to the buffering path",
+        () => manager.bufferBlock(0, 1L, oversized)),
+      ("a negative partition id offered to the durable path", () => manager.admitDurably(-1, 1L,
+        payload)),
+      ("a negative sequence number offered to the durable path", () => manager.admitDurably(0, -1L,
+        payload)),
+      ("a null payload offered to the durable path", () => manager.admitDurably(0, 1L, null)),
+      ("an empty payload offered to the durable path", () => manager.admitDurably(0, 1L,
+        Array.emptyByteArray)),
+      ("a payload past the protocol's block size offered to the durable path",
+        () => manager.admitDurably(0, 1L, oversized)),
+      ("a non-positive partition count", () => manager.registerPartitionCount(0)),
+      ("a negative partition count", () => manager.registerPartitionCount(-1)),
+      ("a partition count past the tracked ceiling",
+        () => manager.registerPartitionCount(MemorySpillManager.MAX_TRACKED_PARTITIONS + 1)),
+      ("a partition count conflicting with the one already registered",
+        () => manager.registerPartitionCount(reducePartitions + 1)),
+      ("a non-positive divisor for the per-partition budget",
+        () => manager.perPartitionBudgetBytesFor(0)),
+      ("a null task context for cleanup registration", () => manager.registerCleanup(null)),
+      ("a null spill file offered for a lease", () => manager.acquireSpillFileLease(null)),
+      ("a null spill file offered for a lease release", () => manager.releaseSpillFileLease(null)))
+
+    refusals.foreach { case (description, attempt) =>
+      intercept[IllegalArgumentException] {
+        attempt()
+      }
+    }
+
+    assert(manager.bufferedBytes === bufferedBefore,
+      s"No refused call may charge the buffer budget, but the tally went from ${bufferedBefore} " +
+        s"to ${manager.bufferedBytes}")
+    assert(manager.executorReservedBytes === reservedBefore,
+      s"No refused call may charge the executor's shared allowance, but it went from " +
+        s"${reservedBefore} to ${manager.executorReservedBytes}")
+    assert(manager.retainedBlockCount(0) === retainedBefore,
+      s"No refused call may retain a block, but the count went from ${retainedBefore} to " +
+        s"${manager.retainedBlockCount(0)}")
+    assert(manager.lastAcceptedSequence(0) === cursorBefore,
+      s"No refused call may advance a partition's sequence cursor, but it went from " +
+        s"${cursorBefore} to ${manager.lastAcceptedSequence(0)}")
+    assert(manager.diskBytesSpilled === diskBefore && spillFilesOf(manager).size === filesBefore,
+      "No refused call may write or allocate a spill file")
+    assert(manager.durableAdmissionCount === durableBefore && manager.spillCount === spillsBefore,
+      "No refused call may advance a spill or durable-admission counter")
+    assert(manager.numPartitions === reducePartitions,
+      s"A refused partition count must leave the registered one in place, but the manager " +
+        s"reports ${manager.numPartitions}")
+    assert(!manager.memoryPressureDetected,
+      "A malformed call is a programming error rather than memory pressure, so it must not raise " +
+        "the signal that stands streaming down")
+  }
+
+  test("every consumer and acknowledgement guard refuses without changing any state") {
+    val manager = newManager(newTrackedTaskContext(), newManualClock(), newQuota(roomyMemoryBytes))
+    assert(manager.registerConsumer(consumerId), "A live producer must admit a consumer")
+    bufferBlocks(manager, 0, 2)
+
+    val bufferedBefore = manager.bufferedBytes
+    val consumersBefore = manager.registeredConsumers
+    val refusalsBefore = manager.rejectedAcknowledgementCount
+    val positionBefore = manager.consumerPosition(consumerId, 0)
+
+    val refusals: Seq[(String, () => Any)] = Seq(
+      ("a null consumer identity offered for registration", () => manager.registerConsumer(null)),
+      ("an empty consumer identity offered for registration", () => manager.registerConsumer("")),
+      ("a null consumer identity offered for unregistration",
+        () => manager.unregisterConsumer(null)),
+      ("an empty consumer identity offered for unregistration",
+        () => manager.unregisterConsumer("")),
+      ("a null consumer identity offered for an acknowledgement",
+        () => manager.acknowledge(null, 0, 0L)),
+      ("an empty consumer identity offered for an acknowledgement",
+        () => manager.acknowledge("", 0, 0L)),
+      ("a negative partition id offered for an acknowledgement",
+        () => manager.acknowledge(consumerId, -1, 0L)))
+
+    refusals.foreach { case (description, attempt) =>
+      intercept[IllegalArgumentException] {
+        attempt()
+      }
+    }
+
+    assert(manager.registeredConsumers === consumersBefore,
+      s"No refused call may change the registered consumers, but they went from " +
+        s"${consumersBefore.mkString("[", ", ", "]")} to " +
+        s"${manager.registeredConsumers.mkString("[", ", ", "]")}")
+    assert(manager.bufferedBytes === bufferedBefore,
+      s"No refused acknowledgement may release memory, but the tally went from ${bufferedBefore} " +
+        s"to ${manager.bufferedBytes}")
+    assert(manager.consumerPosition(consumerId, 0) === positionBefore,
+      s"No refused acknowledgement may advance a consumer's position, but it went from " +
+        s"${positionBefore} to ${manager.consumerPosition(consumerId, 0)}")
+    assert(manager.rejectedAcknowledgementCount === refusalsBefore,
+      s"A malformed acknowledgement is refused at the boundary and is not the refused-in-range " +
+        s"case the counter records, but the counter went from ${refusalsBefore} to " +
+        s"${manager.rejectedAcknowledgementCount}")
+    assert(manager.lastAcceptedSequence(0) === 1L,
+      s"No refused call may disturb the admitted run, which must still end at 1, but it ended at " +
+        s"${manager.lastAcceptedSequence(0)}")
   }
 }

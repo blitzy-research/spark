@@ -1605,11 +1605,13 @@ private[spark] class StreamingShuffleReader[K, C](
           enqueue(block)
         case Some(StreamCompleted(completedPartition, totalBlocks)) =>
           markTerminated(completedPartition, totalBlocks)
-        case Some(ProducerLost(lostPartition, reason, cause)) =>
+        case Some(ProducerLost(lostPartition, reason, cause, invalidation)) =>
           val attributedPartition =
             if (servesPartition(lostPartition)) lostPartition else awaitedPartition
-          failProducer(attributedPartition, StreamingShuffleInvalidationReason.ConnectionTimeout,
-            reason, cause)
+          // The attribution travels on the marker rather than being assumed here: only the handler
+          // can tell a silent channel from a producer that contradicted its own end of stream, and
+          // the two reach an operator's invalidation telemetry as different facts.
+          failProducer(attributedPartition, invalidation, reason, cause)
         case None =>
           checkProducerLiveness(awaitedPartition)
       }
@@ -1678,17 +1680,25 @@ private[spark] class StreamingShuffleReader[K, C](
     }
 
     /**
-     * Records the orderly end of one partition's stream.
+     * Records the orderly end of one partition's stream, taking the first total and keeping it.
      *
      * A total of zero is a valid reading and means the partition was empty; the read must then
      * yield an empty iterator rather than wait out the connection timeout, which is exactly what an
      * empty inbox plus a terminated flag produces.
+     *
+     * The first total recorded is the only one recorded. The handler emits exactly one completion
+     * marker per partition, so a second is not reachable through it -- but the number this reader
+     * completes a partition against must not be a value that any later event could move, because
+     * that number is the whole of the truncation check. Fixing it here makes the guarantee a
+     * property of this class rather than an inference about another one.
      */
     private def markTerminated(completedPartition: Int, totalBlocks: Long): Unit = {
       if (servesPartition(completedPartition)) {
         val inbox = inboxOf(completedPartition)
         inbox.terminated = true
-        inbox.announcedTotalBlocks = totalBlocks
+        if (inbox.announcedTotalBlocks == StreamingShuffleClientHandler.NO_BLOCK_TOTAL) {
+          inbox.announcedTotalBlocks = totalBlocks
+        }
         if (debugEnabled) {
           logDebug(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} partition " +
             log"${MDC(PARTITION_ID, completedPartition)} ended after " +
@@ -1983,11 +1993,31 @@ private[spark] class StreamingShuffleReader[K, C](
      * A stream that ends short is the one failure a checksum cannot catch, because every block that
      * did arrive was intact. Comparing the announced total against what was consumed is what turns
      * a truncated partition into a fetch failure instead of a silently short result.
+     *
+     * <b>Which total is authoritative, and why the order matters.</b> The total is taken from the
+     * completion event this task dequeued -- [[PartitionInbox.announcedTotalBlocks]], written by
+     * [[markTerminated]] from the one `StreamCompleted` marker the handler emitted -- and from the
+     * handler or the protocol only when no such marker has been seen. That preference is a
+     * correctness requirement rather than a tidiness one. The event's total is immutable: it was
+     * captured at the instant the handler latched the termination and it can never be rewritten.
+     * The handler's and the protocol's cells are live state read from the task thread, and
+     * preferring them meant reconciling against whatever the last frame to arrive happened to leave
+     * there -- so a producer sending a second, larger total after a legitimate end of stream could
+     * raise the figure this check compares against and turn a complete partition into a spurious
+     * fetch failure, while the reverse ordering could reconcile a truncated read against a total
+     * that had been lowered to match it. The handler now refuses a contradictory terminator
+     * outright, and this ordering is the second half of that guarantee: the number this task
+     * completes against is the number it was told, once, on the queue it reads.
      */
     private def verifyStreamComplete(inbox: PartitionInbox): Unit = {
-      val announced = handler.announcedBlockCount(inbox.partitionId)
-        .orElse(backpressure.announcedBlockCount(ledgerKey(inbox.partitionId)))
-        .getOrElse(inbox.announcedTotalBlocks)
+      val announced = if (inbox.announcedTotalBlocks !=
+          StreamingShuffleClientHandler.NO_BLOCK_TOTAL) {
+        inbox.announcedTotalBlocks
+      } else {
+        handler.announcedBlockCount(inbox.partitionId)
+          .orElse(backpressure.announcedBlockCount(ledgerKey(inbox.partitionId)))
+          .getOrElse(StreamingShuffleClientHandler.NO_BLOCK_TOTAL)
+      }
       if (announced != StreamingShuffleClientHandler.NO_BLOCK_TOTAL &&
           announced != inbox.consumedBlocks) {
         discardAll()
@@ -2177,10 +2207,9 @@ private[spark] class StreamingShuffleReader[K, C](
             case Some(BlockReceived(block)) => enqueue(block)
             case Some(StreamCompleted(completed, totalBlocks)) =>
               markTerminated(completed, totalBlocks)
-            case Some(ProducerLost(lost, reason, cause)) =>
+            case Some(ProducerLost(lost, reason, cause, invalidation)) =>
               val attributed = if (servesPartition(lost)) lost else awaitedPartition
-              failProducer(attributed, StreamingShuffleInvalidationReason.ConnectionTimeout,
-                reason, cause)
+              failProducer(attributed, invalidation, reason, cause)
             case None => draining = false
           }
         }
@@ -2450,6 +2479,19 @@ private[spark] object StreamingShuffleReader {
    */
   val CONNECTOR_SHUTDOWN_TIMEOUT_MS: Long = BackpressureProtocol.ACK_TIMEOUT_MS
 
+  /**
+   * Most channel identities the production connector remembers as having gone inactive before their
+   * handler was published.
+   *
+   * An entry is created by a transport callback and consumed by the binding that follows it, so the
+   * live population is the number of connections being created at once -- one per reduce task
+   * currently opening a channel. The bound is generous against that and exists only because a
+   * transport callback is not an event this connector controls the rate of; a refused entry costs
+   * the early notification and nothing else, because the consumer's own five-second detector still
+   * releases the task.
+   */
+  val MAX_EARLY_INACTIVE_CHANNELS: Int = 4096
+
   /** Sequence numbers count from zero, one per data block, per partition stream. */
   val FIRST_SEQUENCE_NUMBER: Long = 0L
 
@@ -2651,7 +2693,7 @@ private[spark] class NettyStreamingShuffleProducerConnector(
   private val handlers = new ConcurrentHashMap[String, StreamingShuffleClientHandler]()
 
   /**
-   * The handler of the connection currently being created on this thread.
+   * The claim on the connection currently being created on this thread.
    *
    * The transport builds the pipeline before it hands the client back, so there is no point at
    * which a caller could register a handler against a channel that is guaranteed not to have
@@ -2659,8 +2701,42 @@ private[spark] class NettyStreamingShuffleProducerConnector(
    * registering bootstrap below runs synchronously, on this thread, inside `createUnmanagedClient`,
    * and a frame arriving before it finds the handler here. A thread local rather than a field
    * because several reduce tasks share one connector and connect concurrently.
+   *
+   * The claim rather than the handler alone, so that a lifecycle callback arriving in the interval
+   * before the binding can be *recorded* against the connection being created rather than merely
+   * forwarded to a handler that is not yet published; see [[ConnectionClaim]].
    */
-  private val connecting = new ThreadLocal[StreamingShuffleClientHandler]()
+  private val connecting = new ThreadLocal[ConnectionClaim]()
+
+  /**
+   * Every connection currently being created, across all connecting threads.
+   *
+   * [[close]] reads it, and that is the only reason it exists: a thread local is invisible to the
+   * thread that is shutting the connector down, so a connection in flight would be released neither
+   * by [[close]] -- which cannot see it -- nor by its own connecting thread, which is about to
+   * publish it into registries [[close]] has already emptied. Marking every outstanding claim
+   * cancelled is what makes the connecting thread close the channel it just created instead of
+   * publishing it.
+   */
+  private val claims = ConcurrentHashMap.newKeySet[ConnectionClaim]()
+
+  /**
+   * Channels that went inactive before their handler could be published, by channel identity.
+   *
+   * Written by [[channelInactive]] on a transport thread and read by [[bind]] on the connecting
+   * one, which is why it is keyed by the channel's own identity rather than held in a thread local:
+   * the two callbacks do not share a thread, and the channel key is the one name both of them have.
+   * Entries are short-lived by construction -- each is removed by the binding that consumes it or
+   * by the connect that gives up -- and the set is bounded regardless, because a transport callback
+   * is not an event this connector controls the rate of.
+   */
+  private val earlyInactiveChannels = ConcurrentHashMap.newKeySet[String]()
+
+  /** Channels closed here because their ownership could not be settled. Zero on a clean run. */
+  private val declinedConnections = new AtomicInteger(0)
+
+  /** Terminal callbacks replayed at binding time because they arrived before it. */
+  private val earlyTerminalCallbacks = new AtomicInteger(0)
 
   /**
    * The unmanaged client of each live channel, keyed the same way as [[handlers]].
@@ -2689,6 +2765,33 @@ private[spark] class NettyStreamingShuffleProducerConnector(
 
   private val closed = new AtomicBoolean(false)
 
+  /**
+   * Opens one channel to one producer, as a single ownership transition.
+   *
+   * <b>Why a claim, and not simply a check.</b> Creating the channel and publishing the handler
+   * that owns it are two steps with a real interval between them -- a socket connect and, when the
+   * application is authenticated, a handshake -- and two things can happen in that interval, both
+   * of which used to be lost. The connector can be closed, in which case a handler and a client
+   * would be published into registries [[close]] had already emptied: the channel would never be
+   * closed and its handler would never be released, which is precisely the leak the shutdown path
+   * exists to prevent. Or the channel can go away again before it is published, in which case
+   * [[channelInactive]] fires against registries that do not yet hold it, and the terminal callback
+   * would be dropped -- leaving the reduce task waiting out its full connection timeout on a
+   * channel that was already dead.
+   *
+   * A claim closes both. It is registered before the client is created and resolved after it, and
+   * it resolves in exactly one of three ways: the channel is published and owned; the connector
+   * closed in the interval, so the channel is closed here and nothing is published; or a terminal
+   * callback arrived in the interval, in which case the channel is published, the callback is
+   * replayed to the handler, and the reduce task learns of the loss at once instead of by timeout.
+   * `channelActive` is announced only on the first of the three, because announcing a subscription
+   * on a channel this method is about to close or has just declared dead would ask a producer to
+   * start streaming to nobody.
+   *
+   * @param location the producer to reach
+   * @param handler the consumer handler that will own the channel
+   * @return the client, or `None` when no channel could be established or kept
+   */
   override def connect(
       location: StreamingShuffleProducerLocation,
       handler: StreamingShuffleClientHandler): Option[TransportClient] = {
@@ -2697,17 +2800,22 @@ private[spark] class NettyStreamingShuffleProducerConnector(
         log"${MDC(HOST_PORT, location.hostPort)} because this connector is closed")
       None
     } else {
-      connecting.set(handler)
+      val claim = new ConnectionClaim(handler)
+      connecting.set(claim)
+      claims.add(claim)
       try {
-        val client = clientFactory.createUnmanagedClient(location.host, location.port)
-        bind(client, handler)
-        // The transport raises channelActive from the pipeline before the client is returned, which
-        // is earlier than the binding above on a channel that connected before this thread resumed.
-        // Announcing here as well is idempotent -- the producer treats a repeat subscription as a
-        // no-op -- and it is what guarantees the in-progress request is issued exactly once per
-        // connection however the two orderings interleave.
-        handler.channelActive(client)
-        Some(client)
+        val client = createTransportClient(location.host, location.port)
+        if (bind(client, handler, claim)) {
+          // The transport raises channelActive from the pipeline before the client is returned,
+          // which is earlier than the binding above on a channel that connected before this thread
+          // resumed. Announcing here as well is idempotent -- the producer treats a repeat
+          // subscription as a no-op -- and it is what guarantees the in-progress request is issued
+          // exactly once per connection however the two orderings interleave.
+          handler.channelActive(client)
+          Some(client)
+        } else {
+          None
+        }
       } catch {
         case _: InterruptedException =>
           Thread.currentThread().interrupt()
@@ -2719,10 +2827,39 @@ private[spark] class NettyStreamingShuffleProducerConnector(
             log"${MDC(HOST_PORT, location.hostPort)}: ${MDC(ERROR, e.getMessage)}")
           None
       } finally {
+        claims.remove(claim)
         connecting.remove()
+        // With no connection being created, no remembered channel identity can ever be consumed by
+        // a binding, so the record is swept here rather than being left to a timestamp or a reaper.
+        // A claim is removed only after its own bind has run, so an entry a concurrent binding is
+        // about to consume is still protected by that binding's claim.
+        if (claims.isEmpty()) {
+          earlyInactiveChannels.clear()
+        }
       }
     }
   }
+
+  /**
+   * Opens one socket to one producer, authenticating it if the application is authenticated.
+   *
+   * The client is unmanaged deliberately: a pooled client would be shared between reduce tasks, and
+   * a streaming consumer handler owns the whole of its channel's receive window, so two tasks
+   * sharing one socket would each throttle the other's producer. The bootstraps run synchronously
+   * inside the call, so what is returned is already authenticated.
+   *
+   * Separated from [[connect]] as the one seam a test can substitute. The interval between creating
+   * a channel and publishing its owner is where the ownership races this class defends against
+   * live, and an interleaving cannot be *proved* deterministic unless a test can hold the creation
+   * open while the other side of the race runs. Overriding this is how that is done; production
+   * behaviour is exactly the factory call it wraps.
+   *
+   * @param host producer host to reach
+   * @param port producer streaming port to reach
+   * @return the authenticated, unmanaged client
+   */
+  protected def createTransportClient(host: String, port: Int): TransportClient =
+    clientFactory.createUnmanagedClient(host, port)
 
   /**
    * Releases the transport this connector owns, once, and does not return until it is released or a
@@ -2753,6 +2890,14 @@ private[spark] class NettyStreamingShuffleProducerConnector(
    */
   override def close(): Unit = {
     if (closed.compareAndSet(false, true)) {
+      // Cancelled before anything is released, and before the registries are read. A connection
+      // still being created is invisible to every step below -- it is in no registry yet -- so
+      // without this its connecting thread would publish a handler and a socket into registries
+      // this method had already emptied, and nothing would ever release either. Cancelling makes
+      // that thread close the channel it created instead. Setting the flag first and cancelling
+      // second means a connect that has not yet registered a claim is refused outright by the flag,
+      // so no connection can slip between the two.
+      claims.asScala.foreach(_.cancel())
       val bound = handlers.size()
       handlers.values().asScala.foreach { handler =>
         try {
@@ -2786,6 +2931,7 @@ private[spark] class NettyStreamingShuffleProducerConnector(
           log"${MDC(COUNT, bound)} channel(s) after " +
           log"${MDC(NUM_BLOCKS, unboundFrames.get())} unbound frame(s)")
       }
+      earlyInactiveChannels.clear()
     }
   }
 
@@ -2797,6 +2943,40 @@ private[spark] class NettyStreamingShuffleProducerConnector(
    * number of sockets left behind is what distinguishes one slow peer from a systematic leak.
    */
   def unreleasedChannels: Int = unreleasedChannelCount.get()
+
+  /**
+   * Received frames that arrived on a channel this connector could not route, since it was created.
+   *
+   * Exposed for the same reason [[unreleasedChannels]] is: the condition is diagnostic rather than
+   * fatal -- the frame is counted and the sequence-gap repair asks for it again -- so the only way
+   * to establish that a frame was routed rather than dropped, or dropped rather than raised, is to
+   * read the count. Lifecycle callbacks are deliberately absent from it, so a healthy run leaves it
+   * at zero however the transport happens to order channel activation against the binding.
+   */
+  private[streaming] def unboundFrameCount: Long = unboundFrames.get()
+
+  /**
+   * Channels this connector opened and then closed itself because their ownership could not be
+   * settled -- the connector was closing while the channel was being created.
+   *
+   * Zero on every ordinary run. A non-zero reading is positive evidence that the
+   * connect-versus-close race was taken and that the losing side released its own socket rather
+   * than publishing it, which is the one way to distinguish "the race never happened" from "the
+   * race was handled".
+   */
+  def declinedConnectionCount: Int = declinedConnections.get()
+
+  /**
+   * Terminal callbacks that arrived before their channel's handler was published and were replayed
+   * to that handler at binding time.
+   *
+   * Zero on every ordinary run. A non-zero reading means a channel died inside the creation
+   * interval and its handler was told at once rather than by timeout.
+   */
+  def earlyTerminalCallbackCount: Int = earlyTerminalCallbacks.get()
+
+  /** Whether this connector still holds a registration for any channel. */
+  def boundChannelCount: Int = handlers.size()
 
   /** The channels this connector still holds, snapshotted before the factory is closed. */
   private def liveChannels(): Seq[Channel] = {
@@ -2907,10 +3087,10 @@ private[spark] class NettyStreamingShuffleProducerConnector(
    * subscription itself once the binding completes, the producer treats a repeat announcement as a
    * no-op, so the in-progress request is issued exactly once per connection either way.
    *
-   * Counting this as an unbound frame is what made every enabled run report a warning about a frame
-   * nobody had lost, so it is recorded only under the streaming debug key -- while a *data* frame
-   * with no handler keeps its warning in [[dispatchTo]], because that one really would be a frame
-   * the sequence-gap repair has to ask for again.
+   * Counting it as an unbound frame would warn about a frame nobody had lost on every healthy
+   * connection, so it is recorded only under the streaming debug key -- while a *data* frame with
+   * no handler keeps its warning in [[dispatchTo]], because that one really would be a frame the
+   * sequence-gap repair has to ask for again.
    */
   override def channelActive(client: TransportClient): Unit = {
     handlerFor(client) match {
@@ -2931,12 +3111,44 @@ private[spark] class NettyStreamingShuffleProducerConnector(
    *
    * The registration is removed here and only here, so a handler is reachable for exactly as long
    * as the channel it owns can deliver anything.
+   *
+   * <b>A callback that arrives before the binding is recorded, not merely forwarded.</b> Forwarding
+   * it was not wrong, but on its own it was not enough: the removals above find nothing, so the
+   * connecting thread goes on to publish a handler and a client for a channel that is already dead,
+   * and this connector then holds a registration nothing will ever remove. The channel's identity
+   * is recorded instead, by key, because that is the one thing both threads can name -- this
+   * callback runs on a transport thread while the binding runs on the connecting one, so a thread
+   * local cannot carry the fact between them. [[bind]] then sees it and settles both halves at
+   * once: the channel is given up and the handler is told, which is the difference between a reduce
+   * task that learns of the loss now and one that waits out its whole connection timeout.
    */
   override def channelInactive(client: TransportClient): Unit = {
     val key = channelKeyOf(client)
     clients.remove(key)
-    val handler = Option(handlers.remove(key)).orElse(currentlyConnecting)
-    handler.foreach(_.channelInactive(client))
+    Option(handlers.remove(key)) match {
+      case Some(handler) => handler.channelInactive(client)
+      case None =>
+        recordEarlyInactive(key)
+        currentlyConnecting.foreach(_.channelInactive(client))
+    }
+  }
+
+  /**
+   * Remembers that one channel went inactive before its handler was published.
+   *
+   * Bounded, and it has to be: an entry is created by a transport callback, so the number of them
+   * is not a quantity this connector controls on its own. The bound is generous against the
+   * legitimate case -- an entry lives only from a callback until the connecting thread reaches
+   * [[bind]] -- and a refused entry costs nothing but the early notification, since the reduce
+   * task's own five-second detector still releases it.
+   *
+   * @param channelKey identity of the channel that went inactive
+   */
+  private def recordEarlyInactive(channelKey: String): Unit = {
+    if (!claims.isEmpty() &&
+        earlyInactiveChannels.size() < StreamingShuffleReader.MAX_EARLY_INACTIVE_CHANNELS) {
+      earlyInactiveChannels.add(channelKey)
+    }
   }
 
   /**
@@ -2965,8 +3177,13 @@ private[spark] class NettyStreamingShuffleProducerConnector(
   /**
    * The handler that owns one channel, if that channel can still be answered for.
    *
-   * The registration is consulted first and the connecting thread local second, which is what makes
-   * a channel routable from the instant it exists rather than from the instant it is published.
+   * The registration answers for every channel that has been bound, whichever thread asks. The
+   * connecting thread local is consulted second and answers only on the connecting thread itself,
+   * which is the thread that runs the registering bootstrap inside `createUnmanagedClient`: it is
+   * what lets a frame delivered synchronously during connection reach its handler before the
+   * binding is published. A transport thread sees the registration alone, so a callback raised on
+   * the event loop before the binding completes is an ordering rather than a loss --
+   * [[channelActive]] says why nothing is lost by it.
    */
   private def handlerFor(client: TransportClient): Option[StreamingShuffleClientHandler] =
     Option(handlers.get(channelKeyOf(client))).orElse(currentlyConnecting)
@@ -2999,15 +3216,122 @@ private[spark] class NettyStreamingShuffleProducerConnector(
     }
   }
 
+  /** The claim of the connection this thread is in the middle of creating, if any. */
+  private def currentClaim: Option[ConnectionClaim] = Option(connecting.get())
+
   /** The handler of the connection this thread is in the middle of creating, if any. */
   private def currentlyConnecting: Option[StreamingShuffleClientHandler] =
-    Option(connecting.get())
+    currentClaim.map(_.handler)
 
-  /** Binds one handler to one channel for the life of that channel. */
-  private def bind(client: TransportClient, handler: StreamingShuffleClientHandler): Unit = {
+  /**
+   * Completes one connection's ownership transition, or declines it.
+   *
+   * This is the single point at which a channel becomes this connector's to release. Three
+   * conditions are settled here, in the order that makes each one meaningful:
+   *
+   *  1. '''The connector must still be open.''' Publishing into registries [[close]] has emptied
+   *     would leave a channel nothing releases, so the registration is refused and the channel is
+   *     closed here instead. The check is repeated after the registration too, because closure can
+   *     be decided between the two -- and then the entries this method just made are withdrawn and
+   *     the channel closed, which is the same outcome reached the other way round.
+   *  2. '''The registration happens before the terminal check.''' A callback that arrives once the
+   *     entries exist routes itself through them in the ordinary way, so the only callbacks the
+   * next     step has to account for are the ones that arrived *before* this point.
+   *  3. '''A terminal callback that arrived in the interval is replayed.''' It found no
+   * registration     and could not deliver itself, so this thread delivers it -- which is what
+   * turns "the reduce     task waits out its five-second timeout on a channel that was already
+   * dead" into "the reduce     task is told at once".
+   *
+   * @param client the transport client the factory returned
+   * @param handler the consumer handler that owns it
+   * @param claim the claim registered before the client was created
+   * @return true when the channel is published and owned, false when it has been declined and
+   * closed
+   */
+  private def bind(
+      client: TransportClient,
+      handler: StreamingShuffleClientHandler,
+      claim: ConnectionClaim): Boolean = {
     val key = channelKeyOf(client)
-    handlers.put(key, handler)
-    clients.put(key, client)
+    if (closed.get() || claim.isCancelled) {
+      declineConnection(client, "the connector closed while the channel was being created")
+      false
+    } else {
+      handlers.put(key, handler)
+      clients.put(key, client)
+      if (closed.get() || claim.isCancelled) {
+        handlers.remove(key)
+        clients.remove(key)
+        declineConnection(client, "the connector closed as the channel was being published")
+        false
+      } else if (earlyInactiveChannels.remove(key)) {
+        // The channel died before it could be published. It is withdrawn rather than left
+        // registered -- there is nothing for a registration to route to -- and the handler is told,
+        // which is what tells the reduce task the producer is gone instead of leaving it to a
+        // timeout.
+        earlyTerminalCallbacks.incrementAndGet()
+        handlers.remove(key)
+        clients.remove(key)
+        if (debugEnabled) {
+          logDebug(log"A streaming shuffle channel to " +
+            log"${MDC(HOST_PORT, String.valueOf(client.getSocketAddress()))} went inactive " +
+            log"before its consumer handler was published; the callback is replayed on the " +
+            log"connecting thread so the reduce task learns of the loss at once")
+        }
+        handler.channelInactive(client)
+        false
+      } else {
+        true
+      }
+    }
+  }
+
+  /**
+   * Closes a channel this connector has decided not to own, and says why.
+   *
+   * Reported rather than silent, because a declined connection is a real socket that was opened and
+   * is now being given up, and an operator reading a shutdown that mentions none of them cannot
+   * tell a clean release from one that raced.
+   *
+   * @param client the client whose channel is being given up
+   * @param reason operator-facing context for the diagnostic
+   */
+  private def declineConnection(client: TransportClient, reason: String): Unit = {
+    declinedConnections.incrementAndGet()
+    logWarning(log"Closing a streaming shuffle channel to " +
+      log"${MDC(HOST_PORT, String.valueOf(client.getSocketAddress()))} because " +
+      log"${MDC(REASON, reason)}")
+    try {
+      Option(client.getChannel()).foreach(_.close())
+      client.close()
+    } catch {
+      case NonFatal(e) =>
+        logWarning(log"A declined streaming shuffle channel did not close cleanly: " +
+          log"${MDC(ERROR, e.getMessage)}")
+    }
+  }
+
+  /**
+   * One connection whose creation has begun and whose ownership has not yet been settled.
+   *
+   * It carries the handler so a frame arriving before the binding can still be routed on the
+   * connecting thread, and it carries the cancellation [[close]] raises so that a connecting thread
+   * gives its channel up rather than publishing it into registries that have been emptied. A
+   * channel that goes inactive in the same interval is recorded by key instead, in
+   * [[earlyInactiveChannels]], because that callback arrives on a transport thread and a thread
+   * local cannot carry a fact between two threads.
+   *
+   * @param handler the consumer handler that will own the channel
+   */
+  private final class ConnectionClaim(val handler: StreamingShuffleClientHandler) {
+
+    private val cancelled = new AtomicBoolean(false)
+
+    /** Whether [[close]] has decided this connection must not be published. */
+    def isCancelled: Boolean = cancelled.get()
+
+    /** Marks this connection as one the connecting thread must give up rather than publish. */
+    def cancel(): Unit = cancelled.set(true)
   }
 
   /**

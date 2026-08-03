@@ -67,14 +67,22 @@ private[spark] trait StreamingShuffleBufferUtilizationContributor {
  *    so the write path performs no metric work at all and concurrent shuffles on one executor are
  *    aggregated rather than overwriting one another.
  *  - `shuffle.streaming.spillCount` (counter) -- the number of spill events performed to keep
- *    the buffer budget within its configured threshold. Only evictions the budget actually forced
- *    are counted: the end-of-stream flush that makes a producer's retained window durable is a
- *    routine step of every successful streaming map task rather than a symptom of pressure, so
- *    counting it here would advance this series once per task at a fraction of a percent of the
- *    budget and leave an operator unable to tell a healthy shuffle from a struggling one, or to
- *    measure a spill rate against the configured threshold at all. That event is reported by
- *    `MemorySpillManager.durabilityFlushCount` and in the producing task's own summary instead,
- *    and its volume still reaches the standard spill accumulators on `TaskMetrics`.
+ *    the buffer budget within its configured threshold. Exactly two kinds of disk write are
+ *    counted, because both are the same condition -- the configured buffer percentage was not
+ *    enough for what a producer was holding, so bytes went to local disk to keep the bound: an
+ *    eviction the budget forced, and a block written straight to disk because the allowance could
+ *    not admit it to memory at all. Counting both is what keeps this series consistent with the
+ *    volume on `TaskMetrics.diskBytesSpilled`, so that a spill rate and an average spill size are
+ *    computable rather than a path producing volume with no event behind it. The one disk write
+ *    that is deliberately '''not''' counted is the end-of-stream flush that makes a producer's
+ *    retained window durable: that is a routine step of a successful streaming map task rather
+ *    than a symptom of pressure, so counting it here would advance this series once per task at a
+ *    fraction of a percent of the budget and leave an operator unable to tell a healthy shuffle
+ *    from a struggling one, or to measure a spill rate against the configured threshold at all.
+ *    That event is reported by `MemorySpillManager.durabilityFlushCount`, which counts non-empty
+ *    durability eviction passes, and in the producing task's own summary instead, and its volume
+ *    still reaches the standard spill accumulators on
+ *    `TaskMetrics`.
  *  - `shuffle.streaming.backpressureEvents` (counter) -- the number of transitions into a
  *    throttled state, whether caused by exhausted consumer credit or by a refused rate-limiter
  *    acquisition.
@@ -192,9 +200,11 @@ private[spark] object StreamingShuffleMetricsSource extends Source {
    * Tracks the total number of spill events performed by the streaming shuffle spill manager.
    * Incremented once per spill event, never once per evicted partition and never per record.
    *
-   * Only a threshold or pressure driven eviction is counted, never the end-of-stream durability
-   * flush; see the namespace documentation above for why the distinction is what gives this series
-   * its meaning.
+   * Both pressure-driven disk writes are counted -- an eviction the budget forced, and a block
+   * written straight to disk because the buffer allowance could not admit it -- and the
+   * end-of-stream durability flush, which `MemorySpillManager.durabilityFlushCount` reports as
+   * non-empty durability eviction passes, is not. See the namespace documentation above for why
+   * counting exactly those two, and not the flush, is what gives this series its meaning.
    */
   val METRIC_SPILL_COUNT: Counter = metricRegistry.counter(MetricRegistry.name("spillCount"))
 

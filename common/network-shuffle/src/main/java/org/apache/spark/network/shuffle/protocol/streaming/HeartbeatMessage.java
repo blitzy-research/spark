@@ -80,6 +80,18 @@ import org.apache.spark.annotation.Private;
  * #MAX_CONSUMER_ID_ENCODED_BYTES} is refused where it enters, so no remote peer can make a producer
  * hold, index or log an arbitrarily long string by claiming one.
  *
+ * <p><b>Why the identity travels on the wire, which is what makes this the one variable-length
+ * message.</b> The consumer-failure flow requires a producer to retain a consumer's unacknowledged
+ * window while that consumer is absent and to <i>resume</i> it -- replaying from memory or from
+ * spill -- when the consumer reconnects. A reconnection arrives on a new channel, so an identity
+ * derived from the channel would make the returning consumer a different consumer, and the
+ * producer would have to discard the window it was holding and force the reduce task's stage to be
+ * recomputed instead. The identity is therefore a property of the consumer session rather than of
+ * the connection, and it has to be stated in the first frame the session sends, which is this one.
+ * The heartbeat is consequently 37 bytes plus the identity rather than a fixed 33, and that is a
+ * deliberate cost of a recoverable reconnection: the departure is recorded here for the same reason
+ * the header's own field set is recorded on {@link StreamingShuffleMessage}.
+ *
  * The discriminator is {@link StreamingShuffleMessageType#HEARTBEAT}, whose wire id is 2. That is
  * unrelated to the {@code HEARTBEAT} constant of {@link
  * org.apache.spark.network.shuffle.protocol.BlockTransferMessage.Type}, which carries id 5 in the
@@ -402,16 +414,34 @@ public final class HeartbeatMessage extends StreamingShuffleMessage {
    * Rejects an identity outside its legitimate domain, returning it unchanged so that it can be
    * assigned straight to the field.
    *
-   * The same ceiling applies to an identity built in memory as to one read off the wire, and it is
-   * stated here so that a sender cannot construct a message a receiver would be obliged to refuse.
-   * An empty identity is legitimate and means the sender declares none; null is not, because the
-   * field is compared and encoded unconditionally.
+   * The same rules apply to an identity built in memory as to one read off the wire, and they are
+   * stated here so that a sender cannot construct a message a receiver would be obliged to refuse,
+   * and so that {@link #decode(ByteBuf)} -- which reaches the field only through this constructor
+   * -- enforces exactly what construction does. An empty identity is legitimate and means the
+   * sender declares none; null is not, because the field is compared and encoded unconditionally.
+   *
+   * <b>Length is not the only bound, and the second one is a security bound.</b> This identity is
+   * chosen by a remote peer and it is written into a producer executor's log records, where it
+   * names the consumer a message is about. A log record is a line-oriented artefact read by
+   * operators and parsed by log pipelines, so an identity containing a carriage return, a line feed
+   * or either of Unicode's own line separators does not merely look untidy -- it ends the record
+   * early and starts a new one whose whole content the peer chose, which is how a peer forges log
+   * entries it was never the subject of. The other non-printable characters are refused with them:
+   * a NUL truncates a record in a C-based consumer of the log, a backspace or an escape rewrites
+   * what a terminal displays, and none of them can appear in a legitimate executor identity, which
+   * Spark composes from an executor id and a socket address.
+   *
+   * Refusing at the boundary rather than sanitising at each use is deliberate. There are many log
+   * sites and a sanitiser omitted at one of them reinstates the whole problem, whereas a value that
+   * cannot enter the system cannot reach any of them. It also keeps the identity usable as a map
+   * key without a second, differently-normalised form of it existing anywhere.
    *
    * @param consumerId the candidate identity
    * @return consumerId, unchanged
    * @throws NullPointerException if consumerId is null
    * @throws IllegalArgumentException if the identity's UTF-8 encoding exceeds
-   *         {@link #MAX_CONSUMER_ID_ENCODED_BYTES}
+   *         {@link #MAX_CONSUMER_ID_ENCODED_BYTES}, or if it contains a control character, a
+   *         delete, or a Unicode line or paragraph separator
    */
   private static String checkConsumerId(String consumerId) {
     Objects.requireNonNull(consumerId, "consumerId");
@@ -421,6 +451,41 @@ public final class HeartbeatMessage extends StreamingShuffleMessage {
         "identity of " + encodedLength + " byte(s), which exceeds the limit of " +
         MAX_CONSUMER_ID_ENCODED_BYTES);
     }
+    for (int index = 0; index < consumerId.length(); index++) {
+      char candidate = consumerId.charAt(index);
+      if (isForbiddenInConsumerId(candidate)) {
+        // The offending character is reported by code point rather than by value: this message
+        // becomes an exception message and therefore a log record of its own, so echoing the
+        // character would reproduce in the diagnostic exactly the injection it is refusing.
+        throw new IllegalArgumentException("Streaming shuffle heartbeat carries a consumer " +
+          "identity with a forbidden character at index " + index + ": U+" +
+          String.format("%04X", (int) candidate) + ". A consumer identity may not contain a " +
+          "control character, a delete, or a Unicode line or paragraph separator, because it is " +
+          "written into line-oriented log records on the producer executor");
+      }
+    }
     return consumerId;
+  }
+
+  /**
+   * Whether one character may never appear in a consumer identity.
+   *
+   * The set is the union of the two C0 and C1 control ranges, the delete character, and the two
+   * Unicode separators that a conforming reader treats as a line break -- {@code U+2028 LINE
+   * SEPARATOR} and {@code U+2029 PARAGRAPH SEPARATOR}. Expressed as ranges rather than as a list of
+   * individual characters so that nothing in either control block can be overlooked, and checked
+   * per {@code char} rather than per code point because every character in the set is in the Basic
+   * Multilingual Plane and outside the surrogate range, so a surrogate pair can never match one
+   * half of it by accident.
+   *
+   * @param candidate the character to test
+   * @return true when the character must be refused
+   */
+  private static boolean isForbiddenInConsumerId(char candidate) {
+    return candidate <= 0x1F                      // C0 controls, including tab, CR and LF
+      || candidate == 0x7F                        // delete
+      || (candidate >= 0x80 && candidate <= 0x9F)  // C1 controls, including NEL at U+0085
+      || candidate == '\u2028'                    // Unicode line separator
+      || candidate == '\u2029';                   // Unicode paragraph separator
   }
 }

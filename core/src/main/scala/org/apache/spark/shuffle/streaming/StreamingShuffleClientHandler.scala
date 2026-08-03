@@ -295,6 +295,19 @@ private[spark] class StreamingShuffleClientHandler(
   // debug: the notifier retains the root cause either way, and the count is observable.
   private val escalationsReported = new AtomicLong(0L)
 
+  // Admissions that have charged the executor's shared receive budget but have not yet finished
+  // recording ownership of it. Raised for the whole of that window by admitBlock and read by
+  // close(), which is the one place two threads can otherwise both believe the other owns a charge:
+  // close() returns what the per-partition ledgers hold and then drops them, so an admission that
+  // recorded itself afterwards would leave bytes charged to a ledger nobody reads. close() waits
+  // out this counter, and any admission that discovers the closure first rolls its own charge back.
+  private val admissionsInFlight = new AtomicInteger(0)
+
+  // Admissions whose charge was returned because this handler closed while they were in flight.
+  // Zero on every ordinary run; a non-zero reading means the race really was taken and the rollback
+  // really did run, which is what makes the guarantee observable rather than merely intended.
+  private val admissionsRolledBack = new AtomicLong(0L)
+
   // Netty identity of the one channel this handler is bound to, latched on the first callback the
   // transport makes and never replaced. This is the capability binding: a handler is created per
   // producer generation and connected to exactly one authenticated socket, so the channel's
@@ -1012,6 +1025,14 @@ private[spark] class StreamingShuffleClientHandler(
    *     was assured would move the expectation past a block the queue then refused, and a position
    *     the consumer has silently skipped is the one kind of loss no checksum can detect: nothing
    *     downstream would ever ask for it again.
+   *
+   * Ahead of all four sits one further check, which is not about this block but about the stream:
+   * a stream that has already ended accepts nothing more. Admitting a block past an accepted
+   * terminator would put the stream's block count above the total that terminator fixed, which is
+   * the total the reader completes against -- so the completion check would be comparing a
+   * consumed count against a total the data had already outgrown. The block is refused and the
+   * producer declared lost, exactly as a contradictory terminator is; see
+   * [[rejectBlockAfterTermination]].
    */
   private def handleDataBlock(block: DataBlockMessage): Unit = {
     val partitionId = block.partitionId()
@@ -1019,6 +1040,11 @@ private[spark] class StreamingShuffleClientHandler(
     val state = partitionStateOf(partitionId)
 
     state.lastInboundMillis.set(clock.getTimeMillis())
+
+    if (state.terminated.get()) {
+      rejectBlockAfterTermination(state, sequenceNumber)
+      return
+    }
 
     val expected = state.expectedSequenceNumber.get()
     val payloadLength = block.payloadLength().toLong
@@ -1055,6 +1081,10 @@ private[spark] class StreamingShuffleClientHandler(
     val partitionId = state.partitionId
     val sequenceNumber = block.sequenceNumber()
     val payloadLength = block.payloadLength().toLong
+    // Sampled before the quarantine is released, so the frontier this admission is judged against
+    // is the one that was in force when the block arrived rather than one a concurrent admission
+    // moved.
+    val expectedAtAdmission = state.expectedSequenceNumber.get()
     val replacement = state.releaseQuarantine(sequenceNumber)
     // The executor-wide budget is charged before the block is retained anywhere, and refused
     // admission is treated exactly as a failed hand-off: the sequence cursor does not move, the
@@ -1065,36 +1095,95 @@ private[spark] class StreamingShuffleClientHandler(
       refuseForQuota(state, sequenceNumber, payloadLength)
       return
     }
-    if (enqueue(BlockReceived(block), payloadLength)) {
-      // Per-sequence accounting, so that an acknowledgement releases exactly the bytes of the
-      // prefix it names and never the whole of what has arrived. A replacement overwrites the
-      // entry it replaces, so the quota charge above must be matched by releasing whatever that
-      // position was already holding, or the two ledgers would drift by one block per repair.
-      val superseded = state.recordReceived(sequenceNumber, payloadLength)
-      if (superseded > 0L) {
-        backpressure.releaseReceiveQuota(superseded)
+    // From here to the matching decrement this admission is *in flight*, and [[close]] can see that
+    // it is. Without the announcement the two could interleave so that this thread reserved the
+    // quota and enqueued the block, close() then returned every byte its ledgers knew about and
+    // dropped the ledgers, and this thread finally charged the bytes to a ledger nothing would ever
+    // read again -- a permanent reduction of the budget every later consumer on this executor draws
+    // from. The counter is what makes that window observable, and [[rollBackAdmission]] below is
+    // what closes it.
+    admissionsInFlight.incrementAndGet()
+    try {
+      if (enqueue(BlockReceived(block), payloadLength)) {
+        // Re-checked after the hand-off succeeded, because closure can have been decided between
+        // the check inside enqueue() and this point. A closed handler serves a task that has gone,
+        // so the block is worthless: what matters is that its charge is returned exactly once and
+        // that no ownership is recorded against a ledger close() has already accounted for.
+        if (closed.get()) {
+          rollBackAdmission(payloadLength)
+          return
+        }
+        // Per-sequence accounting, so that an acknowledgement releases exactly the bytes of the
+        // prefix it names and never the whole of what has arrived. A replacement overwrites the
+        // entry it replaces, so the quota charge above must be matched by releasing whatever that
+        // position was already holding, or the two ledgers would drift by one block per repair.
+        val superseded = state.recordReceived(sequenceNumber, payloadLength)
+        if (superseded > 0L) {
+          backpressure.releaseReceiveQuota(superseded)
+        }
+        // The cursor advances exactly when this block occupies or extends the frontier, which is a
+        // stricter statement than "this block was not a replacement" and a necessary one. A
+        // replacement for a position *below* the frontier must not move it -- the cursor is already
+        // past that position and moving it would skip the blocks in between -- but a replacement
+        // for the frontier position itself must, because that is the position the stream has now
+        // reached. Deciding it by the replacement flag alone left the frontier stuck whenever the
+        // very first block of a repaired position was the one being repaired, and a frontier that
+        // lags the data makes every statement derived from it -- the end-of-stream reconciliation
+        // above all -- wrong by exactly the number of repairs the stream needed.
+        if (sequenceNumber >= expectedAtAdmission) {
+          state.expectedSequenceNumber.set(sequenceNumber + 1L)
+          state.highestReceivedSequenceNumber.set(sequenceNumber)
+        }
+        state.acceptedBlocks.incrementAndGet()
+        if (debugEnabled) {
+          logDebug(log"Streaming shuffle accepted block " +
+            log"${MDC(BLOCK_ID, blockIdOf(partitionId, sequenceNumber))} of " +
+            log"${MDC(NUM_BYTES, payloadLength)} byte(s) for shuffle " +
+            log"${MDC(SHUFFLE_ID, shuffleId)} partition ${MDC(PARTITION_ID, partitionId)}, " +
+            log"replacement: ${MDC(REASON, replacement)}")
+        }
+      } else {
+        // The hand-off failed, so nothing is holding the bytes and the charge must come back.
+        backpressure.releaseReceiveQuota(payloadLength)
+        if (replacement) {
+          // The quarantine must stand: something has to ask for this position again, and the
+          // escalation enqueue() has already recorded is what fails the task if nothing can.
+          // Re-arming is what keeps "no position is silently skipped" true on this path too.
+          state.quarantine(sequenceNumber, sequenceNumber)
+        }
       }
-      if (!replacement) {
-        state.expectedSequenceNumber.set(sequenceNumber + 1L)
-        state.highestReceivedSequenceNumber.set(sequenceNumber)
-      }
-      state.acceptedBlocks.incrementAndGet()
-      if (debugEnabled) {
-        logDebug(log"Streaming shuffle accepted block " +
-          log"${MDC(BLOCK_ID, blockIdOf(partitionId, sequenceNumber))} of " +
-          log"${MDC(NUM_BYTES, payloadLength)} byte(s) for shuffle " +
-          log"${MDC(SHUFFLE_ID, shuffleId)} partition ${MDC(PARTITION_ID, partitionId)}, " +
-          log"replacement: ${MDC(REASON, replacement)}")
-      }
-    } else {
-      // The hand-off failed, so nothing is holding the bytes and the charge must come back.
-      backpressure.releaseReceiveQuota(payloadLength)
-      if (replacement) {
-        // The quarantine must stand: something has to ask for this position again, and the
-        // escalation enqueue() has already recorded is what fails the task if nothing can.
-        // Re-arming is what keeps "no position is silently skipped" true on this path too.
-        state.quarantine(sequenceNumber, sequenceNumber)
-      }
+    } finally {
+      admissionsInFlight.decrementAndGet()
+    }
+  }
+
+  /**
+   * Returns the charge of an admission that a concurrent closure made worthless.
+   *
+   * The block was reserved and handed to the queue, and then this handler closed; the queue it was
+   * handed to has been drained, so nothing is holding the bytes and nothing ever will. Exactly one
+   * ledger must therefore give them back, and it is this one -- the per-partition ledgers were
+   * either already accounted for by [[close]] or never learned about this block at all, so charging
+   * it to them would either double-return the bytes or lose them.
+   *
+   * The hand-off queue is drained again as well. The block was placed on it after [[close]] had
+   * already emptied it, and a closed handler serves a task that has gone, so nothing will ever take
+   * it off again -- draining is what stops a payload from being retained for the whole life of
+   * whatever still references this handler. It is safe to drain unconditionally here because the
+   * closure has been observed: every event on the queue at this point is one no reader can consume.
+   *
+   * @param payloadBytes the bytes this admission reserved
+   */
+  private def rollBackAdmission(payloadBytes: Long): Unit = {
+    admissionsRolledBack.incrementAndGet()
+    drainAndRelease()
+    if (payloadBytes > 0L) {
+      backpressure.releaseReceiveQuota(payloadBytes)
+    }
+    if (debugEnabled) {
+      logDebug(log"Streaming shuffle returned ${MDC(NUM_BYTES, payloadBytes)} byte(s) of the " +
+        log"executor's shared receive budget for shuffle ${MDC(SHUFFLE_ID, shuffleId)} because " +
+        log"the consumer handler closed while the block was being admitted")
     }
   }
 
@@ -1179,29 +1268,134 @@ private[spark] class StreamingShuffleClientHandler(
   }
 
   /**
-   * Records an orderly end of stream.
+   * Records an orderly end of stream -- once, and only when the stream really has reached its end.
    *
    * This is what distinguishes silence that means completion from silence that means failure. A
    * terminated stream stops arming the liveness timers, so a partition that legitimately produced
    * nothing at all -- announced with a total of zero blocks, which is entirely valid -- is never
    * mistaken for a producer that died five seconds ago. Completion is delivered as a marker on the
    * queue rather than left to be inferred from a timeout, so the reduce task learns of it at once.
+   *
+   * <b>Acceptance is a state transition, not a field assignment, and that is the whole point.</b>
+   * A terminator is a peer-authored claim that a stream is finished, and a claim taken on trust is
+   * the one loss no checksum can detect: every block that did arrive was intact, so a partition
+   * short by its last hundred blocks reads as a complete, silently truncated result. Three
+   * conditions therefore govern it, and each closes a distinct way a stream could end short:
+   *
+   *  1. '''The claim must match the position actually reached.''' `totalBlocks` is compared against
+   *     the next position this consumer expects, which is exactly the number of blocks it has
+   *     admitted. A terminator naming more than that is premature -- the producer is claiming
+   *     blocks this consumer never received -- and a terminator naming fewer contradicts what has
+   *     already been delivered. Neither may be accepted, and neither is merely dropped: a stream
+   *     that is being told it is over when it is not has lost its producer as surely as one whose
+   *     socket closed, so the mismatch is escalated and the reduce task raises a fetch failure that
+   *     the unmodified scheduler resolves by recomputing the upstream stage.
+   *  2. '''Exactly one terminator wins.''' The transition is latched by compare-and-set on
+   *     [[PartitionState.terminated]], so a second terminator can never overwrite the total the
+   *     first one established -- the total the queued completion event already carries and the
+   *     reader reconciles against. A repeat of the same total is a harmless retransmission of a
+   *     control frame and is ignored; a repeat naming a *different* total is a contradiction from
+   *     the producer and is escalated.
+   *  3. '''Nothing may follow it.''' A data block arriving after acceptance is refused by
+   *     [[handleDataBlock]] rather than admitted, because a block accepted past the announced total
+   *     would make the total wrong and the completion check meaningless.
+   *
+   * The order is deliberate: the total is published *before* the flag is raised, so no observer can
+   * see a terminated stream whose total has not yet been written, and the queued marker is emitted
+   * only by the thread that won the latch.
    */
   private def handleTermination(termination: StreamTerminationMessage): Unit = {
     val partitionId = termination.partitionId()
     val totalBlocks = termination.totalBlocks()
     val state = partitionStateOf(partitionId)
     state.lastInboundMillis.set(clock.getTimeMillis())
-    state.announcedBlocks.set(totalBlocks)
-    state.terminated.set(true)
-    backpressure.onStreamTermination(consumerKey(partitionId), termination)
-    if (state.completionSignalled.compareAndSet(false, true)) {
-      enqueue(StreamCompleted(partitionId, totalBlocks), 0L)
+    val expected = state.expectedSequenceNumber.get()
+    if (totalBlocks != expected) {
+      rejectTermination(state, totalBlocks, expected)
+    } else if (state.terminated.compareAndSet(false, true)) {
+      // Written before the flag is observable to anyone else, and never written again: this is the
+      // one and only total, and it is the total the queued marker below carries.
+      state.announcedBlocks.set(totalBlocks)
+      backpressure.onStreamTermination(consumerKey(partitionId), termination)
+      if (state.completionSignalled.compareAndSet(false, true)) {
+        enqueue(StreamCompleted(partitionId, totalBlocks), 0L)
+      }
+      if (debugEnabled) {
+        logDebug(log"Streaming shuffle stream for shuffle " +
+          log"${MDC(SHUFFLE_ID, shuffleId)} partition ${MDC(PARTITION_ID, partitionId)} ended " +
+          log"after ${MDC(COUNT, totalBlocks)} block(s)")
+      }
+    } else if (state.announcedBlocks.get() != totalBlocks) {
+      rejectTermination(state, totalBlocks, state.announcedBlocks.get())
+    } else {
+      state.duplicateTerminations.incrementAndGet()
+      if (debugEnabled) {
+        logDebug(log"Streaming shuffle ignored a repeated end-of-stream for shuffle " +
+          log"${MDC(SHUFFLE_ID, shuffleId)} partition ${MDC(PARTITION_ID, partitionId)}, which " +
+          log"had already ended after ${MDC(COUNT, totalBlocks)} block(s)")
+      }
     }
-    if (debugEnabled) {
-      logDebug(log"Streaming shuffle stream for shuffle ${MDC(SHUFFLE_ID, shuffleId)} partition " +
-        log"${MDC(PARTITION_ID, partitionId)} ended after ${MDC(COUNT, totalBlocks)} block(s)")
-    }
+  }
+
+  /**
+   * Refuses a terminator that does not describe this stream, and declares the producer lost.
+   *
+   * Escalation rather than a dropped frame, for the reason [[handleTermination]] states: a stream
+   * whose producer claims an end it has not reached cannot be completed correctly, and the only
+   * correct outcome is the one every other unrecoverable producer fault reaches -- a fetch failure
+   * raised on the task thread, which the unmodified scheduler resolves by recomputing the upstream
+   * stage. The typed condition names both totals, because a diagnostic that reported only the
+   * claimed one would say nothing about the position the claim contradicts.
+   *
+   * @param state the partition whose stream was being ended
+   * @param claimedTotal the block total the terminator claimed
+   * @param reconciledTotal the total the claim is refused against -- the position this consumer has
+   *                        actually reached, or the total an accepted terminator already
+   * established
+   */
+  /**
+   * Refuses a data block that arrived after this stream had ended, and declares the producer lost.
+   *
+   * Not dropped, and not admitted. Dropping it would leave the reduce task reading a stream whose
+   * producer is demonstrably still sending output it has already declared finished -- so either the
+   * terminator was wrong or this block is, and neither reading permits the partition to be reported
+   * complete. Admitting it would be worse still: the stream's consumed count would pass the total
+   * the terminator fixed, and [[StreamingShuffleReader]]'s completion reconciliation would compare
+   * a count against a total the data had outgrown. The one safe answer is the one every other
+   * unrecoverable producer fault reaches, a fetch failure and an upstream recomputation.
+   *
+   * @param state the partition whose stream had already ended
+   * @param sequenceNumber the position the late block claimed
+   */
+  private def rejectBlockAfterTermination(state: PartitionState, sequenceNumber: Long): Unit = {
+    state.blocksAfterTermination.incrementAndGet()
+    logWarning(log"Streaming shuffle refused block " +
+      log"${MDC(BLOCK_ID, blockIdOf(state.partitionId, sequenceNumber))} of shuffle " +
+      log"${MDC(SHUFFLE_ID, shuffleId)} because that stream had already ended after " +
+      log"${MDC(COUNT, state.announcedBlocks.get())} block(s); a producer still sending past its " +
+      log"own end of stream cannot be completed, so the upstream stage is recomputed")
+    escalate(
+      StreamingShuffleErrors.invalidSequenceNumber(
+        shuffleId, state.partitionId, state.announcedBlocks.get(), sequenceNumber),
+      state.partitionId,
+      StreamingShuffleInvalidationReason.IncompleteStream)
+  }
+
+  private def rejectTermination(
+      state: PartitionState,
+      claimedTotal: Long,
+      reconciledTotal: Long): Unit = {
+    state.rejectedTerminations.incrementAndGet()
+    logWarning(log"Streaming shuffle refused an end-of-stream for shuffle " +
+      log"${MDC(SHUFFLE_ID, shuffleId)} partition ${MDC(PARTITION_ID, state.partitionId)} " +
+      log"claiming ${MDC(COUNT, claimedTotal)} block(s) against " +
+      log"${MDC(THRESHOLD, reconciledTotal)}; a stream may only end at the position it has " +
+      log"reached, so the producer is treated as lost and the upstream stage is recomputed")
+    escalate(
+      StreamingShuffleErrors.invalidSequenceNumber(
+        shuffleId, state.partitionId, reconciledTotal, claimedTotal),
+      state.partitionId,
+      StreamingShuffleInvalidationReason.IncompleteStream)
   }
 
   /**
@@ -1714,7 +1908,28 @@ private[spark] class StreamingShuffleClientHandler(
    * what it dropped.
    */
   private def escalate(cause: Throwable, partitionId: Int): Unit = {
-    signalProducerLost(partitionId, cause.getClass.getSimpleName, cause)
+    escalate(cause, partitionId, StreamingShuffleInvalidationReason.ConnectionTimeout)
+  }
+
+  /**
+   * The same escalation, attributing the loss to a specific invalidation reason.
+   *
+   * Separated so that the two callers who *know* what went wrong -- a producer that contradicted
+   * its own end of stream, and one that kept sending past it -- can say so, while every
+   * transport-level failure keeps the connection-timeout attribution without having to name it. The
+   * reason travels to the reader on the marker and reaches the driver's invalidation telemetry
+   * unchanged, so an operator sees a truncated stream reported as a truncated stream rather than as
+   * a silent socket.
+   *
+   * @param cause the failure that revealed the loss
+   * @param partitionId the partition the loss is attributed to
+   * @param invalidation how the reader should attribute its invalidation
+   */
+  private def escalate(
+      cause: Throwable,
+      partitionId: Int,
+      invalidation: StreamingShuffleInvalidationReason): Unit = {
+    signalProducerLost(partitionId, cause.getClass.getSimpleName, cause, invalidation)
     errorNotifier.setError(cause)
     val reported = escalationsReported.incrementAndGet()
     if (reported <= MAX_REPORTED_ESCALATIONS) {
@@ -1736,7 +1951,12 @@ private[spark] class StreamingShuffleClientHandler(
    * across everything the task has taken from this queue as well as everything still on it, and
    * only the task thread can see both. This handler's part is to say that no more is coming.
    */
-  private def signalProducerLost(partitionId: Int, reason: String, cause: Throwable): Unit = {
+  private def signalProducerLost(
+      partitionId: Int,
+      reason: String,
+      cause: Throwable,
+      invalidation: StreamingShuffleInvalidationReason =
+        StreamingShuffleInvalidationReason.ConnectionTimeout): Unit = {
     // A failure that belongs to the channel rather than to one stream must still be reported, and
     // it cannot use a partition's latch because it names no partition. Latching it separately is
     // what stops a peer sending malformed frames from filling the hand-off queue with markers while
@@ -1749,7 +1969,7 @@ private[spark] class StreamingShuffleClientHandler(
       }
     if (firstSignal) {
       producerLostAtMillis.compareAndSet(NO_TIMESTAMP, clock.getTimeMillis())
-      enqueue(ProducerLost(partitionId, reason, cause), 0L)
+      enqueue(ProducerLost(partitionId, reason, cause, invalidation), 0L)
     }
   }
 
@@ -1883,6 +2103,37 @@ private[spark] class StreamingShuffleClientHandler(
     readState(partitionId, 0L)(_.quotaRefusals.get())
 
   /**
+   * End-of-stream frames of one partition refused because they did not describe its stream.
+   *
+   * A non-zero reading is a producer that claimed an end it had not reached, or that contradicted
+   * an end it had already announced; both are escalated rather than accepted, so this is the
+   * observable evidence that a silent truncation was refused.
+   */
+  def rejectedTerminationCount(partitionId: Int): Long =
+    readState(partitionId, 0L)(_.rejectedTerminations.get())
+
+  /** End-of-stream frames of one partition ignored because an identical one had been accepted. */
+  def duplicateTerminationCount(partitionId: Int): Long =
+    readState(partitionId, 0L)(_.duplicateTerminations.get())
+
+  /** Data blocks of one partition refused because that stream had already ended. */
+  def blocksAfterTerminationCount(partitionId: Int): Long =
+    readState(partitionId, 0L)(_.blocksAfterTermination.get())
+
+  /**
+   * Block admissions whose share of the executor's shared receive budget was returned because this
+   * handler closed while the admission was in flight.
+   *
+   * Zero on every ordinary run. A non-zero reading is positive evidence that the admission-versus-
+   * closure race was taken and that the rollback path returned the charge, which is the one way to
+   * tell "the race never happened" from "the race was handled".
+   */
+  def rolledBackAdmissionCount: Long = admissionsRolledBack.get()
+
+  /** Admissions that have charged the shared receive budget but not yet recorded ownership. */
+  def admissionsInFlightCount: Int = admissionsInFlight.get()
+
+  /**
    * Partitions this handler holds metadata for, which can never exceed the width of the range it
    * was constructed with however many partition ids a peer names.
    */
@@ -1934,9 +2185,22 @@ private[spark] class StreamingShuffleClientHandler(
    *
    * `setAutoRead` is deliberately not touched here: reopening the receive window of a channel that
    * is about to close could only pull in bytes nobody will read.
+   *
+   * <b>Admissions in flight are settled before the ledgers are read.</b> The closed flag is raised
+   * first, so every admission that has not yet reserved anything sees it and stops; the ones
+   * already past that point are then waited out, so that by the time the per-partition ledgers are
+   * summed and dropped, each in-flight admission has either recorded its charge on a ledger this
+   * method is about to return, or has seen the closure and rolled its own charge back. Both
+   * outcomes return the bytes exactly once. The wait is bounded and does not block indefinitely: an
+   * admission is a handful of lock-free operations with no I/O and no lock in it, and the bound
+   * exists only so that a pathologically descheduled event-loop thread cannot stall an executor's
+   * shutdown -- a charge left behind by an admission that outlives the bound is still returned by
+   * that admission's own rollback, so the accounting stays exact even in the case the bound exists
+   * for.
    */
   def close(): Unit = {
     if (closed.compareAndSet(false, true)) {
+      awaitAdmissionsInFlight()
       val drained = drainAndRelease()
       // Everything still charged to the executor's shared budget comes back here, whether this
       // handler is closing after an orderly end of stream, after a producer failure or after task
@@ -1954,6 +2218,35 @@ private[spark] class StreamingShuffleClientHandler(
           log"${MDC(NUM_BYTES, returned)} byte(s) of the executor's shared receive budget after " +
           log"${MDC(THRESHOLD, throttleTransitions.get())} throttling transition(s)")
       }
+    }
+  }
+
+  /**
+   * Waits, briefly and without sleeping, for every admission already past its reservation to
+   * finish.
+   *
+   * `onSpinWait` rather than a sleep or a lock: the work being waited for is a short run of
+   * lock-free operations on another thread, so yielding the pipeline is both the cheapest and the
+   * most responsive way to let it complete, and introducing a lock here would put the task thread
+   * and a Netty event-loop thread in a mutual wait that neither the transport nor this class needs.
+   *
+   * Exceeding the bound is reported rather than treated as a failure, because it is not one: the
+   * admission that has not finished will roll its own charge back when it discovers the closure, so
+   * the budget is exact either way. What the bound buys is that an executor shutting down is never
+   * held by a descheduled thread.
+   */
+  private def awaitAdmissionsInFlight(): Unit = {
+    var spins = 0
+    while (admissionsInFlight.get() > 0 && spins < MAX_ADMISSION_SETTLE_SPINS) {
+      Thread.onSpinWait()
+      spins += 1
+    }
+    val stillInFlight = admissionsInFlight.get()
+    if (stillInFlight > 0) {
+      logWarning(log"Streaming shuffle consumer for shuffle ${MDC(SHUFFLE_ID, shuffleId)} closed " +
+        log"with ${MDC(COUNT, stillInFlight)} block admission(s) still in flight after " +
+        log"${MDC(THRESHOLD, MAX_ADMISSION_SETTLE_SPINS)} spin(s); each returns its own share of " +
+        log"the executor's shared receive budget as it discovers the closure")
     }
   }
 
@@ -1978,7 +2271,12 @@ private[spark] class StreamingShuffleClientHandler(
   private def releaseAllQuota(): Long = {
     var released = 0L
     partitions.values().asScala.foreach { state =>
-      val outstanding = state.outstandingBytes
+      // Drained rather than read, so the ledger cannot report the same bytes twice. The ledgers are
+      // dropped straight afterwards, but a state can still be reachable through a reference an
+      // observer took before the closure, and a second read of an undrained ledger would return
+      // bytes this call has already given back -- inflating the executor's budget instead of
+      // restoring it.
+      val outstanding = state.drainOutstandingBytes()
       if (outstanding > 0L) {
         released += outstanding
         backpressure.releaseReceiveQuota(outstanding)
@@ -2125,6 +2423,19 @@ private[spark] object StreamingShuffleClientHandler {
 
   /** Sentinel for a timestamp that has not been taken. */
   val NO_TIMESTAMP: Long = Long.MinValue
+
+  /**
+   * Spins [[StreamingShuffleClientHandler.close]] will give an admission already in flight before
+   * it reads and drops the per-partition ledgers.
+   *
+   * An admission past its reservation is a short run of lock-free map and counter operations with
+   * no I/O and no lock in it, so this is generous by orders of magnitude against the work being
+   * waited for and still bounded in the case it exists for: a thread descheduled at exactly the
+   * wrong instant must not be able to hold an executor's shutdown. Exceeding it costs nothing in
+   * correctness, because the admission that has not finished returns its own charge when it sees
+   * the closure.
+   */
+  val MAX_ADMISSION_SETTLE_SPINS: Int = 4096
 
   /**
    * Sentinel for "no incompatible protocol revision has been seen".
@@ -2299,8 +2610,20 @@ private[spark] object StreamingShuffleClientHandler {
    *              orderly channel close rather than as a failure. Carried on the marker so that the
    *              fetch failure the reader raises names the transport-level cause instead of leaving
    *              it to be recovered from a raw error the reader must no longer prefer.
+   * @param invalidation how the loss should be attributed when the reader invalidates what it took
+   *                     from this producer. Carried on the marker because only the component that
+   *                     observed the loss can tell a silent channel from a producer that
+   * contradicted                     its own end of stream, and the two are different facts for an
+   * operator                     reading the invalidation telemetry. Defaults to the connection
+   * timeout, which                     is what every transport-level loss is.
    */
-  final case class ProducerLost(partitionId: Int, reason: String, cause: Throwable) extends Inbound
+  final case class ProducerLost(
+      partitionId: Int,
+      reason: String,
+      cause: Throwable,
+      invalidation: StreamingShuffleInvalidationReason =
+        StreamingShuffleInvalidationReason.ConnectionTimeout)
+    extends Inbound
 
   /**
    * Per-partition bookkeeping for one channel.
@@ -2378,11 +2701,34 @@ private[spark] object StreamingShuffleClientHandler {
     /** Timestamp the producer stamped into its last heartbeat. Diagnostic only. */
     val remoteHeartbeatMillis = new AtomicLong(NO_TIMESTAMP)
 
-    /** Whether the producer has announced the orderly end of this stream. */
+    /**
+     * Whether the producer has announced the orderly end of this stream.
+     *
+     * Raised by compare-and-set in
+     * [[StreamingShuffleClientHandler.handleTermination]] and never lowered, so the transition into
+     * a terminated stream happens exactly once and the total published alongside it is immutable
+     * from that instant. Everything downstream -- the completion marker on the hand-off queue, the
+     * reader's reconciliation against it, and the refusal of any later block -- depends on that
+     * being a latch rather than an assignment.
+     */
     val terminated = new AtomicBoolean(false)
 
-    /** Blocks the producer claims to have sent, or [[NO_BLOCK_TOTAL]] before it has said. */
+    /**
+     * Blocks the producer claims to have sent, or [[NO_BLOCK_TOTAL]] before it has said.
+     *
+     * Written exactly once, by the thread that wins [[terminated]], and only after the claim has
+     * been reconciled against the position this consumer actually reached.
+     */
     val announcedBlocks = new AtomicLong(NO_BLOCK_TOTAL)
+
+    /** End-of-stream frames refused because they did not describe this stream. */
+    val rejectedTerminations = new AtomicLong(0L)
+
+    /** End-of-stream frames ignored because an identical one had already been accepted. */
+    val duplicateTerminations = new AtomicLong(0L)
+
+    /** Data blocks refused because this stream had already ended. */
+    val blocksAfterTermination = new AtomicLong(0L)
 
     /** Latch ensuring completion is delivered to the task exactly once. */
     val completionSignalled = new AtomicBoolean(false)
@@ -2451,6 +2797,24 @@ private[spark] object StreamingShuffleClientHandler {
 
     /** Bytes of accepted blocks that no acknowledgement has covered yet. */
     def outstandingBytes: Long = math.max(0L, receivedBytes.get() - acknowledgedBytes.get())
+
+    /**
+     * Takes every byte this ledger still holds and empties it, in one step.
+     *
+     * The emptying is what makes the answer safe to act on: the caller is returning these bytes to
+     * the executor's shared budget, and a ledger that still reported them afterwards could have
+     * them returned a second time. Emptying it by crediting the acknowledged total rather than by
+     * zeroing both totals keeps the received figure available as the diagnostic it is, while making
+     * [[outstandingBytes]] read zero from this point on.
+     *
+     * @return the bytes that were outstanding, which the caller now owns the release of
+     */
+    def drainOutstandingBytes(): Long = {
+      receivedBytesBySequence.clear()
+      val outstanding = math.max(0L, receivedBytes.get() - acknowledgedBytes.getAndSet(
+        receivedBytes.get()))
+      outstanding
+    }
 
     /**
      * Marks an inclusive range of positions as awaiting a replacement.

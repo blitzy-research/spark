@@ -17,12 +17,15 @@
 
 package org.apache.spark.shuffle.streaming
 
+import java.io.File
+import java.nio.charset.StandardCharsets
+import java.nio.file.Files
 import java.util.concurrent.atomic.AtomicLong
 
 import org.mockito.Mockito.mock
 import org.scalatest.matchers.should.Matchers
 
-import org.apache.spark.{SparkConf, SparkFunSuite, SparkIllegalArgumentException}
+import org.apache.spark.{SparkConf, SparkFunSuite, SparkIllegalArgumentException, TaskContext}
 import org.apache.spark.internal.config.{EXECUTOR_MEMORY, SHUFFLE_STREAMING_MAX_BANDWIDTH_MBPS}
 import org.apache.spark.network.shuffle.protocol.streaming.{AckMessage, StreamingShuffleMessageType}
 import org.apache.spark.rpc.RpcEnv
@@ -30,28 +33,25 @@ import org.apache.spark.shuffle.{ShuffleReadMetricsReporter, ShuffleWriteMetrics
 import org.apache.spark.util.{Clock, ManualClock}
 
 /**
- * Unit tests for [[BackpressureProtocol]] and [[TokenBucketRateLimiter]], the two components that
- * together own the streaming shuffle's flow control.
+ * Unit tests for [[BackpressureProtocol]] and [[TokenBucketRateLimiter]], which together own the
+ * streaming shuffle's flow control.
  *
- * Three layers of backpressure act on the streaming path and this suite exercises the two that are
- * expressible without a socket: application-level credit derived from consumer acknowledgements,
- * owned by the protocol, and rate limiting, owned by the token bucket. The third layer -- TCP-level
- * throttling by toggling a channel's `autoRead` -- belongs to the streaming client handler and is
- * covered where that handler is covered. What this suite does assert about the third layer is the
- * predicate the handler reads, [[BackpressureProtocol.hasCredit]], because that predicate is the
- * whole of the protocol's part in it.
+ * Three layers of backpressure act on the streaming path. This suite exercises the two that are
+ * expressible without a socket -- application-level credit derived from consumer acknowledgements,
+ * owned by the protocol, and rate limiting, owned by the token bucket. TCP-level throttling by
+ * toggling a channel's `autoRead` belongs to the streaming client handler and is covered where that
+ * handler is; all this suite asserts of it is [[BackpressureProtocol.hasCredit]], the predicate the
+ * handler reads, because that predicate is the whole of the protocol's part in it.
  *
- * <b>Determinism.</b> Every timer in the subsystem reads an injected [[Clock]], so a five-second
- * bound is one method call rather than a wait. Nothing in this file sleeps, nothing polls a wall
- * clock, and the two concurrent cases release their threads from a barrier so that contention is
- * proven rather than hoped for. Every boundary is asserted twice -- once that the timer fires at
- * its bound and once that it does not fire one millisecond early -- because "the timer fired" and
+ * <b>Determinism.</b> Every timer reads an injected [[Clock]], so a five-second bound is one method
+ * call rather than a wait: nothing sleeps or polls a wall clock, and the two concurrent cases
+ * release their threads from a barrier so contention is proven rather than hoped for. Each boundary
+ * is asserted twice, at its bound and one millisecond short of it, because "the timer fired" and
  * "the timer did not fire early" are different claims and a suite owes both.
  *
  * <b>Global state.</b> [[StreamingShuffleMetricsSource]] is a JVM singleton whose counters outlive
- * a test, so `beforeEach` returns them to zero and the assertions that read them work in deltas
- * from a baseline captured after that reset. Both together are what make the metric assertions
- * independent of whatever ran before them in the same JVM.
+ * a test, so `beforeEach` returns them to zero and the metric assertions work in deltas from a
+ * baseline captured after that reset.
  */
 class BackpressureProtocolSuite extends SparkFunSuite
   with Matchers
@@ -66,7 +66,6 @@ class BackpressureProtocolSuite extends SparkFunSuite
   private val thirdShuffleId: Int = 2
   private val fourthShuffleId: Int = 3
 
-  /** Producer generation every key in this suite belongs to, held fixed so keys differ by role. */
   private val mapId: Long = 0L
   private val taskAttemptId: Long = 0L
   private val partitionId: Int = 0
@@ -77,19 +76,12 @@ class BackpressureProtocolSuite extends SparkFunSuite
    */
   private val consumerId: String = "consumer-a"
 
-  /** Reduce partition count registered for a shuffle unless a case needs a specific width. */
   private val partitionCount: Int = 4
 
-  /** Credit allowance opened for a stream, chosen so four equal blocks fill it exactly. */
   private val creditLimitBytes: Long = 4096L
 
-  /** A modest block, small enough that pacing never interferes with a credit assertion. */
   private val blockBytes: Long = 1024L
 
-  /**
-   * Milliseconds in one second, taken from the protocol rather than restated, so the interval this
-   * suite advances a clock by is the interval the protocol measures rates over.
-   */
   private val millisPerSecond: Long = BackpressureProtocol.MILLIS_PER_SECOND
 
   /**
@@ -126,7 +118,6 @@ class BackpressureProtocolSuite extends SparkFunSuite
 
     private val reads = new AtomicLong(0L)
 
-    /** Readings taken through this clock since it was created. */
     def readCount: Long = reads.get()
 
     override def getTimeMillis(): Long = {
@@ -215,25 +206,10 @@ class BackpressureProtocolSuite extends SparkFunSuite
     protocolWith(streamingConfWithOverrides(), clock, null)
   }
 
-  /**
-   * A protocol whose egress is paced against a declared link capacity.
-   *
-   * @param clock the frozen clock the case controls
-   * @return the protocol under test
-   */
   private def newPacedProtocol(clock: ManualClock): BackpressureProtocol = {
     protocolWith(
       streamingConfWithOverrides(maxBandwidthMBps = Some(linkCapacityMBps)), clock, null)
   }
-
-  // -----------------------------------------------------------------------------------------------
-  // 1. Consumer acknowledgement processing and buffer reclamation.
-  //
-  // An acknowledgement is the single event that frees producer memory and lifts backpressure, so
-  // this is the case that pins what an acknowledgement does: it advances the credit ledger, it
-  // drains the unacknowledged window, and it opens the hundred-millisecond window inside which the
-  // buffers it freed must actually be released.
-  // -----------------------------------------------------------------------------------------------
 
   test("consumer acknowledgement processing and buffer reclamation") {
     val clock = newManualClock()
@@ -268,7 +244,6 @@ class BackpressureProtocolSuite extends SparkFunSuite
     assert(protocol.unacknowledgedBlockCount(key) === 4,
       "four blocks were sent and none acknowledged")
 
-    // A fifth block is refused. That is flow control, not failure: the caller keeps the block.
     assert(!protocol.tryAdmit(key, blockSize, 4L),
       "a block that does not fit the remaining credit must be refused")
     assert(protocol.outstandingBytes(key) === creditLimitBytes,
@@ -278,7 +253,6 @@ class BackpressureProtocolSuite extends SparkFunSuite
     assert(protocol.state === BackpressureState.Throttled,
       "the executor reports the most severe state any of its streams is in")
 
-    // An acknowledgement of the first two blocks releases exactly their bytes, and nothing more.
     val released = protocol.onAck(key, 1L)
     assert(released === 2L * blockSize,
       "an acknowledgement must release every block at or below the consumed position and no other")
@@ -315,7 +289,6 @@ class BackpressureProtocolSuite extends SparkFunSuite
     assert(protocol.confirmReclamation(key).isEmpty,
       "one acknowledgement opens one reclamation window, so a second confirmation closes nothing")
 
-    // A duplicate or reordered acknowledgement is absorbed rather than allowed to rewind anything.
     assert(protocol.onAck(key, 1L) === 0L, "a duplicate acknowledgement releases nothing")
     assert(protocol.onAck(key, 0L) === 0L, "a reordered acknowledgement releases nothing")
     assert(protocol.acknowledgedPosition(key) === 1L,
@@ -342,19 +315,23 @@ class BackpressureProtocolSuite extends SparkFunSuite
     assert(protocol.tryAdmit(key, blockBytes, 0L),
       "one block is admitted so there is something to ack")
 
-    // The framing of an acknowledgement: the shared twenty-five byte header plus one long, and one
-    // further byte of type discriminator once it is framed for the wire.
+    // The framing of an acknowledgement, asserted against literals rather than against the
+    // encoder's own constants: a value read from the encoder agrees with it by construction and so
+    // states nothing, whereas these numbers are the format this suite is entitled to expect a peer
+    // to speak. verifyWireContractAgainstEncoder() is what couples the two, and it runs below.
+    verifyWireContractAgainstEncoder()
     val acknowledgement = ack(firstShuffleId, mapId, partitionId, 1L, 0L)
-    assert(HeaderEncodedLength === 25,
-      "the streaming wire header is twenty-five bytes: version, shuffle, map, partition, sequence")
-    assert(acknowledgement.encodedLength() === FixedMessageEncodedLength,
-      "an acknowledgement is the header plus its eight-byte consumed position")
-    assert(framedLength(acknowledgement.encodedLength()) === acknowledgement.encodedLength() + 1,
-      "framing adds exactly the one-byte type discriminator")
+    assert(acknowledgement.encodedLength() === 33,
+      s"an acknowledgement is 33 bytes: a 25-byte header and an eight-byte consumed " +
+        s"position, but encoded to ${acknowledgement.encodedLength()}")
+    assert(framedLength(acknowledgement.encodedLength()) === 34,
+      s"a framed acknowledgement is 34 bytes, the encoded 33 plus one type-discriminator " +
+        s"byte, but framed to ${framedLength(acknowledgement.encodedLength())}")
     assert(acknowledgement.consumerPosition() === 0L,
       "the message must carry the position it was built with")
+    assert(acknowledgement.sequenceNumber() === 1L,
+      "the header carries the next position expected, which is one beyond the one consumed")
 
-    // Applied through the wire form, an acknowledgement does exactly what the positional form does.
     assert(protocol.onAck(key, acknowledgement) === blockBytes,
       "an acknowledgement that arrived on the wire must release the same bytes")
     assert(protocol.outstandingBytes(key) === 0L, "the window is drained by the wire form too")
@@ -362,7 +339,7 @@ class BackpressureProtocolSuite extends SparkFunSuite
     // The stream key is supplied by the handler that owns the channel, because the wire carries
     // only a shuffle, a map and a partition and those three do not identify a stream. A frame whose
     // identity contradicts the key it arrived as is refused rather than applied to another ledger.
-    val misaddressed = ack(secondShuffleId, mapId, partitionId, 2L, 0L)
+    val misaddressed = ack(secondShuffleId, mapId, partitionId, 1L, 0L)
     assert(protocol.tryAcknowledge(key, misaddressed).isEmpty,
       "a frame naming another shuffle must never be applied to this ledger")
     assert(protocol.misaddressedFrameCount === 1L,
@@ -382,8 +359,6 @@ class BackpressureProtocolSuite extends SparkFunSuite
       "the total form of the call absorbs a refusal as zero released bytes")
     assert(protocol.acknowledgedPosition(key) === 0L, "a refused acknowledgement advances nothing")
 
-    // The nothing-consumed sentinel is taken from the message type, so the wire and the protocol
-    // agree on it by construction rather than by two matching literals.
     assert(NothingConsumedPosition === BackpressureProtocol.NOTHING_ACKNOWLEDGED,
       "the protocol's sentinel is the message type's sentinel")
     assert(NothingConsumedPosition === -1L, "nothing consumed is minus one, not zero")
@@ -399,19 +374,13 @@ class BackpressureProtocolSuite extends SparkFunSuite
         "be the reason a legitimate transfer stalls")
   }
 
-  // -----------------------------------------------------------------------------------------------
-  // 2. Rate limiting via the token bucket.
-  //
-  // The bucket is the canonical two-parameter formulation: a bucket size, which is the burst a
-  // producer may emit after an idle period, and a token rate, which is the sustained throughput it
-  // is allowed. One token is one byte. Tokens accrue at the rate, surplus is discarded once the
-  // bucket is full, and a request arriving when the bucket cannot cover it is over limit.
-  //
-  // This is first-party code by deliberate choice. Guava's rate limiter is on the classpath but has
-  // zero usages anywhere in Spark, is relocated under shading, and is oriented towards blocking
-  // acquisition -- and non-blocking is a hard requirement here, because every caller is a network
-  // event-loop thread and a parked one stalls every channel multiplexed onto it.
-  // -----------------------------------------------------------------------------------------------
+  // Rate limiting via the token bucket, in the canonical two-parameter formulation: a bucket size,
+  // which is the burst allowed after an idle period, and a token rate, which is the sustained
+  // throughput. One token is one byte, surplus is discarded once the bucket is full, and a request
+  // the bucket cannot cover is over limit. First-party code by deliberate choice: Guava's rate
+  // limiter is on the classpath but has zero usages anywhere in Spark, is relocated under shading,
+  // and is oriented towards blocking acquisition -- and non-blocking is a hard requirement, because
+  // every caller is a network event-loop thread and a parked one stalls every channel on it.
 
   test("rate limiting via token bucket") {
     val base = newManualClock()
@@ -428,18 +397,15 @@ class BackpressureProtocolSuite extends SparkFunSuite
     assert(limiter.availableTokens === capacityBytes,
       "a bucket starts full so a producer's first burst is not delayed by a refill interval")
 
-    // Draining the whole bucket succeeds and returns immediately: acquisition never parks.
     assert(limiter.tryAcquire(capacityBytes), "a full bucket admits a request for all of it")
     assert(limiter.availableTokens === 0L, "an admitted request is debited in full")
 
-    // A refusal is a signal, not an error, and it publishes nothing at all.
     assert(!limiter.tryAcquire(1L),
       "an empty bucket refuses, which is flow control and not failure")
     assert(limiter.availableTokens === 0L, "a refusal must leave the ledger untouched")
     assert(limiter.millisUntilAvailable(refillRate) === millisPerSecond,
       "a refused caller is told exactly when the bucket's own arithmetic will admit it")
 
-    // Accrual is monotonic in the clock, up to the bucket size and no further.
     base.advance(millisPerSecond)
     assert(limiter.availableTokens === refillRate,
       "one second of accrual mints exactly one second of the token rate")
@@ -449,10 +415,31 @@ class BackpressureProtocolSuite extends SparkFunSuite
     base.advance(10L * millisPerSecond)
     assert(limiter.availableTokens === capacityBytes, "accrual is clamped at the bucket size")
 
-    // An empty payload needs no special case at the call site.
+    // An empty payload needs no special case at the call site. A NEGATIVE length is a different
+    // matter: it is not a small request but a nonsensical one, and admitting it "without charge"
+    // would let a caller present a byte count the cap could never account for. Zero is the only
+    // uncharged length, and the limiter refuses the rest of the non-positive domain rather than
+    // absorbing it -- which is also what makes tryAcquire agree with millisUntilAvailable, its own
+    // sibling, on what a legal argument is.
     assert(limiter.tryAcquire(0L), "a zero-sized request is admitted without charge")
-    assert(limiter.tryAcquire(-1L), "a non-positive request is admitted without charge")
-    assert(limiter.availableTokens === capacityBytes, "neither of those may debit anything")
+    intercept[IllegalArgumentException] {
+      limiter.tryAcquire(-1L)
+    }
+    intercept[IllegalArgumentException] {
+      limiter.tryAcquire(Long.MinValue)
+    }
+    assert(limiter.availableTokens === capacityBytes,
+      "neither the free zero nor the refused negatives may debit anything")
+
+    // The same refusal holds when no rate is configured, so the contract does not depend on whether
+    // the operator happened to set a cap. An unlimited limiter that absorbed a negative length
+    // would accept an argument its rate-limited twin rejects.
+    val unlimited = TokenBucketRateLimiter.unlimited(clock)
+    assert(unlimited.isUnlimited, "the fixture must actually be the unlimited form")
+    assert(unlimited.tryAcquire(0L), "an unlimited limiter still admits an empty payload for free")
+    intercept[IllegalArgumentException] {
+      unlimited.tryAcquire(-1L)
+    }
 
     // A request larger than the whole bucket is refused outright rather than admitted against a
     // full bucket and charged only the capacity, which is what would let the surplus bytes travel
@@ -475,7 +462,6 @@ class BackpressureProtocolSuite extends SparkFunSuite
     assert(flooredLimiter.tryAcquire(MinTokenBucketCapacityBytes),
       "a maximum-sized block must never be permanently refused for size")
 
-    // Returning a limiter to a known state is what lets one bucket serve several measurements.
     assert(limiter.tryAcquire(capacityBytes), "the bucket is drained again")
     assert(limiter.availableTokens === 0L, "and is empty")
     limiter.reset()
@@ -528,7 +514,6 @@ class BackpressureProtocolSuite extends SparkFunSuite
     assert(limiter.oversizedRequestCount === 0L,
       "a request within the bucket size is over limit, not oversized, and is not counted as one")
 
-    // And the caller may retry the identical request, unchanged, once accrual has caught up.
     clock.advance(millisPerSecond)
     assert(limiter.tryAcquire(remainingTokens + 1L),
       "the request a refusal made the caller hold is admitted verbatim once tokens have accrued")
@@ -558,8 +543,6 @@ class BackpressureProtocolSuite extends SparkFunSuite
     assert(clock.readCount === readsAfterConstruction,
       "the unlimited fast path must admit with no arithmetic, no compare-and-set and no clock read")
 
-    // Behaviour is identical at two different clock readings, which is the same fact stated from
-    // the outside: nothing the clock says can change what an unlimited limiter does.
     base.setTime(ManualClockEpochMillis + 3600L * millisPerSecond)
     assert(limiter.tryAcquire(Long.MaxValue), "an hour later, still admitted")
     assert(limiter.availableTokens === Long.MaxValue, "and still reporting no ceiling")
@@ -581,7 +564,6 @@ class BackpressureProtocolSuite extends SparkFunSuite
     val declaredMBps = 1000
     val administeredBytesPerSecond = declaredMBps.toLong * BytesPerMebibyte
 
-    // Step one: the declared link capacity is split evenly across the shuffles the executor serves.
     assert(TokenBucketRateLimiter.perShuffleBytesPerSecond(declaredMBps, 1) ===
       administeredBytesPerSecond, "one shuffle takes the whole declared capacity as its share")
     assert(TokenBucketRateLimiter.perShuffleBytesPerSecond(declaredMBps, 4) ===
@@ -597,7 +579,6 @@ class BackpressureProtocolSuite extends SparkFunSuite
     assert(applyBandwidthCeiling(0L) === 1L,
       "a rate is floored at one byte per second so a very small cap throttles rather than halts")
 
-    // Composed, the two steps are the contract: (0.8 * cap) / numConcurrentShuffles.
     (1 to 4).foreach { shuffles =>
       val share = refillBytesPerSecond(declaredMBps, shuffles)
       assert(share === applyBandwidthCeiling(
@@ -607,7 +588,6 @@ class BackpressureProtocolSuite extends SparkFunSuite
         s"the aggregate of $shuffles limiters must stay inside the ceiling, not exceed it each")
     }
 
-    // A non-positive divisor is read as one, so the division the limiter performs is always safe.
     assert(TokenBucketRateLimiter.perShuffleBytesPerSecond(declaredMBps, 0) ===
       TokenBucketRateLimiter.perShuffleBytesPerSecond(declaredMBps, 1),
       "zero concurrent shuffles is treated as one, so there is no division by zero")
@@ -615,7 +595,6 @@ class BackpressureProtocolSuite extends SparkFunSuite
       TokenBucketRateLimiter.perShuffleBytesPerSecond(declaredMBps, 1),
       "a negative count is treated as one for the same reason")
 
-    // The burst allowance is one second of the rate, floored at one maximum-sized encoded frame.
     assert(TokenBucketRateLimiter.burstCapacityBytes(1L) === MaxEncodedFrameBytes.toLong,
       "a tiny rate still yields a bucket that can hold one whole frame")
     assert(TokenBucketRateLimiter.burstCapacityBytes(administeredBytesPerSecond) ===
@@ -645,19 +624,14 @@ class BackpressureProtocolSuite extends SparkFunSuite
     assert(!budget.release(secondShuffleId), "releasing a shuffle that holds no limiter is a no-op")
   }
 
-  // -----------------------------------------------------------------------------------------------
-  // 3. Timeout detection and failure signalling.
-  //
-  // Two windows, and they are different lengths for different reasons. A producer that sends
-  // nothing at all for five seconds has lost its connection, and that is what the reader turns
-  // into a partial-read invalidation and a fetch failure. A consumer that has bytes outstanding
-  // and acknowledges none of them for ten seconds is gone, and that is what makes the writer
-  // retain, spill and later replay its unacknowledged window.
-  //
-  // Both are enforced at application level rather than by TCP: the transport exposes keepalive as a
-  // boolean only and the JDK offers no socket option for a keepalive interval, so these timers are
-  // the whole of the two bounds. Both read the injected clock, which is what makes them exact.
-  // -----------------------------------------------------------------------------------------------
+  // Timeout detection and failure signalling. Two windows of different lengths for different
+  // reasons: a producer that sends nothing at all for five seconds has lost its connection, which
+  // the reader turns into a partial-read invalidation and a fetch failure, whereas a consumer with
+  // bytes outstanding that acknowledges none for ten seconds is gone, which is what makes the
+  // writer retain, spill and later replay its unacknowledged window. Both are enforced at
+  // application level rather than by TCP, because the transport exposes keepalive as a boolean only
+  // and the JDK offers no socket option for a keepalive interval, and both read the injected clock,
+  // which makes them exact.
 
   test("timeout detection and failure signalling") {
     assert(ProducerConnectionTimeoutMillis === 5000L,
@@ -676,7 +650,6 @@ class BackpressureProtocolSuite extends SparkFunSuite
       "a stream that has just opened has heard from its peer")
     assert(protocol.millisSinceInbound(key) === Some(0L), "no time has passed since it opened")
 
-    // The boundary, both ways. Silence is measured from the last inbound event of any kind.
     advanceJustBeforeProducerTimeout(clock)
     assert(protocol.millisSinceInbound(key) === Some(ProducerConnectionTimeoutMillis - 1L),
       "the detector must see exactly the interval the clock advanced")
@@ -688,8 +661,6 @@ class BackpressureProtocolSuite extends SparkFunSuite
     assert(protocol.timedOutProducerStreams === Seq(key),
       "the whole-set scan must apply the same definition as the single-stream predicate")
 
-    // Inbound activity of any kind clears it, which is the point of the heartbeat: a producer that
-    // is alive but momentarily has nothing to send is not a failed producer.
     protocol.onHeartbeat(key)
     assert(!protocol.isProducerTimedOut(key), "a heartbeat alone keeps a producer judged alive")
     assert(protocol.millisSinceInbound(key) === Some(0L), "and re-bases the interval")
@@ -700,7 +671,6 @@ class BackpressureProtocolSuite extends SparkFunSuite
     clock.advance(ProducerConnectionTimeoutMillis)
     assert(protocol.isProducerTimedOut(key), "and the timer arms again from that arrival")
 
-    // Silence that means completion is not silence that means failure.
     protocol.onStreamTermination(key, 1L)
     assert(protocol.isStreamTerminated(key), "the producer announced the orderly end of the stream")
     assert(protocol.announcedBlockCount(key) === Some(1L), "and how many blocks it sent")
@@ -729,9 +699,6 @@ class BackpressureProtocolSuite extends SparkFunSuite
     protocol.registerShuffle(firstShuffleId, partitionCount)
     assert(protocol.registerStream(key, creditLimitBytes), "the ledger must open")
 
-    // Sending arms the window, and the boundary holds both ways. The window is measured from the
-    // last acknowledgement, and a ledger that has had none is dated from the moment it opened, so
-    // the arming instant is read from the clock rather than assumed.
     assert(protocol.tryAdmit(key, blockBytes, 0L), "one block goes out")
     assert(protocol.outstandingBytes(key) === blockBytes, "so one block is outstanding")
     val armedAtMillis = clock.getTimeMillis()
@@ -746,8 +713,6 @@ class BackpressureProtocolSuite extends SparkFunSuite
     assert(protocol.timedOutConsumerStreams === Seq(key),
       "which is the detection the writer turns into retention, spill and replay")
 
-    // An acknowledgement that advances the position re-bases the window and empties the ledger, so
-    // the consumer is neither behind nor unresponsive any more.
     assert(protocol.onAck(key, 0L) === blockBytes, "the outstanding block is acknowledged")
     assert(!protocol.isConsumerTimedOut(key), "a consumer that has caught up is not timed out")
     assert(protocol.outstandingBytes(key) === 0L, "and holds nothing")
@@ -785,23 +750,20 @@ class BackpressureProtocolSuite extends SparkFunSuite
     clock.advance(1L)
     assert(protocol.shouldSendHeartbeat(key), "and is due at exactly the five-second interval")
 
-    // The heartbeat is stamped from the injected clock. That is the design fact that makes clock
-    // injection possible AND mandatory: the message type takes its timestamp from the caller and
-    // reads no clock of its own, so the protocol's notion of time is the only one in play.
+    // A heartbeat carries no time value and no identity. It reports the position the sender has
+    // reached and nothing else, because both of the fields it used to carry were peer-controlled
+    // inputs to a local decision: a remote stamp would let skew masquerade as liveness, and a wire
+    // identity would let a frame claim a session the connection it arrived on does not own.
     val nextPosition = 7L
     val emitted = protocol.heartbeatFor(key, nextPosition)
     assert(emitted.isDefined, "a registered stream must be able to build its heartbeat")
     val message = emitted.get
-    assert(message.timestampMs() === clock.getTimeMillis(),
-      "the stamp must be this protocol's clock reading, not a wall-clock reading of its own")
     assert(message.sequenceNumber() === nextPosition,
       "the position is supplied by the handler that owns the channel and taken on trust")
-    assert(message.consumerId() === consumerId,
-      "a consumer heartbeat declares the session identity the producer keys its cursor by")
     assert(message.shuffleId() === firstShuffleId, "and names the stream it belongs to")
     assert(message.partitionId() === partitionId, "including its reduce partition")
+    assert(message.mapId() === mapId, "and the producer whose stream it paces")
 
-    // The framing of a heartbeat: the shared header, twelve fixed body bytes, and the identity.
     assert(heartbeatEncodedLength(0) === HeartbeatBaseEncodedLength,
       "a heartbeat naming no consumer is the header plus its fixed body")
     assert(message.encodedLength() === heartbeatEncodedLength(consumerId.length),
@@ -813,28 +775,30 @@ class BackpressureProtocolSuite extends SparkFunSuite
     clock.advance(HeartbeatIntervalMillis)
     assert(protocol.shouldSendHeartbeat(key), "which elapses again on the same cadence")
 
-    // An inbound heartbeat refreshes liveness from the LOCAL instant of arrival, and retains the
-    // peer's own stamp for diagnostics only. Two hosts do not agree on the wall clock, so a
-    // detector built on a remote reading would mistake skew for a failure.
+    // An inbound heartbeat refreshes liveness from the LOCAL instant of arrival, which is the only
+    // instant available now that the wire carries none. Two hosts do not agree on the wall clock,
+    // so a detector built on a remote reading would mistake skew for a failure -- which is why
+    // the remote reading was removed from the wire rather than merely ignored.
     clock.advance(ProducerConnectionTimeoutMillis)
     assert(protocol.isProducerTimedOut(key), "the producer has fallen silent")
-    val skewedPeerStamp = clock.getTimeMillis() + 60L * millisPerSecond
-    protocol.onHeartbeat(key, heartbeat(firstShuffleId, mapId, partitionId, 8L, skewedPeerStamp))
+    val arrivalInstant = clock.getTimeMillis()
+    protocol.onHeartbeat(key,
+      heartbeat(firstShuffleId, mapId, partitionId, 8L, arrivalInstant))
     assert(!protocol.isProducerTimedOut(key), "and is alive again the moment its heartbeat arrives")
     assert(protocol.millisSinceInbound(key) === Some(0L),
       "liveness is judged from the local instant of arrival")
-    assert(protocol.remoteHeartbeatTimestamp(key) === Some(skewedPeerStamp),
-      "while the peer's stamp is retained, unmodified, for diagnostics and nothing else")
+    assert(protocol.remoteHeartbeatTimestamp(key) === Some(arrivalInstant),
+      "and the instant recorded for diagnostics is that same local reading")
 
     // The control-message dispatcher applies each message by its concrete type, never by its
-    // encoded length: the fixed-shape control messages do not all encode to the same length, and a
-    // codec that tried to use length would silently read one message as another.
+    // encoded length: every control message encodes to exactly the same length, so a codec that
+    // tried to use length would silently read one message as another.
     assert(protocol.onControlMessage(
-      key, heartbeat(firstShuffleId, mapId, partitionId, 9L, skewedPeerStamp)) ===
+      key, heartbeat(firstShuffleId, mapId, partitionId, 9L, clock.getTimeMillis())) ===
         Some(StreamingShuffleMessageType.HEARTBEAT), "a heartbeat dispatches as a heartbeat")
     protocol.onDataReceived(key, 0L, blockBytes)
     assert(protocol.onControlMessage(
-      key, ack(firstShuffleId, mapId, partitionId, 10L, 0L)) ===
+      key, ack(firstShuffleId, mapId, partitionId, 1L, 0L)) ===
         Some(StreamingShuffleMessageType.ACK), "an acknowledgement dispatches as an ack")
     assert(protocol.acknowledgedPosition(key) === 0L, "and is applied on the way through")
     assert(protocol.onControlMessage(
@@ -850,7 +814,6 @@ class BackpressureProtocolSuite extends SparkFunSuite
     protocol.registerShuffle(firstShuffleId, partitionCount)
     assert(protocol.registerStream(key, creditLimitBytes), "the ledger must open")
 
-    // The ladder is one second doubled once per attempt, over five permitted attempts.
     assert(RetryBaseBackoffMillis === 1000L, "the first pause is one second")
     assert(MaxRetryAttempts === 5, "and five attempts are permitted")
     assert(RetryBackoffLadderMillis === Seq(1000L, 2000L, 4000L, 8000L, 16000L),
@@ -888,8 +851,6 @@ class BackpressureProtocolSuite extends SparkFunSuite
     assert(protocol.nextRetryBackoffMillis(key).isEmpty,
       "a spent budget must escalate rather than report a sixth pause")
 
-    // Progress restores the budget in full, so a later, unrelated failure is not made to inherit an
-    // exhausted one.
     assert(protocol.onAck(key, 0L) === blockBytes, "the consumer acknowledges the block")
     assert(protocol.retransmitAttempts(key) === 0, "which resets the attempt count")
     assert(!protocol.isRetryExhausted(key), "and restores the budget")
@@ -908,7 +869,6 @@ class BackpressureProtocolSuite extends SparkFunSuite
     assert(protocol.outstandingBytes(key) === blockBytes,
       "and re-charging a retained block replaces its entry rather than counting it twice")
 
-    // The clock walks the whole ladder, deterministically, with no sleeping anywhere.
     val startMillis = clock.getTimeMillis()
     val instants = advanceThroughRetryBackoff(clock)
     assert(instants.length === MaxRetryAttempts, "one instant per permitted attempt")
@@ -918,25 +878,17 @@ class BackpressureProtocolSuite extends SparkFunSuite
       "so the whole ladder spans thirty-one seconds of injected time and no real time at all")
   }
 
-  // -----------------------------------------------------------------------------------------------
-  // 4. Priority arbitration under concurrent load.
-  //
-  // Buffer utilisation is an executor-wide quantity that no single shuffle can compute, so each
-  // contributes the two numbers it knows and the protocol sums them. Arbitration between the
-  // resulting concurrent shuffles is keyed on the two quantities the feature names -- pending
-  // volume and reduce partition count -- with the shuffle id breaking every remaining tie so the
-  // order is total and never depends on the order a concurrent map happened to enumerate.
-  //
-  // Concurrency here is real rather than nominal: the threads are released from one barrier, so
-  // every one of them is proven to be inside the body before any of them proceeds. Nothing sleeps.
-  // -----------------------------------------------------------------------------------------------
+  // Priority arbitration under concurrent load. Buffer utilisation is an executor-wide quantity no
+  // single shuffle can compute, so each contributes the two numbers it knows and the protocol sums
+  // them. Arbitration is keyed on the two quantities the feature names -- pending volume and reduce
+  // partition count -- with the shuffle id breaking every remaining tie, so the order is total and
+  // never depends on the order a concurrent map happened to enumerate. Concurrency here is real:
+  // the threads are released from one barrier, so every one is inside the body before any proceeds.
 
   test("priority arbitration under concurrent load") {
     val clock = newManualClock()
     val protocol = newProtocol(clock)
 
-    // Four shuffles chosen so that every rung of the comparison is exercised: the widest is not the
-    // most demanding, two hold equal volume with unequal width, and two are equal on both keys.
     val widths = Map(firstShuffleId -> 2, secondShuffleId -> 8, thirdShuffleId -> 8,
       fourthShuffleId -> 8)
     val perStreamBytes = Map(firstShuffleId -> 512L, secondShuffleId -> 2048L,
@@ -948,7 +900,6 @@ class BackpressureProtocolSuite extends SparkFunSuite
       "the registered set reads back ascending, so a reading of it is always deterministic")
     assert(protocol.numRegisteredShuffles === shuffleOrder.size, "all four shuffles are registered")
 
-    // Every stream is opened and charged from its own thread, all released together.
     val parties = shuffleOrder.size * streamsPerShuffle
     val keys = runConcurrently(parties, "backpressure-arbitration") { index =>
       val shuffleId = shuffleOrder(index / streamsPerShuffle)
@@ -1002,7 +953,6 @@ class BackpressureProtocolSuite extends SparkFunSuite
         s"nobody yields while the executor is under its threshold, including shuffle $shuffleId")
     }
 
-    // Once the executor is over its threshold, everyone but the exempt shuffle gives way.
     shuffleOrder.foreach(shuffleId => protocol.reportBufferUtilization(shuffleId, 80L, 100L))
     assert(protocol.aggregateBufferUtilizationPercent === DefaultSpillThresholdPercent.toLong,
       "four shuffles each at eighty percent aggregate to eighty percent, not to three hundred")
@@ -1015,8 +965,6 @@ class BackpressureProtocolSuite extends SparkFunSuite
     assert(!protocol.shouldYield(fourthShuffleId + 1),
       "and a shuffle this protocol has never seen is not asked either")
 
-    // Retiring a shuffle takes its streams, its utilisation contribution and its place in the order
-    // with it, which is what stops a finished shuffle from arbitrating forever.
     assert(protocol.unregisterShuffle(secondShuffleId) === streamsPerShuffle,
       "unregistering a shuffle drops every stream belonging to it")
     assert(protocol.streamCount === parties - streamsPerShuffle, "and only those")
@@ -1071,7 +1019,6 @@ class BackpressureProtocolSuite extends SparkFunSuite
       "utilisation is deliberately not clamped at a hundred percent")
     assert(protocol.isSpillRequired, "and an over-budget executor certainly needs to evict")
 
-    // Dropping a shuffle drops its contribution with it.
     assert(protocol.unregisterShuffle(firstShuffleId) === 0,
       "a shuffle with no streams drops none")
     assert(protocol.aggregateBufferUtilizationPercent === 0L,
@@ -1112,7 +1059,6 @@ class BackpressureProtocolSuite extends SparkFunSuite
       assert(protocol.concurrentShuffleIds === Seq(firstShuffleId, secondShuffleId),
         "and arbitrates over exactly the shuffles the registry agrees are active")
 
-      // Registration alone already moved the divisor, because each registration claims a share.
       assert(budget.divisor === 2, "two live limiters divide the cap two ways")
       assert(budget.currentShareBytesPerSecond === Some(refillBytesPerSecond(declaredMBps, 2)),
         "which is exactly the contract's (0.8 * cap) / numConcurrentShuffles")
@@ -1155,14 +1101,10 @@ class BackpressureProtocolSuite extends SparkFunSuite
       "arbitrating over its own registrations unfiltered when no registry is reachable")
   }
 
-  // -----------------------------------------------------------------------------------------------
-  // 5. Telemetry: the backpressure event counter is edge-triggered.
-  //
-  // The metric an operator reads must answer "how many times did flow control engage", not "how
-  // often did a producer happen to retry". Those are different numbers, and the second one grows
-  // with retry frequency rather than with anything about the job, so the counter is advanced on the
-  // transition into a throttled state and not on each refusal inside it.
-  // -----------------------------------------------------------------------------------------------
+  // Telemetry: the backpressure event counter is edge-triggered. The metric an operator reads must
+  // answer "how many times did flow control engage", not "how often did a producer retry" -- the
+  // second grows with retry frequency rather than with anything about the job -- so the counter
+  // advances on the transition into a throttled state and not on each refusal inside it.
 
   test("backpressure events are edge-triggered rather than counted per refusal") {
     assert(streamingShuffleMetricNames() === MetricNames.toSet,
@@ -1250,26 +1192,58 @@ class BackpressureProtocolSuite extends SparkFunSuite
     assert(observedBackpressureEvents() - baseline === 5L,
       "five episodes, five events, and not one event per refusal")
 
-    // A non-positive reservation is granted without touching the ledger, so a control frame that
-    // carries no payload needs no special case at the call site.
+    // Exactly zero is granted without touching the ledger, so a block that carries an empty payload
+    // needs no special case at the call site.
     assert(protocol.tryReserveReceiveQuota(0L), "a zero-sized reservation is free")
     assert(protocol.reservedReceiveQuotaBytes === 0L, "and charges nothing")
     assert(protocol.backpressureEventCount === 5L, "and is not an event")
+
+    // A HOSTILE length is the case the budget exists for, because the figure it is given comes off
+    // the wire. Both directions are closed:
+    //
+    //  - A request near the top of the signed sixty-four bit range must be refused. An
+    //    implementation that tested `reserved + bytes > budget` would let that sum wrap negative,
+    //    compare as comfortably under the budget, and charge it -- so the one request the budget
+    //    exists to refuse would be the one request that escaped. Comparing against the remaining
+    //    headroom instead cannot wrap. One byte is held first, so the reading being added to is
+    //    non-zero and the wrap this guards against is genuinely reachable.
+    //  - A negative request must be refused outright. Absorbing it as "free" would let a peer hand
+    //    back budget it never reserved, which is the same escape in the other direction.
+    assert(protocol.tryReserveReceiveQuota(1L), "one byte is held, so the ledger is non-zero")
+    val reservedBeforeHostileRequest = protocol.reservedReceiveQuotaBytes
+    val refusalsBeforeHostileRequest = protocol.receiveQuotaRefusalCount
+    assert(reservedBeforeHostileRequest === 1L, "and it is exactly the one byte")
+    assert(!protocol.tryReserveReceiveQuota(Long.MaxValue),
+      "a reservation of the largest representable length must be refused, not wrapped")
+    assert(protocol.reservedReceiveQuotaBytes === reservedBeforeHostileRequest,
+      "and a refusal must leave the ledger exactly as it was")
+    assert(protocol.receiveQuotaRefusalCount === refusalsBeforeHostileRequest + 1L,
+      "while still being counted as the refusal it is")
+    assert(!protocol.tryReserveReceiveQuota(protocol.receiveQuotaBytes),
+      "the byte already held is enough to refuse a request for the whole budget, which is the " +
+        "arithmetic the wrap would have hidden")
+    intercept[IllegalArgumentException] {
+      protocol.tryReserveReceiveQuota(-1L)
+    }
+    intercept[IllegalArgumentException] {
+      protocol.tryReserveReceiveQuota(Long.MinValue)
+    }
+    intercept[IllegalArgumentException] {
+      protocol.releaseReceiveQuota(-1L)
+    }
+    assert(protocol.reservedReceiveQuotaBytes === reservedBeforeHostileRequest,
+      "no refused request, in either direction, may move the ledger")
+    protocol.releaseReceiveQuota(1L)
+    assert(protocol.reservedReceiveQuotaBytes === 0L, "and the held byte returns on release")
   }
 
-  // -----------------------------------------------------------------------------------------------
-  // 6. The full state machine.
-  //
-  // Four states in a strict severity order, so that one reading can describe a set of streams: the
-  // executor is in the most severe state any of its streams is in. Degradation dominates all of
-  // them, because a subsystem that has to step aside is in no position to call itself merely
-  // throttled; spilling dominates throttling, because utilisation is executor-wide while credit
-  // is per stream.
-  //
-  // Eighty percent and ninety percent are DIFFERENT constants here. Eighty is the default spill
-  // threshold and, separately, the bandwidth ceiling; ninety is where measured link saturation
-  // trips the fallback. Conflating them is the easiest mistake available in this file.
-  // -----------------------------------------------------------------------------------------------
+  // The full state machine: four states in a strict severity order, so one reading can describe a
+  // set of streams, the executor being in the most severe state any of its streams is in.
+  // Degradation dominates everything, because a subsystem that has to step aside is in no position
+  // to call itself merely throttled; spilling dominates throttling, because utilisation is
+  // executor-wide while credit is per stream. Eighty and ninety per cent are DIFFERENT constants
+  // here: eighty is the default spill threshold and, separately, the bandwidth ceiling, ninety is
+  // where measured link saturation trips the fallback.
 
   test("the backpressure state machine covers every specified transition") {
     val clock = newManualClock()
@@ -1278,20 +1252,17 @@ class BackpressureProtocolSuite extends SparkFunSuite
     protocol.registerShuffle(firstShuffleId, partitionCount)
     assert(protocol.registerStream(key, creditLimitBytes), "the ledger must open")
 
-    // Flowing is the resting state.
     assert(protocol.state === BackpressureState.Flowing, "a protocol with nothing wrong is flowing")
     assert(protocol.streamState(key) === BackpressureState.Flowing, "and so is each of its streams")
     assert(protocol.throttledStreamCount === 0, "with nothing held back")
     assert(!protocol.isDegraded, "and nothing latched against it")
 
-    // Flowing -> Throttled, because the consumer's credit is exhausted.
     assert(protocol.tryAdmit(key, creditLimitBytes, 0L), "the whole allowance goes out")
     assert(!protocol.tryAdmit(key, creditLimitBytes, 1L), "so the next block is refused on credit")
     assert(protocol.state === BackpressureState.Throttled, "which throttles the executor's reading")
     assert(protocol.streamState(key) === BackpressureState.Throttled, "and the stream's")
     assert(protocol.throttledStreamCount === 1, "with exactly one stream held back")
 
-    // Throttled -> Flowing, because an acknowledgement advanced the consumer position.
     assert(protocol.onAck(key, 0L) === creditLimitBytes, "the acknowledgement releases the window")
     assert(protocol.confirmReclamation(key) === Some(0L),
       "and the owner of the freed buffers confirms the release at once")
@@ -1336,7 +1307,6 @@ class BackpressureProtocolSuite extends SparkFunSuite
     assert(protocol.lastPollTimeMillis === clock.getTimeMillis(),
       "recorded from the injected clock")
 
-    // Flowing -> Spilling, because aggregate buffer utilisation reached the spill threshold.
     protocol.reportBufferUtilization(firstShuffleId, 80L, 100L)
     assert(protocol.aggregateBufferUtilizationPercent === DefaultSpillThresholdPercent.toLong,
       "the executor is at exactly its configured threshold")
@@ -1345,16 +1315,12 @@ class BackpressureProtocolSuite extends SparkFunSuite
     assert(protocol.streamState(key) === BackpressureState.Spilling,
       "and utilisation is executor-wide, so it overlays every stream")
 
-    // Throttled -> Spilling: a stream that is ALSO held back reports the more severe of the two,
-    // because utilisation is executor-wide while credit is per stream.
     assert(protocol.tryAdmit(key, creditLimitBytes, 1L), "the credit-bound stream sends again")
     assert(!protocol.tryAdmit(key, creditLimitBytes, 2L), "and is refused again")
     assert(protocol.isStreamThrottled(key), "so it is genuinely throttled")
     assert(protocol.state === BackpressureState.Spilling, "yet spilling dominates the reading")
     assert(protocol.streamState(key) === BackpressureState.Spilling, "for that stream too")
 
-    // Spilling -> Flowing: eviction completed, and the buffers the acknowledgement freed were
-    // released inside the hundred-millisecond bound.
     assert(protocol.onAck(key, 1L) === creditLimitBytes, "the acknowledgement frees the buffers")
     clock.advance(ReclamationDeadlineMillis)
     assert(protocol.confirmReclamation(key) === Some(ReclamationDeadlineMillis),
@@ -1364,19 +1330,38 @@ class BackpressureProtocolSuite extends SparkFunSuite
     assert(!protocol.isSpillRequired, "the eviction brought the executor back under its threshold")
     assert(protocol.state === BackpressureState.Flowing, "so it is flowing once more")
 
-    // Spilling -> Degraded: an allocation that still fails after a spill is an OOM risk, and
-    // continuing would cost the job its heap rather than merely its throughput.
+    // Spilling stays Spilling when a block that could not be buffered is retained on local disk
+    // instead. This is the specified answer to a full buffer, so it is pressure telemetry and NOT a
+    // degradation: the producer goes on streaming, and a protocol that reported itself Degraded
+    // here would be claiming streaming is unsustainable while the shuffle it serves carries on.
     protocol.reportBufferUtilization(firstShuffleId, 95L, 100L)
     assert(protocol.state === BackpressureState.Spilling,
       "the executor is over its threshold again")
+    assert(protocol.durableSpillAdmissionCount === 0L, "and nothing has been retained on disk yet")
+    protocol.reportDurableSpillAdmission(key)
+    assert(protocol.durableSpillAdmissionCount === 1L,
+      "a block retained on disk because the allowance was met must be counted")
+    assert(!protocol.isDegraded,
+      "spilling past the allowance is the specified answer to a full buffer, so it must NOT " +
+        s"latch a reason, but it latched ${protocol.degradationReasons.mkString(", ")}")
+    assert(protocol.degradationReasons.isEmpty, "no reason at all, not merely a different one")
+    assert(protocol.state === BackpressureState.Spilling,
+      "and the state must still be the spilling one it was in, because the producer is streaming")
+    protocol.reportDurableSpillAdmission(key)
+    assert(protocol.durableSpillAdmissionCount === 2L,
+      "every retained block is counted, however few of them are reported individually")
+    assert(!protocol.isDegraded, "and no number of them ever degrades the subsystem")
+
+    // Spilling -> Degraded: an allocation that still fails after a spill is an OOM risk, and
+    // continuing would cost the job its heap rather than merely its throughput. This is the one
+    // memory condition that is genuinely unanswerable, and it is a different call from the one
+    // above precisely so that the two cannot be confused.
     protocol.reportBufferAllocationFailure(key)
     assert(protocol.state === BackpressureState.Degraded, "and an allocation failure degrades it")
     assert(protocol.degradationReasons ===
       Seq(BackpressureDegradationReason.BufferAllocationFailure),
       "naming the second of the four conditions under which streaming steps aside")
 
-    // Degraded is latched, because the fallback policy may sample it after the condition that
-    // caused it has passed, so an explicit clear is the only way back.
     protocol.clearDegradation()
     assert(!protocol.isDegraded, "clearing forgets every latched reason")
     assert(protocol.state === BackpressureState.Spilling, "revealing the condition underneath it")
@@ -1407,7 +1392,6 @@ class BackpressureProtocolSuite extends SparkFunSuite
       Seq(BackpressureDegradationReason.ConsumerSustainedSlowness),
       "naming the first of the four conditions")
 
-    // Recovery clears the latch, which is what makes the window continuous rather than cumulative.
     protocol.clearDegradation()
     assert(protocol.onAck(slowKey, 0L) === blockBytes, "the consumer catches up")
     assert(!protocol.isConsumerSlow(slowKey),
@@ -1477,8 +1461,6 @@ class BackpressureProtocolSuite extends SparkFunSuite
       Seq(BackpressureDegradationReason.ProtocolVersionMismatch),
       "naming the fourth of the four conditions")
 
-    // All four reasons are reachable, they accumulate rather than replace one another, and they are
-    // reported in the order they are declared so a log line is never at the mercy of set iteration.
     protocol.reportBufferAllocationFailure(key)
     assert(protocol.degradationReasons === Seq(
       BackpressureDegradationReason.BufferAllocationFailure,
@@ -1499,33 +1481,28 @@ class BackpressureProtocolSuite extends SparkFunSuite
     protocol.clearDegradation()
     assert(protocol.state === BackpressureState.Flowing, "clearing is the only way back")
 
-    // And a reset returns the protocol to exactly what a freshly constructed one reports.
     protocol.reset()
     assert(protocol.streamCount === 0, "every ledger is dropped")
     assert(protocol.numRegisteredShuffles === 0, "every registration with them")
     assert(protocol.aggregateBufferUtilizationPercent === 0L, "every utilisation contribution too")
     assert(protocol.backpressureEventCount === 0L, "the local event total is rewound")
     assert(protocol.reclamationDeadlineBreaches === 0L, "so is the breach total")
+    assert(protocol.durableSpillAdmissionCount === 0L, "and so is the durable-admission total")
     assert(!protocol.isDegraded, "no reason stays latched")
     assert(protocol.state === BackpressureState.Flowing, "and the state is the resting one")
   }
 
-  // -----------------------------------------------------------------------------------------------
-  // 7. Thread model: the protocol never calls a shuffle metrics reporter.
-  //
-  // The read and write metrics reporters document that they assume single-threaded use, so an
-  // implementation of one is entitled to skip synchronisation. This protocol is consulted from the
-  // task thread and from network event-loop threads alike, so calling a reporter from here would
-  // break that promise silently. The Dropwizard metric source is different in kind -- it is a
-  // lock-free registry -- and is the only telemetry this protocol advances.
-  // -----------------------------------------------------------------------------------------------
+  // Thread model: the protocol never calls a shuffle metrics reporter. The read and write reporters
+  // document that they assume single-threaded use, so an implementation of one is entitled to skip
+  // synchronisation -- and this protocol is consulted from the task thread and from network
+  // event-loop threads alike, so calling a reporter from here would break that promise silently.
+  // The Dropwizard metric source is different in kind, being a lock-free registry, and is the only
+  // telemetry this protocol advances.
 
-  test("the protocol never calls a shuffle metrics reporter") {
+  test("the protocol cannot reach a shuffle metrics reporter and reports through the source") {
     val reporterTypes =
       Seq(classOf[ShuffleReadMetricsReporter], classOf[ShuffleWriteMetricsReporter])
 
-    // Structurally: no constructor and no method of the protocol so much as mentions a reporter, so
-    // there is no seam through which one could be reached.
     val constructorMentions = classOf[BackpressureProtocol].getDeclaredConstructors
       .flatMap(_.getParameterTypes)
       .filter(parameter => reporterTypes.exists(_.isAssignableFrom(parameter)))
@@ -1540,10 +1517,119 @@ class BackpressureProtocolSuite extends SparkFunSuite
       "no method of the protocol may accept or return a metrics reporter, yet these do: " +
         methodMentions.map(_.getName).mkString(", "))
 
-    // Behaviourally: recorders that would notice a single call stay silent while every path this
-    // suite exercises is driven, and the lock-free counter the protocol may advance does move.
-    val writeMetrics = new RecordingStreamingShuffleWriteMetrics
-    val readMetrics = new RecordingStreamingShuffleReadMetrics
+    // Signatures alone do not settle it, because a body could reach a reporter without naming one
+    // in a signature -- through the ambient task context, which is global and needs no parameter.
+    // So the COMPILED artefact is inspected: every method reference a class body makes puts the
+    // owning type's internal name in that class file's constant pool, so the absence of these three
+    // names is the absence of any call at all. The two reporter interfaces are checked, and so is
+    // TaskContext, which is the only route by which one could be obtained without being handed in.
+    val forbiddenReferences = Seq(
+      "org/apache/spark/shuffle/ShuffleReadMetricsReporter",
+      "org/apache/spark/shuffle/ShuffleWriteMetricsReporter",
+      "org/apache/spark/TaskContext")
+    val protocolClassFiles = compiledClassFilesOf(classOf[BackpressureProtocol])
+    // The guard that makes this assertion non-vacuous: a scan that found no class files would
+    // "pass" while proving nothing, so the artefacts it read are named and counted first. The
+    // protocol's per-stream ledger and its rate window are nested types, and a scan that missed
+    // them would miss most of the code that could make such a call.
+    assert(protocolClassFiles.size >= 4,
+      "the scan must have read the protocol, its companion and its nested types, yet it read " +
+        s"only ${protocolClassFiles.size}: ${protocolClassFiles.map(_.getName).mkString(", ")}")
+    Seq("BackpressureProtocol$StreamLedger.class", "BackpressureProtocol$RateWindow.class")
+      .foreach { nested =>
+        assert(protocolClassFiles.exists(_.getName == nested),
+          s"the scan must include the nested $nested, yet it read only " +
+            protocolClassFiles.map(_.getName).mkString(", "))
+      }
+    protocolClassFiles.foreach { classFile =>
+      val bytecode = Files.readAllBytes(classFile.toPath)
+      forbiddenReferences.foreach { reference =>
+        assert(!containsUtf8(bytecode, reference),
+          s"${classFile.getName} references $reference, so the protocol can reach a metrics " +
+            "reporter from a network event-loop thread and the reporter's single-threaded " +
+            "contract is broken")
+      }
+    }
+
+    // Behaviourally: an ambient task context is INSTALLED, so the one seam a body could have used
+    // is live and observable while every path this suite exercises is driven. Its shuffle metrics
+    // are read before and after; a single reporting call anywhere in the protocol would move them.
+    // The lock-free Dropwizard counter, which is safe from any thread, is the one telemetry that
+    // does advance.
+    val taskContext = TaskContext.empty()
+    TaskContext.setTaskContext(taskContext)
+    try {
+      val ambientWriteMetrics = taskContext.taskMetrics.shuffleWriteMetrics
+      val ambientReadMetrics = taskContext.taskMetrics.shuffleReadMetrics
+      val baseline = observedBackpressureEvents()
+      val clock = newManualClock()
+      val protocol = newProtocol(clock)
+      val key = producerKey()
+      protocol.registerShuffle(firstShuffleId, partitionCount)
+      assert(protocol.registerStream(key, creditLimitBytes), "the ledger must open")
+      assert(protocol.tryAdmit(key, creditLimitBytes, 0L), "one full window goes out")
+      assert(!protocol.tryAdmit(key, creditLimitBytes, 1L), "the next block is throttled")
+      assert(protocol.onAck(key, 0L) === creditLimitBytes, "and then acknowledged")
+      protocol.onDataReceived(key, 1L, blockBytes)
+      protocol.onDiscardedData(key, blockBytes)
+      protocol.onHeartbeat(key)
+      assert(protocol.heartbeatFor(key, 2L).isDefined, "a heartbeat is built")
+      protocol.reportBufferUtilization(firstShuffleId, 10L, 100L)
+      assert(protocol.pollOnce() >= 0, "a poll runs")
+      assert(!protocol.isConsumerSustainedSlow(key), "slowness is observed")
+      protocol.reportDurableSpillAdmission(key)
+      assert(!protocol.isDegraded, "a durable admission is reported without latching anything")
+      protocol.reportBufferAllocationFailure(key)
+      assert(protocol.isDegraded, "a reason is latched")
+      protocol.clearDegradation()
+      protocol.onStreamTermination(key, 2L)
+      assert(protocol.unregisterShuffle(firstShuffleId) === 1, "and the shuffle is retired")
+
+      assert(TaskContext.get() eq taskContext,
+        "the fixture must actually be the ambient context throughout, or the observation below " +
+          "would be of a context nothing could have reached")
+      assert(ambientWriteMetrics.bytesWritten === 0L && ambientWriteMetrics.recordsWritten === 0L &&
+          ambientWriteMetrics.writeTime === 0L,
+        "the protocol must never report through the ambient task context's write metrics, since " +
+          "the write path reports from the task thread while the protocol runs on network " +
+          s"threads too, yet it recorded ${ambientWriteMetrics.bytesWritten} byte(s), " +
+          s"${ambientWriteMetrics.recordsWritten} record(s) and " +
+          s"${ambientWriteMetrics.writeTime} ns")
+      assert(ambientReadMetrics.remoteBytesRead === 0L &&
+          ambientReadMetrics.localBytesRead === 0L &&
+          ambientReadMetrics.recordsRead === 0L &&
+          ambientReadMetrics.remoteBlocksFetched === 0L &&
+          ambientReadMetrics.localBlocksFetched === 0L &&
+          ambientReadMetrics.fetchWaitTime === 0L,
+        "and it must never report through the ambient read metrics either, yet it recorded " +
+          s"${ambientReadMetrics.remoteBytesRead} remote byte(s), " +
+          s"${ambientReadMetrics.recordsRead} record(s) and " +
+          s"${ambientReadMetrics.remoteBlocksFetched} remote block(s)")
+      assert(observedBackpressureEvents() - baseline === 1L,
+        "while the lock-free Dropwizard counter, which is safe from any thread, did advance")
+    } finally {
+      TaskContext.unset()
+    }
+    // A field would be the one remaining way to hold a reporter without naming one in any
+    // signature, so the fields are enumerated too. With constructors, methods and fields all
+    // closed, the property is established by construction: there is no seam through which a
+    // reporter could be supplied and nowhere for one to be held.
+    //
+    // Deliberately NOT asserted by handing the protocol a recording reporter and checking that it
+    // was never called. There is no way to hand it one -- which is precisely what the three checks
+    // above establish -- so such a recorder would sit beside the protocol rather than inside it,
+    // and its call count would be zero however the protocol behaved. An assertion that cannot fail
+    // is worse than no assertion, because it reads like coverage.
+    val fieldMentions = classOf[BackpressureProtocol].getDeclaredFields
+      .filter(field => reporterTypes.exists(_.isAssignableFrom(field.getType)))
+    assert(fieldMentions.isEmpty,
+      "no field of the protocol may hold a metrics reporter, yet these do: " +
+        fieldMentions.map(field => s"${field.getName}: ${field.getType.getName}").mkString(", "))
+
+    // Behaviourally: the telemetry the protocol IS entitled to advance -- the lock-free Dropwizard
+    // counter, which is safe from any thread -- moves exactly once while every path this suite
+    // exercises is driven. That is the positive half of the same statement: the protocol reports,
+    // and it reports through the one mechanism whose thread model permits it.
     val baseline = observedBackpressureEvents()
     val clock = newManualClock()
     val protocol = newProtocol(clock)
@@ -1566,27 +1652,66 @@ class BackpressureProtocolSuite extends SparkFunSuite
     protocol.onStreamTermination(key, 2L)
     assert(protocol.unregisterShuffle(firstShuffleId) === 1, "and the shuffle is retired")
 
-    assert(writeMetrics.callCount === 0L,
-      "the protocol must never call a write metrics reporter, because the write path reports " +
-        "from the task thread while the protocol runs on network threads too")
-    assert(readMetrics.callCount === 0L, "and it must never call a read metrics reporter either")
-    assertSingleThreadedReporting(
-      writeMetrics.foreignThreadCallCount, "the streaming shuffle write reporter")
-    assertSingleThreadedReporting(
-      readMetrics.foreignThreadCallCount, "the streaming shuffle read reporter")
     assert(observedBackpressureEvents() - baseline === 1L,
-      "while the lock-free Dropwizard counter, which is safe from any thread, did advance")
+      "the throttle above must have advanced the Dropwizard backpressure counter exactly once, " +
+        s"but it moved by ${observedBackpressureEvents() - baseline}")
   }
 
-  // -----------------------------------------------------------------------------------------------
-  // 8. Configuration: consumed from its typed entries, never re-declared.
-  //
-  // The five streaming shuffle properties are declared exactly once, in the core configuration
-  // package object, and every fixture and component reads them through those typed entries. A range
-  // is enforced by the entry's own validator at READ time, so a value outside it never reaches a
-  // component at all -- and because the validator raises an EXISTING error condition, the streaming
-  // shuffle adds no error-catalogue entry for configuration validation.
-  // -----------------------------------------------------------------------------------------------
+  /**
+   * Every compiled class file of a class, its Scala companion and their nested types.
+   *
+   * Read from the artefact directory the class itself was loaded from, so the set is what the
+   * compiler actually produced rather than what reflection happens to expose -- a private nested
+   * type is in the directory whether or not any signature mentions it.
+   *
+   * @param cls the class whose artefacts are wanted
+   * @return the class files, which the caller must check is not vacuously empty
+   */
+  private def compiledClassFilesOf(cls: Class[_]): Seq[File] = {
+    val simpleName = cls.getName.split('.').last
+    val resource = cls.getResource(s"$simpleName.class")
+    assert(resource != null, s"$simpleName must have been compiled to a readable class file")
+    assert(resource.getProtocol == "file",
+      s"$simpleName must be loaded from a directory of class files, not from ${resource}")
+    val directory = new File(resource.toURI).getParentFile
+    val prefix = s"$simpleName."
+    val nestedPrefix = s"$simpleName$$"
+    Option(directory.listFiles()).toSeq.flatten
+      .filter(_.isFile)
+      .filter { file =>
+        file.getName.endsWith(".class") &&
+          (file.getName == s"$simpleName.class" ||
+            file.getName == s"$simpleName$$.class" ||
+            file.getName.startsWith(nestedPrefix))
+      }
+      .filter(_.getName.startsWith(prefix.dropRight(1)))
+      .sortBy(_.getName)
+  }
+
+  /**
+   * Whether a class file's bytes contain a name, which is how a pool reference is detected.
+   *
+   * Internal class names are ASCII, and the constant pool stores them as modified UTF-8, so for
+   * these names the encoded form and the literal bytes coincide and a substring search is exact.
+   *
+   * @param bytecode the class file's bytes
+   * @param name the internal class name to look for, slash-separated
+   * @return true when the name appears anywhere in the class file
+   */
+  private def containsUtf8(bytecode: Array[Byte], name: String): Boolean = {
+    val needle = name.getBytes(StandardCharsets.UTF_8)
+    if (needle.length > bytecode.length) {
+      false
+    } else {
+      (0 to bytecode.length - needle.length).exists { start =>
+        var index = 0
+        while (index < needle.length && bytecode(start + index) == needle(index)) {
+          index += 1
+        }
+        index == needle.length
+      }
+    }
+  }
 
   test("the spill threshold and the receive budget are consumed from their typed entries") {
     val clock = newManualClock()
@@ -1605,7 +1730,6 @@ class BackpressureProtocolSuite extends SparkFunSuite
           s"and exactly $threshold percent must, because the threshold is inclusive")
       }
 
-    // A value outside the documented range is refused where the entry is read.
     val rejected = intercept[SparkIllegalArgumentException] {
       protocolWith(
         streamingConfWithOverrides(spillThreshold = MaxSpillThresholdPercent + 1), clock, null)
@@ -1638,5 +1762,126 @@ class BackpressureProtocolSuite extends SparkFunSuite
       "the receive budget is floored at one maximum-sized encoded frame")
     assert(tinyProtocol.tryReserveReceiveQuota(MaxEncodedFrameBytes.toLong),
       "so the largest legal frame is always admissible")
+  }
+
+  // -----------------------------------------------------------------------------------------------
+  // Negative validation. Each guard below is a boundary a caller can reach, and each is asserted to
+  // refuse AND to leave the ledger exactly as it was: a guard that threw after mutating state would
+  // be worse than no guard, because the caller would be told nothing happened when something had.
+  // -----------------------------------------------------------------------------------------------
+
+  test("every registration guard refuses without changing any state") {
+    val clock = newManualClock()
+    val protocol = newProtocol(clock)
+    protocol.registerShuffle(firstShuffleId, partitionCount)
+    val key = producerKey()
+    assert(protocol.registerStream(key, creditLimitBytes), "the ledger must open")
+
+    val shufflesBefore = protocol.registeredShuffleIds
+    val streamsBefore = protocol.registeredStreams
+    val creditBefore = protocol.availableCreditBytes(key)
+    val eventsBefore = observedBackpressureEvents()
+
+    val refusals: Seq[(String, () => Any)] = Seq(
+      ("a negative shuffle id", () => protocol.registerShuffle(-1, partitionCount)),
+      ("a zero partition count", () => protocol.registerShuffle(firstShuffleId + 1, 0)),
+      ("a negative partition count", () => protocol.registerShuffle(firstShuffleId + 1, -1)),
+      ("a null stream key", () => protocol.registerStream(null, creditLimitBytes)),
+      ("a stream key naming a negative shuffle",
+        () => protocol.registerStream(
+          BackpressureStreamKey.forProducer(-1, mapId, taskAttemptId, partitionId, consumerId),
+          creditLimitBytes)),
+      ("a stream key naming a negative partition",
+        () => protocol.registerStream(
+          BackpressureStreamKey.forProducer(firstShuffleId, mapId, taskAttemptId, -1, consumerId),
+          creditLimitBytes)),
+      ("a zero credit limit", () => protocol.registerStream(producerKey(partition = 1), 0L)),
+      ("a negative credit limit", () => protocol.registerStream(producerKey(partition = 1), -1L)))
+
+    refusals.foreach { case (description, attempt) =>
+      intercept[IllegalArgumentException] {
+        attempt()
+      }
+    }
+
+    assert(protocol.registeredShuffleIds === shufflesBefore,
+      s"no refused registration may add a shuffle, but the registry went from " +
+        s"${shufflesBefore.mkString("[", ", ", "]")} to " +
+        s"${protocol.registeredShuffleIds.mkString("[", ", ", "]")}")
+    assert(protocol.registeredStreams === streamsBefore,
+      s"no refused registration may open a ledger, but the streams went from " +
+        s"${streamsBefore.mkString("[", ", ", "]")} to " +
+        s"${protocol.registeredStreams.mkString("[", ", ", "]")}")
+    assert(protocol.availableCreditBytes(key) === creditBefore,
+      s"no refused registration may disturb an open ledger's credit, but it went from " +
+        s"${creditBefore} to ${protocol.availableCreditBytes(key)}")
+    assert(observedBackpressureEvents() === eventsBefore,
+      s"a malformed call is a programming error rather than backpressure, so no event may be " +
+        s"recorded, but the counter went from ${eventsBefore} to ${observedBackpressureEvents()}")
+    assert(protocol.egressBytes === 0L && protocol.ingressBytes === 0L,
+      s"no refused call may charge the link, but egress read ${protocol.egressBytes} and ingress " +
+        s"${protocol.ingressBytes}")
+  }
+
+  test("every sequence and total guard refuses without changing any state") {
+    val clock = newManualClock()
+    val protocol = newProtocol(clock)
+    val key = producerKey()
+    val receiveKey = consumerKey()
+    protocol.registerShuffle(firstShuffleId, partitionCount)
+    assert(protocol.registerStream(key, creditLimitBytes), "the producer ledger must open")
+    assert(protocol.registerStream(receiveKey, creditLimitBytes), "the consumer ledger must open")
+    assert(protocol.tryAdmit(key, blockBytes, 0L), "one block is admitted so there is a window")
+
+    val outstandingBefore = protocol.outstandingBytes(key)
+    val creditBefore = protocol.availableCreditBytes(key)
+    val sentBefore = protocol.sentBytes(key)
+    val chargedBefore = protocol.highestChargedSequenceNumber(key)
+    val windowBefore = protocol.unacknowledgedWindow(key)
+    val egressBefore = protocol.egressBytes
+    val ingressBefore = protocol.ingressBytes
+    val replayedBefore = protocol.replayedBytes(key)
+    val eventsBefore = observedBackpressureEvents()
+
+    val refusals: Seq[(String, () => Any)] = Seq(
+      ("a negative sequence number offered for admission",
+        () => protocol.tryAdmit(key, blockBytes, -1L)),
+      ("a negative sequence number offered for a replay",
+        () => protocol.tryAdmitReplay(key, blockBytes, -1L)),
+      ("a negative sequence number offered on receipt",
+        () => protocol.onDataReceived(receiveKey, -1L, blockBytes)),
+      ("a negative announced block total",
+        () => protocol.onStreamTermination(receiveKey, -1L)))
+
+    refusals.foreach { case (description, attempt) =>
+      intercept[IllegalArgumentException] {
+        attempt()
+      }
+    }
+
+    assert(protocol.outstandingBytes(key) === outstandingBefore &&
+        protocol.availableCreditBytes(key) === creditBefore &&
+        protocol.sentBytes(key) === sentBefore,
+      s"no refused call may charge or release credit, but outstanding went from " +
+        s"${outstandingBefore} to ${protocol.outstandingBytes(key)}, credit from ${creditBefore} " +
+        s"to ${protocol.availableCreditBytes(key)} and sent from ${sentBefore} to " +
+        s"${protocol.sentBytes(key)}")
+    assert(protocol.highestChargedSequenceNumber(key) === chargedBefore,
+      s"no refused call may advance the charged sequence cursor, but it went from " +
+        s"${chargedBefore} to ${protocol.highestChargedSequenceNumber(key)}")
+    assert(protocol.unacknowledgedWindow(key) === windowBefore,
+      s"no refused call may widen the unacknowledged window, but it went from ${windowBefore} to " +
+        s"${protocol.unacknowledgedWindow(key)}")
+    assert(protocol.replayedBytes(key) === replayedBefore,
+      s"no refused replay may be counted as replayed volume, but it went from ${replayedBefore} " +
+        s"to ${protocol.replayedBytes(key)}")
+    assert(protocol.egressBytes === egressBefore && protocol.ingressBytes === ingressBefore,
+      s"no refused call may charge the link, but egress went from ${egressBefore} to " +
+        s"${protocol.egressBytes} and ingress from ${ingressBefore} to ${protocol.ingressBytes}")
+    assert(observedBackpressureEvents() === eventsBefore,
+      s"no refused call may record a backpressure event, but the counter went from " +
+        s"${eventsBefore} to ${observedBackpressureEvents()}")
+    assert(protocol.isStreamRegistered(key) && protocol.isStreamRegistered(receiveKey),
+      "both ledgers must still be open after every refusal")
   }
 }

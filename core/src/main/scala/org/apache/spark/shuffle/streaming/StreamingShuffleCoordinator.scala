@@ -405,7 +405,13 @@ private[spark] case class StreamingShuffleProducerLiveness(live: Boolean, coordi
 private[spark] case class StreamingShuffleRegistrationGrant(
     coordinatorEpoch: Long,
     capabilityToken: String,
-    fallback: StreamingShuffleFallbackState = StreamingShuffleFallbackState())
+    fallback: StreamingShuffleFallbackState = StreamingShuffleFallbackState()) {
+
+  /** Renders the grant without disclosing the credential it carries. */
+  override def toString: String =
+    s"StreamingShuffleRegistrationGrant(coordinatorEpoch=$coordinatorEpoch, " +
+      s"capabilityToken=${StreamingShuffleCoordinator.REDACTED_TOKEN}, fallback=$fallback)"
+}
 
 /**
  * Base type of every message handled by [[StreamingShuffleCoordinator]].
@@ -415,7 +421,17 @@ private[spark] case class StreamingShuffleRegistrationGrant(
  * signal. Every member is `private[spark]`, so none of them widens a public surface and none
  * needs a binary-compatibility exclusion.
  */
-private[spark] sealed trait StreamingShuffleCoordinatorMessage
+private[spark] sealed trait StreamingShuffleCoordinatorMessage {
+
+  /**
+   * The rendering a capability token takes wherever a member of this family renders itself.
+   *
+   * Held on the base type rather than restated in each member, so that the family cannot acquire a
+   * message whose token rendering differs from its siblings', and so that the substitute is one
+   * value to change rather than nine.
+   */
+  protected def redactedToken: String = StreamingShuffleCoordinator.REDACTED_TOKEN
+}
 
 /**
  * Announces that an executor has begun streaming the output of one map task.
@@ -446,7 +462,14 @@ private[spark] case class RegisterStreamingShuffleProducer(
     location: StreamingShuffleProducerLocation,
     numPartitions: Int,
     protocolVersion: Byte,
-    timestampMs: Long) extends StreamingShuffleCoordinatorMessage
+    timestampMs: Long) extends StreamingShuffleCoordinatorMessage {
+
+  /** Renders the request without disclosing the credential it carries. */
+  override def toString: String =
+    s"RegisterStreamingShuffleProducer(shuffleId=$shuffleId, " +
+      s"capabilityToken=$redactedToken, location=$location, numPartitions=$numPartitions, " +
+      s"protocolVersion=$protocolVersion, timestampMs=$timestampMs)"
+}
 
 /**
  * Asks for the producers currently streaming a shuffle, on behalf of a reduce task that consumes
@@ -469,7 +492,13 @@ private[spark] case class LookupStreamingShuffleProducers(
     shuffleId: Int,
     capabilityToken: String,
     startPartition: Int,
-    endPartition: Int) extends StreamingShuffleCoordinatorMessage
+    endPartition: Int) extends StreamingShuffleCoordinatorMessage {
+
+  /** Renders the request without disclosing the credential it carries. */
+  override def toString: String =
+    s"LookupStreamingShuffleProducers(shuffleId=$shuffleId, " +
+      s"capabilityToken=$redactedToken, startPartition=$startPartition, endPartition=$endPartition)"
+}
 
 /**
  * Refreshes the liveness of one registered producer generation. The reply reports
@@ -495,7 +524,13 @@ private[spark] case class HeartbeatStreamingShuffleProducer(
     shuffleId: Int,
     capabilityToken: String,
     generation: StreamingShuffleProducerGeneration,
-    timestampMs: Long) extends StreamingShuffleCoordinatorMessage
+    timestampMs: Long) extends StreamingShuffleCoordinatorMessage {
+
+  /** Renders the request without disclosing the credential it carries. */
+  override def toString: String =
+    s"HeartbeatStreamingShuffleProducer(shuffleId=$shuffleId, " +
+      s"capabilityToken=$redactedToken, generation=$generation, timestampMs=$timestampMs)"
+}
 
 /**
  * Why a producer generation was invalidated, as a closed set of codes rather than as free text.
@@ -618,7 +653,13 @@ private[spark] case class InvalidateStreamingShuffleProducer(
     capabilityToken: String,
     generation: StreamingShuffleProducerGeneration,
     reason: StreamingShuffleInvalidationReason,
-    detail: String = null) extends StreamingShuffleCoordinatorMessage
+    detail: String = null) extends StreamingShuffleCoordinatorMessage {
+
+  /** Renders the request without disclosing the credential it carries. */
+  override def toString: String =
+    s"InvalidateStreamingShuffleProducer(shuffleId=$shuffleId, " +
+      s"capabilityToken=$redactedToken, generation=$generation, reason=$reason, detail=$detail)"
+}
 
 /**
  * Drops all state for a shuffle. Answered with `true` when state was present and dropped, and
@@ -629,7 +670,12 @@ private[spark] case class InvalidateStreamingShuffleProducer(
  *                        which the unregistration is refused
  */
 private[spark] case class UnregisterStreamingShuffle(shuffleId: Int, capabilityToken: String)
-  extends StreamingShuffleCoordinatorMessage
+  extends StreamingShuffleCoordinatorMessage {
+
+  /** Renders the request without disclosing the credential it carries. */
+  override def toString: String =
+    s"UnregisterStreamingShuffle(shuffleId=$shuffleId, capabilityToken=$redactedToken)"
+}
 
 /**
  * Reports that one producer has finished streaming its whole map output, so that a consumer can
@@ -649,7 +695,13 @@ private[spark] case class CompleteStreamingShuffleProducer(
     shuffleId: Int,
     capabilityToken: String,
     generation: StreamingShuffleProducerGeneration)
-  extends StreamingShuffleCoordinatorMessage
+  extends StreamingShuffleCoordinatorMessage {
+
+  /** Renders the request without disclosing the credential it carries. */
+  override def toString: String =
+    s"CompleteStreamingShuffleProducer(shuffleId=$shuffleId, " +
+      s"capabilityToken=$redactedToken, generation=$generation)"
+}
 
 /**
  * Declares that a shuffle must stand streaming down for every participant, and why.
@@ -678,7 +730,13 @@ private[spark] case class DeclareStreamingShuffleFallback(
     shuffleId: Int,
     capabilityToken: String,
     reasonName: String,
-    detail: String = null) extends StreamingShuffleCoordinatorMessage
+    detail: String = null) extends StreamingShuffleCoordinatorMessage {
+
+  /** Renders the request without disclosing the credential it carries. */
+  override def toString: String =
+    s"DeclareStreamingShuffleFallback(shuffleId=$shuffleId, " +
+      s"capabilityToken=$redactedToken, reasonName=$reasonName, detail=$detail)"
+}
 
 /**
  * Asks whether a shuffle has stood streaming down, so that a participant can decide between the
@@ -694,7 +752,12 @@ private[spark] case class DeclareStreamingShuffleFallback(
  */
 private[spark] case class GetStreamingShuffleFallbackState(
     shuffleId: Int,
-    capabilityToken: String) extends StreamingShuffleCoordinatorMessage
+    capabilityToken: String) extends StreamingShuffleCoordinatorMessage {
+
+  /** Renders the request without disclosing the credential it carries. */
+  override def toString: String =
+    s"GetStreamingShuffleFallbackState(shuffleId=$shuffleId, capabilityToken=$redactedToken)"
+}
 
 /**
  * Asks how many streaming shuffles are concurrently active on one executor. The answer is the
@@ -932,6 +995,23 @@ private[spark] case class StreamingShuffleState(
     val remaining = index.getOrElse(executorId, 1) - 1
     if (remaining <= 0) index - executorId else index.updated(executorId, remaining)
   }
+
+  /**
+   * Renders the registry entry without disclosing the credential it holds.
+   *
+   * This value is the most exposed of the token-bearing ones, because it is the coordinator's own
+   * per-shuffle record: it is interpolated into diagnostics about the shuffle it describes and it
+   * is the natural thing to render when the registry is dumped. Producer entries are summarised by
+   * count rather than listed, because a registry of a wide shuffle holds one per map task and a
+   * diagnostic that expanded them all would be unusable as well as long.
+   */
+  override def toString: String =
+    s"StreamingShuffleState(numPartitions=$numPartitions, mapStage=$mapStage, " +
+      s"protocolVersion=$protocolVersion, coordinatorEpoch=$coordinatorEpoch, " +
+      s"capabilityToken=${StreamingShuffleCoordinator.REDACTED_TOKEN}, " +
+      s"producers=${producers.size}, retiredAttempts=${retiredAttempts.size}, " +
+      s"producerExecutors=${producerExecutors.size}, fallback=$fallback, " +
+      s"lastActivityMs=$lastActivityMs)"
 }
 
 /**
@@ -946,16 +1026,25 @@ private[spark] case class StreamingShuffleState(
  * address. It also supplies `numConcurrentShuffles`, the divisor of the token-bucket refill rate
  * `maxBandwidthMBps * 1 MiB / numConcurrentShuffles`, which no existing Spark API reports.
  *
- * What "while the map stage is in flight" does and does not promise. This endpoint answers a lookup
- * against producers that are merely *registered*, so a consumer asking during production is
- * answered rather than made to wait -- but when a consumer asks is decided by task submission,
- * which belongs to the DAG scheduler and is an absolute preservation zone for this feature. Under
- * the unmodified scheduler a reduce stage is submitted only once its map stage reports available
- * output, so at an ordinary stage boundary the lookups this endpoint serves name producers that
- * have already finished, and their retained output is served from the resolver. The reply also
- * carries the completion set, so a reader records which of the two actually happened instead of
- * assuming the overlap. See `StreamingShuffleWriter` and `StreamingShuffleServerHandler` for the
- * same statement from the producing side.
+ * ==What "while the map stage is in flight" means here==
+ *
+ * A lookup is answered from the set of *registered* producers, and registration happens when a
+ * producer begins streaming rather than when it finishes. So a consumer that asks mid-production is
+ * answered with a live address on the spot -- there is one lookup path, and it serves a consumer
+ * that asks during production and one that asks afterwards identically. Nothing in this endpoint
+ * waits for a map stage to complete, and nothing in it distinguishes the two callers.
+ *
+ * What differs between them is only *when* they call, and that is decided by task submission, which
+ * belongs to the DAG scheduler. The scheduler is an absolute preservation zone for this feature --
+ * AAP 0.2.1 and 0.2.2 forbid modifying the DAG scheduler or the task lifecycle, and AAP 0.8.2 Tier
+ * 1 restates it -- and the unmodified scheduler submits a reduce stage only once its map stage
+ * reports available output. At an ordinary stage boundary the lookups served here therefore name
+ * producers whose task has ended, and the retained output of those producers is served from the
+ * block resolver over the same wire protocol, by the same handler, as a live one. The reply carries
+ * the completion set so that a reader *records* which of the two it got rather than assuming
+ * either. See `StreamingShuffleWriter` and `StreamingShuffleServerHandler` for the same bound
+ * stated from the producing side, and `StreamingShuffleWriterSuite`'s "a subscribed consumer is
+ * served while the map task is still producing" for the machine-checked form of it.
  *
  * Coexistence with the classic path. This registry is entirely separate from map-output tracking
  * and shares no state with it. Sort-based shuffle remains the default and the fallback, and
@@ -2881,6 +2970,27 @@ private[spark] object StreamingShuffleCoordinator extends Logging {
    * executor.
    */
   val ENDPOINT_NAME: String = "StreamingShuffleCoordinator"
+
+  /**
+   * What a capability token renders as, everywhere one would otherwise be rendered.
+   *
+   * '''Why every token-bearing value needs this.''' The token is the whole of the coordinator's
+   * authorization: a peer holding it may replace a producer address, refresh a liveness window,
+   * invalidate a generation, force a shuffle onto the sort-based path, or drop a registration
+   * outright. A `case class` gets a generated `toString` that renders every field, and these
+   * values reach renderings nobody writes by hand -- Spark's own RPC layer logs a message it
+   * cannot deliver or does not recognise in full, an `Option` or a collection of them lands in a
+   * `require` diagnostic, and a state value is interpolated into a log record about the shuffle it
+   * describes. A credential printed in any of those has left the trusted channel it was designed
+   * never to leave, and it stays in the log for as long as the log does.
+   *
+   * So the presence of a token is reported and its value never is. The substitute is a fixed
+   * string, deliberately not a hash or a prefix: a stable derivation of a secret is still a
+   * distinguisher for it, and a prefix is a head start for whoever is guessing the rest. It
+   * matches the rendering `StreamingShuffleHandle` already uses, so the one credential in this
+   * subsystem reads the same wherever it is mentioned.
+   */
+  val REDACTED_TOKEN: String = "<redacted>"
 
   /**
    * Streaming shuffle wire-protocol version this build speaks.

@@ -174,8 +174,8 @@ private[spark] trait StreamingShuffleRouteRegistry {
  * =Why a healthy shuffle can put nothing on the wire=
  *
  * Stated here because this handler is where the evidence shows up, and it reads like a fault when
- * it is not one. At an ordinary stage boundary this handler will report every block as enqueued and
- * held -- "egress is paced, no consumer has subscribed, or no channel is writable" -- and finish
+ * it is not one. At an ordinary stage boundary this handler reports every block as enqueued and
+ * held -- "egress is paced, no consumer has subscribed, or no channel is writable" -- and finishes
  * with zero bytes on the wire, having streamed nothing live to anyone.
  *
  * That is the expected reading, and the reason is structural rather than local. Whether a consumer
@@ -190,13 +190,12 @@ private[spark] trait StreamingShuffleRouteRegistry {
  * materialisation; the producer/consumer overlap is capability rather than outcome.
  *
  * Live egress through this handler is therefore exercised where a consumer really is attached -- a
- * reduce attempt reading while a superseded or speculative map attempt still produces, a replay
- * requested by a reconnecting consumer -- and would be exercised throughout under a scheduler that
- * submitted consumers earlier. Nothing in this file assumes either case: the accounting of bytes on
- * the wire is kept exact precisely so the difference is measurable rather than assumed, and
- * `StreamingShuffleWriter`'s own class documentation carries the same statement from the producing
- * side. Do not read a zero as a defect in egress, and do not add a warning for it: it is the
- * scheduler's submission order, visible from here.
+ * replay requested by a reconnecting consumer, and any subscriber a scheduler that submitted
+ * consumers earlier would provide. Nothing in this file assumes either case: the accounting of
+ * bytes on the wire is kept exact precisely so the difference is measurable rather than assumed,
+ * and `StreamingShuffleWriter`'s own class documentation carries the same statement from the
+ * producing side. Do not read a zero as a defect in egress, and do not add a warning for it: it is
+ * the scheduler's submission order, visible from here.
  *
  * @param conf the executor's configuration, read exactly once during construction
  * @param shuffleId the shuffle whose partitions this handler streams
@@ -409,6 +408,29 @@ private[spark] class StreamingShuffleServerHandler(
   private val sessionCapacityReported = new AtomicBoolean(false)
   private val consumerCapacityReported = new AtomicBoolean(false)
 
+  /**
+   * Consumer-session slots currently claimed, which is the concurrency ceiling made atomic.
+   *
+   * A counter rather than `sessions.size()`, because a ceiling enforced by reading a size and then
+   * inserting is two steps: a burst of connections all read a size below the ceiling and then all
+   * insert past it, so the ceiling fails under exactly the arrival pattern it exists to bound. A
+   * slot is claimed by compare-and-set before a session is built and returned by [[forgetSession]],
+   * which is the single teardown point every removal path routes through.
+   */
+  private val liveSessionSlots = new AtomicInteger(0)
+
+  /**
+   * Subscribers currently admitted per reduce partition.
+   *
+   * The number of sessions is bounded and one session's subscription map is bounded, but their
+   * product decides how much per-stream state a single partition can be made to carry -- and a
+   * partition is legitimately read by exactly one reduce task. Bounding the subscribers of a
+   * partition closes that product. Entries are created on first subscription and cleared with the
+   * handler; there is at most one per reduce partition, so the map is bounded by the shuffle's own
+   * width rather than by anything a peer chooses.
+   */
+  private val subscribersByPartition = new ConcurrentHashMap[Integer, AtomicInteger]()
+
   // Partitions whose end of stream has been requested. Read on the egress hot path to decide
   // whether the deferral scan below has anything to look for: that scan visits every stream this
   // handler owns, so running it after each drain pass while the task is still producing would make
@@ -447,6 +469,9 @@ private[spark] class StreamingShuffleServerHandler(
     new MemorySpillManager.LogAggregationGate(MemorySpillManager.LOG_AGGREGATION_WINDOW_MS)
   private val lossyChannelClosures = new AtomicLong(0L)
   private val lossyChannelLogGate =
+    new MemorySpillManager.LogAggregationGate(MemorySpillManager.LOG_AGGREGATION_WINDOW_MS)
+  private val framingBudgetRefusals = new AtomicLong(0L)
+  private val framingBudgetLogGate =
     new MemorySpillManager.LogAggregationGate(MemorySpillManager.LOG_AGGREGATION_WINDOW_MS)
 
   /**
@@ -878,6 +903,27 @@ private[spark] class StreamingShuffleServerHandler(
                 log"${MDC(VALUE, rateLimiter.availableTokens)} token(s) available")
             }
             keepGoing = false
+          } else if (!StreamingShuffleServerHandler.EgressFramingBudget
+              .tryReserve(pending.framedBytes.toLong)) {
+            // Every credit and pacing check has passed, but this executor has as many transient
+            // framing copies in flight as it is allowed. The block is returned to the queue exactly
+            // as a pacing refusal returns it, and the refill wake-up below retries it -- so the
+            // budget delays a block rather than dropping one. The ledger entry the admission above
+            // created is left in place deliberately: it names a block inside the unacknowledged
+            // window, which is where this block still is, and withdrawing it would make the very
+            // replay this queue is about to perform unserviceable.
+            session.queue.offer(pending)
+            throttles.incrementAndGet()
+            throttled = true
+            reportBounded(framingBudgetLogGate, framingBudgetRefusals,
+              log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} partition " +
+                log"${MDC(PARTITION_ID, pending.partitionId)} is holding " +
+                log"${MDC(NUM_BYTES, pending.framedBytes)} framed byte(s) because this executor " +
+                log"already has " +
+                log"${MDC(MAX_SIZE, StreamingShuffleServerHandler.EgressFramingBudget.inFlight)} " +
+                log"byte(s) of streaming shuffle egress in flight, its ceiling of " +
+                log"${MDC(THRESHOLD, StreamingShuffleServerHandler.EgressFramingBudget.capacity)}")
+            keepGoing = false
           } else if (writeBlock(session, pending)) {
             written += pending.framedBytes.toLong
             flushNeeded = true
@@ -949,31 +995,43 @@ private[spark] class StreamingShuffleServerHandler(
    * report a successful map output that at least one reader cannot read. That case is escalated by
    * [[abortUnservableStream]] instead.
    *
-   * <b>Why the framing copy is not charged to the buffer budget.</b> Building the message and
-   * encoding it allocates one transient copy of the payload, and that copy is deliberately
-   * outside the executor-wide quota, because it is not retained: it is handed to the channel and
-   * released as the socket drains it. What bounds it is the transport's own outbound accounting --
-   * the caller writes only while `Channel.isWritable` holds, so the number of framing copies in
-   * flight at once is capped by Netty's write water marks rather than being unbounded. The quota's
-   * job is the different one of bounding what is *held*, and every held byte is in the retained
-   * store, exactly once, charged before it was admitted. A framing copy that was charged as well
-   * would double-count the same block and shrink the real streaming window to half of what the
-   * operator configured.
+   * <b>Why the framing copy is charged to its own budget rather than to the buffer budget.</b>
+   * Building the message and encoding it allocates a transient copy of the payload, and that copy
+   * is deliberately outside the executor-wide *buffer* quota, because it is not retained: it is
+   * handed to the channel and released as the socket drains it. Charging it there as well would
+   * double-count the same block and shrink the real streaming window to half of what the operator
+   * configured -- every held byte is already in the retained store, exactly once, charged before it
+   * was admitted.
+   *
+   * It is nonetheless charged, to
+   * [[StreamingShuffleServerHandler.EgressFramingBudget]], and Netty's own write water marks are
+   * not a substitute for that. A water mark bounds one channel: the caller writes only while
+   * `Channel.isWritable` holds, so a single consumer cannot accumulate copies without limit. But
+   * the ceiling on consumers is [[MAX_CONCURRENT_SESSIONS]] per map output, across every map output
+   * on the executor, and per-channel bounds multiply -- so thousands of sessions each holding one
+   * high-water mark's worth of transient copies is an aggregate no per-channel limit constrains.
+   * The budget is executor wide precisely because that is the quantity that has to be bounded, and
+   * the reservation is taken in [[drainOnce]] before this method runs, so the copy below is never
+   * made until there is room for it. The listener released with the write is what returns it: a
+   * copy stops occupying the executor the moment the transport is done with it, not when this
+   * method returns.
    *
    * @return true if a frame was handed to the channel
    */
   private def writeBlock(session: ConsumerSession, pending: PendingBlock): Boolean = {
     val partitionId = pending.partitionId
     val sequenceNumber = pending.sequenceNumber
+    val framedBytes = pending.framedBytes.toLong
     val payload = retainedOutput.flatMap(_.retainedPayload(partitionId, sequenceNumber))
     session.releasePending(pending)
     payload match {
       case Some(bytes) =>
         val block = DataBlockMessage.withComputedChecksum(
           shuffleId, mapId, partitionId, sequenceNumber, bytes)
-        val framedBytes = pending.framedBytes.toLong
         session.recordSent(partitionId, sequenceNumber, framedBytes)
-        session.channel.write(sendable(block)).addListener(writeFailureListener)
+        session.channel.write(sendable(block))
+          .addListener(StreamingShuffleServerHandler.EgressFramingBudget.releaseOn(framedBytes))
+          .addListener(writeFailureListener)
         bytesWritten.addAndGet(framedBytes)
         blocksWritten.incrementAndGet()
         if (pending.replay) {
@@ -987,6 +1045,11 @@ private[spark] class StreamingShuffleServerHandler(
         }
         true
       case None =>
+        // No frame was built, so no copy is in flight and the reservation the drain took for this
+        // block is returned at once. Returning it here rather than leaving it to a write listener
+        // that will never fire is what keeps the budget a live measure of bytes actually in flight
+        // instead of a figure that only ever rises.
+        StreamingShuffleServerHandler.EgressFramingBudget.release(framedBytes)
         unservableBlocks.incrementAndGet()
         if (session.ackPosition(partitionId) >= sequenceNumber) {
           // Stale queue entry: this consumer confirmed the block before the drain reached it, so
@@ -1358,12 +1421,20 @@ private[spark] class StreamingShuffleServerHandler(
    * <b>Why this exists.</b> A map task's writer performs the same upkeep while it runs, and for the
    * resources it owns that is the only place it can be performed: buffered bytes are task-managed
    * execution memory, and the executor takes them back when the task ends. But a consumer's need
-   * for upkeep does not end when the producing task does -- it barely begins there. The scheduler
-   * starts no reduce task until its map stage has finished, so on the happy path *every* consumer
-   * of this output subscribes after the writer has gone, and the heartbeats that hold its stream
-   * open, the expiry that bounds its state, and the drain that delivers its blocks all have to come
-   * from somewhere else. That somewhere is [[StreamingShuffleListener]], whose lifetime is the
-   * executor's, calling this method on a fixed cadence.
+   * for upkeep does not end when the producing task does. A consumer attached during production is
+   * driven by the writer itself -- [[enqueueBlock]] drains to it on the spot -- and one that
+   * attaches after the task has ended has no producer thread left to drive anything, yet is served
+   * by exactly the same egress path. The heartbeats that hold its stream open, the expiry that
+   * bounds its state, and the drain that delivers its blocks therefore have to be callable from
+   * outside a task, and that is what this method is. The caller is [[StreamingShuffleListener]],
+   * whose lifetime is the executor's, on a fixed cadence.
+   *
+   * The post-completion case is not a rare one, and that is a consequence of the DAG scheduler
+   * rather than of anything here: the scheduler submits a reduce stage only once its map stage
+   * reports available output, and it is an absolute preservation zone for this feature (AAP 0.2.1
+   * and 0.2.2 forbid modifying the DAG scheduler or the task lifecycle; AAP 0.8.2 Tier 1 restates
+   * it). So at an ordinary stage boundary this method is the whole of what serves a consumer, while
+   * during production the writer's own maintenance is -- and both reach the same code.
    *
    * Four duties, in the order that makes each one's input current:
    *
@@ -1849,10 +1920,11 @@ private[spark] class StreamingShuffleServerHandler(
    * '''Why the ordinary close is not a warning.''' A reduce task closes its channel when it has
    * finished reading, so one close per consumer is the expected end of every healthy shuffle, and
    * the count of them is `numMaps * numReduces` for the application as a whole. Reporting each at
-   * warning level put an executor's log volume in direct proportion to the width of its shuffles --
-   * a thousand-by-a-thousand shuffle produces hundreds of thousands of lines, one to two orders of
-   * magnitude past the volume this feature is allowed -- and every one of them described a clean
-   * teardown as a lost channel, which trains an operator to ignore the subsystem's warnings.
+   * warning level would put an executor's log volume in direct proportion to the width of its
+   * shuffles -- a thousand-by-a-thousand shuffle produces hundreds of thousands of lines, one to
+   * two orders of magnitude past the volume this feature is allowed -- and every one of them would
+   * describe a clean teardown as a lost channel, which trains an operator to ignore the subsystem's
+   * warnings.
    *
    * So the two cases are separated by what the close actually leaves behind. A session that owes
    * its consumer nothing -- nothing written and unacknowledged, nothing still queued -- has
@@ -1864,15 +1936,14 @@ private[spark] class StreamingShuffleServerHandler(
    */
   override def channelInactive(client: TransportClient): Unit = {
     guard {
-      val session = sessions.remove(sessionKeyOf(client))
-      if (session != null) {
+      val session = sessions.get(sessionKeyOf(client))
+      if (session != null && forgetSession(session)) {
         // Sampled before the ledgers are released, because releasing them is what zeroes them.
         val owedBytes = session.unacknowledgedBytes
         val queuedBytes = session.pendingBytes
         // The ledgers describe a flow over this channel and end with it; the consumer's cursor in
         // the retained store does not, which is what its next connection resumes against.
         releaseConsumerLedgers(session)
-        sessionsByConsumer.remove(session.consumerId, session)
         session.close()
         if (owedBytes == 0L && queuedBytes == 0L) {
           if (debugEnabled) {
@@ -2171,9 +2242,30 @@ private[spark] class StreamingShuffleServerHandler(
         adoptIdentity(client, session, heartbeat.consumerId())
       }
       .foreach { session =>
-        if (session.subscribe(partitionId)) {
+        if (session.subscribedTo(partitionId)) {
+          // Already subscribed on this channel: an ordinary repeat heartbeat, which neither opens a
+          // ledger nor claims a subscriber slot.
+          ()
+        } else if (!claimSubscriberSlot(partitionId)) {
+          // Refused before a ledger, a queue entry or a payload copy exists. The number of sessions
+          // and the width of one session's subscription map are each bounded, but their product is
+          // what decides how much per-stream state a single partition can be made to carry, and a
+          // partition is legitimately read by exactly one reduce task. Refusing here is what closes
+          // that product, and refusing it *before* the drain is what keeps a fan-out attempt from
+          // costing this executor a payload copy per session.
+          reportBounded(subscriptionRefusalLogGate, subscriptionRefusals,
+            log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} refused consumer " +
+              log"${MDC(SESSION_ID, session.consumerId)} a subscription to partition " +
+              log"${MDC(PARTITION_ID, partitionId)}: it already serves " +
+              log"${MDC(COUNT, subscriberCount(partitionId))} subscriber(s) of that partition, " +
+              log"the ceiling of ${MDC(MAX_SIZE, MAX_SUBSCRIBERS_PER_PARTITION)}")
+        } else if (session.subscribe(partitionId)) {
           openConsumerLedger(session, partitionId)
           resumeFrom(session, partitionId, heartbeat.sequenceNumber())
+        } else {
+          // The session refused the subscription itself -- it is closing -- so the slot claimed
+          // just above is surplus and goes straight back.
+          releaseSubscriberSlot(partitionId)
         }
         reportHeartbeat(session, heartbeat)
         // A drain unconditionally, and this is load bearing rather than tidy. Every consumer of a
@@ -2556,6 +2648,30 @@ private[spark] class StreamingShuffleServerHandler(
   /** How many channels have been refused because the session ceiling was already reached. */
   def refusedSessionCount: Long = refusedSessions.get()
 
+  /**
+   * Consumer-session slots currently claimed against the concurrency ceiling.
+   *
+   * Normally equal to [[sessionCount]], and deliberately reported separately: the two are
+   * maintained by different mechanisms -- a counter claimed before insertion and the registry's own
+   * size -- and a divergence between them is the observable signature of a teardown path that
+   * forgot to return its slot, which would silently retire capacity for every later connection.
+   */
+  def claimedSessionSlots: Int = liveSessionSlots.get()
+
+  /** Blocks delayed because this executor had no room for another transient framing copy. */
+  def framingBudgetRefusalCount: Long = framingBudgetRefusals.get()
+
+  /**
+   * How many subscriptions have been refused, whether by the per-partition subscriber ceiling or by
+   * a request this producer could not honour.
+   *
+   * Reported because a refusal is the one outcome of a subscription attempt that leaves no other
+   * trace: the session survives, the channel stays open and the partition simply never streams to
+   * that peer. An operator investigating a reduce task that is waiting on output has no other way
+   * to distinguish "the producer refused you" from "the producer has nothing yet".
+   */
+  def subscriptionRefusalCount: Long = subscriptionRefusals.get()
+
   /** How many consumer identities have gone untracked because the ledger ceiling was reached. */
   def untrackedConsumerCount: Long = untrackedConsumers.get()
 
@@ -2644,9 +2760,12 @@ private[spark] class StreamingShuffleServerHandler(
    * contained so that one owner failing cannot leave the others held.
    *
    * It is deliberately '''not''' reached on the successful path. A successful map output stays
-   * published and stays routed precisely because the unmodified scheduler starts no reduce task
-   * until the map stage has finished, so every consumer of that output arrives after the producing
-   * task is already gone.
+   * published and stays routed because a consumer is entitled to read it after the producing task
+   * has ended -- whether it had already attached during production and is resuming, or is attaching
+   * for the first time. Withdrawing on success would break both, and the second is the ordinary
+   * case under the unmodified DAG scheduler, which submits a reduce stage only once its map stage
+   * reports available output and which this feature may not modify (AAP 0.2.1, 0.2.2, 0.8.2 Tier
+   * 1).
    *
    * @param reason short description of what is being recovered from, for the operator's log
    * @return whether this call performed the withdrawal, as opposed to finding it already done
@@ -2701,10 +2820,11 @@ private[spark] class StreamingShuffleServerHandler(
    * This is the counterpart of the writer's unsuccessful stop and of its task completion listener:
    * once nothing this handler could serve remains published, nothing may be queued or scheduled on
    * it again. A successful producer deliberately does *not* come here when its task ends -- its
-   * output stays published and, because the scheduler starts no reduce task until the map stage has
-   * finished, its consumers have not started yet -- so the callers are failure, cancellation, a
-   * refused hand-off and a superseded generation. Channel loss deliberately does not come here
-   * either, because a consumer that reconnects must still be replayable.
+   * output stays published, and its consumers are entitled to keep reading it whether they attached
+   * during production or after it, which under the unmodified DAG scheduler is usually after it --
+   * so the callers are failure, cancellation, a refused hand-off and a superseded generation.
+   * Channel loss deliberately does not come here either, because a consumer that reconnects must
+   * still be replayable.
    *
    * The order matters. The close transition is latched first, so no thread can queue a block,
    * schedule a refill wake-up or start a drain pass after this point; only then are the sessions
@@ -2728,6 +2848,11 @@ private[spark] class StreamingShuffleServerHandler(
       }
       sessions.clear()
       sessionsByConsumer.clear()
+      // The two accounted ceilings are cleared with the registries they account for. They are
+      // counters rather than derived sizes, so clearing the maps alone would leave this handler
+      // believing it still served every session it ever admitted.
+      liveSessionSlots.set(0)
+      subscribersByPartition.clear()
       consumerLastSeenMs.clear()
       streams.clear()
       if (releasedBytes > 0L || debugEnabled) {
@@ -2795,27 +2920,165 @@ private[spark] class StreamingShuffleServerHandler(
     val existing = sessions.get(key)
     if (existing != null) {
       Some(existing)
-    } else if (sessions.size() >= MAX_CONCURRENT_SESSIONS) {
+    } else if (!claimSessionSlot()) {
+      // The slot is claimed before the session is built, and that ordering is the whole of the
+      // ceiling. Reading the map's size and then inserting is two steps, so every thread in a burst
+      // of connections can read a size below the ceiling and then insert past it -- which makes the
+      // ceiling a suggestion under exactly the load it exists for. Claiming a slot with a
+      // compare-and-set admits one thread per slot and no more, whatever the arrival pattern.
       refusedSessions.incrementAndGet()
       if (sessionCapacityReported.compareAndSet(false, true)) {
         logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} refused an egress channel " +
           log"from ${MDC(HOST_PORT, client.getSocketAddress())}: it already serves " +
-          log"${MDC(COUNT, sessions.size())} consumer session(s), the ceiling of " +
+          log"${MDC(COUNT, liveSessionSlots.get())} consumer session(s), the ceiling of " +
           log"${MDC(MAX_SIZE, MAX_CONCURRENT_SESSIONS)}. Further refusals are counted but not " +
           log"logged")
       }
       closeSession(client)
       None
     } else {
+      // The client id is the peer's authenticated application identity when the application has
+      // authentication enabled, and a value the peer supplied in its handshake when it does not. It
+      // is sanitized either way, and for the same reason the protocol refuses control characters in
+      // a declared consumer identity: this string names the consumer in this producer's log
+      // records, and a record separator inside it would end a line early and start one whose whole
+      // content the peer chose. Sanitizing rather than refusing, because a session must still be
+      // created for a peer whose handshake identity is odd -- refusing would turn a cosmetic
+      // anomaly into an unservable consumer -- and because the socket address that follows it keeps
+      // the result unique.
       val provisional = Option(client.getClientId())
+        .map(sanitizedIdentity)
         .filter(_.nonEmpty)
         .map(id => s"$id@${client.getSocketAddress()}")
         .getOrElse(s"anonymous@${client.getSocketAddress()}")
       val created =
         new ConsumerSession(key, provisional, client.getChannel(), clock.getTimeMillis())
       val raced = sessions.putIfAbsent(key, created)
-      Some(if (raced != null) raced else created)
+      if (raced != null) {
+        // Another thread built the session for this same channel first. The slot this thread
+        // claimed is therefore surplus and must go back at once, or a channel that two callbacks
+        // reached simultaneously would consume two slots for the one session it created.
+        releaseSessionSlot()
+        Some(raced)
+      } else {
+        Some(created)
+      }
     }
+  }
+
+  /**
+   * Claims one of this map output's consumer-session slots, or refuses.
+   *
+   * A compare-and-set loop rather than a size check followed by an insertion, because those are two
+   * steps and a burst of connections all pass the first before any of them reaches the second -- so
+   * the ceiling would be exceeded by exactly the arrival pattern it exists to bound. The claim
+   * admits one thread per slot whatever the pattern, and every path that removes a session returns
+   * its slot through [[releaseSessionSlot]].
+   *
+   * @return true when a slot was claimed and the caller owns its release
+   */
+  private def claimSessionSlot(): Boolean = {
+    var current = liveSessionSlots.get()
+    var settled = false
+    var granted = false
+    while (!settled) {
+      if (current >= MAX_CONCURRENT_SESSIONS) {
+        settled = true
+      } else if (liveSessionSlots.compareAndSet(current, current + 1)) {
+        granted = true
+        settled = true
+      } else {
+        current = liveSessionSlots.get()
+      }
+    }
+    granted
+  }
+
+  /**
+   * Returns one consumer-session slot.
+   *
+   * Floored at zero rather than allowed to go negative, because a negative reading would silently
+   * raise the ceiling for every later connection -- turning one accounting slip into an unbounded
+   * one. Every teardown path routes through [[forgetSession]], so there is exactly one place a slot
+   * comes back from and it cannot be forgotten by a new caller.
+   */
+  private def releaseSessionSlot(): Unit = {
+    liveSessionSlots.updateAndGet(current => math.max(0, current - 1))
+  }
+
+  /**
+   * Removes one session from both registries and returns everything it held.
+   *
+   * The single teardown point, and it has to be single: a session holds a slot in the concurrency
+   * ceiling and a subscriber slot in each partition it subscribed to, and both are accounted rather
+   * than derived, so a removal path that forgot either would leak a ceiling. Idempotent in the
+   * session, because several paths can race to release the same one -- an inactive channel, a
+   * superseded reconnection, an expiry sweep and the handler's own shutdown.
+   *
+   * @param session the session to forget
+   * @return true when this call was the one that removed it
+   */
+  private def forgetSession(session: ConsumerSession): Boolean = {
+    val removed = sessions.remove(session.sessionKey, session)
+    if (removed) {
+      releaseSessionSlot()
+      session.subscribedPartitions.foreach(releaseSubscriberSlot)
+    }
+    sessionsByConsumer.remove(session.consumerId, session)
+    removed
+  }
+
+  /**
+   * Claims one subscriber slot on one partition, or refuses.
+   *
+   * <b>Why partitions are bounded separately from sessions.</b> A session's own subscription map is
+   * bounded by the partition count, and the number of sessions is bounded by
+   * [[MAX_CONCURRENT_SESSIONS]] -- but the product of the two is what decides how much per-stream
+   * state one partition can be made to carry, and a partition is legitimately read by exactly one
+   * reduce task. A peer that opened many sessions and subscribed every one of them to the same
+   * partition would multiply that partition's credit ledgers, deferred-termination records and
+   * queue entries by the session count while staying inside both existing ceilings. Bounding the
+   * subscribers of a partition closes that product, and it does so *before* any payload is copied,
+   * because a refused subscription never reaches the drain at all.
+   *
+   * The ceiling is generous against the legitimate case: one reduce task per partition, plus room
+   * for the reconnections a genuine consumer makes while its previous session is still within the
+   * expiry window.
+   *
+   * @param partitionId the partition being subscribed to
+   * @return true when a subscriber slot was claimed
+   */
+  private def claimSubscriberSlot(partitionId: Int): Boolean = {
+    val counter = subscribersByPartition.computeIfAbsent(
+      Integer.valueOf(partitionId), _ => new AtomicInteger(0))
+    var current = counter.get()
+    var settled = false
+    var granted = false
+    while (!settled) {
+      if (current >= MAX_SUBSCRIBERS_PER_PARTITION) {
+        settled = true
+      } else if (counter.compareAndSet(current, current + 1)) {
+        granted = true
+        settled = true
+      } else {
+        current = counter.get()
+      }
+    }
+    granted
+  }
+
+  /** Returns one subscriber slot on one partition. */
+  private def releaseSubscriberSlot(partitionId: Int): Unit = {
+    val counter = subscribersByPartition.get(Integer.valueOf(partitionId))
+    if (counter != null) {
+      counter.updateAndGet(current => math.max(0, current - 1))
+    }
+  }
+
+  /** How many sessions are currently subscribed to one partition. */
+  def subscriberCount(partitionId: Int): Int = {
+    val counter = subscribersByPartition.get(Integer.valueOf(partitionId))
+    if (counter == null) 0 else counter.get()
   }
 
   /**
@@ -2902,12 +3165,59 @@ private[spark] class StreamingShuffleServerHandler(
     }
   }
 
+  /**
+   * Replaces every character that could break a log record with a single visible substitute.
+   *
+   * Applied to the one identity this producer derives rather than receives -- the transport
+   * handshake identity -- because every identity that arrives on the wire is already refused at the
+   * protocol boundary by `HeartbeatMessage`'s own validation. The two together mean no consumer
+   * identity holding a record separator can exist anywhere in this subsystem, which is a stronger
+   * guarantee than sanitising at each of the many sites that log one: a sanitiser omitted at a
+   * single site would reinstate the whole problem, and there is no correct value for a sanitiser to
+   * miss here.
+   *
+   * The substitute is a single question mark per offending character rather than an escape
+   * sequence, so the result stays a stable map key of predictable length and two identities
+   * differing only in their forbidden characters remain distinguishable from one that had them
+   * removed.
+   *
+   * @param identity the identity to render safe, which may be empty
+   * @return the identity with every control character, delete and Unicode line or paragraph
+   *         separator replaced
+   */
+  private def sanitizedIdentity(identity: String): String = {
+    var index = 0
+    var sanitized: java.lang.StringBuilder = null
+    while (index < identity.length) {
+      val candidate = identity.charAt(index)
+      // Code points rather than character literals, and deliberately: a `'\uXXXX'` literal for a
+      // non-ASCII character is itself a non-ASCII character in this source file as far as the style
+      // gate is concerned, and the two values named here -- U+2028 LINE SEPARATOR and U+2029
+      // PARAGRAPH SEPARATOR -- are line breaks to many readers and log pipelines while being
+      // neither control characters nor ASCII.
+      val forbidden = candidate <= 0x1f || candidate == 0x7f ||
+        (candidate >= 0x80 && candidate <= 0x9f) ||
+        candidate == UNICODE_LINE_SEPARATOR || candidate == UNICODE_PARAGRAPH_SEPARATOR
+      if (forbidden) {
+        // Allocated only once something has to change, so the common path -- an identity that is
+        // already safe -- copies nothing at all and returns the string it was given.
+        if (sanitized == null) {
+          sanitized = new java.lang.StringBuilder(identity.length).append(identity, 0, index)
+        }
+        sanitized.append('?')
+      } else if (sanitized != null) {
+        sanitized.append(candidate)
+      }
+      index += 1
+    }
+    if (sanitized == null) identity else sanitized.toString
+  }
+
   /** Closes one consumer's session and its channel, leaving every other consumer untouched. */
   private def closeSession(client: TransportClient): Unit = {
-    val session = sessions.remove(sessionKeyOf(client))
-    if (session != null) {
+    val session = sessions.get(sessionKeyOf(client))
+    if (session != null && forgetSession(session)) {
       releaseConsumerLedgers(session)
-      sessionsByConsumer.remove(session.consumerId, session)
       session.close()
     }
     client.getChannel().close()
@@ -2922,8 +3232,7 @@ private[spark] class StreamingShuffleServerHandler(
    * emptied would otherwise leave a socket open that nothing serves.
    */
   private def evictSession(session: ConsumerSession): Unit = {
-    sessions.remove(session.sessionKey, session)
-    sessionsByConsumer.remove(session.consumerId, session)
+    forgetSession(session)
     releaseConsumerLedgers(session)
     session.close()
     try {
@@ -3106,6 +3415,136 @@ private[spark] object StreamingShuffleServerHandler {
   val MAX_CONCURRENT_SESSIONS: Int = 4096
 
   /**
+   * Most bytes of transient egress framing this executor may have in flight at once, across every
+   * map output it is producing and every consumer session on each of them.
+   *
+   * <b>Why an executor-wide ceiling is required and per-channel water marks are not enough.</b> A
+   * Netty write water mark bounds one channel: a caller that writes only while `Channel.isWritable`
+   * holds cannot accumulate copies for a single slow consumer without limit. But the ceilings on
+   * consumers are per map output -- [[MAX_CONCURRENT_SESSIONS]] sessions each -- and an executor
+   * produces many map outputs, so per-channel bounds multiply. Thousands of sessions each holding
+   * one high-water mark's worth of transient copies is an aggregate that no per-channel limit
+   * constrains, and a transient copy is up to a whole block, which is what makes the aggregate the
+   * quantity that has to be bounded.
+   *
+   * The value is thirty-two blocks' worth of framing. That is deliberately modest against the heap
+   * of any executor streaming shuffle would be enabled on, and generous against the work it bounds:
+   * a copy exists only from the moment a frame is built to the moment the transport is done with
+   * it, so thirty-two concurrent copies is thirty-two writes genuinely in the socket layer at the
+   * same instant, not thirty-two consumers. It is expressed as a multiple of the block cap rather
+   * than as an absolute figure so that it tracks the protocol's own framing size if that ever
+   * changes.
+   *
+   * Reaching it delays a block; it never drops one. A refused block is returned to its session's
+   * queue exactly as a pacing refusal returns it, and the same refill wake-up retries it.
+   */
+  val MAX_IN_FLIGHT_EGRESS_BYTES: Long = 32L * MAX_FRAMED_BYTES
+
+  /**
+   * The executor-wide ceiling on transient egress framing, as a live reservation ledger.
+   *
+   * An `object` because the quantity is executor wide: one JVM produces many map outputs, each with
+   * its own handler, and a budget held per handler would bound nothing that needed bounding. It is
+   * lock free and allocation free on both paths, because both run on Netty event-loop threads where
+   * a lock would stall a socket and an allocation per block would be an allocation per two
+   * mebibytes.
+   */
+  object EgressFramingBudget {
+
+    private val reserved = new AtomicLong(0L)
+
+    private val refusals = new AtomicLong(0L)
+
+    /**
+     * Takes room for one framing copy, or refuses.
+     *
+     * A compare-and-set loop rather than an unconditional add, because an add that overshot and
+     * then corrected itself would let two threads both build a copy the budget has room for only
+     * one of -- which is precisely the aggregate this ceiling exists to prevent. Non-negative
+     * requests of zero are admitted without touching the ledger, so a caller need not special-case
+     * them.
+     *
+     * @param bytes framed bytes the copy will occupy
+     * @return true when the reservation was taken and the caller owns its release
+     */
+    def tryReserve(bytes: Long): Boolean = {
+      if (bytes <= 0L) {
+        true
+      } else {
+        var current = reserved.get()
+        var settled = false
+        var granted = false
+        while (!settled) {
+          val candidate = current + bytes
+          if (candidate > MAX_IN_FLIGHT_EGRESS_BYTES) {
+            refusals.incrementAndGet()
+            settled = true
+          } else if (reserved.compareAndSet(current, candidate)) {
+            granted = true
+            settled = true
+          } else {
+            current = reserved.get()
+          }
+        }
+        granted
+      }
+    }
+
+    /**
+     * Returns a reservation.
+     *
+     * Floored at zero rather than allowed to go negative, because a ledger that could read negative
+     * would silently raise the effective ceiling for everyone else -- turning one accounting
+     * mistake into an unbounded one. A release that would underflow is a defect in a caller, and
+     * clamping keeps the ceiling honest while that caller is found.
+     *
+     * @param bytes framed bytes to return
+     */
+    def release(bytes: Long): Unit = {
+      if (bytes > 0L) {
+        reserved.updateAndGet(current => math.max(0L, current - bytes))
+      }
+    }
+
+    /**
+     * A channel listener that returns one reservation when the transport is done with its copy.
+     *
+     * The listener is what makes the budget a measure of bytes genuinely in flight rather than of
+     * bytes some method has returned from: a `Channel.write` completes on an event-loop thread long
+     * after the call that issued it, and the copy occupies the executor for exactly that interval.
+     * It fires on success, on failure and on cancellation alike, which is what stops a failing
+     * consumer from retiring the executor's whole allowance one block at a time.
+     *
+     * @param bytes framed bytes to return once the write completes
+     * @return the listener to attach to the write future
+     */
+    def releaseOn(bytes: Long): ChannelFutureListener = new ChannelFutureListener {
+      override def operationComplete(future: ChannelFuture): Unit = release(bytes)
+    }
+
+    /** Framed bytes currently reserved for copies in flight across this executor. */
+    def inFlight: Long = reserved.get()
+
+    /** The ceiling, restated here so an operator-facing diagnostic reads both from one place. */
+    def capacity: Long = MAX_IN_FLIGHT_EGRESS_BYTES
+
+    /** Blocks delayed because the executor had no room for another framing copy. */
+    def refusalCount: Long = refusals.get()
+
+    /**
+     * Clears the ledger, for a test that must assert against a known baseline.
+     *
+     * The state is JVM wide, so a suite that measured it without resetting would be measuring
+     * whatever ran before it. Never called from production code, which has no reason to forget a
+     * reservation it still owes.
+     */
+    private[streaming] def resetForTesting(): Unit = {
+      reserved.set(0L)
+      refusals.set(0L)
+    }
+  }
+
+  /**
    * Most logical consumer identities the liveness ledger tracks at once.
    *
    * The ledger is keyed by an identity the consumer declares, so its size is likewise a quantity
@@ -3120,6 +3559,39 @@ private[spark] object StreamingShuffleServerHandler {
    * unregister it outright.
    */
   val MAX_TRACKED_CONSUMERS: Int = 2 * MAX_CONCURRENT_SESSIONS
+
+  /**
+   * Most sessions that may be subscribed to one reduce partition of one map output at a time.
+   *
+   * The two existing ceilings bound the number of sessions and the width of one session's
+   * subscription map, but neither bounds their product -- and it is the product that decides how
+   * much per-stream state one partition can be made to carry. A peer that opened many connections
+   * and subscribed every one of them to the same partition would multiply that partition's credit
+   * ledgers, its deferred-termination records and its queue entries by the session count while
+   * staying comfortably inside both of them.
+   *
+   * Eight, because the legitimate figure is one: a reduce partition is read by exactly one reduce
+   * task. The remaining seven are headroom for the reconnections a genuine consumer makes -- a task
+   * whose channel dropped reconnects while its previous session is still inside the expiry window,
+   * and a speculative attempt of the same reduce task reads the same partition legitimately. A peer
+   * needing more than eight simultaneous subscriptions to one partition is not a reduce task.
+   *
+   * A refused subscription is refused before a ledger, a queue entry or a payload copy exists,
+   * which is what makes this a bound on work as well as on state.
+   */
+  val MAX_SUBSCRIBERS_PER_PARTITION: Int = 8
+
+  /**
+   * U+2028 LINE SEPARATOR, which ends a line for many readers and log pipelines.
+   *
+   * Named as a code point rather than written as a character literal because a literal for a
+   * non-ASCII character is a non-ASCII character in the source file, which the style gate refuses
+   * -- and because the name says which character it is, where the escape would not.
+   */
+  val UNICODE_LINE_SEPARATOR: Int = 0x2028
+
+  /** U+2029 PARAGRAPH SEPARATOR, a line break to the same readers, named for the same reason. */
+  val UNICODE_PARAGRAPH_SEPARATOR: Int = 0x2029
 
   /**
    * Most block references one consumer's egress queue may hold at once.

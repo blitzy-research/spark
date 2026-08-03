@@ -965,9 +965,8 @@ private[spark] class StreamingShuffleFallbackPolicy(
    * operator most likely to rely on the condition is the one least likely to know it is absent.
    *
    * Emitted at most once per JVM, latched in the companion object rather than in this instance: the
-   * notice describes the configuration of the whole executor, so a second manager instantiated in
-   * the same JVM -- which local and local-cluster runs do -- must not repeat it, and nothing on any
-   * task path reaches this method at all.
+   * notice describes the configuration of the whole executor, so however many policies a JVM
+   * constructs it states the fact once, and nothing on any task path reaches this method at all.
    */
   private def logSaturationCoverage(): Unit = {
     if (streamingEnabled && administeredCapacityBytesPerSecond.isEmpty &&
@@ -1128,8 +1127,8 @@ private[spark] object StreamingShuffleFallbackPolicy {
   /**
    * Whether the notice about an unevaluable saturation condition has already been emitted.
    *
-   * Process wide rather than per instance, so an executor that constructs a second policy -- which
-   * a local or local-cluster run does -- states the fact once rather than once per construction.
+   * Process wide rather than per instance, so a JVM that constructs more than one policy states the
+   * fact once rather than once per construction.
    */
   private[streaming] val saturationNoticeEmitted = new AtomicBoolean(false)
 

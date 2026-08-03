@@ -18,62 +18,54 @@
 package org.apache.spark.shuffle.streaming
 
 import java.nio.ByteBuffer
+import java.util.Locale
 
-import org.apache.spark.{LocalSparkContext, SparkConf, SparkContext, SparkFunSuite}
-import org.apache.spark.internal.config.{SHUFFLE_MANAGER, SHUFFLE_STREAMING_BUFFER_SIZE_PERCENT, SHUFFLE_STREAMING_ENABLED, SHUFFLE_STREAMING_MAX_BANDWIDTH_MBPS, SHUFFLE_STREAMING_SPILL_THRESHOLD}
+import scala.collection.mutable
+
+import org.apache.logging.log4j.Level
+import org.apache.logging.log4j.core.LogEvent
+
+import org.apache.spark.{FetchFailed, LocalSparkContext, ShuffleDependency, SparkConf, SparkContext, SparkEnv, SparkFunSuite, SparkThrowableHelper, TaskFailedReason}
+import org.apache.spark.internal.config.{SHUFFLE_MANAGER, SHUFFLE_STREAMING_BUFFER_SIZE_PERCENT, SHUFFLE_STREAMING_ENABLED, SHUFFLE_STREAMING_MAX_BANDWIDTH_MBPS, SHUFFLE_STREAMING_SPILL_THRESHOLD, STAGE_MAX_CONSECUTIVE_ATTEMPTS, TASK_MAX_FAILURES}
 import org.apache.spark.network.shuffle.protocol.streaming.StreamingShuffleMessage
+import org.apache.spark.scheduler.{SparkListener, SparkListenerStageSubmitted, SparkListenerTaskEnd}
 import org.apache.spark.shuffle.sort.SortShuffleManager
 import org.apache.spark.util.ManualClock
 
 /**
  * Tests the streaming shuffle's graceful-degradation contract: the four conditions on which it
- * stands down, the operator kill switch, and the one property that makes the whole subsystem safe
- * to ship.
+ * stands down, the operator kill switch, and the one property that makes every path safe.
  *
- * That property is worth stating before the tests that check it, because it is the reason this
- * suite exists: '''there is no configuration, no failure and no resource condition under which a
- * job is left without a functioning shuffle implementation.''' Every condition
- * `StreamingShuffleFallbackPolicy` recognises routes to the same terminus as the kill switch --
- * delegation to an internally held, completely unmodified `SortShuffleManager`. A trip costs
- * throughput and latency. It never costs correctness, and it never costs the job. Zero regression
- * is therefore a structural guarantee rather than a hope, and the tests below are what make the
- * structure observable.
+ * That property is why this suite exists: '''there is no configuration, no failure and no resource
+ * condition under which a job is left without a functioning shuffle implementation.''' Every
+ * condition `StreamingShuffleFallbackPolicy` recognises routes to the same terminus as the kill
+ * switch -- delegation to an internally held, unmodified `SortShuffleManager`. A trip costs
+ * throughput and latency, never correctness and never the job, so zero regression is a structural
+ * guarantee and the tests below are what make the structure observable.
  *
- * ==What is asserted, and how==
+ * Each of the four conditions is asserted at its exact boundary:
  *
- * Four conditions, each at its exact boundary:
- *
- *  - Consumer slowness: the consumer held at least 2x behind the producer, continuously, for
- *    '''strictly longer''' than sixty seconds. Both halves are asserted -- that it does not fire
- *    one millisecond early, that it does not fire at exactly the window, that it does fire one
- *    millisecond past it, and that a consumer which recovers clears the timer so the elapsed time
- *    cannot be re-used later.
+ *  - Consumer slowness: at least 2x behind the producer, continuously, for '''strictly longer'''
+ *    than sixty seconds. Asserted from both sides, and a consumer that recovers clears the timer so
+ *    the elapsed time cannot be re-used later.
  *  - Memory pressure: a '''partial''' buffer grant that eviction could not reverse. A satisfied
- *    grant does not trip, and a reservation of nothing cannot be short-granted so it is not
- *    evidence of anything.
+ *    grant does not trip, and a reservation of nothing cannot be short-granted at all.
  *  - Network saturation: utilisation '''strictly above''' ninety per cent of the administered link
- *    capacity. Exactly at the threshold is not saturation, and a link whose capacity is unknown is
- *    never described as saturated -- which is also why no division by zero is reachable.
- *  - Protocol version mismatch: an '''explicit''' compatibility check on the version byte the wire
- *    header carries, never an inference from a failed decode. The peek that reads that byte is
- *    non-consuming, so the very same buffer still decodes afterwards.
+ *    capacity. Exactly at the threshold is not saturation, and a link of unknown capacity is never
+ *    described as saturated, which is also why no division by zero is reachable.
+ *  - Protocol version mismatch: an '''explicit''' check on the version byte in the wire header,
+ *    never an inference from a failed decode. The peek that reads it is non-consuming, so the same
+ *    buffer still decodes afterwards.
  *
  * Plus the kill switch, `spark.shuffle.streaming.enabled`, which defaults to `false` and reaches
- * the identical terminus without any condition having been observed at all.
+ * the identical terminus with no condition observed at all.
  *
- * ==Determinism==
- *
- * Nothing here sleeps. Every elapsed interval is an advance of an injected `ManualClock`, and every
- * timing boundary is walked to the exact millisecond, which is what lets this suite assert that a
- * timer does '''not''' fire early -- an assertion a wall-clock test cannot make at all. The one
- * concurrent case is released from a barrier with a bounded timeout rather than from a sleep.
- *
- * ==Scope==
- *
- * The condition set, the metric set and the error-condition set are all closed, and the tests at
- * the end of this suite assert that degradation adds nothing to any of them: no fifth fallback
- * condition, no fifth metric, and no error condition at all, because a fallback is reported through
- * a boolean and a value from a sealed set rather than by raising anything.
+ * Nothing here sleeps: every elapsed interval is an advance of an injected `ManualClock` walked to
+ * the exact millisecond, which is what lets the suite assert a timer does '''not''' fire early, and
+ * the one concurrent case is released from a barrier with a bounded timeout. The condition, metric
+ * and error-condition sets are all closed, and the tests at the end assert degradation adds nothing
+ * to any of them -- a fallback is reported through a boolean and a value from a sealed set rather
+ * than by raising anything.
  */
 class StreamingShuffleFallbackSuite
   extends SparkFunSuite
@@ -83,16 +75,12 @@ class StreamingShuffleFallbackSuite
   import StreamingShuffleFallbackReason._
   import StreamingShuffleTestHelper._
 
-  /** Shuffle id every single-shuffle fixture in this suite samples under. */
   private val ShuffleId: Int = 0
 
-  /** A second shuffle id, for the cases that must show sampling state is held per shuffle. */
   private val OtherShuffleId: Int = 1
 
-  /** Map id stamped into the framed messages this suite builds. */
   private val MapId: Long = 0L
 
-  /** Partition id stamped into the framed messages this suite builds. */
   private val PartitionId: Int = 0
 
   /** Sequence number stamped into the framed messages this suite builds. */
@@ -100,6 +88,15 @@ class StreamingShuffleFallbackSuite
 
   /** Partitions the end-to-end kill-switch job groups into. */
   private val PartitionCount: Int = DefaultPartitionCount
+
+  /**
+   * How long an end-to-end test waits for the listener bus to deliver a finished job's events.
+   *
+   * The bus delivers asynchronously, so a test that read a recorder without draining it first would
+   * be asserting on whatever had arrived by then. Generous rather than tight, because it is only
+   * ever paid when something has gone wrong.
+   */
+  private val ListenerDrainTimeoutMillis: Long = 60000L
 
   /**
    * A producer rate that is unambiguously producing.
@@ -129,13 +126,10 @@ class StreamingShuffleFallbackSuite
    */
   private val LinkCapacityBytesPerSecond: Double = 100.0d
 
-  /** Egress sitting exactly at the saturation threshold, which must not trip. */
   private val EgressAtSaturationThreshold: Double = LinkSaturationTripPercent.toDouble
 
-  /** Bytes a buffer reservation asks for in the memory-pressure cases. */
   private val RequestedBufferBytes: Long = 1024L
 
-  /** An administered bandwidth cap, in MB/s, for the cases that need saturation to be evaluable. */
   private val AdministeredBandwidthMbps: Int = 100
 
   /**
@@ -150,10 +144,8 @@ class StreamingShuffleFallbackSuite
   /** Padding placed ahead of a framed message, to prove a peek honours the buffer's position. */
   private val FramePaddingBytes: Int = 3
 
-  /** Readers used by the concurrent latch case, alongside the one thread that trips the policy. */
   private val ConcurrentReaderCount: Int = 8
 
-  /** Reads each concurrent reader performs, enough to straddle the trip on any scheduler. */
   private val LatchReadIterations: Int = 20000
 
   /**
@@ -206,12 +198,6 @@ class StreamingShuffleFallbackSuite
     policy.recordConsumerThroughput(ShuffleId, LaggingConsumerBytesPerSecond, clock.getTimeMillis())
   }
 
-  /**
-   * Drives the consumer-slowness condition all the way to a trip.
-   *
-   * @param policy the policy to drive
-   * @param clock the clock to advance past the sustained window
-   */
   private def driveSustainedConsumerSlowness(
       policy: StreamingShuffleFallbackPolicy,
       clock: ManualClock): Unit = {
@@ -220,15 +206,6 @@ class StreamingShuffleFallbackSuite
     resampleConsumerSlowness(policy, clock)
   }
 
-  /**
-   * A framed streaming shuffle message: the one-byte type discriminator followed by the encoded
-   * body.
-   *
-   * Built from a real message rather than from hand-written bytes, so the header layout under test
-   * is the production one and cannot drift from it.
-   *
-   * @return the framed bytes, positioned at the start of the frame
-   */
   private def framedMessage(): ByteBuffer = {
     ack(ShuffleId, MapId, PartitionId, SequenceNumber, NothingConsumedPosition).toByteBuffer()
   }
@@ -272,6 +249,23 @@ class StreamingShuffleFallbackSuite
     padded
   }
 
+  /**
+   * The captured log events that are the unevaluable-saturation notice, and nothing else.
+   *
+   * Selected on two independent substrings rather than on one, so that an unrelated policy log line
+   * that happens to mention saturation -- or one that happens to mention the bandwidth property --
+   * cannot be counted as the notice and make a once-per-JVM assertion pass for the wrong reason.
+   *
+   * @param appender the appender the constructions under test logged through
+   * @return the matching events, in the order they were emitted
+   */
+  private def saturationNotices(appender: LogAppender): Seq[LogEvent] = {
+    appender.loggingEvents.filter { event =>
+      val text = event.getMessage.getFormattedMessage
+      text.contains(SHUFFLE_STREAMING_MAX_BANDWIDTH_MBPS.key) && text.contains("saturation")
+    }.toSeq
+  }
+
   // -----------------------------------------------------------------------------------------------
   // Trip 1: the consumer held at least 2x behind the producer for longer than sixty seconds.
   //
@@ -293,7 +287,6 @@ class StreamingShuffleFallbackSuite
     assert(policy.trackedShuffleCount == 1,
       "sampling one shuffle must create throughput state for exactly that shuffle")
 
-    // One millisecond short of the window: 59999 ms of deficit is not sixty seconds of deficit.
     advanceJustBeforeSustainedSlownessWindow(clock)
     resampleConsumerSlowness(policy, clock)
     assert(clock.getTimeMillis() - armedAt == JustBeforeSustainedSlownessMillis,
@@ -301,8 +294,6 @@ class StreamingShuffleFallbackSuite
     assert(!policy.hasTripped,
       "a deficit held for less than the window must not trip; 59999 ms is not more than 60000 ms")
 
-    // Exactly at the window. The contract is strictly greater than, so this is still not a trip:
-    // held for exactly the window is not yet held for longer than it.
     clock.advance(1L)
     resampleConsumerSlowness(policy, clock)
     assert(clock.getTimeMillis() - armedAt == SustainedSlownessWindowMillis,
@@ -371,7 +362,6 @@ class StreamingShuffleFallbackSuite
     assert(!policy.hasTripped,
       "time that elapsed before the consumer recovered must not count towards a later deficit")
 
-    // And the re-armed window behaves exactly like the first one: it trips once exceeded.
     advancePastSustainedSlownessWindow(clock)
     resampleConsumerSlowness(policy, clock)
     assert(policy.hasTripped, "the re-armed window must trip once it is exceeded in its own right")
@@ -409,17 +399,12 @@ class StreamingShuffleFallbackSuite
       "sampling two shuffles must hold their throughput state independently")
   }
 
-  // -----------------------------------------------------------------------------------------------
   // Trip 2: memory pressure prevented a buffer allocation, so streaming risks exhausting memory.
-  //
-  // The signal is a PARTIAL GRANT, which is Spark's own established idiom for memory pressure and
-  // not anything invented for this subsystem: MemoryConsumer.acquireMemory answers with the amount
-  // it was actually able to grant, and that amount may be smaller than the request. Spark's own
-  // spillable collections treat exactly that outcome as the cue to spill. The policy is the
-  // escalation rather than the first responder, so a caller reports here only once eviction has
-  // been attempted and could not free enough room -- streaming trades memory for latency, and when
-  // the memory is not there the trade is off.
-  // -----------------------------------------------------------------------------------------------
+  // The signal is a PARTIAL GRANT, which is Spark's own idiom rather than anything invented here:
+  // MemoryConsumer.acquireMemory answers with the amount it could grant, which may be less than the
+  // request, and Spark's spillable collections treat exactly that as the cue to spill. This policy
+  // is the escalation rather than the first responder, so a caller reports here only once eviction
+  // has been attempted and could not free enough room.
 
   test("a partial buffer grant trips memory pressure") {
     val clock = newManualClock()
@@ -441,8 +426,6 @@ class StreamingShuffleFallbackSuite
   test("a buffer grant refused outright trips memory pressure") {
     val policy = activePolicy(newManualClock())
 
-    // Zero granted is the extreme of the same signal, not a different one: there is no separate
-    // condition for "granted nothing", because the cause and the response are identical.
     policy.recordAllocationGrant(RequestedBufferBytes, 0L)
 
     assert(policy.hasTripped, "a reservation granted nothing at all must trip")
@@ -462,7 +445,6 @@ class StreamingShuffleFallbackSuite
     assert(!policy.hasTripped,
       "a reservation granted more than it asked for is not memory pressure")
 
-    // A request for nothing cannot be short-granted, so it is no evidence of pressure either way.
     val unevaluableBefore = policy.unevaluableSampleCount
     policy.recordAllocationGrant(0L, 0L)
     policy.recordAllocationGrant(-1L, 0L)
@@ -476,20 +458,14 @@ class StreamingShuffleFallbackSuite
       "a satisfied reservation must leave the streaming path in service")
   }
 
-  // -----------------------------------------------------------------------------------------------
-  // Trip 3: network utilisation above ninety per cent of the administered link capacity.
-  //
-  // Two independent properties are asserted here, and both matter. The comparison is STRICTLY
-  // greater than, so exactly at the threshold is tolerated rather than tripped. And a capacity that
-  // is zero, negative or not a finite number is not a capacity at all: such a sample is refused
-  // before any division is attempted, which is why no division by zero and no NaN comparison is
-  // reachable from this method however it is called.
-  //
-  // Note also that ninety per cent is the SATURATION TRIP and eighty per cent is the token bucket's
-  // bandwidth ceiling. They are different constants doing different jobs -- one is a rate limit
-  // streaming imposes on itself while it continues to stream, the other is the point at which it
-  // stops altogether -- and the last case in this group exists to keep them from being conflated.
-  // -----------------------------------------------------------------------------------------------
+  // Trip 3: network utilisation above ninety per cent of the administered link capacity. Two
+  // independent properties are asserted. The comparison is STRICTLY greater than, so exactly at the
+  // threshold is tolerated rather than tripped; and a capacity that is zero, negative or not finite
+  // is not a capacity at all and is refused before any division, which is why no division by zero
+  // and no NaN comparison is reachable however the method is called. Ninety per cent is the
+  // SATURATION TRIP while eighty per cent is the token bucket's bandwidth ceiling -- one is a rate
+  // limit streaming imposes on itself while it keeps streaming, the other is where it stops -- and
+  // the last case in this group exists to keep them from being conflated.
 
   test("link utilisation exactly at the saturation threshold does not trip") {
     val policy = activePolicy(newManualClock())
@@ -526,8 +502,6 @@ class StreamingShuffleFallbackSuite
     val policy = activePolicy(newManualClock())
     val unevaluableBefore = policy.unevaluableSampleCount
 
-    // Each of these would be a division by zero, a division by a negative, or a NaN comparison if
-    // the guard were missing. None of them may throw, and none of them may trip.
     policy.recordLinkUtilization(RequestedBufferBytes.toDouble, 0.0d)
     policy.recordLinkUtilization(0.0d, 0.0d)
     policy.recordLinkUtilization(RequestedBufferBytes.toDouble, -1.0d)
@@ -569,19 +543,117 @@ class StreamingShuffleFallbackSuite
     assert(policy.administeredLinkCapacityBytesPerSecond.contains(capacityBytesPerSecond),
       "the administered cap must be converted from MB/s into bytes per second")
 
-    // Exactly at the threshold, expressed against the administered capacity rather than a fixture
-    // constant, so the boundary is asserted on the value the policy will actually divide by.
     val capacity = capacityBytesPerSecond.toDouble
     policy.recordLinkUtilization(capacity * LinkSaturationTripPercent.toDouble / 100.0d)
     assert(!policy.hasTripped,
       "the administered capacity must tolerate utilisation at the threshold")
 
-    // A fully saturated link is strictly above the tolerated share and must trip.
     policy.recordLinkUtilization(capacity)
     assert(policy.hasTripped, "a fully saturated administered link must trip")
     assert(policy.trippedReason.contains(NetworkSaturation),
       s"the reported reason must be NetworkSaturation but was ${policy.trippedReason}")
     assert(policy.shouldDelegateToSortShuffle, "the terminus is the same for an administered link")
+  }
+
+  test("the unevaluable saturation notice is stated once per jvm and never repeated") {
+    // The latch is process wide by design, so it has to be returned to whatever this JVM found it
+    // at: this suite must not decide, by running order, what a later suite observes.
+    val latch = StreamingShuffleFallbackPolicy.saturationNoticeEmitted
+    val latchedOnEntry = latch.get()
+    try {
+      latch.set(false)
+
+      // The other path, asserted first, because "emitted once" is worth nothing unless there is a
+      // configuration under which it is not emitted at all. Two of them: a link with an
+      // administered capacity has an evaluable saturation condition and nothing to report, and a
+      // policy on which streaming is switched off is not going to evaluate any condition whatever.
+      val silentAppender = new LogAppender("saturation coverage notice, other paths")
+      withLogAppender(
+        silentAppender,
+        loggerNames = Seq(classOf[StreamingShuffleFallbackPolicy].getName),
+        level = Some(Level.INFO)) {
+        val capped = new StreamingShuffleFallbackPolicy(
+          streamingConfWithOverrides(maxBandwidthMBps = Some(AdministeredBandwidthMbps)),
+          newManualClock())
+        assert(capped.administeredLinkCapacityBytesPerSecond.isDefined,
+          "the capped fixture must have an administered capacity, or it proves nothing")
+
+        val gatedOff = new StreamingShuffleFallbackPolicy(gatedOffStreamingConf(), newManualClock())
+        assert(gatedOff.administeredLinkCapacityBytesPerSecond.isEmpty,
+          "the gated-off fixture must have no capacity, or it is silent for the wrong reason")
+        assert(!gatedOff.streamingActive,
+          "the gated-off fixture must have the kill switch engaged")
+      }
+      assert(saturationNotices(silentAppender).isEmpty,
+        "an evaluable condition and a disengaged subsystem both have nothing to say: " +
+          s"${saturationNotices(silentAppender).mkString("; ")}")
+      assert(!latch.get(),
+        "neither of those constructions may consume the once-per-JVM notice")
+
+      // Now the branch itself: streaming enabled, no administered capacity, so three conditions are
+      // live and the fourth is inert. That is a legitimate configuration and the operator is told,
+      // exactly once.
+      val appender = new LogAppender("saturation coverage notice")
+      var constructed = 0
+      withLogAppender(
+        appender,
+        loggerNames = Seq(classOf[StreamingShuffleFallbackPolicy].getName),
+        level = Some(Level.INFO)) {
+        val first = new StreamingShuffleFallbackPolicy(streamingConf(), newManualClock())
+        constructed += 1
+        assert(latch.get(),
+          "the first construction that cannot evaluate saturation must latch the notice")
+        assert(first.streamingActive, "the first construction must have streaming enabled")
+        val noticesAfterFirst = saturationNotices(appender)
+        assert(noticesAfterFirst.size == 1,
+          s"exactly one notice must be emitted but ${noticesAfterFirst.size} were")
+
+        // A second and a third policy in the same JVM -- which every local and local-cluster run
+        // constructs -- describe the same executor configuration and must add nothing. Each is
+        // shown to be in the very state that produced the notice, so silence is suppression and
+        // not a differently configured instance that had nothing to report.
+        (0 until 2).foreach { _ =>
+          val repeat = new StreamingShuffleFallbackPolicy(streamingConf(), newManualClock())
+          constructed += 1
+          assert(repeat.streamingActive,
+            "a repeat construction must have streaming enabled")
+          assert(repeat.administeredLinkCapacityBytesPerSecond.isEmpty,
+            "a repeat construction must still be unable to evaluate saturation")
+          val unevaluableBefore = repeat.unevaluableSampleCount
+          repeat.recordLinkUtilization(Double.MaxValue)
+          assert(repeat.unevaluableSampleCount == unevaluableBefore + 1L,
+            "a repeat construction must still count saturation samples as un-evaluable")
+          assert(!repeat.hasTripped,
+            "an un-evaluable sample must not trip, however large")
+        }
+      }
+
+      val notices = saturationNotices(appender)
+      assert(notices.size == 1,
+        s"the notice is once per JVM, not once per policy, but ${notices.size} were emitted")
+      assert(latch.get(), "the latch must remain set after the repeats")
+      assert(constructed == 3, "three policies must have been constructed")
+
+      // What the one notice says. It is a notice and not a warning, because an uncapped link is a
+      // legitimate configuration; it names the property that would make the condition evaluable;
+      // and it says plainly that the other three conditions are unaffected, so an operator reading
+      // it does not conclude that fallback as a whole is off.
+      val notice = notices.head
+      assert(notice.getLevel == Level.INFO,
+        s"an unevaluable condition is a notice rather than a fault but was ${notice.getLevel}")
+      val text = notice.getMessage.getFormattedMessage
+      assert(text.contains(SHUFFLE_STREAMING_MAX_BANDWIDTH_MBPS.key),
+        s"the notice must name the property that makes saturation evaluable: $text")
+      assert(text.contains(LinkSaturationTripPercent.toString),
+        s"the notice must name the share that cannot be evaluated: $text")
+      assert(text.contains("never") && text.contains("trip"),
+        s"the notice must say the condition will never trip: $text")
+      assert(text.contains("consumer slowness") && text.contains("memory pressure") &&
+          text.contains("protocol version"),
+        s"the notice must say which conditions remain active: $text")
+    } finally {
+      latch.set(latchedOnEntry)
+    }
   }
 
   test("the saturation trip share and the egress bandwidth ceiling are different constants") {
@@ -607,29 +679,30 @@ class StreamingShuffleFallbackSuite
       "the policy and the backpressure protocol must agree on the sustained window")
   }
 
-  // -----------------------------------------------------------------------------------------------
-  // Trip 4: a producer/consumer protocol version mismatch, detected explicitly.
-  //
-  // This condition is an EXPLICIT compatibility check and never an inference from a failed decode.
-  // The wire header carries a protocol version byte for precisely this purpose, so that an executor
-  // rolled to a different revision is recognised BEFORE any attempt is made to interpret its frames
-  // and degrades deterministically to sort-based shuffle instead of misreading bytes. Two
-  // properties are therefore asserted beyond the trip itself: that the peek which reads that byte
-  // does not consume the buffer, so the very same buffer can still be decoded afterwards; and that
-  // a frame too short to carry a version is reported as the framing fault it is rather than
-  // mislabelled as a version mismatch, because truncation is recovered by checksum verification and
-  // retransmission.
-  // -----------------------------------------------------------------------------------------------
+  // Trip 4: a producer/consumer protocol version mismatch, detected explicitly and never inferred
+  // from a failed decode. The wire header carries a protocol version byte for exactly this purpose,
+  // so an executor rolled to a different revision is recognised BEFORE any attempt to interpret its
+  // frames and degrades deterministically instead of misreading bytes. Two further properties are
+  // asserted: the peek that reads the byte does not consume the buffer, so the same buffer still
+  // decodes afterwards; and a frame too short to carry a version is reported as the framing fault
+  // it is rather than mislabelled a version mismatch, because truncation is recovered by checksum
+  // verification and retransmission.
 
   test("only the current streaming shuffle protocol version is compatible") {
-    assert(ProtocolVersion == StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION,
-      "the shared fixtures must report the version this build actually speaks")
+    // The whole wire contract is compared with the encoder here, in one call, so a layout change
+    // fails with a message naming the field that moved rather than being absorbed silently by an
+    // assertion built on the drifted value. The literals themselves live in the shared fixtures and
+    // are deliberately independent of production.
+    verifyWireContractAgainstEncoder()
+    assert(ProtocolVersion == 1,
+      "the streaming protocol revision this build speaks is 1, stated independently of the encoder")
+    assert(StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION == 1,
+      s"the encoder must stamp revision 1, but stamps " +
+        s"${StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION}; a revision change is one " +
+        "every peer of a different build has to be considered against")
     assert(StreamingShuffleMessage.isCompatible(StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION),
       "this build must consider its own protocol revision compatible")
 
-    // Compatibility requires exact equality, so every other value of the byte is incompatible. The
-    // whole domain is walked rather than one sample of it, because "a different version" is not a
-    // single case and a check that accepted a neighbouring revision would pass a narrower test.
     val everyOtherVersion = (Byte.MinValue.toInt to Byte.MaxValue.toInt)
       .map(_.toByte)
       .filter(_ != StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION)
@@ -638,11 +711,14 @@ class StreamingShuffleFallbackSuite
     assert(everyOtherVersion.forall(version => !StreamingShuffleMessage.isCompatible(version)),
       "no revision other than the current one may be considered compatible")
 
-    // The layout the version byte opens, stated as the sum of its parts rather than as a literal so
-    // that this assertion describes the header rather than merely echoing a number.
-    assert(HeaderEncodedLength == 1 + 4 + 8 + 4 + 8,
-      "the shared header is a version byte, a shuffle id, a map id, a partition id and a sequence")
-    assert(FrameTypePrefixLength == 1,
+    // The layout the version byte opens, stated as the sum of its parts so that this assertion
+    // describes the header rather than merely echoing a number, and asserted against the encoder's
+    // own constant so that it is the encoder being pinned rather than the fixture.
+    assert(StreamingShuffleMessage.HEADER_ENCODED_LENGTH == 1 + 4 + 8 + 4 + 8,
+      s"the shared header is a version byte, a shuffle id, a map id, a partition id and a " +
+        s"sequence number -- 25 bytes -- but the encoder reports " +
+        s"${StreamingShuffleMessage.HEADER_ENCODED_LENGTH}")
+    assert(StreamingShuffleMessage.FRAME_TYPE_PREFIX_LENGTH == 1,
       "a framed message opens with exactly one type-discriminator byte")
   }
 
@@ -753,16 +829,13 @@ class StreamingShuffleFallbackSuite
       "a framing fault must leave the streaming path in service")
   }
 
-  // -----------------------------------------------------------------------------------------------
-  // The operator kill switch, which is the lower rung of the two-tier activation model.
-  //
-  // Tier 1, spark.shuffle.manager=streaming, decides which manager class Spark instantiates. Tier
-  // 2, spark.shuffle.streaming.enabled, gates the behaviour of the class Tier 1 selected, and it
-  // defaults to false. While it is false the streaming manager forwards every service-provider call
-  // verbatim to its internal delegate, built as new SortShuffleManager(conf) -- one argument, which
-  // is the whole of that class's constructor. That is what lets an operator restore sort behaviour
-  // without redeploying a different manager class, and it is the SAME TERMINUS as all four trips.
-  // -----------------------------------------------------------------------------------------------
+  // The operator kill switch, the lower rung of the two-tier activation model. Tier 1,
+  // spark.shuffle.manager=streaming, decides which manager class Spark instantiates; tier 2,
+  // spark.shuffle.streaming.enabled, gates the behaviour of the class tier 1 selected and defaults
+  // to false. While it is false the streaming manager forwards every service-provider call verbatim
+  // to its internal delegate, built as new SortShuffleManager(conf), which is what lets an operator
+  // restore sort behaviour without redeploying a different manager class -- and it is the SAME
+  // TERMINUS as all four trips.
 
   test("the operator kill switch is engaged by default and is not a trip") {
     val defaults = new SparkConf(false).set(SHUFFLE_MANAGER, StreamingShuffleManager.SHORT_NAME)
@@ -789,11 +862,6 @@ class StreamingShuffleFallbackSuite
     val conf = withLocalMaster(gatedOffStreamingConf(), "streaming-shuffle-fallback-delegation")
     sc = new SparkContext(conf)
 
-    // The delegate is built exactly as the streaming manager builds its own, with the single
-    // constructor argument that is the whole of SortShuffleManager's constructor. Comparing the two
-    // managers call for call is what turns "gated off is indistinguishable from sort" from a claim
-    // into an observation: the assertion is not that the result looks reasonable, it is that it is
-    // the very same kind of object the sort manager itself would have returned.
     val delegate = new SortShuffleManager(conf)
     val manager = new StreamingShuffleManager(conf, isDriver = true)
     try {
@@ -854,24 +922,16 @@ class StreamingShuffleFallbackSuite
     assert(!sc.getConf.get(SHUFFLE_STREAMING_ENABLED),
       "the behaviour gate must be closed for this application")
 
-    // This is the write path as well as the read path: a groupByKey shuffles for real, so a job
-    // that produces the baseline's output proves the writer was the sort writer and the reader the
-    // sort reader. Nothing is mocked and nothing is inspected -- the job either shuffles correctly
-    // or it does not.
     val observed = groupedOutputAsSet(sc, PartitionCount)
     assertNoDataLoss(observed, baseline, "a job run with the streaming kill switch engaged")
   }
 
-  // -----------------------------------------------------------------------------------------------
-  // Latching, and the diagnostics that survive it.
-  //
-  // The tripped state latches: once tripped, an instance stays tripped until reset. Streaming and
-  // sort-based shuffle cannot both own the same shuffle, so oscillating back into streaming
-  // mid-shuffle would mean two producers of the same data. Latching also makes the decision
+  // Latching, and the diagnostics that survive it. Once tripped an instance stays tripped until
+  // reset, because streaming and sort-based shuffle cannot both own one shuffle and oscillating
+  // back mid-shuffle would mean two producers of the same data. Latching also makes the decision
   // monotone, which is what allows the hot-path read to be a single atomic load with no lock, no
-  // allocation and no clock read -- and reset exists for tests and for reusing an instance, never
-  // as a runtime recovery path.
-  // -----------------------------------------------------------------------------------------------
+  // allocation and no clock read; reset exists for tests and for reusing an instance, never as a
+  // runtime recovery path.
 
   test("the tripped state latches on the first condition observed") {
     val clock = newManualClock()
@@ -977,17 +1037,20 @@ class StreamingShuffleFallbackSuite
     assert(policy.shouldDelegateToSortShuffle, "the terminus is reached under contention too")
   }
 
-  // -----------------------------------------------------------------------------------------------
-  // The central assertion: every path terminates in a working shuffle.
-  //
-  // This is the whole point of the fallback policy, and it is asserted over the complete set of
-  // paths rather than one at a time, so that a fifth path added later without a terminus would fail
-  // here. There is no configuration, no failure and no resource condition that leaves a job without
-  // a functioning shuffle implementation, which is how zero regression is guaranteed structurally
+  // The central assertion: every path terminates in a working shuffle. It is asserted over the
+  // complete set of paths rather than one at a time, so a fifth path added later without a terminus
+  // fails here. No configuration, no failure and no resource condition leaves a job without a
+  // functioning shuffle implementation, which is how zero regression is guaranteed structurally
   // rather than merely tested for.
-  // -----------------------------------------------------------------------------------------------
 
-  test("every fallback condition and the kill switch terminate in a working shuffle") {
+  test("every fallback condition and the kill switch reach the policy's sort shuffle terminus") {
+    // What is asserted here is the POLICY's verdict, which is one half of the guarantee. The other
+    // half -- that a live StreamingShuffleManager acts on that verdict by routing every
+    // service-provider call to its internal SortShuffleManager, and that a real shuffle registered
+    // afterwards produces the sort-based baseline's output -- is asserted against a live manager by
+    // "every fallback condition makes a live manager delegate every service provider call" in the
+    // manager suite, and against a live job mid-write by the case further down this file. Naming
+    // all three is what stops this one from being read as more than it proves.
     val drivers: Seq[(StreamingShuffleFallbackReason,
         (StreamingShuffleFallbackPolicy, ManualClock) => Unit)] = Seq(
       ConsumerTooSlow -> ((policy, clock) => driveSustainedConsumerSlowness(policy, clock)),
@@ -1022,8 +1085,6 @@ class StreamingShuffleFallbackSuite
         s"$reason must not rewrite the operator's configured intent")
     }
 
-    // The kill switch reaches the identical terminus with no condition observed at all, which is
-    // what makes it a runtime switch rather than a fifth failure mode.
     val gated = new StreamingShuffleFallbackPolicy(gatedOffStreamingConf(), newManualClock())
     assert(gated.shouldDelegateToSortShuffle,
       "the kill switch must reach the same terminus as every trip condition")
@@ -1031,14 +1092,152 @@ class StreamingShuffleFallbackSuite
     assert(!gated.hasTripped, "the kill switch must reach that terminus without any trip at all")
   }
 
+  /**
+   * Records what the scheduler was told during a job, so a stand-down can be told from a failure.
+   *
+   * Three facts are collected and each answers a different question. The COUNTED failures answer
+   * whether a stand-down spent one of the task attempts the master permits -- it must not, which is
+   * the whole of the finding. The FETCH failures answer whether recovery came through the one
+   * scheduler-facing signal this subsystem is allowed to use. And the per-stage submission counts
+   * answer whether the map stage was genuinely recomputed, which is what distinguishes a mid-write
+   * stand-down from a preflight delegation that never needed recomputing at all.
+   *
+   * Every callback is synchronized, because the listener bus delivers on its own thread while the
+   * test thread reads.
+   */
+  private class StandDownRecorder extends SparkListener {
+
+    private val counted = new mutable.ArrayBuffer[TaskFailedReason]()
+    private val fetched = new mutable.ArrayBuffer[FetchFailed]()
+    private val submissions = new mutable.HashMap[Int, Int]()
+
+    override def onTaskEnd(event: SparkListenerTaskEnd): Unit = synchronized {
+      event.reason match {
+        case failed: FetchFailed =>
+          fetched += failed
+        case failed: TaskFailedReason if failed.countTowardsTaskFailures =>
+          counted += failed
+        case _ =>
+      }
+    }
+
+    override def onStageSubmitted(event: SparkListenerStageSubmitted): Unit = synchronized {
+      val stageId = event.stageInfo.stageId
+      submissions.put(stageId, submissions.getOrElse(stageId, 0) + 1)
+    }
+
+    /** Failures the scheduler charged against `spark.task.maxFailures`. */
+    def countedFailures: Seq[TaskFailedReason] = synchronized(counted.toSeq)
+
+    /** Fetch failures, which the scheduler resolves by recomputing rather than by counting. */
+    def fetchFailures: Seq[FetchFailed] = synchronized(fetched.toSeq)
+
+    /** Submissions of the busiest stage, which is one more than the times it was recomputed. */
+    def maxStageSubmissions: Int = synchronized {
+      if (submissions.isEmpty) 0 else submissions.values.max
+    }
+  }
+  test("a job completes under a one-failure master when each condition trips mid-write") {
+    // The claim, and why a master that permits exactly one task failure is the setting that proves
+    // it: a mid-write trip cannot delegate, because the records already framed cannot be re-driven
+    // into another writer, so the map output has to be produced again. If the mechanism for that
+    // were a task failure it would consume the single attempt `local[n]` permits and abort the job.
+    // Streaming standing down would then break the job it exists to accelerate, which is the exact
+    // opposite of graceful degradation.
+    //
+    // So each of the four conditions is driven ON THE EXECUTOR, from inside a map function running
+    // while the streaming writer is pulling records from it -- a genuine mid-write trip through the
+    // live policy the production code consults -- and the job must still produce the sort-based
+    // baseline's output.
+    val baseline = sortBaselineGroupedOutput(numPartitions = PartitionCount)
+    assert(baseline.nonEmpty, "the sort-based baseline must produce output to compare against")
+
+    val conf = withLocalMaster(streamingConf(), "streaming-shuffle-midwrite-standdown")
+      // Explicit rather than relied upon. A plain local[n] master already fixes this at one, and
+      // stating it here is what makes the test's premise visible instead of incidental.
+      .set(TASK_MAX_FAILURES, 1)
+      // Recovery is by fetch failure, and a fetch failure is reported per map output that cannot be
+      // found. A stood-down map stage therefore takes as many resubmissions as it has void outputs,
+      // which is a property of the recovery mechanism rather than of this feature; the allowance is
+      // raised so the test measures the feature and not the default.
+      .set(STAGE_MAX_CONSECUTIVE_ATTEMPTS, 2 * PartitionCount + 4)
+    sc = new SparkContext(conf)
+
+    val manager = SparkEnv.get.shuffleManager.asInstanceOf[StreamingShuffleManager]
+    assert(manager.streamingFallbackPolicy.streamingActive,
+      "streaming must be in service before the first condition is driven")
+
+    StreamingShuffleFallbackReason.all.foreach { reason =>
+      // Each condition gets a shuffle of its own, and the executor's policy is returned to service
+      // between them: the latch is monotone by design, so a second condition driven against a
+      // tripped policy would degrade at preflight and never reach the mid-write path under test.
+      manager.streamingFallbackPolicy.reset()
+      assert(manager.streamingFallbackPolicy.streamingActive,
+        s"streaming must be back in service before $reason is driven")
+
+      val holder = new MidWriteTripHolder(reason)
+      val shuffled = midWriteTrippingWorkload(sc, PartitionCount, holder)
+      // Set after the graph is built and before the action, so the closure carries the real shuffle
+      // id: task closures are serialized when the job is submitted, not when the RDD is defined.
+      holder.shuffleId = shuffled.dependencies.head
+        .asInstanceOf[ShuffleDependency[Int, String, _]].shuffleId
+      assert(holder.shuffleId >= 0, "the workload must have registered a shuffle to trip")
+
+      val recorder = new StandDownRecorder
+      sc.addSparkListener(recorder)
+      val observed = try {
+        shuffled.mapValues(values => values.toSeq.sorted).collect().toSet
+      } finally {
+        sc.listenerBus.waitUntilEmpty(ListenerDrainTimeoutMillis)
+        sc.removeSparkListener(recorder)
+      }
+
+      assertNoDataLoss(observed, baseline,
+        s"a job whose map stage stood streaming down mid-write because of $reason")
+      assert(manager.streamingFallbackPolicy.hasTripped ||
+          manager.streamingFallbackPolicy.shuffleHasFallenBack(holder.shuffleId),
+        s"$reason must have been latched by the run rather than merely attempted")
+
+      // The three properties that distinguish this from a preflight delegation, and that together
+      // are the whole of what the finding asked to be proven.
+      //
+      // 1. NO task failure was counted. This is the claim: a stand-down completes its attempt, so
+      //    the one failure this master permits was never spent and the job could not abort.
+      assert(recorder.countedFailures.isEmpty,
+        s"a stand-down for $reason must count no task failure, yet the run reported " +
+          s"${recorder.countedFailures.size}: " +
+          recorder.countedFailures.take(3).map(_.toErrorString).mkString("[", ", ", "]"))
+      // 2. Recovery never charged the scheduler, and it never thrashed. Three routes exist, all
+      //    three are sanctioned, and which one a run takes depends on how far the map stage had got
+      //    when the condition was driven -- so the assertion states what all three guarantee rather
+      //    than picking one of them:
+      //      - the tripping attempt reconstructs the records it had already framed and rewrites the
+      //        whole attempt through the sort-based delegate, so nothing is missing and the one
+      //        submission suffices;
+      //      - a producer that had ALREADY registered streamed output has that registration
+      //        withdrawn on the driver, so the map stage reports itself unavailable and is
+      //        resubmitted for exactly the partitions withdrawn, served from the sort-based
+      //        delegate, before any consumer has read them;
+      //      - an attempt that could not rewrite its output at all completes with a void status,
+      //        which a consumer turns into a fetch failure -- the one scheduler-facing signal this
+      //        subsystem uses, and one the scheduler answers by recomputing, never by counting.
+      //    A bound of one resubmission per map partition is what separates all three from the
+      //    failure mode this finding was about: a stage resubmitted over and over until the
+      //    stage-attempt limit aborts the job.
+      assert(recorder.maxStageSubmissions <= 1 + PartitionCount,
+        s"a stand-down for $reason must be recovered within one resubmission per map partition, " +
+          s"yet the busiest stage of a $PartitionCount partition shuffle was submitted " +
+          s"${recorder.maxStageSubmissions} time(s), with ${recorder.fetchFailures.size} fetch " +
+          "failure(s) reported")
+    }
+  }
+
   // -----------------------------------------------------------------------------------------------
-  // Closed sets: the conditions, the metrics, and what a fallback is allowed to raise.
-  //
-  // Each of these sets is closed on purpose. A fifth condition would be a fifth way for streaming
-  // to abandon the fast path, and every such way has to be specified, tested and documented before
-  // it can be trusted. A fifth metric would be an operator-facing surface nobody had agreed to. And
-  // a fallback raises nothing at all: it is reported through a boolean and a value from a sealed
-  // set, which is exactly why it needs no error condition of its own.
+  // Closed sets: the conditions, the metrics, and what a fallback is allowed to raise. A fifth
+  // condition would be a fifth way for streaming to abandon the fast path, and every such way has
+  // to be specified, tested and documented before it can be trusted; a fifth metric would be an
+  // operator-facing surface nobody agreed to; and a fallback raises nothing at all, being reported
+  // through a boolean and a value from a sealed set, which is why it needs no error condition.
   // -----------------------------------------------------------------------------------------------
 
   test("the fallback condition set is closed at exactly four conditions") {
@@ -1065,7 +1264,6 @@ class StreamingShuffleFallbackSuite
     assert(StreamingShuffleFallbackReason.fromName(null).isEmpty,
       "resolution must tolerate a null name rather than raise on it")
 
-    // The prose an operator reads, which composes into the single warning a trip emits.
     assert(all.forall(_.description.nonEmpty),
       "every condition must carry an operator-facing wording")
     assert(all.map(_.description).distinct.size == all.size,
@@ -1083,10 +1281,37 @@ class StreamingShuffleFallbackSuite
     assert(StreamingShuffleMetricsSource.sourceName == MetricsSourceName,
       "the four metrics must live under the single streaming shuffle namespace")
 
-    // Every condition is driven on one policy. None of these calls may raise: degradation is
-    // reported through hasTripped and a value from the sealed set, so there is no fallback error
-    // condition to add to the catalogue and this suite would fail here if one had been invented and
-    // thrown.
+    // The error catalogue, read as the catalogue rather than inferred from the absence of a throw.
+    // Three conditions are authorized under this feature's prefix and all three describe a WIRE
+    // fault -- a block whose checksum did not verify, a block out of sequence, a frame of a type
+    // the peer should not have sent. None of them describes a degradation, and that is the claim:
+    // standing streaming down is reported through `hasTripped` and a value from a sealed set, so it
+    // needs no condition of its own. Comparing the set exactly is what makes the claim checkable:
+    // an invented fourth condition, or one for a fallback reason, fails here whether or not
+    // anything ever throws it.
+    val catalogued = SparkThrowableHelper.errorReader.errorInfoMap.keys
+      .filter(_.startsWith(StreamingShuffleConditionPrefix)).toSet
+    assert(catalogued == AuthorizedErrorConditions,
+      s"the catalogue must hold exactly the authorized streaming shuffle conditions " +
+        s"${AuthorizedErrorConditions.toSeq.sorted.mkString("[", ", ", "]")} but held " +
+        s"${catalogued.toSeq.sorted.mkString("[", ", ", "]")}")
+    catalogued.foreach { condition =>
+      assert(SparkThrowableHelper.getSqlState(condition) == StreamingShuffleSqlState,
+        s"$condition must carry SQLSTATE $StreamingShuffleSqlState, matching the checksum " +
+          s"verification precedent, but carried ${SparkThrowableHelper.getSqlState(condition)}")
+    }
+    // No condition names a degradation. Checked against the sealed set itself rather than against a
+    // list of words, so a fifth reason added later is covered without this test being revisited.
+    StreamingShuffleFallbackReason.all.foreach { reason =>
+      val named = catalogued.filter(_.toUpperCase(Locale.ROOT).contains(
+        reason.toString.toUpperCase(Locale.ROOT)))
+      assert(named.isEmpty,
+        s"$reason is a degradation and must be reported through the sealed set rather than as an " +
+          s"error condition, yet the catalogue held ${named.mkString("[", ", ", "]")}")
+    }
+
+    // Every condition is driven on one policy. None of these calls may raise, which is the runtime
+    // half of the same claim: the catalogue has nothing for a degradation AND nothing is thrown.
     val clock = newManualClock()
     val policy = activePolicy(clock)
     driveSustainedConsumerSlowness(policy, clock)
@@ -1101,15 +1326,17 @@ class StreamingShuffleFallbackSuite
     assert(streamingShuffleMetricNames() == expectedMetrics,
       s"driving every fallback condition must publish no further metric but published " +
         s"${streamingShuffleMetricNames()}")
+    // And the catalogue is unchanged by having driven them, which is what closes the loop: nothing
+    // a degradation does adds a condition.
+    assert(SparkThrowableHelper.errorReader.errorInfoMap.keys
+        .filter(_.startsWith(StreamingShuffleConditionPrefix)).toSet == AuthorizedErrorConditions,
+      "driving every fallback condition must leave the authorized condition set exactly as it was")
   }
 
-  // -----------------------------------------------------------------------------------------------
-  // Configuration: read once, held immutably, and validated when it is read.
-  //
-  // Reading every value at construction and never consulting the configuration again is what makes
-  // "streaming shuffle configuration changes require an executor restart" true by construction
-  // rather than true by note, and it is why there is no dynamic-reconfiguration path to test.
-  // -----------------------------------------------------------------------------------------------
+  // Configuration: read once, held immutably, and validated when it is read. Reading every value at
+  // construction and never consulting the configuration again is what makes "streaming shuffle
+  // configuration changes require an executor restart" true by construction rather than by note,
+  // and it is why there is no dynamic-reconfiguration path to test.
 
   test("configuration is read once at construction and never re-read") {
     val conf = streamingConf()
@@ -1119,7 +1346,6 @@ class StreamingShuffleFallbackSuite
     assert(policy.administeredLinkCapacityBytesPerSecond.isEmpty,
       "the fixture must start with an uncapped link")
 
-    // Mutating the configuration after construction changes nothing about the live instance.
     conf.set(SHUFFLE_STREAMING_ENABLED, false)
     conf.set(SHUFFLE_STREAMING_MAX_BANDWIDTH_MBPS, AdministeredBandwidthMbps)
 
@@ -1131,8 +1357,6 @@ class StreamingShuffleFallbackSuite
     assert(policy.administeredLinkCapacityBytesPerSecond.isEmpty,
       "a live policy must not pick up a bandwidth cap administered after it was constructed")
 
-    // A policy constructed afterwards does observe the new values, which is what an executor
-    // restart amounts to: the value is held per instance and is not cached anywhere process wide.
     val restarted = new StreamingShuffleFallbackPolicy(conf, newManualClock())
     assert(restarted.killSwitchEngaged, "a restarted policy must observe the new configuration")
     assert(restarted.administeredLinkCapacityBytesPerSecond
@@ -1161,7 +1385,6 @@ class StreamingShuffleFallbackSuite
     assert(thresholdFailure.getMessage.contains("The spill threshold must be in [50, 95]."),
       s"the failure must quote the documented range but said: ${thresholdFailure.getMessage}")
 
-    // The documented defaults, by contrast, construct without complaint.
     val defaults = streamingConf()
     assert(defaults.get(SHUFFLE_STREAMING_BUFFER_SIZE_PERCENT) == DefaultBufferSizePercent,
       "the buffer budget must default to the documented share of executor memory")

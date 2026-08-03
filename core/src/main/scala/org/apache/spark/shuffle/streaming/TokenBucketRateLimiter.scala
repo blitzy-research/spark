@@ -217,18 +217,27 @@ private[spark] class TokenBucketRateLimiter(
    * was about to send and try again later, which is exactly the pressure the spill manager and the
    * backpressure protocol react to.
    *
-   * @param bytes the number of bytes the caller wants to send. A non-positive value is admitted
-   *              without charge, so callers need no special case for an empty payload
+   * <b>The argument is validated before the unlimited fast path, not after.</b> A negative length
+   * is not a small request, it is a nonsensical one, and admitting it "without charge" would make
+   * the limiter's contract depend on whether a rate happened to be configured -- so an unlimited
+   * deployment would accept a byte count that a rate-limited deployment charged as a credit. It is
+   * refused in both, which is the only reading that keeps a cap a cap. Exactly zero remains an
+   * uncharged no-op, because a block may legitimately carry an empty payload.
+   *
+   * @param bytes the number of bytes the caller wants to send; must not be negative. Exactly zero
+   *              is admitted without charge, so callers need no special case for an empty payload
    * @return true if the tokens were charged and the caller may send now, false if the request is
    *         over limit and the caller must hold the data and retry
+   * @throws IllegalArgumentException when `bytes` is negative
    */
   def tryAcquire(bytes: Long): Boolean = {
+    require(bytes >= 0L, s"Acquired bytes must be non-negative but was $bytes.")
     if (unlimited) {
-      // Unlimited fast path, tested before anything else: no clock read, no arithmetic and no
-      // compare-and-set, because there is no rate to enforce. This is the state an operator gets
-      // by leaving spark.shuffle.streaming.maxBandwidthMBps unset.
+      // Unlimited fast path: no clock read, no arithmetic and no compare-and-set, because there is
+      // no rate to enforce. This is the state an operator gets by leaving
+      // spark.shuffle.streaming.maxBandwidthMBps unset.
       true
-    } else if (bytes <= 0L) {
+    } else if (bytes == 0L) {
       true
     } else {
       chargeBucket(bytes)

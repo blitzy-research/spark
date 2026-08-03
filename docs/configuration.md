@@ -1423,13 +1423,14 @@ Apart from these, the following properties are also available, and may be useful
   <td><code>spark.shuffle.streaming.enabled</code></td>
   <td>false</td>
   <td>
-    Whether the streaming shuffle behavior is active. This property only takes effect when
+    Whether the streaming shuffle behavior is active. Only takes effect when
     <code>spark.shuffle.manager</code> is set to <code>streaming</code>, which selects the streaming
-    shuffle manager. When this property is false, the streaming shuffle manager delegates every
+    shuffle manager. While this property is false the streaming shuffle manager delegates every
     service-provider call to the sort-based shuffle manager, so behavior is indistinguishable from
-    the default sort-based shuffle; this acts as a runtime kill switch that does not require
-    changing the shuffle manager. Changing this value requires an executor restart. See
-    <a href="streaming-shuffle.html">Streaming Shuffle</a> for details.
+    the default sort-based shuffle; it is therefore a kill switch that restores sort behavior
+    without changing the shuffle manager. Every <code>spark.shuffle.streaming.*</code> property,
+    including this one, is read once when the streaming shuffle manager is constructed and then held
+    immutably, so changing any of them requires an executor restart to take effect.
   </td>
   <td>4.2.0</td>
 </tr>
@@ -1437,11 +1438,19 @@ Apart from these, the following properties are also available, and may be useful
   <td><code>spark.shuffle.streaming.bufferSizePercent</code></td>
   <td>20</td>
   <td>
-    Percentage of executor memory reserved across all streaming shuffle buffers. The per-partition
-    allowance is that aggregate budget divided by the number of partitions, that is
-    <code>(executorMemory * bufferSizePercent) / numPartitions</code>. Must be in the range 1 to 50;
-    values outside that range are rejected when the configuration is read. Only takes effect when
-    streaming shuffle is enabled.
+    Percentage of the executor's on-heap unified memory region reserved across all streaming
+    shuffle buffers. The basis is the region Spark shares between execution and storage, that is
+    <code>(heap space - 300MB) * spark.memory.fraction</code> as described in
+    <a href="tuning.html#memory-management-overview">Memory Management Overview</a>, and not the
+    total configured executor heap: at the default <code>spark.memory.fraction</code> of 0.6 a value
+    of 20 reserves 12% of the heap remaining after Spark's 300MB reservation, not 20% of the heap.
+    The aggregate budget is <code>(unifiedMemoryRegion * bufferSizePercent) / 100</code> and the
+    per-partition allowance is that budget divided by the number of partitions. The budget is
+    executor-wide rather than per task, so every concurrently streaming task on the executor draws
+    on the same allowance and a reservation that would exceed it is refused rather than granted.
+    Must be in the range 1 to 50; values outside that range are rejected when the configuration is
+    read. Only takes effect when streaming shuffle is enabled, and changing it requires an executor
+    restart.
   </td>
   <td>4.2.0</td>
 </tr>
@@ -1450,9 +1459,11 @@ Apart from these, the following properties are also available, and may be useful
   <td>80</td>
   <td>
     Buffer utilization percentage at which the streaming shuffle spills the largest buffered
-    partitions to local disk in LRU order. Must be in the range 50 to 95; values outside that range
-    are rejected when the configuration is read. Only takes effect when streaming shuffle is
-    enabled.
+    partitions to local disk in LRU order. The percentage is taken against the aggregate budget set
+    by <code>spark.shuffle.streaming.bufferSizePercent</code>, not against the executor heap. Must
+    be in the range 50 to 95; values outside that range are rejected when the configuration is
+    read. Only takes effect when streaming shuffle is enabled, and changing this value requires an
+    executor restart.
   </td>
   <td>4.2.0</td>
 </tr>
@@ -1460,14 +1471,18 @@ Apart from these, the following properties are also available, and may be useful
   <td><code>spark.shuffle.streaming.maxBandwidthMBps</code></td>
   <td>(none)</td>
   <td>
-    When set, declares the administered network link capacity, in MB/s, against which streaming
-    shuffle egress is paced on one executor. This declares the capacity of the link rather than the
-    rate streaming is permitted to reach: streaming holds itself to 80% of the declared capacity and
-    divides that allowance evenly across the shuffles the executor is serving, so each shuffle's
-    token bucket refills at <code>(0.8 * maxBandwidthMBps) / numConcurrentShuffles</code> MB/s. Must
-    be positive. When unset, streaming shuffle egress is uncapped and no pacing is applied at all.
-    Changing this value requires an executor restart. Only takes effect when streaming shuffle is
-    enabled.
+    When set, declares the administered network link capacity, in MB/s, that streaming shuffle
+    egress on one executor is paced against. It declares the capacity of the link rather than the
+    rate streaming may reach: streaming holds itself to 80% of the declared capacity and divides that
+    allowance evenly across the shuffles the executor is serving, so each shuffle's token bucket
+    refills at <code>(0.8 * maxBandwidthMBps) / numConcurrentShuffles</code> MB/s. Must be positive.
+    Declaring a capacity also activates the network-saturation fallback condition, which stands
+    streaming down when link utilization exceeds 90% of it. While unset, egress is uncapped and no
+    pacing is applied, and because there is then no capacity to measure utilization against the
+    network-saturation condition cannot be evaluated and never trips; the other three fallback
+    conditions (a consumer sustained at 2x slower than its producer, memory pressure that prevents
+    buffer allocation, and a producer/consumer protocol version mismatch) are unaffected. Only takes
+    effect when streaming shuffle is enabled, and changing it requires an executor restart.
   </td>
   <td>4.2.0</td>
 </tr>
@@ -1476,7 +1491,11 @@ Apart from these, the following properties are also available, and may be useful
   <td>false</td>
   <td>
     Whether verbose streaming shuffle debug logging is emitted for the streaming shuffle subsystem.
-    Off by default to keep log volume bounded. Only takes effect when streaming shuffle is enabled.
+    Off by default to keep log volume bounded. This property takes effect whenever
+    <code>spark.shuffle.manager</code> is set to <code>streaming</code>, independently of
+    <code>spark.shuffle.streaming.enabled</code>: with streaming gated off, it still emits the
+    diagnostics that report why each shuffle was delegated to the sort-based shuffle manager.
+    Changing this value requires an executor restart.
   </td>
   <td>4.2.0</td>
 </tr>

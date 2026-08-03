@@ -464,6 +464,19 @@ private[spark] class BackpressureProtocol(
   private val reportedDegradations =
     ConcurrentHashMap.newKeySet[BackpressureDegradationReason]()
 
+  // Blocks a producer could not buffer and retained on local disk instead. This is ordinary spill
+  // behaviour and emphatically NOT a degradation condition -- see
+  // [[reportDurableSpillAdmission]] -- so it is counted here rather than latched beside the four
+  // reasons, and the count is what an operator reads to see how much of a shuffle's output took
+  // that route.
+  private val durableSpillAdmissions = new AtomicLong(0L)
+
+  // Rate gate for the default-level durable-admission record. Once the allowance is met the
+  // condition recurs for every block a wide shuffle cuts, so it is reported as one bounded
+  // aggregate carrying the number of occurrences it stands in for, exactly as throttling is.
+  private val durableSpillLogGate =
+    new MemorySpillManager.LogAggregationGate(MemorySpillManager.LOG_AGGREGATION_WINDOW_MS)
+
   // Latch for the wire-revision warning. A peer that speaks the wrong revision refuses every
   // message it sends, so an ungated warning would be a per-message line; the two revisions only
   // need saying once, and the refusal count is observable through the degradation reason set.
@@ -1168,21 +1181,21 @@ private[spark] class BackpressureProtocol(
   /**
    * Whether a retransmission request can be served in full.
    *
-   * The requested window is inclusive at both ends and the message itself has already refused an
-   * upper bound below its lower one, so the only question left is whether every block it names is
-   * still retained -- that is, still inside the unacknowledged window. A request that is not
-   * entirely serviceable is refused as a whole rather than served in part, because a consumer
-   * splicing a partial replay into its input would reorder the partition; the reader escalates such
-   * a request to a fetch failure and the upstream stage is recomputed.
+   * A request names exactly one position, so the only question is whether that block is still
+   * retained -- that is, still inside the unacknowledged window. A consumer that has lost a run of
+   * blocks emits one request per position, and each is answered on its own merits; a request that
+   * cannot be served is refused rather than answered in part, because a consumer splicing a partial
+   * replay into its input would reorder the partition. The reader escalates such a refusal to a
+   * fetch failure and the upstream stage is recomputed.
    *
-   * "Every block" is decided by counting the blocks the window actually retains inside the
-   * requested range and requiring that count to equal the range's full width, which is the only
-   * form of the test that says what it means. Checking the two endpoints and comparing the
-   * request's width against the window's total size would agree with this on every state the
-   * protocol can reach today, because a cumulative acknowledgement retires a prefix and therefore
-   * leaves a contiguous suffix -- but it would agree by accident, resting on an invariant
-   * maintained in a different method, and it would keep agreeing right up until an interior block
-   * was released for some other reason.
+   * Serviceability is decided by counting the blocks the window actually retains within the range
+   * the request names and requiring that count to equal the range's full width, which is the only
+   * form of the test that says what it means. It also survives a widening of the request shape
+   * without becoming wrong: comparing endpoints against the window's total size would agree on
+   * every state the protocol can reach today, because a cumulative acknowledgement retires a prefix
+   * and therefore leaves a contiguous suffix -- but it would agree by accident, resting on an
+   * invariant maintained in a different method, and it would keep agreeing right up until an
+   * interior block was released for some other reason.
    *
    * A pure predicate: it records nothing and changes no state, so it can be consulted as often as a
    * caller likes.
@@ -1908,22 +1921,34 @@ private[spark] class BackpressureProtocol(
    * exists to refuse, and two concurrent admissions could each observe a total that was briefly
    * larger than either of them caused. The loop admits only what fits.
    *
-   * A non-positive request is granted without touching the ledger: a control frame carries no
+   * <b>Why the bound is a subtraction and the argument is validated.</b> Both readings are decided
+   * on a byte count that arrived over the network, and `bytes` is a signed sixty-four bit quantity.
+   * Testing `current + bytes > total` would let a request near `Long.MaxValue` wrap to a negative
+   * sum, compare as comfortably under the budget, and be charged -- so the one input the budget
+   * exists to bound would be the one input that escaped it. Comparing `bytes` against the remaining
+   * headroom instead cannot overflow, because `current` and `total` are both non-negative and their
+   * difference therefore lies in `[0, total]`. A negative request is refused outright rather than
+   * absorbed: it can only be a defect or a hostile frame, and treating it as free would let a peer
+   * hand back budget it never reserved.
+   *
+   * Exactly zero is granted without touching the ledger: a block may legitimately carry an empty
    * payload, and charging zero would be an atomic operation with no effect on the hot path.
    *
-   * @param bytes payload bytes the caller is about to retain
+   * @param bytes payload bytes the caller is about to retain; must not be negative
    * @return true when the bytes were charged, false when the executor's budget is exhausted
+   * @throws IllegalArgumentException when `bytes` is negative
    */
   def tryReserveReceiveQuota(bytes: Long): Boolean = {
-    if (bytes <= 0L) {
+    require(bytes >= 0L, s"Reserved receive bytes must be non-negative but was $bytes.")
+    if (bytes == 0L) {
       true
     } else {
       var granted = false
       var settled = false
       while (!settled) {
         val current = reservedReceiveBytes.get()
-        val proposed = current + bytes
-        if (proposed > receiveQuotaTotalBytes) {
+        val headroom = receiveQuotaTotalBytes - current
+        if (bytes > headroom) {
           receiveQuotaRefusals.incrementAndGet()
           // Counted as a throttle rather than latched as a degradation: an exhausted consumer
           // budget is the backpressure mechanism working as designed, and it becomes a fallback
@@ -1931,7 +1956,7 @@ private[spark] class BackpressureProtocol(
           // reports on its own account.
           enterReceiveQuotaThrottle()
           settled = true
-        } else if (reservedReceiveBytes.compareAndSet(current, proposed)) {
+        } else if (reservedReceiveBytes.compareAndSet(current, current + bytes)) {
           granted = true
           settled = true
         }
@@ -1944,12 +1969,16 @@ private[spark] class BackpressureProtocol(
    * Returns consumer-side heap to the executor's budget.
    *
    * Clamped at zero, so a double release -- which a close racing an acknowledgement can produce --
-   * cannot drive the reading negative and hand out budget that was never reserved. A non-positive
-   * argument is ignored for the same reason [[tryReserveReceiveQuota]] grants one.
+   * cannot drive the reading negative and hand out budget that was never reserved. Exactly zero is
+   * ignored for the same reason [[tryReserveReceiveQuota]] grants it, and a negative release is
+   * refused rather than absorbed: subtracting a negative quantity would ADD budget nobody reserved,
+   * which is the same escape the reservation side refuses in the other direction.
    *
-   * @param bytes payload bytes the caller has finished with
+   * @param bytes payload bytes the caller has finished with; must not be negative
+   * @throws IllegalArgumentException when `bytes` is negative
    */
   def releaseReceiveQuota(bytes: Long): Unit = {
+    require(bytes >= 0L, s"Released receive bytes must be non-negative but was $bytes.")
     if (bytes > 0L) {
       var settled = false
       while (!settled) {
@@ -1985,9 +2014,25 @@ private[spark] class BackpressureProtocol(
   }
 
   /**
-   * Records that a streaming buffer could not be allocated even after spilling, which is the second
-   * condition under which streaming steps aside: continuing would risk exhausting the heap rather
-   * than merely slowing the job down.
+   * Records that a streaming buffer could not be allocated even after spilling '''and that no
+   * durable retention was possible either''', which is the second condition under which streaming
+   * steps aside: continuing would risk exhausting the heap rather than merely slowing the job down.
+   *
+   * <b>This method declares the subsystem degraded, and a caller that goes on streaming afterwards
+   * is contradicting it.</b> The reason latches, [[state]] reports `Degraded` from here on, and a
+   * record is emitted saying streaming should yield to the sort-based implementation. It is
+   * therefore reserved for the one memory condition that really is unanswerable: a producer that
+   * cannot frame a partition at all, which stands the shuffle down and fails its attempt so the map
+   * stage is recomputed on the sort-based path.
+   *
+   * A buffer allowance that has merely been *met* is a different condition with a different answer,
+   * and it belongs to [[reportDurableSpillAdmission]]: the specification's answer to a full buffer
+   * is to spill, so the block is written straight to local disk and the shuffle keeps the streaming
+   * path its consumers are already reading. Routing that case here is what would make the state
+   * self-contradictory -- "streaming is unsustainable and must yield" recorded while the producer
+   * deliberately carries on -- so the two signals are deliberately separate.
+   *
+   * @param key the stream whose allocation could not be satisfied
    */
   def reportBufferAllocationFailure(key: BackpressureStreamKey): Unit = {
     latchDegradation(BackpressureDegradationReason.BufferAllocationFailure)
@@ -1996,6 +2041,59 @@ private[spark] class BackpressureProtocol(
         log"${MDC(SHUFFLE_ID, key.shuffleId)} partition ${MDC(PARTITION_ID, key.partitionId)}")
     }
   }
+
+  /**
+   * Records that a block met the buffer allowance and was retained on local disk instead of in
+   * memory, without declaring the subsystem degraded.
+   *
+   * '''Why this is not a degradation.''' The buffer allowance is a bound, and the specified answer
+   * to a bound that has been reached is to spill rather than to fail: every path must terminate in
+   * a working shuffle. A block that skips memory and goes straight to a temporary shuffle block is
+   * served to a consumer exactly as an evicted one is, so the map output stays complete and stays
+   * reassemblable, and the shuffle keeps the streaming path it is already committed to. Nothing
+   * about that says streaming has become unsustainable, and saying so would be actively harmful:
+   * the fallback verdict is shuffle-wide, so it would tell consumers to read output this producer
+   * has already streamed from a sort-based path that has none of it, which is only consistent if
+   * the whole map stage is recomputed.
+   *
+   * '''What it is instead.''' Pressure telemetry. The occurrence is counted, so
+   * [[durableSpillAdmissionCount]] tells an operator how much of a shuffle took that route, and it
+   * is reported at default level as a bounded aggregate, because once the allowance is met the
+   * condition recurs for every block a wide shuffle cuts and a record per block would be the log
+   * volume this feature may not produce. Neither [[isDegraded]] nor [[state]] moves.
+   *
+   * The genuinely unanswerable case -- a reservation that cannot be met and cannot be spilled past
+   * either -- is [[reportBufferAllocationFailure]], which does degrade.
+   *
+   * @param key the stream whose block was retained on disk rather than in memory
+   */
+  def reportDurableSpillAdmission(key: BackpressureStreamKey): Unit = {
+    val occurrence = durableSpillAdmissions.incrementAndGet()
+    durableSpillLogGate.admit(clock.getTimeMillis()) match {
+      case Some(unreportedAdmissions) =>
+        logInfo(log"Streaming shuffle met its buffer allowance for shuffle " +
+          log"${MDC(SHUFFLE_ID, key.shuffleId)} and retained a block of partition " +
+          log"${MDC(PARTITION_ID, key.partitionId)} on local disk instead of in memory " +
+          log"(${MDC(COUNT, occurrence)} such block(s) so far, " +
+          log"${MDC(NUM_SKIPPED, unreportedAdmissions)} not reported individually). Streaming " +
+          log"continues: spilling is the specified answer to a full buffer, so the map output " +
+          log"stays complete and no participant stands down")
+      case None =>
+        if (debugEnabled) {
+          logDebug(log"Streaming shuffle retained a block of shuffle " +
+            log"${MDC(SHUFFLE_ID, key.shuffleId)} partition " +
+            log"${MDC(PARTITION_ID, key.partitionId)} on local disk " +
+            log"(${MDC(COUNT, occurrence)} so far)")
+        }
+    }
+  }
+
+  /**
+   * Blocks retained on local disk because the buffer allowance was met, across every stream this
+   * protocol serves. Published so a suite -- and an operator -- can tell ordinary spill pressure
+   * from the degradation condition beside it, which is counted nowhere because it latches instead.
+   */
+  def durableSpillAdmissionCount: Long = durableSpillAdmissions.get()
 
   /**
    * How saturated the administered link is, as a percentage of the capacity the operator declared.
@@ -2274,6 +2372,7 @@ private[spark] class BackpressureProtocol(
     versionMismatchReported.set(false)
     throttleTransitions.set(0L)
     reclamationBreaches.set(0L)
+    durableSpillAdmissions.set(0L)
     lastPollMillis.set(clock.getTimeMillis())
   }
 
@@ -2337,17 +2436,20 @@ private[spark] class BackpressureProtocol(
   }
 
   /**
-   * Latches a degradation reason and reports it at most once for the lifetime of this protocol.
+   * Records a degradation reason and reports it at most once for the lifetime of this protocol.
    *
    * There are only four reasons, so an unconditional line per reason is bounded by four lines per
    * protocol instance and is worth emitting at default level: a job that quietly reverted to
-   * sort-based shuffle is exactly the situation in which an operator needs to find out why.
+   * sort-based shuffle is exactly the situation in which an operator needs to find out why. The
+   * line reports the observation rather than a decision, because whether a shuffle yields is
+   * settled by `StreamingShuffleFallbackPolicy` and not here.
    */
   private def latchDegradation(reason: BackpressureDegradationReason): Unit = {
     degradations.add(reason)
     if (reportedDegradations.add(reason)) {
-      logInfo(log"Streaming shuffle is no longer sustainable and should yield to sort-based " +
-        log"shuffle: ${MDC(REASON, reason.code)}. Aggregate buffer utilisation is " +
+      logInfo(log"Streaming shuffle observed a degradation condition, which is a reason a " +
+        log"shuffle yields to sort-based shuffle: ${MDC(REASON, reason.code)}. " +
+        log"Aggregate buffer utilisation is " +
         log"${MDC(PERCENT, aggregateBufferUtilizationPercent)}% against a threshold of " +
         log"${MDC(THRESHOLD, spillThreshold)}% across " +
         log"${MDC(COUNT, numRegisteredShuffles)} shuffle(s)")
@@ -2958,7 +3060,7 @@ private[spark] object BackpressureProtocol {
     def isHeartbeatDue(nowMillis: Long, intervalMs: Long): Boolean =
       nowMillis - lastHeartbeatSentMillis.get() >= intervalMs
 
-    /** The timestamp the peer stamped into its last heartbeat, if it has sent one. */
+    /** The local instant at which the peer's last heartbeat arrived, if it has sent one. */
     def remoteHeartbeatTimestamp: Option[Long] = {
       val observed = remoteHeartbeatMillis.get()
       if (observed == NO_TIMESTAMP) None else Some(observed)

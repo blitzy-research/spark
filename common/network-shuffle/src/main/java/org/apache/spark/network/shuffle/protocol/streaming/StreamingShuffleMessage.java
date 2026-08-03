@@ -65,6 +65,35 @@ import org.apache.spark.network.protocol.Encodable;
  * maps writing the same partition use the very same numbers. The map id is the field that keeps
  * those two streams apart, which is why it is part of the shared header rather than of one message.
  *
+ * <p>This is a deliberate, documented departure from the narrower header first sketched for this
+ * subsystem -- protocol version, shuffle id, partition id and sequence number, 17 bytes -- and the
+ * departure is recorded here rather than left to be discovered, because a wire format is a
+ * contract with peers that may be running a different build. Two in-tree requirements fix the wider
+ * field set, and neither can be met without it:
+ *
+ * <ol>
+ *   <li><b>Inbound frames must be routable before they are decoded.</b> A producer executor
+ *       runs one streaming listener for every map task it hosts, and a consumer's channel carries
+ *       the
+ *       acknowledgements, heartbeats and retransmission requests for whichever of those map outputs
+ *       that reduce task is reading. The listener therefore peeks the shuffle id and the map id out
+ *       of the header to select the producer the frame belongs to. Without the map id, a producer
+ *       executor could only be addressed as a whole, which would require every map task on it to
+ *       share one ordered stream per partition -- a different producer model from the per-map-task
+ *       one this subsystem implements, and one the specification never describes.</li>
+ *   <li><b>A partition's sequence numbers are per producer.</b> Two map tasks on one executor both
+ *       number the blocks of partition <i>p</i> from zero, so a consumer that could not tell them
+ *       apart would see duplicated and apparently out-of-order sequence numbers on a single stream
+ *       and would reject correct output.</li>
+ * </ol>
+ *
+ * <p>The consequence for byte arithmetic is stated once, here, so that no other layer has to derive
+ * it: the header is 25 bytes; an acknowledgement, a retransmission request and a stream terminator
+ * are 33 bytes each; a heartbeat is 37 bytes plus its consumer identity; a data block is 37 bytes
+ * plus its payload; and every framed message is one byte more than its encoded length. The suites
+ * assert these figures as independent literals, so a change here fails a test rather than being
+ * adopted silently.
+ *
  * The header is {@value #HEADER_ENCODED_LENGTH} bytes, so a framed message always occupies {@code
  * encodedLength() + 1} bytes in total. The field order above is normative. It is written by {@link
  * #encodeHeader(ByteBuf)} and read by {@link #readHeader(ByteBuf)}, both defined here rather than
@@ -191,11 +220,10 @@ public abstract class StreamingShuffleMessage implements Encodable {
    *
    * This is the authoritative name for that one byte, and it is public because a framed message is
    * a resource in its own right: memory accounting and rate limiting must budget for the bytes that
-   * actually reach the network, which are this prefix plus {@code encodedLength()} and not
-   * {@code encodedLength()} alone. Every place that needs the framed size derives it from this
-   * constant rather than restating the literal one, so the layers cannot come to disagree about the
-   * same byte -- which is exactly the reasoning {@link #HEADER_ENCODED_LENGTH} applies to the
-   * header.
+   * actually reach the network, which are this prefix plus {@code encodedLength()} and not {@code
+   * encodedLength()} alone. Every place that needs the framed size derives it from this constant
+   * rather than restating the literal one, so the layers cannot come to disagree about the same
+   * byte -- which is exactly the reasoning {@link #HEADER_ENCODED_LENGTH} applies to the header.
    */
   public static final int FRAME_TYPE_PREFIX_LENGTH = 1;
 
