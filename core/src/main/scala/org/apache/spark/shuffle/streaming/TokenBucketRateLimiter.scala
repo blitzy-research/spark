@@ -107,12 +107,17 @@ import org.apache.spark.util.{Clock, SystemClock}
  *                     immutably here. It is the sole authority over the one diagnostic this class
  *                     emits, so an operator who leaves that key at its default of false sees
  *                     nothing from the limiter even when logging is globally set to DEBUG
+ * @param ceiling the executor-wide bucket every charge made against this one is also charged
+ *                against, or None for a limiter that answers for itself alone. See
+ *                [[TokenBucketRateLimiter.ExecutorEgressBudget]] for why a per-shuffle share alone
+ *                cannot hold an executor's aggregate egress to the administered capacity
  */
 private[spark] class TokenBucketRateLimiter(
     initialCapacityBytes: Long,
     initialRefillBytesPerSecond: Long,
     clock: Clock = new SystemClock,
-    debugEnabled: Boolean = false) extends Logging {
+    debugEnabled: Boolean = false,
+    ceiling: Option[TokenBucketRateLimiter] = None) extends Logging {
 
   require(initialCapacityBytes > 0L,
     "The streaming shuffle token bucket capacity must be positive but was " +
@@ -157,6 +162,18 @@ private[spark] class TokenBucketRateLimiter(
   /** Latch ensuring the oversized-request warning is emitted at most once per limiter. */
   private val oversizedLogged = new AtomicBoolean(false)
 
+  /**
+   * Requests this limiter refused, whatever refused them: its own tokens or the executor-wide
+   * ceiling behind it.
+   *
+   * Counted because "the cap was exceeded and nothing was ever throttled" is the signature of a
+   * ceiling that is being enforced by standing streaming down instead of by pacing it, and a
+   * counter is the only way a test or an operator can tell that apart from a workload that simply
+   * never reached the cap. Incremented on the refusal path only, which a paced producer reaches far
+   * less often than the admission path.
+   */
+  private val refusals = new AtomicLong(0L)
+
   // At most one line is logged per limiter, at construction, and nothing is ever logged per
   // acquisition attempt: a limiter is consulted once per outbound block, so a per attempt line
   // would exhaust the per executor log budget within seconds. Even that single line is gated on
@@ -197,9 +214,27 @@ private[spark] class TokenBucketRateLimiter(
    * ceiling at all.
    *
    * Read from the live snapshot, so it stays truthful after the executor's egress budget has been
-   * redistributed and the bucket resized.
+   * redistributed and the bucket resized. Held down to the executor-wide ceiling's own capacity
+   * where one is in force, because a request this bucket could hold but that one could not would be
+   * refused just the same -- and both capacities are floored at one maximum-sized encoded frame, so
+   * the smaller of the two still admits every legal block.
    */
-  def maxAcquirableBytes: Long = if (unlimited) Long.MaxValue else capacityBytes
+  def maxAcquirableBytes: Long = {
+    if (unlimited) {
+      Long.MaxValue
+    } else {
+      ceiling.map(c => math.min(capacityBytes, c.maxAcquirableBytes)).getOrElse(capacityBytes)
+    }
+  }
+
+  /**
+   * Requests this limiter refused, by its own tokens or by the executor-wide ceiling behind it.
+   *
+   * A refusal is flow control rather than an error, so this is a pacing-activity reading rather
+   * than a fault count: zero refusals alongside measured egress above the administered capacity
+   * means the cap is not being enforced by pacing at all.
+   */
+  def refusalCount: Long = refusals.get()
 
   /**
    * Number of requests refused for asking more than the bucket's whole capacity. A non-zero value
@@ -239,8 +274,60 @@ private[spark] class TokenBucketRateLimiter(
       true
     } else if (bytes == 0L) {
       true
+    } else if (!chargeBucket(bytes)) {
+      refusals.incrementAndGet()
+      false
+    } else if (!chargeCeiling(bytes)) {
+      // This shuffle's own share had room but the executor's administered ceiling did not, so the
+      // tokens just taken are given back. Without the refund a request refused by the ceiling would
+      // still spend this bucket's tokens, and the retry that follows would be paced twice for one
+      // block -- the caller would be throttled harder than the operator's cap implies, and by an
+      // amount that grew with every refusal.
+      refund(bytes)
+      refusals.incrementAndGet()
+      false
     } else {
-      chargeBucket(bytes)
+      true
+    }
+  }
+
+  /**
+   * Charges the executor-wide ceiling, if this limiter has one.
+   *
+   * The ceiling is charged after this bucket rather than before it for one reason: a per-shuffle
+   * refusal is the common case under a tight share, and charging the shared bucket first would make
+   * every such refusal pay for a refund on the contended path that every shuffle on the executor
+   * touches.
+   *
+   * @param bytes bytes already charged against this bucket
+   * @return true if the ceiling admitted them, false if it refused
+   */
+  private def chargeCeiling(bytes: Long): Boolean = ceiling.forall(_.tryAcquire(bytes))
+
+  /**
+   * Returns tokens charged for a request that a later gate in the same admission refused.
+   *
+   * Surplus above the capacity is discarded, which is the same rule accrual follows: a bucket
+   * cannot hold more than it can hold. Discarding is safe in the only direction that matters --
+   * the bucket can end up marginally stricter than the cap, never looser -- and can only happen
+   * when the bucket was already near full, which is not a state a refusal is reached from.
+   *
+   * `private[streaming]` rather than public: it is the second half of one atomic-in-intent
+   * admission, not an operation a caller may perform on its own.
+   *
+   * @param bytes the tokens to return; non-positive returns nothing
+   */
+  private[streaming] def refund(bytes: Long): Unit = {
+    if (!unlimited && bytes > 0L) {
+      var attempting = true
+      while (attempting) {
+        val observed = state.get()
+        val restored = math.min(observed.capacityBytes,
+          TokenBucketRateLimiter.saturatingAdd(observed.tokens, bytes))
+        attempting = !state.compareAndSet(observed,
+          new TokenBucketRateLimiter.BucketState(restored, observed.lastRefillNanos,
+            observed.capacityBytes, observed.refillBytesPerSecond))
+      }
     }
   }
 
@@ -255,7 +342,11 @@ private[spark] class TokenBucketRateLimiter(
     if (unlimited) {
       Long.MaxValue
     } else {
-      refill(state.get(), clock.nanoTime()).tokens
+      val own = refill(state.get(), clock.nanoTime()).tokens
+      // The smaller of the two, because a charge has to clear both gates: reporting this bucket's
+      // tokens alone would answer "how much may I send" with a figure the executor's ceiling would
+      // refuse.
+      ceiling.map(c => math.min(own, c.availableTokens)).getOrElse(own)
     }
   }
 
@@ -285,7 +376,7 @@ private[spark] class TokenBucketRateLimiter(
       0L
     } else {
       val observed = refill(state.get(), clock.nanoTime())
-      if (bytes > observed.capacityBytes) {
+      val ownWait = if (bytes > observed.capacityBytes) {
         Long.MaxValue
       } else {
         val shortfall = bytes - observed.tokens
@@ -297,6 +388,11 @@ private[spark] class TokenBucketRateLimiter(
             (shortfall * TokenBucketRateLimiter.MILLIS_PER_SECOND + rate - 1L) / rate)
         }
       }
+      // The longer of the two waits, because the charge clears the later of the two gates.
+      // Reporting this bucket's wait alone is what would let a block refused by the ceiling be
+      // rescheduled immediately, spin on a condition that had not changed, and -- when this bucket
+      // was full -- be rescheduled with no delay at all, which is a wake-up that never comes.
+      ceiling.map(c => math.max(ownWait, c.millisUntilAvailable(bytes))).getOrElse(ownWait)
     }
   }
 
@@ -859,6 +955,42 @@ private[spark] object TokenBucketRateLimiter extends Logging {
     /** Guards the registry and the redistribution pass. Never held across a blocking call. */
     private val lock = new Object
 
+    /**
+     * The executor-wide bucket every per-shuffle charge is also charged against.
+     *
+     * <b>Why dividing the rate is not sufficient.</b> Redistribution already holds the sum of the
+     * per-shuffle token <em>rates</em> to the administered ceiling, so an executor's steady-state
+     * egress obeys the cap. Burst does not follow from rate, though, and it cannot be divided the
+     * same way: a bucket must be able to hold one maximum-sized encoded frame or it would refuse
+     * every block forever, so each per-shuffle bucket's capacity is floored at one frame however
+     * small its paced share is. Five shuffles therefore start with five frames -- some ten
+     * mebibytes -- of instantly spendable allowance between them, and a measured second can read
+     * several times the cap while not one stream is ever throttled. That is not a measurement
+     * artefact: those bytes really do cross the link unpaced, and the only thing that eventually
+     * reacts is the fallback policy, which stands streaming down, invalidates every live producer
+     * and has the shuffle recomputed. The cap ends up enforced by abandoning streaming rather than
+     * by pacing it.
+     *
+     * One shared bucket at the ceiling rate closes that, because burst is a property of a bucket
+     * rather than of a rate: the aggregate can burst by one frame and must then wait for the
+     * ceiling's own refill, whichever shuffle asks. Its capacity is floored at one frame by the
+     * same rule as every other bucket, so a legal block is never refused for size, and its rate is
+     * the whole administered ceiling rather than a share of it, so it never paces below what the
+     * operator declared.
+     *
+     * Sized once and never redistributed: the ceiling is a property of the link the operator
+     * declared, so the divisor does not enter it.
+     */
+    private val aggregate: TokenBucketRateLimiter = maxBandwidthMBps match {
+      case Some(cap) =>
+        val ceilingRate = applyLinkCapacityCeiling(
+          TokenBucketRateLimiter.perShuffleBytesPerSecond(cap, 1))
+        new TokenBucketRateLimiter(
+          burstCapacityBytes(ceilingRate), ceilingRate, clock, debugEnabled)
+      case None =>
+        unlimited(clock, debugEnabled)
+    }
+
     /** Live limiters by shuffle id. Mutated only under [[lock]]. */
     private val limiters = new mutable.HashMap[Int, TokenBucketRateLimiter]()
 
@@ -980,6 +1112,10 @@ private[spark] object TokenBucketRateLimiter extends Logging {
     def reset(): Unit = lock.synchronized {
       limiters.clear()
       reportedConcurrency = 0
+      // The shared ceiling outlives individual limiters, so returning the budget to a freshly
+      // constructed state has to refill it too; leaving it drained would pace the next measurement
+      // against tokens the previous one spent.
+      aggregate.reset()
     }
 
     /** Divisor of the cap. Callers must hold [[lock]]. */
@@ -995,10 +1131,35 @@ private[spark] object TokenBucketRateLimiter extends Logging {
     private def newLimiter(): TokenBucketRateLimiter = maxBandwidthMBps match {
       case Some(cap) =>
         val share = currentShare(cap)
-        new TokenBucketRateLimiter(burstCapacityBytes(share), share, clock, debugEnabled)
+        // Handed the shared ceiling, so this limiter paces its own share AND contributes to the
+        // executor's aggregate being paced. Both gates are consulted by one `tryAcquire` call, so
+        // no caller has to know the ceiling exists.
+        new TokenBucketRateLimiter(
+          burstCapacityBytes(share), share, clock, debugEnabled, Some(aggregate))
       case None =>
         unlimited(clock, debugEnabled)
     }
+
+    /**
+     * The executor-wide ceiling bucket, exposed for the pacing evidence it carries rather than to
+     * be charged directly: a caller charges a shuffle's own limiter, which charges this one.
+     */
+    def aggregateLimiter: TokenBucketRateLimiter = aggregate
+
+    /**
+     * The rate the executor's aggregate egress is paced at, or None when egress is uncapped. This
+     * is [[BANDWIDTH_CEILING_PERCENT]] percent of the administered capacity and is independent of
+     * the divisor, so it is the figure the sum of every live share is held under.
+     */
+    def aggregateBytesPerSecond: Option[Long] = maxBandwidthMBps.map { cap =>
+      applyLinkCapacityCeiling(TokenBucketRateLimiter.perShuffleBytesPerSecond(cap, 1))
+    }
+
+    /**
+     * Requests the executor-wide ceiling refused, across every shuffle. Non-zero is the proof
+     * that the administered capacity is reached by pacing rather than by standing streaming down.
+     */
+    def aggregateRefusalCount: Long = aggregate.refusalCount
 
     /**
      * Republishes every live limiter at the share the current divisor implies. Callers must hold

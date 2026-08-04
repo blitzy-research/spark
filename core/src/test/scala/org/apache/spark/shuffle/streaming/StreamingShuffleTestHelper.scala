@@ -34,8 +34,9 @@ import com.codahale.metrics.{Counter, Gauge}
 import org.scalatest.Tag
 
 import org.apache.spark.{HashPartitioner, Partitioner, ShuffleDependency, SparkConf, SparkContext, SparkEnv, TaskContext, TaskContextImpl}
-import org.apache.spark.internal.config.{SHUFFLE_MANAGER, SHUFFLE_STREAMING_BUFFER_SIZE_PERCENT, SHUFFLE_STREAMING_DEBUG, SHUFFLE_STREAMING_ENABLED, SHUFFLE_STREAMING_MAX_BANDWIDTH_MBPS, SHUFFLE_STREAMING_SPILL_THRESHOLD}
-import org.apache.spark.memory.{MemoryTestingUtils, TaskMemoryManager}
+import org.apache.spark.internal.config.{SHUFFLE_MANAGER, SHUFFLE_STREAMING_BUFFER_SIZE_PERCENT, SHUFFLE_STREAMING_DEBUG, SHUFFLE_STREAMING_ENABLED, SHUFFLE_STREAMING_MAX_BANDWIDTH_MBPS, SHUFFLE_STREAMING_SPILL_THRESHOLD, UNSAFE_EXCEPTION_ON_MEMORY_LEAK}
+import org.apache.spark.internal.config.UI.UI_ENABLED
+import org.apache.spark.memory.TaskMemoryManager
 import org.apache.spark.metrics.MetricsSystem
 import org.apache.spark.metrics.source.Source
 import org.apache.spark.network.buffer.{ManagedBuffer, NioManagedBuffer}
@@ -919,6 +920,38 @@ object StreamingShuffleTestHelper {
 
   val DiskWriterRecordUpdateInterval: Int = 16384
 
+  /**
+   * Property naming the number of times a service may retry a port bind before giving up.
+   *
+   * A raw key rather than a typed entry because Spark declares none for it: `Utils.portMaxRetries`
+   * reads the property directly, so there is nothing to import and this string is the only way to
+   * state it. Named here rather than written at each fixture so the three fixtures cannot drift.
+   */
+  val PortMaxRetriesKey: String = "spark.port.maxRetries"
+
+  /**
+   * Bind retries every fixture grants, which is the figure `Utils.portMaxRetries` hands to any
+   * suite whose configuration carries `spark.testing`.
+   *
+   * Matched to that figure rather than chosen: these suites bind exactly the same ephemeral
+   * endpoints as every other Spark suite -- a driver, a block manager, and on a `local-cluster`
+   * master a master, a worker and an executor for each -- so the tolerance they need is the one the
+   * rest of the test suite already receives, and any smaller number is a flake waiting for a busy
+   * host. See `testEnvelopeConf` for why it has to be stated rather than inherited.
+   */
+  val TestPortMaxRetries: Int = 100
+
+  /**
+   * Lowest execution-memory accounting identity a fixture task memory manager may use.
+   *
+   * A trillion, which is far above any attempt id a scheduler will hand out in a suite -- attempt
+   * ids start at zero and advance by one per task -- and far below `Long.MaxValue`, so the offset
+   * cannot overflow for any identity a fixture would sensibly choose. See
+   * [[StreamingShuffleTestHelper.newTaskMemoryManager]] for why sharing the range with real tasks
+   * makes the managed-memory leak check report a leak against the wrong task.
+   */
+  val FixtureAttemptIdBase: Long = 1000000000000L
+
   // ---------------------------------------------------------------------------------------------
   // Wire protocol.
   //
@@ -1128,6 +1161,17 @@ object StreamingShuffleTestHelper {
     SpillCountMetricName,
     BackpressureEventsMetricName,
     PartialReadInvalidationsMetricName)
+
+  /**
+   * The logger every class in the streaming shuffle package logs beneath.
+   *
+   * Each class logs under its own fully qualified name, and log4j2 propagates a child's events to
+   * every ancestor logger's appenders, so attaching to the package is what measures the whole
+   * subsystem without naming any of its classes -- and without a new class being added later
+   * escaping the measurement. Derived from a type in the package rather than written out, so the
+   * name cannot drift from the package it is meant to name.
+   */
+  val StreamingShuffleLoggerName: String = classOf[StreamingShuffleManager].getPackage.getName
 
   // Workload shape and stress-run parameters. The latency reduction bounds below are the acceptance
   // targets the benchmark reports against, not thresholds any automated gate asserts.
@@ -1387,8 +1431,14 @@ object StreamingShuffleTestHelper {
         // condition names rather than a merely tight budget.
         policy.recordAllocationGrant(MaxBlockSizeBytes.toLong, 0L)
       case StreamingShuffleFallbackReason.NetworkSaturation =>
-        // Ninety-nine percent of the administered link, which is strictly above the trip share.
-        policy.recordLinkUtilization(99.0d, 100.0d)
+        // Ninety-nine percent of the administered link, which is strictly above the trip share, on
+        // as many consecutive samples as a sustained saturation needs. One sample is deliberately
+        // not enough: a pacing bucket must be able to admit one maximum-sized block, so its burst
+        // allowance legitimately exceeds the administered capacity for a single sampling interval,
+        // and tripping on that stood streaming down on links that were never saturated.
+        (1L to StreamingShuffleFallbackPolicy.SATURATION_SUSTAINED_SAMPLES).foreach { _ =>
+          policy.recordLinkUtilization(99.0d, 100.0d)
+        }
       case StreamingShuffleFallbackReason.ProtocolVersionMismatch =>
         // A version one beyond the one this build speaks, detected by the explicit compatibility
         // check rather than inferred from a parse failure.
@@ -1422,7 +1472,66 @@ trait StreamingShuffleTestHelper {
   // Configuration fixtures. Every value is set through its typed ConfigEntry rather than a raw
   // string key, so a fixture that would violate a documented range fails where the fixture is built
   // instead of deep inside the component under test. The entries are consumed here and never
-  // re-declared: each key may be declared exactly once in the JVM.
+  // re-declared: each key may be declared exactly once in the JVM. The one exception is
+  // `spark.port.maxRetries`, for which Spark declares no entry at all; see [[testEnvelopeConf]].
+
+  /**
+   * A `SparkConf` with the three properties of the test envelope that a fixture must state rather
+   * than inherit.
+   *
+   * ==Why stating them is necessary at all==
+   *
+   * Every fixture below defaults to `loadDefaults = false`, deliberately, so that a case is
+   * reproducible whatever the JVM it runs in happens to carry -- see `streamingConfWithOverrides`
+   * for the concrete failure that hermeticity prevents. The cost is that the envelope's own
+   * `-Dspark.*` properties are dropped with everything else, and three of them are load bearing.
+   * A `SparkConf` is the only place the components below read them from, so a property that the
+   * surefire and scalatest configurations set for the whole test JVM reaches nothing here unless it
+   * is stated. [[StreamingShuffleStressSuite]] already discovered and documented this for the leak
+   * check; this method is the same reasoning applied once, for every fixture, rather than once per
+   * suite.
+   *
+   * ==The three properties, and what each one buys==
+   *
+   *  - '''`spark.unsafe.exceptionOnMemoryLeak`''' arms the managed-memory leak check. The executor
+   *    reads it from the `SparkConf` and its own default is false, so without it a task that ended
+   *    still holding acquired execution memory is merely logged as a warning and the suite passes
+   *    regardless. Stating it is what turns "zero retained heap" from an aspiration into a machine
+   *    check for every task every streaming suite runs -- which matters most exactly where these
+   *    suites spend their effort, because a streaming producer holds a buffer budget and a spill
+   *    manager for the life of a task and releases both through a task-completion listener.
+   *  - '''`spark.port.maxRetries`''' restores the bind tolerance every other Spark suite receives.
+   *    `Utils.portMaxRetries` grants 100 retries when `spark.testing` is present in the
+   *    configuration and 16 otherwise, and these suites start `local-cluster` applications whose
+   *    driver, block manager, worker and executor endpoints each bind an ephemeral port; on a busy
+   *    host 16 attempts is not enough and the application fails to start with a `BindException`
+   *    that has nothing to do with the case under test. The value is stated as the raw key because
+   *    it is one of the few `spark.*` properties with no typed entry to state it through.
+   *  - '''`spark.ui.enabled`''' keeps the web user interface out of these runs. It is off in the
+   *    test envelope for a reason -- a Jetty server per `SparkContext` is a bound port, a thread
+   *    pool and a page of log records that no case here reads -- and these suites create hundreds
+   *    of contexts, so inheriting the default of true is both the largest single source of their
+   *    log volume and one more port each to contend for.
+   *
+   * `spark.testing` itself is deliberately '''not''' set. It would grant the same bind tolerance,
+   * but `UnifiedMemoryManager` also reads it to decide whether to reserve its 300MB system
+   * allowance, so putting it in a `SparkConf` silently changes the executor memory a buffer budget
+   * is a percentage of -- and the budget arithmetic is precisely what several of these suites
+   * assert. The narrow key is used instead, which buys the tolerance and changes nothing else.
+   *
+   * Exposed rather than private because a suite that has to build its own configuration -- one
+   * exercising a component directly, with no shuffle manager selected -- still runs in this
+   * envelope, and would otherwise silently opt out of the leak check the package depends on.
+   *
+   * @param loadDefaults whether to pick up ambient `spark.*` system properties
+   * @return a configuration carrying the envelope properties, ready for a fixture to build on
+   */
+  def testEnvelopeConf(loadDefaults: Boolean = false): SparkConf = {
+    new SparkConf(loadDefaults)
+      .set(UNSAFE_EXCEPTION_ON_MEMORY_LEAK, true)
+      .set(PortMaxRetriesKey, TestPortMaxRetries.toString)
+      .set(UI_ENABLED, false)
+  }
 
   /**
    * A configuration that selects the streaming shuffle manager and leaves streaming behaviour off.
@@ -1436,7 +1545,7 @@ trait StreamingShuffleTestHelper {
    * @return a configuration with the manager selected and the behaviour gate closed
    */
   def gatedOffStreamingConf(loadDefaults: Boolean = false): SparkConf = {
-    new SparkConf(loadDefaults)
+    testEnvelopeConf(loadDefaults)
       .set(SHUFFLE_MANAGER, StreamingShuffleManager.SHORT_NAME)
       .set(SHUFFLE_STREAMING_ENABLED, false)
   }
@@ -1449,12 +1558,14 @@ trait StreamingShuffleTestHelper {
    * A configuration that selects sort-based shuffle, which is the default and the fallback.
    *
    * This is the baseline every zero-data-loss and every latency comparison is measured against.
+   * It carries the same envelope properties as its streaming counterpart, because a baseline that
+   * ran under a different envelope would be comparing two things at once.
    *
    * @param loadDefaults whether to pick up ambient `spark.*` system properties
    * @return a configuration on which shuffle behaviour is unchanged from stock Spark
    */
   def sortBaselineConf(loadDefaults: Boolean = false): SparkConf = {
-    new SparkConf(loadDefaults).set(SHUFFLE_MANAGER, "sort")
+    testEnvelopeConf(loadDefaults).set(SHUFFLE_MANAGER, "sort")
   }
 
   /**
@@ -1489,7 +1600,7 @@ trait StreamingShuffleTestHelper {
       debug: Boolean = false,
       enabled: Boolean = true,
       loadDefaults: Boolean = false): SparkConf = {
-    val conf = new SparkConf(loadDefaults)
+    val conf = testEnvelopeConf(loadDefaults)
       .set(SHUFFLE_MANAGER, StreamingShuffleManager.SHORT_NAME)
       .set(SHUFFLE_STREAMING_ENABLED, enabled)
       .set(SHUFFLE_STREAMING_BUFFER_SIZE_PERCENT, bufferSizePercent)
@@ -1926,7 +2037,7 @@ trait StreamingShuffleTestHelper {
   // Both are safe from a test body: a shuffle manager's constructor runs before the driver's memory
   // manager exists, but by the time a test body executes both fixtures find a live one.
 
-  def fakeTaskContext(sc: SparkContext): TaskContext = MemoryTestingUtils.fakeTaskContext(sc.env)
+  def fakeTaskContext(sc: SparkContext): TaskContext = newTaskContext(sc.env)
 
   /**
    * A task context with caller-chosen identity fields.
@@ -1972,12 +2083,54 @@ trait StreamingShuffleTestHelper {
    * point of the memory fixtures is that Spark's own accounting and its leak detection apply to the
    * streaming path unchanged.
    *
+   * ==Why the accounting identity is not the caller's attempt id==
+   *
+   * A `MemoryManager` accounts execution memory '''per task attempt id''', and in these suites the
+   * fixture and the live application share one: the master is `local`, so the driver is also the
+   * executor, and a fixture built in a test body draws on the very memory manager the jobs in that
+   * body draw on. Real attempt ids are handed out from zero upwards, and every fixture identity in
+   * this package is a small number too -- a per-suite counter, or a literal chosen for readability
+   * -- so the two ranges overlap almost completely.
+   *
+   * An overlap is not merely untidy, it is wrong in a way that fails a test for the opposite of the
+   * reason it appears to. A fixture that holds a reservation across a job -- which several cases do
+   * deliberately, because holding memory is how they establish pressure -- shares an accounting
+   * entry with whichever job task drew the same id. When that task finishes, the executor's leak
+   * check calls `releaseAllExecutionMemoryForTask` for the shared id, is handed the '''fixture's'''
+   * outstanding bytes, and reports a managed memory leak against a task that released everything it
+   * took. The pool then logs "release called on N bytes but task only has 0 bytes" when the fixture
+   * finally does release, which is the same collision seen from the other end.
+   *
+   * So the accounting identity is offset into a range no scheduler will ever allocate, while the
+   * identity the task context reports is left exactly as the caller asked. That split is the point:
+   * attempt id is a '''logical''' identity that assertions and streaming producer generations are
+   * built on and must stay readable, whereas the memory manager's key is an '''accounting''' one
+   * that only has to be unique. Keeping the leak check armed is what makes the offset necessary
+   * rather than cosmetic: without it the check cannot tell a real leak from this collision.
+   *
    * @param env live environment supplying the memory manager
-   * @param taskAttemptId attempt the allocations are charged to
+   * @param taskAttemptId logical attempt the allocations belong to; charged to
+   *                      [[StreamingShuffleTestHelper.FixtureAttemptIdBase]] plus this value
    * @return the task memory manager
    */
   def newTaskMemoryManager(env: SparkEnv, taskAttemptId: Long = 0L): TaskMemoryManager =
-    new TaskMemoryManager(env.memoryManager, taskAttemptId)
+    new TaskMemoryManager(env.memoryManager, fixtureAccountingAttemptId(taskAttemptId))
+
+  /**
+   * The execution-memory accounting identity for a fixture whose logical attempt id is given.
+   *
+   * Offset rather than hashed, so the mapping is order preserving and a diagnostic naming an
+   * accounting identity can still be read back to the fixture that owns it. Negative and absurd
+   * logical ids are tolerated by clamping the result into the reserved range, because a fixture's
+   * identity is chosen for readability and must never be able to fold back onto a real one.
+   *
+   * @param taskAttemptId logical attempt id a fixture was built with
+   * @return the identity its allocations are charged to
+   */
+  def fixtureAccountingAttemptId(taskAttemptId: Long): Long = {
+    val offset = math.max(0L, taskAttemptId)
+    FixtureAttemptIdBase + (offset % FixtureAttemptIdBase)
+  }
 
 
   // Wire protocol fixtures. Every message factory takes its timestamp, sequence number and checksum

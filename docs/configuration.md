@@ -1430,7 +1430,9 @@ Apart from these, the following properties are also available, and may be useful
     the default sort-based shuffle; it is therefore a kill switch that restores sort behavior
     without changing the shuffle manager. Every <code>spark.shuffle.streaming.*</code> property,
     including this one, is read once when the streaming shuffle manager is constructed and then held
-    immutably, so changing any of them requires an executor restart to take effect.
+    immutably, so changing any of them requires an executor restart to take effect. See the
+    <a href="streaming-shuffle.html">Streaming Shuffle</a> guide for how to size the buffers, what
+    each fallback condition means in practice, and the operational limits.
   </td>
   <td>4.2.0</td>
 </tr>

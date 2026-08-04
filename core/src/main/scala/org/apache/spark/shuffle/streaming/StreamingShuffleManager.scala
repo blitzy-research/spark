@@ -21,12 +21,14 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 
 import scala.concurrent.duration.DurationLong
+import scala.jdk.CollectionConverters._
 import scala.util.control.NonFatal
 
 import org.apache.spark.{ShuffleDependency, SparkConf, SparkEnv, SparkException, TaskContext}
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.LogKeys.{CLASS_NAME, CONFIG, COUNT, EXECUTOR_ID, HOST_PORT,
-  MAP_ID, NUM_BYTES, NUM_PARTITIONS, NUM_TASKS, REASON, SHUFFLE_ID, TASK_ATTEMPT_ID, VALUE}
+  MAP_ID, NUM_BYTES, NUM_EVENTS, NUM_PARTITIONS, NUM_SKIPPED, NUM_TASKS, REASON, SHUFFLE_ID,
+  TASK_ATTEMPT_ID, THREAD, TIMEOUT, VALUE}
 import org.apache.spark.internal.config.{SHUFFLE_STREAMING_DEBUG, SHUFFLE_STREAMING_ENABLED}
 import org.apache.spark.network.TransportContext
 import org.apache.spark.network.buffer.ManagedBuffer
@@ -308,6 +310,39 @@ private[spark] class StreamingShuffleManager(conf: SparkConf, isDriver: Boolean)
     protocol
   }
 
+  /**
+   * This executor's egress pacing, read-only and at package scope, for the same reason
+   * [[degradationPolicy]] is exposed: the writers and the flow-control protocol on this executor
+   * all charge '''this''' budget, so whether the administered bandwidth cap is actually reached by
+   * pacing -- rather than by the fallback policy standing streaming down once the link has already
+   * been overrun -- can only be established by reading the very budget they charge.
+   *
+   * Deliberately not forced: reading it builds the budget, which is harmless, but a caller on the
+   * shutdown path should consult [[flowControlBuilt]] first rather than construct state in order
+   * to ask whether any exists.
+   */
+  private[streaming] def egressPacing: TokenBucketRateLimiter.ExecutorEgressBudget = egressBudget
+
+  /**
+   * This executor's flow-control protocol, read-only and at package scope. It carries the
+   * throttled stream count and the backpressure-event count, which are the two readings that
+   * distinguish a paced producer from one that was never held back at all.
+   */
+  private[streaming] def flowControl: BackpressureProtocol = backpressure
+
+  /** Whether any flow-control state exists yet, so a caller can ask without creating it. */
+  private[streaming] def flowControlBuilt: Boolean = backpressureBuilt
+
+  /**
+   * The window that bounds this manager's per-shuffle registration record.
+   *
+   * An instance field is enough: there is one manager per driver and per executor, so this
+   * instance's lifetime is the process's. The aggregation type and window are the subsystem's
+   * shared ones, so an operator reads one convention for every bounded record the feature makes.
+   */
+  private val registrationLogAggregator =
+    new MemorySpillManager.ExecutorLogAggregator(MemorySpillManager.LOG_AGGREGATION_WINDOW_MS)
+
   @volatile private var listenerBound: Boolean = false
 
   /**
@@ -417,10 +452,30 @@ private[spark] class StreamingShuffleManager(conf: SparkConf, isDriver: Boolean)
         grantFor(shuffleId, numPartitions, numMaps) match {
           case Some(grant) =>
             capabilityTokens.put(shuffleId, grant.capabilityToken)
-            logInfo(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} registered with " +
+            // Bounded on a window rather than emitted per shuffle, for the same reason the
+            // coordinator's own registration record is: `registerShuffle` runs on the driver once
+            // per shuffle, so this record's volume is the application's shuffle count, and a
+            // workload that submits several shuffles a second would spend the log budget restating
+            // a configuration that has not changed. The admitted record says how many registrations
+            // it stands in for; the per-shuffle form is on the debug key.
+            val entry = log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} registered with " +
               log"${MDC(NUM_PARTITIONS, numPartitions)} partition(s) across " +
               log"${MDC(NUM_TASKS, numMaps)} map task(s) at epoch " +
-              log"${MDC(COUNT, grant.coordinatorEpoch)}")
+              log"${MDC(COUNT, grant.coordinatorEpoch)}"
+            registrationLogAggregator.record(clock.getTimeMillis()) match {
+              case Some(summary) =>
+                logInfo(entry + log"; ${MDC(NUM_EVENTS, summary.occurrences)} streaming " +
+                  log"shuffle(s) registered here, " +
+                  log"${MDC(NUM_SKIPPED, summary.unreported)} of them not reported " +
+                  log"individually so that the log budget is kept")
+              case None =>
+                // At the level it was emitted at, under the feature's own key, so that setting the
+                // streaming debug key restores the per-shuffle record without also having to move
+                // the logging framework to DEBUG.
+                if (debugEnabled) {
+                  logInfo(entry)
+                }
+            }
             new StreamingShuffleHandle(shuffleId, dependency, numPartitions,
               StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION, grant.coordinatorEpoch,
               grant.capabilityToken)
@@ -626,6 +681,18 @@ private[spark] class StreamingShuffleManager(conf: SparkConf, isDriver: Boolean)
         }
       }
       guard("stop the sort-based shuffle delegate")(sortShuffleManager.stop())
+      // The executor's buffer threshold ticker is created by whichever map task first needed
+      // polling and is deliberately executor-scoped, so no individual spill manager may end it --
+      // and none does. This is the one owner whose lifetime matches the ticker's, so it is stopped
+      // here, after every producer has been released and can therefore no longer ask to be polled.
+      guard("stop the executor's streaming buffer threshold ticker") {
+        MemorySpillManager.shutdownExecutorPoller()
+      }
+      // Last, and after every release above, because this is the assertion that all of them worked:
+      // the two Netty groups are released asynchronously and the two daemons were asked rather than
+      // told, so the only way to state that nothing this subsystem started outlives its stop is to
+      // wait for it and report when it does not.
+      guard("await the release of every streaming shuffle thread")(awaitStreamingThreadsReleased())
     }
   }
 
@@ -1210,6 +1277,63 @@ private[spark] class StreamingShuffleManager(conf: SparkConf, isDriver: Boolean)
     }
   }
 
+  /**
+   * Waits, within a bounded deadline, for every thread this subsystem owns to be gone.
+   *
+   * <b>Why a wait is required at all.</b> `TransportServer.close` releases its acceptor and worker
+   * groups with Netty's `shutdownGracefully`, which is a *request*: it returns a future and leaves
+   * the event loops running for a quiet period before they wind down. Nothing in the shared
+   * transport exposes those groups, so they cannot be awaited directly -- and no shared transport
+   * class may be modified for this feature. The consequence, without this method, is that `stop()`
+   * returns while `shuffle-streaming-boss-*` and `shuffle-streaming-server-*` are still alive, so a
+   * JVM that creates and stops contexts accumulates a full set of event loops per context. That is
+   * a real leak with a real cost, and it is also precisely what a suite's thread audit reports.
+   *
+   * <b>Why threads by name rather than groups by reference.</b> The contract this enforces is
+   * exactly "no thread this subsystem started outlives its stop", and a thread's name is the one
+   * handle every one of them shares -- the two Netty groups, whose names derive from the transport
+   * module name, the executor's upkeep sweep and the buffer threshold ticker alike. Reaching them
+   * by reference would require four separate accessors, three of which do not exist, and would
+   * still leave the acceptor group unreachable. Checking the property directly is both complete and
+   * cheaper than the alternatives, and it runs once per executor lifetime.
+   *
+   * Threads whose names begin with Spark's own prefixes are deliberately out of scope: the block
+   * transfer service's and the RPC environment's event loops are released by `SparkEnv`, on its own
+   * schedule, and waiting for them here would block a shuffle manager on components it does not
+   * own.
+   *
+   * A straggler is reported, not thrown. This runs during shutdown, where an exception would
+   * abandon the rest of an orderly release over a thread the JVM is about to reclaim -- but silence
+   * is not acceptable either, because a leak nobody records is a leak nobody fixes.
+   *
+   * @return true when no streaming-owned thread remains by the time this returns
+   */
+  private def awaitStreamingThreadsReleased(): Boolean = {
+    val deadline = clock.getTimeMillis() + StreamingShuffleManager.THREAD_RELEASE_TIMEOUT_MS
+    var remaining = StreamingShuffleManager.liveStreamingThreadNames()
+    while (remaining.nonEmpty && clock.getTimeMillis() < deadline) {
+      try {
+        Thread.sleep(StreamingShuffleManager.THREAD_RELEASE_POLL_MS)
+      } catch {
+        case _: InterruptedException =>
+          Thread.currentThread().interrupt()
+          return StreamingShuffleManager.liveStreamingThreadNames().isEmpty
+      }
+      remaining = StreamingShuffleManager.liveStreamingThreadNames()
+    }
+    if (remaining.nonEmpty) {
+      logWarning(log"Streaming shuffle did not release every thread it owns within " +
+        log"${MDC(TIMEOUT, StreamingShuffleManager.THREAD_RELEASE_TIMEOUT_MS)} ms of stopping; " +
+        log"${MDC(COUNT, remaining.size)} remain: ${MDC(THREAD, remaining.mkString(", "))}")
+      false
+    } else {
+      if (debugEnabled) {
+        logDebug(log"Streaming shuffle released every thread it owns")
+      }
+      true
+    }
+  }
+
   // Failure containment.
 
   /**
@@ -1392,4 +1516,52 @@ private[spark] object StreamingShuffleManager {
    * recovers by failing a task.
    */
   val MIN_COORDINATOR_TIMEOUT_MS: Long = 1000L
+
+  /**
+   * Thread-name prefixes every thread this subsystem starts carries.
+   *
+   * Two prefixes rather than one, because the threads have two origins and neither may be renamed
+   * to suit the other. `shuffle-streaming-` is Netty's own construction from the transport module
+   * name -- `StreamingShuffleServerHandler.TRANSPORT_MODULE_NAME` -- and covers the acceptor,
+   * server and client event loops on both ends of a channel; that name is what gives streaming its
+   * independent `spark.shuffle-streaming.io.*` tuning namespace, so it is a contract rather than a
+   * label. `streaming-shuffle-` is this subsystem's own convention for the two executor-scoped
+   * daemons it schedules itself, the listener's upkeep sweep and the buffer threshold ticker.
+   *
+   * Spark's own prefixes are deliberately absent. `shuffle-boss-*` belongs to the block transfer
+   * service and `rpc-boss-*` to the RPC environment; both are released by `SparkEnv` on its own
+   * schedule, and a shuffle manager that waited for them would block on components it does not own.
+   */
+  val THREAD_NAME_PREFIXES: Seq[String] = Seq("shuffle-streaming-", "streaming-shuffle-")
+
+  /**
+   * The bound, in milliseconds, within which every streaming-owned thread must be gone once the
+   * manager has asked for it.
+   *
+   * Sized against what it is waiting for rather than picked round. Netty's `shutdownGracefully`
+   * uses a two second quiet period by default before an event loop winds down, so any bound at or
+   * under two seconds would report a straggler on every clean shutdown. Ten seconds leaves ample
+   * margin over that while still bounding an executor's shutdown, and a straggler at ten seconds is
+   * genuinely stuck rather than merely finishing.
+   */
+  val THREAD_RELEASE_TIMEOUT_MS: Long = 10000L
+
+  /** Interval between checks while waiting for the threads above. */
+  val THREAD_RELEASE_POLL_MS: Long = 25L
+
+  /**
+   * The names of every live thread this subsystem owns, by the prefixes above.
+   *
+   * A snapshot of the whole JVM rather than of a thread group, because the Netty groups place their
+   * threads in whichever group created them and this must hold whoever that was. Reading it is only
+   * done at shutdown and by a suite asserting the property, so its cost is paid once per executor
+   * lifetime rather than on any hot path.
+   */
+  def liveStreamingThreadNames(): Seq[String] = {
+    Thread.getAllStackTraces.keySet().asScala.toSeq
+      .filter(thread => thread != null && thread.isAlive)
+      .map(_.getName)
+      .filter(name => THREAD_NAME_PREFIXES.exists(prefix => name.startsWith(prefix)))
+      .sorted
+  }
 }

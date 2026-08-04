@@ -141,10 +141,10 @@ import org.apache.spark.util.{Clock, SystemClock}
  */
 private[spark] class StreamingShuffleClientHandler(
     conf: SparkConf,
-    shuffleId: Int,
-    mapId: Long,
+    val shuffleId: Int,
+    val mapId: Long,
     taskAttemptId: Long,
-    consumerId: String,
+    val consumerId: String,
     startPartition: Int,
     endPartition: Int,
     backpressure: BackpressureProtocol,
@@ -363,6 +363,27 @@ private[spark] class StreamingShuffleClientHandler(
    * Consumes one streaming frame that arrived as a one-way message, which is the shape every frame
    * of this protocol travels in.
    */
+  /**
+   * Whether a frame names the producer this handler serves.
+   *
+   * Used by the connector to route a frame on a channel that carries several producers of one
+   * consumer. The header is peeked rather than decoded, so routing costs no allocation and no body
+   * parse -- exactly as the producer side's own router does it -- and a frame too short or
+   * malformed to name a producer answers false, leaving the decision to the caller rather than
+   * claiming a frame this handler may not own.
+   *
+   * @param message the frame, whose position is left untouched
+   * @return true when the frame's header names this handler's shuffle and map output
+   */
+  def routes(message: ByteBuffer): Boolean = {
+    try {
+      StreamingShuffleMessage.peekShuffleId(message) == shuffleId &&
+        StreamingShuffleMessage.peekMapId(message) == mapId
+    } catch {
+      case NonFatal(_) => false
+    }
+  }
+
   override def receive(client: TransportClient, message: ByteBuffer): Unit = {
     guard(consumeFrame(client, message))
   }
@@ -2365,7 +2386,28 @@ private[spark] class StreamingShuffleClientHandler(
    * that admission's own rollback, so the accounting stays exact even in the case the bound exists
    * for.
    */
-  def close(): Unit = {
+  def close(): Unit = close(releaseChannel = true)
+
+  /**
+   * Releases everything this handler holds, once, optionally leaving the channel open.
+   *
+   * <b>Why the channel is now separable from the handler.</b> A handler used to own its channel
+   * outright, because there was one channel per handler: a reduce task opened a socket per producer
+   * it read from. That is no longer true, and could not remain so -- a reduce task reading two
+   * hundred map outputs from one executor opened two hundred sockets to one port, and a stage of
+   * two hundred such tasks opened forty thousand, which is a connect storm that fails connections
+   * rather than a shuffle that streams. Channels are now shared by the handlers of one consumer
+   * talking to one producer executor, and the connector that owns the share is the only party that
+   * can know when the last of them has finished with it. So a handler releasing itself out of a
+   * share must leave the socket alone; a handler that owns its channel outright still closes it,
+   * which is what the default preserves for every caller and every test that had one channel
+   * apiece.
+   *
+   * @param releaseChannel whether to close the channel beneath this handler. False when the channel
+   *                       is shared and its owner will release it once its last participant has
+   * gone
+   */
+  def close(releaseChannel: Boolean): Unit = {
     if (closed.compareAndSet(false, true)) {
       awaitAdmissionsInFlight()
       val drained = drainAndRelease()
@@ -2376,7 +2418,7 @@ private[spark] class StreamingShuffleClientHandler(
       val returned = releaseAllQuota()
       partitions.clear()
       val channel = channelRef.getAndSet(null)
-      if (channel != null) {
+      if (channel != null && releaseChannel) {
         channel.close()
       }
       if (debugEnabled) {

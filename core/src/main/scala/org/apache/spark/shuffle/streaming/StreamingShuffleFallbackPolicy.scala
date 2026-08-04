@@ -62,14 +62,29 @@ private[spark] sealed trait StreamingShuffleFallbackReason {
 private[spark] object StreamingShuffleFallbackReason {
 
   /**
-   * The consumer has been unable to keep up with the producer by the tolerated factor, continuously
-   * for longer than the tolerated window. Sustained rather than instantaneous: a momentary stall is
-   * ordinary flow control that backpressure and spill already absorb, and must not cost the job its
-   * fast path.
+   * The two ends of a pipelined shuffle could not be kept in step.
+   *
+   * The condition has a '''measured''' form and an '''observed''' form, and they are one condition
+   * rather than two because the thing that has failed is the same in both: the producer and the
+   * consumer of one shuffle can no longer sustain a pipeline between them.
+   *
+   *  - Measured: the consumer has been unable to keep up with the producer by the tolerated factor,
+   *    continuously for longer than the tolerated window. Sustained rather than instantaneous,
+   *    because a momentary stall is ordinary flow control that backpressure and spill already
+   *    absorb and must not cost the job its fast path.
+   *  - Observed: a consumer could not resolve a producer at all, or producers of the shuffle kept
+   *    being lost to the connection timeout across successive recomputations. The window of the
+   *    measured form is sixty seconds and the connection timeout is five, so a stream that keeps
+   *    dying is never available to be measured -- which is precisely why the observed form exists.
+   *
+   * The rendering below therefore names the failure rather than one of its two symptoms, and the
+   * free-text detail recorded alongside the verdict states which observation was actually made.
    */
   case object ConsumerTooSlow extends StreamingShuffleFallbackReason {
     override val description: String =
-      "the consumer stayed at least 2x slower than the producer for more than 60 seconds"
+      "a streaming shuffle producer and consumer could not be kept in step: either the consumer " +
+        "stayed at least 2x slower than the producer for more than 60 seconds, or its producers " +
+        "kept being lost to the connection timeout"
   }
 
   /**
@@ -642,16 +657,57 @@ private[spark] class StreamingShuffleFallbackPolicy(
       unevaluableSamples.incrementAndGet()
     } else {
       val utilization = usedBytesPerSecond / capacityBytesPerSecond
-      if (utilization > SATURATION_TRIP_RATIO) {
-        trip(NetworkSaturation,
-          log"streaming shuffle egress reached " +
+      if (utilization <= SATURATION_TRIP_RATIO) {
+        // Under the tolerated share, so any run of over-capacity samples ends here.
+        consecutiveSaturatedSamples.set(0L)
+      } else {
+        val consecutive = consecutiveSaturatedSamples.incrementAndGet()
+        if (consecutive >= SATURATION_SUSTAINED_SAMPLES) {
+          trip(NetworkSaturation,
+            log"streaming shuffle egress reached " +
+              log"${MDC(PERCENT, math.round(utilization * PERCENT_SCALE))}% of the administered " +
+              log"link capacity, ${MDC(NUM_BYTES, usedBytesPerSecond)} bytes/s against " +
+              log"${MDC(MAX_SIZE, capacityBytesPerSecond)} bytes/s, above the " +
+              log"${MDC(THRESHOLD, SATURATION_TRIP_PERCENT)}% this policy tolerates, on " +
+              log"${MDC(COUNT, consecutive)} consecutive sample(s).")
+        } else if (debugEnabled) {
+          logDebug(log"Streaming shuffle egress read " +
             log"${MDC(PERCENT, math.round(utilization * PERCENT_SCALE))}% of the administered " +
-            log"link capacity, ${MDC(NUM_BYTES, usedBytesPerSecond)} bytes/s against " +
-            log"${MDC(MAX_SIZE, capacityBytesPerSecond)} bytes/s, above the " +
-            log"${MDC(THRESHOLD, SATURATION_TRIP_PERCENT)}% this policy tolerates.")
+            log"link capacity on ${MDC(COUNT, consecutive)} consecutive sample(s), short of the " +
+            log"${MDC(MAX_SIZE, SATURATION_SUSTAINED_SAMPLES)} a sustained saturation needs")
+        }
       }
     }
   }
+
+  /**
+   * Consecutive over-capacity samples observed, which is what distinguishes a burst from
+   * saturation.
+   *
+   * <b>Why one sample cannot be enough.</b> The pacing bucket must be able to admit one
+   * maximum-sized block -- a bucket whose capacity were smaller would refuse every block forever,
+   * which is a deadlock rather than a rate limit -- so its burst allowance is at least one frame
+   * however small its paced share is. A bucket that starts full therefore legitimately delivers
+   * that burst inside a single sampling interval, and with several concurrent shuffles the sum of
+   * those bursts exceeds the administered capacity for exactly that interval before any of them can
+   * refill. Tripping on one sample turned that legal burst into a stand-down: egress read at nearly
+   * twice the administered capacity with not one stream throttled, every live producer of the
+   * shuffle was invalidated, and the recomputation wrote more than a quarter of the shuffle's
+   * records a second time. The ceiling was being enforced by abandoning streaming rather than by
+   * pacing it.
+   *
+   * A run, by contrast, is the property the fallback condition is about. A burst clears on the next
+   * sample because the bucket has to refill at its paced rate before it can burst again; a link
+   * that really is saturated stays over capacity sample after sample, and still stands streaming
+   * down within a few seconds -- far inside the sixty-second window the sustained-slowness
+   * condition beside it uses for the same kind of reason.
+   */
+  private val consecutiveSaturatedSamples = new AtomicLong(0L)
+
+  /**
+   * Consecutive over-capacity samples observed with no intervening sample under capacity.
+   */
+  def consecutiveSaturatedSampleCount: Long = consecutiveSaturatedSamples.get()
 
   /**
    * Records observed egress against the capacity the operator administered through
@@ -1136,6 +1192,23 @@ private[spark] object StreamingShuffleFallbackPolicy {
 
   /** [[SATURATION_TRIP_PERCENT]] as a fraction, which is the form the comparison actually uses. */
   val SATURATION_TRIP_RATIO: Double = SATURATION_TRIP_PERCENT.toDouble / 100.0d
+
+  /**
+   * Consecutive over-capacity samples a link must produce before its saturation is treated as
+   * sustained and streaming stands down.
+   *
+   * Three. Sized against what it must exclude rather than picked round: the pacing buckets' burst
+   * allowance can exceed the administered capacity for exactly one sampling interval apiece and
+   * then not again until it has refilled at the paced rate, so two consecutive over-capacity
+   * samples already rule a burst out and three leave margin for a second wave of limiters created
+   * part-way through a shuffle. Against what it must catch it costs almost nothing: the samples
+   * arrive on the protocol's own one-second measurement cadence, so a genuinely saturated link
+   * still stands streaming down within a few seconds, an order of magnitude sooner than the
+   * sixty-second sustained-slowness condition beside it. Deliberately kept in step with
+   * `BackpressureProtocol.LINK_SATURATION_SUSTAINED_INTERVALS`, which applies the same rule to the
+   * protocol's own view of the same condition.
+   */
+  val SATURATION_SUSTAINED_SAMPLES: Long = 3L
 
   /**
    * Bytes in one MiB, used to convert the administered bandwidth from MB/s into bytes per second.

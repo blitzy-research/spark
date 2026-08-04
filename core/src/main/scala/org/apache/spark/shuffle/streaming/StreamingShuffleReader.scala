@@ -1173,7 +1173,14 @@ private[spark] class StreamingShuffleReader[K, C](
             s"[$startPartition, $endPartition) was released while opening a channel to " +
             s"${location.hostPort}.")
       case None =>
-        invalidateProducer(location, StreamingShuffleInvalidationReason.ConnectionTimeout,
+        // Through `recordInvalidation` rather than straight to `invalidateProducer`, because this
+        // arm is an invalidation like every other and has to be counted like one. Going direct
+        // withdrew the producer generation and raised the fetch failure but never touched
+        // `shuffle.streaming.partialReadInvalidations`, so the single most common invalidation an
+        // operator can hit -- a producer that cannot be reached at all -- was the one invisible to
+        // the metric that exists to report invalidations. Every other invalidating path in this
+        // class already goes through here; this one was the exception.
+        recordInvalidation(location, StreamingShuffleInvalidationReason.ConnectionTimeout,
           "the consumer could not open a streaming channel")
         raiseFetchFailure(location, startPartition,
           s"Could not open a streaming shuffle channel to ${location.hostPort} for shuffle " +
@@ -2207,7 +2214,10 @@ private[spark] class StreamingShuffleReader[K, C](
     def discardAll(): Long = synchronized {
       val released = discardBuffered()
       closeOpenStreams()
-      handler.close()
+      // Through the connector, which owns the channel and is therefore the only party that may
+      // decide whether releasing this handler releases the socket beneath it. See
+      // `StreamingShuffleProducerConnector.release`.
+      connector.release(handler, client)
       released
     }
 
@@ -2367,11 +2377,12 @@ private[spark] class StreamingShuffleReader[K, C](
      */
     def close(): Long = {
       if (closed.compareAndSet(false, true)) {
-        val released = discardAll()
-        if (client.isActive()) {
-          client.close()
-        }
-        released
+        // `discardAll` releases the handler through the connector, which closes the channel when it
+        // is this handler's alone and leaves it open when it is shared. Nothing is closed here: a
+        // reduce task reading several producers on one executor shares one socket with itself, so
+        // closing the client from a per-producer teardown would cut off the producers it has not
+        // finished with. See `StreamingShuffleProducerConnector.release`.
+        discardAll()
       } else {
         0L
       }
@@ -2617,6 +2628,19 @@ private[spark] object StreamingShuffleReader {
    */
   val MAX_EARLY_INACTIVE_CHANNELS: Int = 4096
 
+  /**
+   * How many times a handler will try to join a channel its consumer already holds before opening
+   * one of its own.
+   *
+   * A bound rather than an unbounded retry, because the loop's conditions are decided by other
+   * threads -- a channel going inactive, a last participant leaving -- and a bound turns a
+   * pathological interleaving into one extra socket instead of a spin. Small on purpose: each pass
+   * either succeeds or removes the candidate it examined, so more than a couple of passes means
+   * candidates are being replaced as fast as they are read, and opening a channel is then both
+   * cheaper and more likely to be the right answer.
+   */
+  val MAX_SHARE_JOIN_ATTEMPTS: Int = 4
+
   /** Sequence numbers count from zero, one per data block, per partition stream. */
   val FIRST_SEQUENCE_NUMBER: Long = 0L
 
@@ -2727,6 +2751,33 @@ private[spark] trait StreamingShuffleProducerConnector {
       location: StreamingShuffleProducerLocation,
       handler: StreamingShuffleClientHandler): Option[TransportClient]
 
+  /**
+   * Gives up one handler's participation in the channel [[connect]] returned for it.
+   *
+   * <b>Why a reader may not simply close the client.</b> An implementation is free to give two
+   * handlers of the same consumer the same channel -- and the production one does, because a socket
+   * per producer means a socket per map output and a connect storm at any realistic shuffle width.
+   * Once a channel can be shared, closing it is the owner's decision and not a participant's: a
+   * reduce task that closed the client when it finished with one producer would cut off every other
+   * producer it was still reading from the same executor.
+   *
+   * The default is the behaviour of a connector that hands out one channel per handler: release the
+   * handler and close its channel. An implementation that shares channels overrides it and closes
+   * only when the last participant has gone.
+   *
+   * Must be idempotent, and must be safe to call for a handler whose channel is already gone: it
+   * runs from a task-completion listener, so it runs after success, failure and cancellation alike.
+   *
+   * @param handler the handler giving up its participation
+   * @param client the channel [[connect]] returned for that handler
+   */
+  def release(handler: StreamingShuffleClientHandler, client: TransportClient): Unit = {
+    handler.close()
+    if (client.isActive()) {
+      client.close()
+    }
+  }
+
   /** Releases any process-wide resource this connector holds. Must be idempotent. */
   def close(): Unit
 }
@@ -2815,7 +2866,35 @@ private[spark] class NettyStreamingShuffleProducerConnector(
    * while the connection is being created and removed when the channel goes inactive, so a callback
    * can never reach a handler whose reader has finished with it.
    */
-  private val handlers = new ConcurrentHashMap[String, StreamingShuffleClientHandler]()
+  private val handlers = new ConcurrentHashMap[String, ChannelParticipants]()
+
+  /**
+   * The channels available for a handler to join, keyed by consumer and producer endpoint.
+   *
+   * <b>Why sharing, and why keyed exactly like this.</b> A channel used to belong to one handler,
+   * and a handler serves one map output, so a reduce task reading N map outputs from one executor
+   * opened N sockets to one port -- and a stage of M such tasks opened N x M. At two hundred
+   * partitions that is twenty-eight thousand connections carrying under two megabytes between them:
+   * the connect rate alone overruns the listener's accept backlog, so connects begin to fail, the
+   * five-attempt retry ladder spends twenty-five seconds per unreachable producer, the read gives
+   * up with a fetch failure, and the stage is recomputed. The bytes were never the problem; the
+   * sockets were.
+   *
+   * The key is the consumer's identity and the producer's endpoint, and both halves are
+   * load-bearing. The endpoint is what makes sharing possible at all: every map output on one
+   * executor is served by that executor's one streaming listener, and a frame carries the shuffle
+   * and map it belongs to, so one socket can serve all of them and this class can route each frame
+   * to the handler that owns it. The consumer's identity is what keeps sharing safe: it confines a
+   * channel to the handlers of a single reduce task attempt, so no two tasks ever contend for one
+   * socket's receive window -- which is the property the previous socket-per-handler design was
+   * protecting, preserved here rather than traded away -- and it removes the one ambiguity routing
+   * would otherwise have, two attempts of the same reduce partition reading the same producer being
+   * indistinguishable on a shared channel.
+   *
+   * An entry is removed when its channel goes inactive or when its last participant leaves, so this
+   * map holds only channels a further handler could actually join.
+   */
+  private val shareable = new ConcurrentHashMap[String, ChannelShare]()
 
   /**
    * The claim on the connection currently being created on this thread.
@@ -2859,6 +2938,16 @@ private[spark] class NettyStreamingShuffleProducerConnector(
 
   /** Channels closed here because their ownership could not be settled. Zero on a clean run. */
   private val declinedConnections = new AtomicInteger(0)
+
+  /**
+   * Handlers that joined a channel this consumer already held instead of opening one.
+   *
+   * The measure of the change this sharing makes, and the reason it is counted rather than assumed:
+   * a reduce task reading N map outputs from one executor contributes N-1 joins, so the figure is
+   * the number of sockets not opened. It is what a suite asserts on to establish that sharing is in
+   * effect rather than merely implemented.
+   */
+  private val sharedJoins = new AtomicLong(0L)
 
   /** Terminal callbacks replayed at binding time because they arrived before it. */
   private val earlyTerminalCallbacks = new AtomicInteger(0)
@@ -2925,12 +3014,95 @@ private[spark] class NettyStreamingShuffleProducerConnector(
         log"${MDC(HOST_PORT, location.hostPort)} because this connector is closed")
       None
     } else {
+      // A channel this consumer already holds to this producer's executor serves this handler too,
+      // and joining it costs no socket, no handshake and no accept on the far side. Tried first
+      // because it is both the cheap path and the common one: a reduce task typically reads many
+      // map outputs from each executor, and every one of them after the first joins here.
+      joinShare(location, handler).orElse(openShare(location, handler))
+    }
+  }
+
+  /**
+   * Joins a handler to a channel this consumer already holds to this producer's executor.
+   *
+   * Retries rather than failing when the candidate turns out to be unusable, because two conditions
+   * can invalidate it between being found and being joined -- the channel going inactive, and its
+   * last participant leaving -- and both are ordinary. Each attempt either publishes the handler
+   * against a live share or removes a dead entry and looks again, so the loop terminates: every
+   * pass that does not succeed strictly shrinks the set of candidates.
+   *
+   * @param location the producer to reach
+   * @param handler the handler to bind
+   * @return the shared channel, or `None` when this consumer holds none that can be joined
+   */
+  private def joinShare(
+      location: StreamingShuffleProducerLocation,
+      handler: StreamingShuffleClientHandler): Option[TransportClient] = {
+    val key = shareKey(location, handler)
+    var attempts = 0
+    var joined: Option[TransportClient] = None
+    var keepLooking = true
+    while (keepLooking && attempts < StreamingShuffleReader.MAX_SHARE_JOIN_ATTEMPTS) {
+      attempts += 1
+      val share = shareable.get(key)
+      if (share == null) {
+        keepLooking = false
+      } else if (!share.client.isActive() || closed.get()) {
+        // A dead channel must not be handed to a handler that would then wait out its whole
+        // connection timeout on it. Withdrawn conditionally, so a concurrent replacement survives.
+        shareable.remove(key, share)
+      } else if (share.join()) {
+        val channelKey = channelKeyOf(share.client)
+        val participants = handlers.get(channelKey)
+        if (participants == null) {
+          // The channel is being released or has already been forgotten. Give the claim straight
+          // back and look again: leaving it taken would keep the socket alive with no participant.
+          share.leave()
+          shareable.remove(key, share)
+        } else {
+          participants.add(handler)
+          // Announced on this thread, exactly as a freshly created channel's subscription is, so
+          // the in-progress request for this producer is issued once the handler is reachable. The
+          // producer treats a repeat announcement as a no-op.
+          handler.channelActive(share.client)
+          sharedJoins.incrementAndGet()
+          if (debugEnabled) {
+            logDebug(log"Streaming shuffle ${MDC(SHUFFLE_ID, handler.shuffleId)} joined map " +
+              log"${MDC(MAP_ID, handler.mapId)} to the channel this consumer already holds to " +
+              log"${MDC(HOST_PORT, location.hostPort)}, now carrying " +
+              log"${MDC(COUNT, participants.size)} producer(s)")
+          }
+          joined = Some(share.client)
+          keepLooking = false
+        }
+      }
+    }
+    joined
+  }
+
+  /**
+   * Opens a new channel for a handler and publishes it as this consumer's share for that endpoint.
+   *
+   * @param location the producer to reach
+   * @param handler the handler to bind
+   * @return the new channel, or `None` when it could not be established
+   */
+  private def openShare(
+      location: StreamingShuffleProducerLocation,
+      handler: StreamingShuffleClientHandler): Option[TransportClient] = {
+    {
       val claim = new ConnectionClaim(handler)
       connecting.set(claim)
       claims.add(claim)
       try {
         val client = createTransportClient(location.host, location.port)
         if (bind(client, handler, claim)) {
+          // Offered for this consumer's other producers on the same executor to join, and only once
+          // the binding has succeeded: publishing a share for a channel that was then declined
+          // would hand a further handler a socket nothing owns. The claim the share starts with
+          // belongs to the handler just bound, so the channel cannot be judged unreferenced before
+          // it is used.
+          shareable.put(shareKey(location, handler), new ChannelShare(client))
           // The transport raises channelActive from the pipeline before the client is returned,
           // which is earlier than the binding above on a channel that connected before this thread
           // resumed. Announcing here as well is idempotent -- the producer treats a repeat
@@ -3024,16 +3196,22 @@ private[spark] class NettyStreamingShuffleProducerConnector(
       // so no connection can slip between the two.
       claims.asScala.foreach(_.cancel())
       val bound = handlers.size()
-      handlers.values().asScala.foreach { handler =>
-        try {
-          handler.close()
-        } catch {
-          case NonFatal(e) =>
-            logWarning(log"A streaming shuffle consumer handler failed to close: " +
-              log"${MDC(ERROR, e.getMessage)}")
+      // Every participant of every channel, because a channel now carries the handlers of one
+      // consumer rather than one handler. The channels themselves are closed and awaited below, so
+      // each handler is released without touching its socket.
+      handlers.values().asScala.foreach { participants =>
+        participants.drain().foreach { handler =>
+          try {
+            handler.close(releaseChannel = false)
+          } catch {
+            case NonFatal(e) =>
+              logWarning(log"A streaming shuffle consumer handler failed to close: " +
+                log"${MDC(ERROR, e.getMessage)}")
+          }
         }
       }
       handlers.clear()
+      shareable.clear()
       val channels = liveChannels()
       val group = channels.flatMap(channel => Option(channel.eventLoop())
         .flatMap(loop => Option(loop.parent()))).headOption
@@ -3191,14 +3369,14 @@ private[spark] class NettyStreamingShuffleProducerConnector(
   override def getStreamManager(): StreamManager = emptyStreamManager
 
   override def receive(client: TransportClient, message: ByteBuffer): Unit = {
-    dispatchTo(client)(_.receive(client, message))
+    dispatchTo(client, message)(_.receive(client, message))
   }
 
   override def receive(
       client: TransportClient,
       message: ByteBuffer,
       callback: RpcResponseCallback): Unit = {
-    dispatchTo(client)(_.receive(client, message, callback))
+    dispatchTo(client, message)(_.receive(client, message, callback))
   }
 
   /**
@@ -3218,10 +3396,10 @@ private[spark] class NettyStreamingShuffleProducerConnector(
    * sequence-gap repair has to ask for again.
    */
   override def channelActive(client: TransportClient): Unit = {
-    handlerFor(client) match {
-      case Some(handler) =>
-        handler.channelActive(client)
-      case None =>
+    participantsOf(client) match {
+      case handlers if handlers.nonEmpty =>
+        handlers.foreach(_.channelActive(client))
+      case _ =>
         if (debugEnabled) {
           logDebug(log"A streaming shuffle channel to " +
             log"${MDC(HOST_PORT, String.valueOf(client.getSocketAddress()))} became active " +
@@ -3250,8 +3428,14 @@ private[spark] class NettyStreamingShuffleProducerConnector(
   override def channelInactive(client: TransportClient): Unit = {
     val key = channelKeyOf(client)
     clients.remove(key)
+    // The share goes with the channel, so no further handler can be given a socket that has just
+    // died and then wait out its whole connection timeout on it.
+    forgetShare(client)
     Option(handlers.remove(key)) match {
-      case Some(handler) => handler.channelInactive(client)
+      case Some(participants) =>
+        // Every participant is told, because a lost channel is lost for all of them, and each has
+        // to convert that loss into the fetch failure that recomputes its own map task.
+        participants.snapshot().foreach(_.channelInactive(client))
       case None =>
         recordEarlyInactive(key)
         currentlyConnecting.foreach(_.channelInactive(client))
@@ -3286,10 +3470,10 @@ private[spark] class NettyStreamingShuffleProducerConnector(
    * with more of the story, so it is recorded only under the streaming debug key.
    */
   override def exceptionCaught(cause: Throwable, client: TransportClient): Unit = {
-    handlerFor(client) match {
-      case Some(handler) =>
-        handler.exceptionCaught(cause, client)
-      case None =>
+    participantsOf(client) match {
+      case handlers if handlers.nonEmpty =>
+        handlers.foreach(_.exceptionCaught(cause, client))
+      case _ =>
         if (debugEnabled) {
           logDebug(log"A streaming shuffle channel to " +
             log"${MDC(HOST_PORT, String.valueOf(client.getSocketAddress()))} failed with " +
@@ -3310,8 +3494,89 @@ private[spark] class NettyStreamingShuffleProducerConnector(
    * the event loop before the binding completes is an ordering rather than a loss --
    * [[channelActive]] says why nothing is lost by it.
    */
-  private def handlerFor(client: TransportClient): Option[StreamingShuffleClientHandler] =
-    Option(handlers.get(channelKeyOf(client))).orElse(currentlyConnecting)
+  private def handlerFor(
+      client: TransportClient,
+      message: ByteBuffer): Option[StreamingShuffleClientHandler] = {
+    Option(handlers.get(channelKeyOf(client)))
+      .flatMap(participants => participants.routeFor(message))
+      .orElse(currentlyConnecting.filter(handler => handler.routes(message)))
+  }
+
+  /**
+   * Every handler bound to one channel, for a callback that concerns the channel rather than a
+   * frame.
+   *
+   * The connecting thread local is consulted second and answers only on that thread, which is the
+   * thread running the registering bootstrap inside `createUnmanagedClient`: it is what lets a
+   * callback raised synchronously during connection reach its handler before the binding is
+   * published. A transport thread sees the registration alone, so a callback raised on the event
+   * loop before the binding completes is an ordering rather than a loss -- [[channelActive]] says
+   * why nothing is lost by it.
+   */
+  private def participantsOf(client: TransportClient): Seq[StreamingShuffleClientHandler] = {
+    Option(handlers.get(channelKeyOf(client))) match {
+      case Some(participants) => participants.snapshot()
+      case None => currentlyConnecting.toSeq
+    }
+  }
+
+  /** The key under which a handler's consumer shares a channel to one producer endpoint. */
+  private def shareKey(
+      location: StreamingShuffleProducerLocation,
+      handler: StreamingShuffleClientHandler): String =
+    s"${handler.consumerId}@${location.hostPort}"
+
+  /** Withdraws whichever share names this channel, so no further handler can join a dead socket. */
+  private def forgetShare(client: TransportClient): Unit = {
+    shareable.entrySet().removeIf(entry => entry.getValue.client.eq(client))
+  }
+
+  /**
+   * Gives up one handler's participation, closing the channel only when it was the last.
+   *
+   * <b>Why the last participant closes and no earlier one may.</b> The channel carries every
+   * producer this reduce task is reading from one executor, so a handler that closed the socket
+   * when its own producer ended would cut off the producers the task had not finished with --
+   * turning an orderly end of one stream into a lost channel on all the others. The claim count is
+   * what makes "last" exact without a lock, and the share is withdrawn before the socket is closed
+   * so that no handler can join a channel that is on its way out.
+   *
+   * Idempotent in both halves: a handler releases itself once, and a channel with no participants
+   * is closed once. Safe for a channel already gone, because it runs from a task-completion
+   * listener and therefore also runs after the failure that lost the channel in the first place.
+   */
+  override def release(
+      handler: StreamingShuffleClientHandler,
+      client: TransportClient): Unit = {
+    val key = channelKeyOf(client)
+    val participants = handlers.get(key)
+    val wasParticipant = participants != null && participants.remove(handler)
+    // The handler is released whether or not it was still registered: a channel lost earlier
+    // already removed the whole participant set, and the handler still holds receive quota that
+    // must come back. `close` is itself idempotent.
+    handler.close(releaseChannel = false)
+    if (wasParticipant && participants.isEmpty) {
+      // Withdrawn first, so the interval between deciding to close and closing cannot be used to
+      // join. A conditional removal, so a share published for a replacement channel survives.
+      shareable.entrySet().removeIf(entry => entry.getValue.client.eq(client))
+      // Conditional, so a handler that joined between the emptiness test and here keeps its
+      // channel.
+      if (handlers.remove(key, participants)) {
+        clients.remove(key)
+        if (client.isActive()) {
+          client.close()
+        }
+        if (debugEnabled) {
+          logDebug(log"Streaming shuffle released the consumer channel to " +
+            log"${MDC(HOST_PORT, String.valueOf(client.getSocketAddress()))} after its last " +
+            log"producer finished")
+        }
+      }
+    }
+  }
+
+  /** Handlers joined to a channel this consumer already held, since this connector was created. */
+  private[streaming] def sharedJoinCount: Long = sharedJoins.get()
 
   /**
    * Routes one received frame to the handler that owns the channel it arrived on.
@@ -3325,9 +3590,9 @@ private[spark] class NettyStreamingShuffleProducerConnector(
    * them an unreachable handler is an ordinary ordering rather than a loss, and counting them here
    * both cost the counter its meaning and put a warning in every enabled run's log.
    */
-  private def dispatchTo(client: TransportClient)(
+  private def dispatchTo(client: TransportClient, message: ByteBuffer)(
       action: StreamingShuffleClientHandler => Unit): Unit = {
-    handlerFor(client) match {
+    handlerFor(client, message) match {
       case Some(handler) =>
         action(handler)
       case None =>
@@ -3381,7 +3646,12 @@ private[spark] class NettyStreamingShuffleProducerConnector(
       declineConnection(client, "the connector closed while the channel was being created")
       false
     } else {
-      handlers.put(key, handler)
+      // A participant set rather than a single handler, because further handlers of this same
+      // consumer join this channel instead of opening one of their own. It is created holding this
+      // handler and one claim, so the channel is never momentarily unreferenced between being
+      // published and being used.
+      val participants = new ChannelParticipants(handler)
+      handlers.put(key, participants)
       clients.put(key, client)
       if (closed.get() || claim.isCancelled) {
         handlers.remove(key)
@@ -3456,6 +3726,119 @@ private[spark] class NettyStreamingShuffleProducerConnector(
 
     /** Marks this connection as one the connecting thread must give up rather than publish. */
     def cancel(): Unit = cancelled.set(true)
+  }
+
+  /**
+   * The handlers bound to one channel, and the routing of a frame to the one that owns it.
+   *
+   * <b>Why a set and not a single handler.</b> One channel now carries every producer a single
+   * reduce task reads from a single executor, because a socket per producer is a socket per map
+   * output and therefore a connect storm at any realistic shuffle width. What makes that safe is
+   * that a frame says which producer it belongs to: the wire header carries the shuffle and the
+   * map, and this class peeks both without decoding the body -- exactly as the producer side's own
+   * router does -- so each frame reaches the handler that owns its sequence expectation, its
+   * acknowledgement position and its receive window, and no handler ever sees another's bytes.
+   *
+   * Small by construction: the number of map outputs one reduce task reads from one executor. A
+   * linear scan would be defensible at that size, but the map is keyed so that routing cost does
+   * not grow with shuffle width at all.
+   *
+   * @param initial the handler this channel was opened for, so the set is never momentarily empty
+   */
+  private final class ChannelParticipants(initial: StreamingShuffleClientHandler) {
+
+    private val byProducer = new ConcurrentHashMap[(Int, Long), StreamingShuffleClientHandler]()
+
+    byProducer.put((initial.shuffleId, initial.mapId), initial)
+
+    /** Binds one more handler to this channel. */
+    def add(handler: StreamingShuffleClientHandler): Unit =
+      byProducer.put((handler.shuffleId, handler.mapId), handler)
+
+    /**
+     * Unbinds one handler.
+     *
+     * Value-qualified, so a handler that has already been replaced by a later attempt of the same
+     * map task cannot unbind the one that replaced it.
+     *
+     * @return true when this call was the one that removed it
+     */
+    def remove(handler: StreamingShuffleClientHandler): Boolean =
+      byProducer.remove((handler.shuffleId, handler.mapId), handler)
+
+    /** Whether no handler is bound to this channel any more. */
+    def isEmpty: Boolean = byProducer.isEmpty
+
+    /** How many handlers are bound to this channel. */
+    def size: Int = byProducer.size()
+
+    /** The handlers bound now, as a stable sequence a callback can be fanned out over. */
+    def snapshot(): Seq[StreamingShuffleClientHandler] = byProducer.values().asScala.toSeq
+
+    /** Empties the set and returns what it held, for the connector's own shutdown. */
+    def drain(): Seq[StreamingShuffleClientHandler] = {
+      val held = snapshot()
+      byProducer.clear()
+      held
+    }
+
+    /**
+     * The handler a frame belongs to, by the producer its header names.
+     *
+     * `None` for a frame this channel carries no handler for, which the caller counts rather than
+     * raises: it can only mean a producer sent for a stream this consumer has finished with, and
+     * the sequence-gap repair asks again for anything genuinely still wanted.
+     */
+    def routeFor(message: ByteBuffer): Option[StreamingShuffleClientHandler] = {
+      try {
+        val shuffleId = StreamingShuffleMessage.peekShuffleId(message)
+        val mapId = StreamingShuffleMessage.peekMapId(message)
+        Option(byProducer.get((shuffleId, mapId)))
+      } catch {
+        case NonFatal(_) =>
+          // A frame too short or too malformed to name a producer cannot be routed. With exactly
+          // one participant there is no ambiguity about who should see it, and that handler's own
+          // decoding raises the protocol error properly; with several, guessing would deliver a
+          // corrupt frame to a handler it does not belong to.
+          val held = snapshot()
+          if (held.size == 1) Some(held.head) else None
+      }
+    }
+  }
+
+  /**
+   * One channel offered for further handlers of the same consumer to join, with the claims on it.
+   *
+   * The claim count is what makes "the last participant" exact without a lock, and it is separate
+   * from [[ChannelParticipants]] deliberately: a claim is taken before a handler is published and
+   * given back if publishing fails, so during that interval the channel is referenced by a claim
+   * that no participant set yet reflects. Without that, a concurrent release could observe an empty
+   * participant set and close a socket another thread was in the middle of joining.
+   *
+   * @param client the channel being shared
+   */
+  private final class ChannelShare(val client: TransportClient) {
+
+    private val claims = new AtomicInteger(1)
+
+    /**
+     * Takes a claim, refusing once the channel is on its way out.
+     *
+     * @return true when the claim was taken
+     */
+    def join(): Boolean = {
+      var current = claims.get()
+      while (current > 0) {
+        if (claims.compareAndSet(current, current + 1)) {
+          return true
+        }
+        current = claims.get()
+      }
+      false
+    }
+
+    /** Gives a claim back. */
+    def leave(): Unit = claims.decrementAndGet()
   }
 
   /**

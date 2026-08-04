@@ -211,6 +211,22 @@ class BackpressureProtocolSuite extends SparkFunSuite
       streamingConfWithOverrides(maxBandwidthMBps = Some(linkCapacityMBps)), clock, null)
   }
 
+  /**
+   * Advances the injected clock far enough for the executor-wide egress ceiling to top back up.
+   *
+   * A per-shuffle bucket is one stream's own, but the ceiling behind every bucket belongs to the
+   * executor, because the administered capacity governs an executor's aggregate egress rather than
+   * each stream's. Bytes one shuffle puts on the wire are therefore charged to the ceiling too, and
+   * a fixture that means to assert something about credit -- or about a fresh shuffle's own full
+   * bucket -- has to let the ceiling recover first, or it asserts against pacing it did not intend
+   * to provoke. Ten milliseconds at this suite's declared capacity earns back several kibibytes and
+   * is far short of the poll, heartbeat and timeout intervals these cases assert against, so it
+   * cannot perturb any of them.
+   */
+  private def accrueExecutorEgressCeiling(clock: ManualClock): Unit = {
+    clock.advance(millisPerSecond / 100L)
+  }
+
   test("consumer acknowledgement processing and buffer reclamation") {
     val clock = newManualClock()
     val protocol = newProtocol(clock)
@@ -625,6 +641,92 @@ class BackpressureProtocolSuite extends SparkFunSuite
     assert(firstLimiter.refillBytesPerSecond === refillBytesPerSecond(declaredMBps, 1),
       "and the retired share to the shuffle that remains")
     assert(!budget.release(secondShuffleId), "releasing a shuffle that holds no limiter is a no-op")
+  }
+
+  test("rate limiting via token bucket holds the executor's aggregate burst to the ceiling") {
+    // Dividing the RATE is not sufficient, and this is the case that says why. A bucket must be
+    // able to hold one maximum-sized encoded frame or it would refuse every legal block forever,
+    // so every per-shuffle bucket's capacity is floored at one frame however small its paced share
+    // is. Five shuffles therefore start with five frames of instantly spendable allowance between
+    // them. Left unchecked that is not a harmless measurement artefact: those bytes really do cross
+    // the link unpaced, a measured second reads several times the administered capacity with not
+    // one stream throttled, and the only component that reacts is the fallback policy -- which
+    // stands streaming down, invalidates every live producer and has the shuffle recomputed. The
+    // cap ends up enforced by abandoning streaming rather than by pacing it.
+    val declaredMBps = 1
+    val clock = newManualClock()
+    val budget = TokenBucketRateLimiter.executorBudget(
+      streamingConfWithOverrides(maxBandwidthMBps = Some(declaredMBps)), clock)
+    val shuffleCount = 5
+    val limiters = (0 until shuffleCount).map(shuffleId => budget.limiterFor(shuffleId))
+    assert(budget.divisor === shuffleCount, s"$shuffleCount limiters divide the cap that many ways")
+
+    val ceilingRate = budget.aggregateBytesPerSecond.get
+    assert(ceilingRate === applyBandwidthCeiling(declaredMBps.toLong * BytesPerMebibyte),
+      "the aggregate paces at the ceiling applied to the whole declared capacity, undivided")
+    val aggregateCapacity = TokenBucketRateLimiter.burstCapacityBytes(ceilingRate)
+    val perShuffleCapacity = limiters.head.capacityBytes
+    assert(perShuffleCapacity * shuffleCount.toLong > aggregateCapacity,
+      "the fixture must actually present the overrun this ceiling exists to prevent: the sum of " +
+        s"$shuffleCount bucket capacities ($perShuffleCapacity each) must exceed the aggregate " +
+        s"capacity of $aggregateCapacity, or this case proves nothing")
+
+    // Every limiter drains as hard as it can, at one instant, so no accrual can enter the total.
+    val block = MaxEncodedFrameBytes.toLong
+    var admittedBytes = 0L
+    limiters.foreach { limiter =>
+      var admitting = true
+      while (admitting) {
+        if (limiter.tryAcquire(block)) {
+          admittedBytes += block
+        } else {
+          admitting = false
+        }
+      }
+    }
+    assert(admittedBytes <= aggregateCapacity,
+      s"the executor admitted $admittedBytes byte(s) at one instant, above the aggregate burst " +
+        s"allowance of $aggregateCapacity: the per-shuffle buckets are pacing themselves but not " +
+        "the executor")
+    assert(admittedBytes < perShuffleCapacity * shuffleCount.toLong,
+      "and strictly less than the sum of the individual allowances, which is the whole point")
+    assert(budget.aggregateRefusalCount > 0L,
+      "a refusal must be recorded against the executor-wide ceiling, because a cap reached with " +
+        "nothing ever throttled is a cap enforced by standing streaming down rather than by pacing")
+    assert(limiters.exists(_.refusalCount > 0L),
+      "and the refusal must be visible at the limiter the caller actually holds")
+
+    // A refused request costs nothing. The ceiling refuses AFTER the shuffle's own bucket has been
+    // charged, so without the refund the caller would be paced twice for one block -- throttled
+    // harder than the operator's cap implies, by an amount that grew with every refusal.
+    val exhausted = limiters.head
+    val beforeRefusal = exhausted.capacityBytes - exhausted.availableTokens
+    assert(!exhausted.tryAcquire(block), "the fixture must be at the ceiling for this assertion")
+    assert(exhausted.capacityBytes - exhausted.availableTokens === beforeRefusal,
+      "a request the ceiling refused must leave the shuffle's own tokens exactly as they were")
+
+    // And the wait a refused caller is told to come back after is the ceiling's, not its own. A
+    // limiter whose own bucket still holds tokens would otherwise be told to retry immediately,
+    // spin on a condition that had not changed, and -- at zero delay -- schedule no wake-up at all,
+    // which is how a final rate-limited block is lost rather than throttled.
+    assert(exhausted.millisUntilAvailable(block) > 0L,
+      "a caller refused by the ceiling must be given the ceiling's own refill wait")
+
+    // Accrual releases it, at the ceiling's rate rather than at five times the ceiling's rate.
+    clock.advance(millisPerSecond)
+    assert(exhausted.tryAcquire(block) || exhausted.availableTokens > 0L,
+      "one second of accrual at the ceiling rate must put the executor back in service")
+    assert(budget.aggregateLimiter.refillBytesPerSecond === ceilingRate,
+      "and the rate it comes back at is the administered ceiling, which the divisor never touches")
+
+    // Uncapped egress keeps the unlimited fast path: no ceiling, no arithmetic, nothing to refund.
+    val uncapped = TokenBucketRateLimiter.executorBudget(streamingConfWithOverrides(), clock)
+    assert(uncapped.aggregateLimiter.isUnlimited,
+      "an absent cap must leave the aggregate unlimited rather than pacing at a derived rate")
+    assert(uncapped.aggregateBytesPerSecond.isEmpty,
+      "and report no aggregate rate at all, because none was declared")
+    assert(uncapped.limiterFor(firstShuffleId).tryAcquire(Long.MaxValue),
+      "so an uncapped limiter still admits everything, ceiling or no ceiling")
   }
 
   // Timeout detection and failure signalling. Two windows of different lengths for different
@@ -1281,15 +1383,19 @@ class BackpressureProtocolSuite extends SparkFunSuite
     // The paced stream belongs to a SECOND shuffle, and that is load-bearing rather than tidiness:
     // a bucket is per shuffle, so a stream sharing the first shuffle's bucket would find it partly
     // spent by the credit episode above, and the refusal would no longer be attributable to a full
-    // bucket having been drained by this stream alone.
+    // bucket having been drained by this stream alone. The executor-wide ceiling every bucket also
+    // charges against IS shared, which the accrual below accounts for.
     protocol.registerShuffle(secondShuffleId, partitionCount)
     val pacedKey = producerKey(secondShuffleId, partitionId, "consumer-paced")
     val generousCredit = 8L * MaxEncodedFrameBytes.toLong
     assert(protocol.registerStream(pacedKey, generousCredit), "a stream with ample credit opens")
+    // The credit episode above charged the executor-wide ceiling for the bytes it sent, so the
+    // ceiling recovers before this shuffle's own full bucket is asserted against.
+    accrueExecutorEgressCeiling(clock)
     assert(protocol.tryAdmit(pacedKey, MaxEncodedFrameBytes.toLong, 0L),
       "a bucket starts full, so the first maximum-sized frame is admitted")
     assert(protocol.availableCreditBytes(pacedKey) > 0L,
-      "credit still remains, so whatever refuses the next frame can only be the pacing bucket")
+      "credit still remains, so whatever refuses the next frame can only be the pacing layer")
     assert(!protocol.tryAdmit(pacedKey, MaxEncodedFrameBytes.toLong, 1L),
       "and the drained bucket does refuse it")
     assert(protocol.isStreamThrottled(pacedKey), "which throttles the stream")
@@ -1321,6 +1427,9 @@ class BackpressureProtocolSuite extends SparkFunSuite
     assert(protocol.streamState(key) === BackpressureState.Spilling,
       "and utilisation is executor-wide, so it overlays every stream")
 
+    // The paced stream drained the shared ceiling with a maximum-sized frame a moment ago, and this
+    // assertion is about credit rather than about pacing, so the ceiling recovers first.
+    accrueExecutorEgressCeiling(clock)
     assert(protocol.tryAdmit(key, creditLimitBytes, 1L), "the credit-bound stream sends again")
     assert(!protocol.tryAdmit(key, creditLimitBytes, 2L), "and is refused again")
     assert(protocol.isStreamThrottled(key), "so it is genuinely throttled")
@@ -1440,11 +1549,40 @@ class BackpressureProtocolSuite extends SparkFunSuite
       "the trip is strictly beyond ninety percent, so exactly ninety does NOT fire")
     assert(protocol.state === BackpressureState.Flowing, "and the executor stays flowing")
 
+    // Beyond ninety, and then beyond ninety again, and again: saturation is a sustained condition
+    // and one interval of it is not enough. The reason is the pacing bucket rather than caution. A
+    // bucket has to be able to admit one maximum-sized block or it would refuse every block
+    // forever, so its burst allowance is at least one frame however small its paced share is -- and
+    // a bucket that starts full therefore legitimately delivers that burst inside a single
+    // interval, which with several concurrent shuffles sums to a multiple of the administered
+    // capacity for exactly one interval. Tripping on one reading turned that legal burst into a
+    // stand-down: measured at nearly twice the administered capacity with not one stream throttled,
+    // every producer invalidated, and over a quarter of the shuffle's records written a second time
+    // by the recomputation. A burst clears on the next interval; a saturated link does not, and
+    // still trips three seconds in -- twenty times sooner than the sustained-slowness condition
+    // beside it.
+    var interval = 2L
+    while (interval < BackpressureProtocol.LINK_SATURATION_SUSTAINED_INTERVALS + 1L) {
+      clock.advance(BackpressureProtocol.SATURATION_SAMPLE_WINDOW_MS)
+      protocol.onDataReceived(observedKey, interval, aboveNinetyPercent)
+      assert(protocol.ingressBytesPerSecond === aboveNinetyPercent,
+        s"interval $interval carries the same over-capacity volume and publishes the same rate")
+      assert(protocol.linkSaturationPercent > LinkSaturationTripPercent,
+        s"so interval $interval reads beyond ninety percent")
+      assert(!protocol.isLinkSaturated,
+        s"but interval $interval is short of the sustained run, so saturation must not trip yet")
+      assert(protocol.state === BackpressureState.Flowing,
+        s"and the executor stays flowing through interval $interval")
+      interval += 1L
+    }
+
     clock.advance(BackpressureProtocol.SATURATION_SAMPLE_WINDOW_MS)
-    protocol.onDataReceived(observedKey, 2L, aboveNinetyPercent)
+    protocol.onDataReceived(observedKey, interval, aboveNinetyPercent)
     assert(protocol.ingressBytesPerSecond === aboveNinetyPercent, "one interval later, one rung up")
     assert(protocol.linkSaturationPercent > LinkSaturationTripPercent, "the link is beyond ninety")
-    assert(protocol.isLinkSaturated, "so saturation trips")
+    assert(protocol.isLinkSaturated,
+      s"so saturation trips once ${BackpressureProtocol.LINK_SATURATION_SUSTAINED_INTERVALS} " +
+        "consecutive intervals have read over capacity")
     assert(protocol.state === BackpressureState.Degraded, "and the executor degrades")
     assert(protocol.degradationReasons === Seq(BackpressureDegradationReason.LinkSaturation),
       "naming the third of the four conditions")

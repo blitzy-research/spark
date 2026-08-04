@@ -30,7 +30,7 @@ import org.apache.spark.executor.ShuffleWriteMetrics
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.LogKeys.{BLOCK_ID, BYTE_SIZE, CLASS_NAME, COUNT, DURATION,
   FILE_NAME, MAX_SIZE, MEMORY_SIZE, NUM_BYTES, NUM_EVENTS, NUM_PARTITIONS, NUM_SKIPPED,
-  PARTITION_ID, PATH, REASON, THRESHOLD}
+  PARTITION_ID, PATH, REASON, THREAD_NAME, THRESHOLD, TIMEOUT}
 import org.apache.spark.internal.config.{CPUS_PER_TASK, EXECUTOR_CORES, SHUFFLE_FILE_BUFFER_SIZE,
   SHUFFLE_STREAMING_BUFFER_SIZE_PERCENT, SHUFFLE_STREAMING_DEBUG,
   SHUFFLE_STREAMING_SPILL_THRESHOLD}
@@ -3164,6 +3164,17 @@ private[spark] object MemorySpillManager extends Logging {
   val POLLER_THREAD_NAME: String = "streaming-shuffle-spill-poller"
 
   /**
+   * The bound, in milliseconds, within which the executor's threshold ticker must be gone once
+   * [[shutdownExecutorPoller]] has asked it to stop.
+   *
+   * Generous against the work involved -- a round is a comparison per registered instance, and the
+   * registry is emptied before the request -- so reaching this bound means a round is genuinely
+   * wedged rather than merely in flight, which is worth a warning. Short enough that an executor
+   * shutting down is not held up by it.
+   */
+  val POLLER_SHUTDOWN_TIMEOUT_MS: Long = 5000L
+
+  /**
    * Cadence of the buffer-utilisation check, in milliseconds. [[MemorySpillManager.pollOnce]]
    * suppresses checks that arrive sooner than this.
    */
@@ -3654,6 +3665,60 @@ private[spark] object MemorySpillManager extends Logging {
   }
 
   /**
+   * Stops the executor's shared threshold ticker and waits, within a bounded deadline, for its
+   * thread to be gone.
+   *
+   * <b>Why this exists and why it is the manager that calls it.</b> The ticker is created lazily by
+   * the first instance that needs polling and is deliberately executor-scoped, because the budget
+   * it evaluates is shared across every concurrent map task -- so no individual instance may shut
+   * it down, and none does: a closing instance only removes itself from [[pollTargets]]. That
+   * leaves exactly one owner able to end it, the component whose lifetime the executor's streaming
+   * subsystem has: [[StreamingShuffleManager]], from its `stop`. Without this call the thread named
+   * [[POLLER_THREAD_NAME]] outlives every context that ever streamed a shuffle, which in a
+   * long-lived JVM that creates and stops contexts -- a test suite, a notebook kernel, a session
+   * server -- accumulates one thread per context.
+   *
+   * The registry is emptied before the executor is shut down so that a round already in flight
+   * finds nothing to poll rather than touching an instance whose environment is being torn down.
+   * Termination is then awaited, because `shutdownNow` is a request: returning before the thread is
+   * gone would let a caller report a clean shutdown while the thread it asked to stop is still
+   * running, which is precisely the leak this method exists to close. The wait is bounded, and a
+   * straggler is reported rather than thrown -- this runs during shutdown, where an exception would
+   * abandon the rest of an orderly release over a thread the JVM is about to reclaim.
+   *
+   * Idempotent, and safe to call on an executor that never polled anything: with no ticker created
+   * there is nothing to stop and nothing to wait for.
+   *
+   * @return true when no ticker is running by the time this returns
+   */
+  def shutdownExecutorPoller(): Boolean = {
+    val running = synchronized {
+      val current = poller
+      poller = null
+      current
+    }
+    pollTargets.clear()
+    running match {
+      case null => true
+      case executor =>
+        executor.shutdownNow()
+        val terminated = try {
+          executor.awaitTermination(POLLER_SHUTDOWN_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        } catch {
+          case _: InterruptedException =>
+            Thread.currentThread().interrupt()
+            executor.isTerminated
+        }
+        if (!terminated) {
+          logWarning(log"The streaming shuffle buffer threshold ticker " +
+            log"${MDC(THREAD_NAME, POLLER_THREAD_NAME)} did not terminate within " +
+            log"${MDC(TIMEOUT, POLLER_SHUTDOWN_TIMEOUT_MS)} ms of being asked to stop")
+        }
+        terminated
+    }
+  }
+
+  /**
    * Drives one cadence tick across every registered instance.
    *
    * A single instance must never be able to stop the executor's ticker: a closed instance is
@@ -3699,6 +3764,8 @@ private[spark] object MemorySpillManager extends Logging {
     pollTargets.clear()
     logAggregators.foreach(aggregator => aggregator.reset())
     StreamingShuffleWriter.resetLogAggregationForTesting()
+    StreamingShuffleServerHandler.withdrawalLogAggregator.reset()
+    StreamingShuffleServerHandler.consumerExpiryLogGate.reset()
   }
 
   // Internal admission and eviction outcomes. Modelled as types rather than as booleans so that the

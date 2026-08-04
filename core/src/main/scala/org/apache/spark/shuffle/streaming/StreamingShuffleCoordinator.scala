@@ -29,8 +29,9 @@ import scala.util.control.NonFatal
 import org.apache.spark.{MapOutputTrackerMaster, SparkConf, SparkEnv}
 import org.apache.spark.internal.{config, Logging, LogKeys, MessageWithContext}
 import org.apache.spark.internal.LogKeys.{CLASS_NAME, COUNT, DESCRIPTION, ELAPSED_TIME, EPOCH,
-  EXECUTOR_ID, HOST, HOST_PORT, INDEX, MAP_ID, MAX_SIZE, NEW_VALUE, NUM_PARTITIONS, NUM_SKIPPED,
-  NUM_TASKS, REASON, SHUFFLE_ID, STATUS, TASK_ATTEMPT_ID, TIME_UNITS, TIMEOUT}
+  EXECUTOR_ID, HOST, HOST_PORT, INDEX, MAP_ID, MAX_ATTEMPTS, MAX_SIZE, NEW_VALUE, NUM_EVENTS,
+  NUM_PARTITIONS, NUM_SKIPPED, NUM_TASKS, REASON, SHUFFLE_ID, STATUS, TASK_ATTEMPT_ID, THRESHOLD,
+  TIME_UNITS, TIMEOUT}
 import org.apache.spark.network.shuffle.protocol.streaming.StreamingShuffleMessage
 import org.apache.spark.rpc.{RpcCallContext, RpcEndpointRef, RpcEnv, RpcTimeout,
   ThreadSafeRpcEndpoint}
@@ -882,6 +883,8 @@ private[spark] case class StreamingShuffleState(
     retiredAttempts: Map[Int, Long] = Map.empty,
     producerExecutors: Map[String, Int] = Map.empty,
     fallback: StreamingShuffleFallbackState = StreamingShuffleFallbackState(),
+    producerTimeouts: Map[Int, Int] = Map.empty,
+    producerTimeoutTotal: Int = 0,
     lastActivityMs: Long = 0L) {
 
   /** Whether the executor has at least one live producer of this shuffle. */
@@ -909,6 +912,30 @@ private[spark] case class StreamingShuffleState(
    */
   def isRetired(generation: StreamingShuffleProducerGeneration): Boolean =
     retiredAttempts.get(generation.mapIndex).exists(generation.taskAttemptId <= _)
+
+  /**
+   * How many registered producer generations of one map output a consumer has invalidated because
+   * the producer stopped answering inside the connection-timeout window.
+   *
+   * Counted per map index, because the map index is the logical output that a recomputation
+   * replaces: a second entry for one index means a second attempt of the same output was also lost,
+   * which is the difference between one transient loss and a recomputation that is not converging.
+   * Only invalidations that actually withdrew a live registration are counted, so a consumer that
+   * retries an invalidation of a generation already gone cannot inflate the figure.
+   */
+  def producerTimeoutsOf(mapIndex: Int): Int = producerTimeouts.getOrElse(mapIndex, 0)
+
+  /**
+   * This state with one more producer-liveness invalidation recorded against a map index.
+   *
+   * The running total is carried as its own field rather than summed from the map on demand,
+   * because it is read on the invalidation path and a wide shuffle holds one entry per map task.
+   */
+  def withProducerTimeout(mapIndex: Int): StreamingShuffleState = {
+    copy(
+      producerTimeouts = producerTimeouts.updated(mapIndex, producerTimeoutsOf(mapIndex) + 1),
+      producerTimeoutTotal = producerTimeoutTotal + 1)
+  }
 
   /**
    * This state with one producer published, keeping the executor index exact. Replacing the
@@ -1047,6 +1074,7 @@ private[spark] case class StreamingShuffleState(
       s"capabilityToken=${StreamingShuffleCoordinator.REDACTED_TOKEN}, " +
       s"producers=${producers.size}, retiredAttempts=${retiredAttempts.size}, " +
       s"producerExecutors=${producerExecutors.size}, fallback=$fallback, " +
+      s"producerTimeouts=${producerTimeouts.size}/$producerTimeoutTotal, " +
       s"lastActivityMs=$lastActivityMs)"
 }
 
@@ -1176,10 +1204,78 @@ private[spark] class StreamingShuffleCoordinator(
   // cannot be gated on this flag anyway because it would have to precede this very declaration.
   private val debugEnabled: Boolean = conf.get(config.SHUFFLE_STREAMING_DEBUG)
 
+  // The windows that bound this endpoint's two per-shuffle records. One coordinator serves the
+  // whole application, so a record per shuffle is a volume the workload chooses rather than one
+  // this endpoint controls; the same aggregation type and window the rest of the subsystem uses
+  // keeps the convention single, and instance scope is sufficient here because there is exactly one
+  // instance.
+  private val registrationLogAggregator =
+    new MemorySpillManager.ExecutorLogAggregator(MemorySpillManager.LOG_AGGREGATION_WINDOW_MS)
+
+  private val unregistrationLogAggregator =
+    new MemorySpillManager.ExecutorLogAggregator(MemorySpillManager.LOG_AGGREGATION_WINDOW_MS)
+
+  /**
+   * The window bounding the record made when a producer generation is invalidated or retired.
+   *
+   * <b>Why this one needs bounding at all.</b> A producer invalidation is a consequential event --
+   * it is what has an upstream stage recomputed -- so the temptation is to record every one. Its
+   * frequency, though, is a property of how often tasks fail rather than of how many distinct
+   * things an operator needs to know: a workload losing a tenth of its producers emits one of these
+   * per failed task, which at ten tasks a second is enough on its own to exhaust the whole
+   * ten-mebibyte-an-hour budget this subsystem is held to. Bounding it on the same rolling window
+   * as every other repeated record keeps the first invalidation in each window at its own level,
+   * carries the count of the rest, and restores each of them verbatim under the debug key.
+   *
+   * A window of its own rather than the registration or unregistration window, because an
+   * invalidation and a registration are different events and a burst of one must not be able to
+   * silence the other.
+   */
+  private val invalidationLogAggregator =
+    new MemorySpillManager.ExecutorLogAggregator(MemorySpillManager.LOG_AGGREGATION_WINDOW_MS)
+
   // A producer that has not been seen for longer than this is treated as gone. The window is one
   // full liveness bound, so a producer heartbeating at the connection-timeout cadence may miss a
   // single heartbeat without being reaped.
   private val livenessTimeoutMs: Long = StreamingShuffleCoordinator.PRODUCER_LIVENESS_TIMEOUT_MS
+
+  // How many consecutive attempts of one stage the scheduler will make before it aborts the job.
+  // Read here, once, because it is the budget every producer-liveness invalidation of this shuffle
+  // spends: each one fails a reduce attempt and costs one recomputation. Read rather than assumed,
+  // so an operator who raises their own tolerance for recomputation raises streaming's with it --
+  // which is exactly what a long-running stress workload does.
+  private val stageAttemptAllowance: Int = conf.get(config.STAGE_MAX_CONSECUTIVE_ATTEMPTS)
+
+  private val perMapProducerTimeoutTolerance: Int =
+    StreamingShuffleCoordinator.perMapProducerTimeoutTolerance(stageAttemptAllowance)
+
+  private val shuffleProducerTimeoutTolerance: Int =
+    StreamingShuffleCoordinator.shuffleProducerTimeoutTolerance(stageAttemptAllowance)
+
+  /**
+   * Reports one shuffle registration change at default level at most once per window, and otherwise
+   * only under the debug key.
+   *
+   * @param entry the record to make
+   * @param aggregator the window this record is bounded by
+   */
+  private def reportRegistrationBounded(
+      entry: => MessageWithContext,
+      aggregator: MemorySpillManager.ExecutorLogAggregator): Unit = {
+    aggregator.record(clock.getTimeMillis()) match {
+      case Some(summary) =>
+        logInfo(entry + log"; ${MDC(NUM_EVENTS, summary.occurrences)} such change(s) so far, " +
+          log"${MDC(NUM_SKIPPED, summary.unreported)} of them not reported individually so that " +
+          log"the driver stays inside its log budget")
+      case None =>
+        // At the level it was emitted at, under the feature's own key, so that setting the
+        // streaming debug key restores the per-shuffle record without also reconfiguring the
+        // log framework.
+        if (debugEnabled) {
+          logInfo(entry)
+        }
+    }
+  }
 
   // Active streaming shuffles, keyed by shuffle id. See StreamingShuffleState for why the values
   // are immutable and why every mutation goes through an atomic compute.
@@ -1506,10 +1602,18 @@ private[spark] class StreamingShuffleCoordinator(
         None
       } else {
         if (created) {
-          logInfo(log"Registered streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} with " +
-            log"${MDC(NUM_PARTITIONS, numPartitions)} reduce partitions and " +
-            log"${MDC(NUM_TASKS, numMaps)} map task(s) at epoch " +
-            log"${MDC(EPOCH, state.coordinatorEpoch)}")
+          // Bounded on a window rather than emitted per shuffle. One record per shuffle reads as
+          // modest, and is, for a job with a handful of stage boundaries -- but the driver hosts
+          // one coordinator for the whole application, so this record's volume is the application's
+          // shuffle count, and a workload that submits several shuffles a second spends the log
+          // budget on registrations alone. The admitted record states how many registrations it
+          // stands in for; the per-shuffle form is on the debug key.
+          reportRegistrationBounded(
+            log"Registered streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} with " +
+              log"${MDC(NUM_PARTITIONS, numPartitions)} reduce partitions and " +
+              log"${MDC(NUM_TASKS, numMaps)} map task(s) at epoch " +
+              log"${MDC(EPOCH, state.coordinatorEpoch)}",
+            registrationLogAggregator)
         } else if (debugEnabled) {
           // Info-level logging stays proportional to the number of shuffles, so a repeated,
           // idempotent registration is recorded only under the debug gate.
@@ -2140,6 +2244,16 @@ private[spark] class StreamingShuffleCoordinator(
     var invalidated = false
     var newlyRetired = false
     var registeredAttemptId = Option.empty[Long]
+    // Producer-liveness accounting, read out of the same atomic update that records it so the
+    // decision below is taken on a consistent view rather than on a re-read that another
+    // invalidation could have moved.
+    val timedOut =
+      StreamingShuffleInvalidationReason.sanitize(reason) ==
+        StreamingShuffleInvalidationReason.ConnectionTimeout
+    var mapTimeouts = 0
+    var shuffleTimeouts = 0
+    var declaredMaps = 0
+    var alreadyStoodDown = false
     shuffleStates.computeIfPresent(shuffleId,
       (_: Int, existing: StreamingShuffleState) => {
         known = true
@@ -2152,9 +2266,19 @@ private[spark] class StreamingShuffleCoordinator(
         } else if (existing.generationOf(generation.mapIndex).contains(generation)) {
           invalidated = true
           epoch = epochCounter.incrementAndGet()
-          existing.withoutProducer(generation.mapIndex)
+          val withdrawn = existing.withoutProducer(generation.mapIndex)
             .withRetiredGeneration(generation)
             .copy(coordinatorEpoch = epoch)
+          val counted = if (timedOut) {
+            withdrawn.withProducerTimeout(generation.mapIndex)
+          } else {
+            withdrawn
+          }
+          mapTimeouts = counted.producerTimeoutsOf(generation.mapIndex)
+          shuffleTimeouts = counted.producerTimeoutTotal
+          declaredMaps = counted.mapStage.numMaps
+          alreadyStoodDown = counted.hasFallenBack
+          counted
         } else {
           epoch = existing.coordinatorEpoch
           newlyRetired = !existing.isRetired(generation)
@@ -2167,33 +2291,182 @@ private[spark] class StreamingShuffleCoordinator(
       return StreamingShuffleCoordinator.NO_EPOCH
     }
     if (invalidated) {
-      logInfo(log"Invalidated streaming shuffle producer for shuffle " +
-        log"${MDC(SHUFFLE_ID, shuffleId)} map ${MDC(MAP_ID, generation.mapId)} attempt " +
-        log"${MDC(TASK_ATTEMPT_ID, generation.taskAttemptId)}; shuffle advanced to epoch " +
-        log"${MDC(EPOCH, epoch)}: ${MDC(REASON, recordedReason)} " +
-        log"(${MDC(DESCRIPTION, recordedDetail)})")
+      // Bounded on a rolling window, because one of these is made per lost producer and a workload
+      // losing a tenth of its tasks would otherwise spend the whole executor log budget on them.
+      // The window carries the count of the ones it withheld, and the debug key restores each of
+      // them verbatim.
+      reportRegistrationBounded(
+        log"Invalidated streaming shuffle producer for shuffle " +
+          log"${MDC(SHUFFLE_ID, shuffleId)} map ${MDC(MAP_ID, generation.mapId)} attempt " +
+          log"${MDC(TASK_ATTEMPT_ID, generation.taskAttemptId)}; shuffle advanced to epoch " +
+          log"${MDC(EPOCH, epoch)}: ${MDC(REASON, recordedReason)} " +
+          log"(${MDC(DESCRIPTION, recordedDetail)})",
+        invalidationLogAggregator)
     } else if (newlyRetired && registeredAttemptId.isDefined) {
-      // Logged once per generation, because a repeat of the same invalidation no longer advances
-      // the retirement record and therefore falls through to the debug branch. That bound is what
-      // keeps a consumer that retries an invalidation from amplifying the log.
-      logInfo(log"Retired the superseded streaming shuffle producer generation of shuffle " +
-        log"${MDC(SHUFFLE_ID, shuffleId)} map ${MDC(MAP_ID, generation.mapId)} attempt " +
-        log"${MDC(TASK_ATTEMPT_ID, generation.taskAttemptId)} without disturbing the registered " +
-        log"attempt ${MDC(NEW_VALUE, registeredAttemptId.get)} at epoch ${MDC(EPOCH, epoch)}: " +
-        log"${MDC(REASON, recordedReason)}")
+      // Made once per generation, because a repeat of the same invalidation no longer advances the
+      // retirement record and therefore falls through to the debug branch. That bound is what keeps
+      // a consumer that retries an invalidation from amplifying the log; the window above is what
+      // keeps a workload losing many DISTINCT generations from doing the same.
+      reportRegistrationBounded(
+        log"Retired the superseded streaming shuffle producer generation of shuffle " +
+          log"${MDC(SHUFFLE_ID, shuffleId)} map ${MDC(MAP_ID, generation.mapId)} attempt " +
+          log"${MDC(TASK_ATTEMPT_ID, generation.taskAttemptId)} without disturbing the " +
+          log"registered attempt ${MDC(NEW_VALUE, registeredAttemptId.get)} at epoch " +
+          log"${MDC(EPOCH, epoch)}: " +
+          log"${MDC(REASON, recordedReason)}",
+        invalidationLogAggregator)
     } else if (newlyRetired) {
-      logInfo(log"Retired the unregistered streaming shuffle producer generation of shuffle " +
-        log"${MDC(SHUFFLE_ID, shuffleId)} map ${MDC(MAP_ID, generation.mapId)} attempt " +
-        log"${MDC(TASK_ATTEMPT_ID, generation.taskAttemptId)} at epoch ${MDC(EPOCH, epoch)}: " +
-        log"${MDC(REASON, recordedReason)}")
+      reportRegistrationBounded(
+        log"Retired the unregistered streaming shuffle producer generation of shuffle " +
+          log"${MDC(SHUFFLE_ID, shuffleId)} map ${MDC(MAP_ID, generation.mapId)} attempt " +
+          log"${MDC(TASK_ATTEMPT_ID, generation.taskAttemptId)} at epoch ${MDC(EPOCH, epoch)}: " +
+          log"${MDC(REASON, recordedReason)}",
+        invalidationLogAggregator)
     } else if (debugEnabled) {
       val cause = if (known) "already retired generation" else "unknown shuffle"
       logDebug(log"Ignoring an invalidation naming an ${MDC(REASON, cause)} for shuffle " +
         log"${MDC(SHUFFLE_ID, shuffleId)} map ${MDC(MAP_ID, generation.mapId)} attempt " +
         log"${MDC(TASK_ATTEMPT_ID, generation.taskAttemptId)}: ${MDC(NEW_VALUE, recordedReason)}")
     }
+    if (invalidated && timedOut && !alreadyStoodDown) {
+      escalateProducerTimeouts(shuffleId, capabilityToken, generation.mapIndex, mapTimeouts,
+        shuffleTimeouts, declaredMaps)
+    }
     epoch
   }
+
+  /**
+   * Stands a shuffle down once producer-liveness invalidations show that recomputing it on the
+   * streaming path is not converging.
+   *
+   * ==Why this exists==
+   *
+   * A consumer that receives nothing from a registered producer inside the connection timeout
+   * invalidates that producer and raises a fetch failure, and the unmodified scheduler answers by
+   * recomputing the upstream map output. That is the specified producer-failure flow and it is
+   * correct: the reduce side never mixes surviving pre-failure data with post-recomputation data,
+   * and every completing run produces exactly the output sort-based shuffle would have.
+   *
+   * What that flow lacks on its own is a '''bound'''. Nothing about a recomputation changes the
+   * condition that caused the timeout, so a shuffle whose producers cannot sustain the stream --
+   * because the executor is starved of buffer budget, of threads, or of both -- loses a producer,
+   * recomputes, loses one again, and repeats until `spark.stage.maxConsecutiveAttempts` is spent
+   * and the scheduler aborts the job. An abort is the one outcome graceful degradation exists to
+   * make impossible: the feature's guarantee is that no configuration and no resource condition
+   * leaves a job without a working shuffle, and sort-based shuffle is always a working shuffle.
+   *
+   * Neither of the two rate-based trip conditions can rescue that case, and for a structural reason
+   * rather than a tuning one. The consumer-slowness condition is sustained over sixty seconds,
+   * while the connection timeout fires at five, so the producer is invalidated and the reduce
+   * attempt is gone long before sixty seconds of evidence exists. And the memory-pressure trip is
+   * deliberately confined to a reservation that was actually '''prevented''': a full buffer whose
+   * block reached local disk instead is answered by spilling, which is the specified answer and
+   * which keeps a producer streaming output its consumers are already reading. So this is a third
+   * observation, made where it can be observed at all -- on the driver, the one participant that
+   * sees every consumer's invalidations across every attempt of the stage.
+   *
+   * ==The two bounds, and why they are derived rather than chosen==
+   *
+   * Both are expressed in the operator's own currency, `spark.stage.maxConsecutiveAttempts`, so the
+   * subsystem never spends more of the scheduler's budget than the scheduler has:
+   *
+   *  - '''per map output''' ([[perMapProducerTimeoutTolerance]]): two generations of one map index
+   *    lost to a timeout means the recomputation of that output was lost the same way the original
+   *    was. That is the specific signal, and it is the one that fires first in practice, because a
+   *    recomputed producer is the one a consumer is still waiting on.
+   *  - '''per shuffle''' ([[shuffleProducerTimeoutTolerance]]): losses spread evenly across map
+   *    indices would satisfy no per-index bound while still spending an attempt each, so the
+   *    shuffle-wide count is bounded one below the attempt allowance. That is the safety net that
+   *    makes termination unconditional rather than probable.
+   *
+   * Neither is a hair trigger: a healthy streaming shuffle records '''no''' producer-liveness
+   * invalidations at all, so this can only fire where the alternative was repeated recomputation.
+   *
+   * ==Why the reason recorded is consumer slowness==
+   *
+   * The four fallback conditions are a closed set, deliberately, and a fifth would be a fifth way
+   * to abandon the fast path. Of the four, this is a producer and consumer that could not be kept
+   * in step -- which is what the consumer-slowness condition names -- rather than memory, link
+   * capacity or protocol disagreement. The reader already declares the same reason when it cannot
+   * resolve a producer at all, for the same reason, and the detail recorded here states the counts
+   * and the derivation so the record is never ambiguous about which observation was made.
+   *
+   * @param shuffleId shuffle whose producers keep being lost
+   * @param capabilityToken token the invalidation presented, already validated by the caller
+   * @param mapIndex map output whose producer was just invalidated
+   * @param mapTimeouts producer-liveness invalidations recorded against that map index
+   * @param shuffleTimeouts producer-liveness invalidations recorded across the whole shuffle
+   * @param declaredMaps map outputs the shuffle declared, reported so the record is diagnosable
+   */
+  private def escalateProducerTimeouts(
+      shuffleId: Int,
+      capabilityToken: String,
+      mapIndex: Int,
+      mapTimeouts: Int,
+      shuffleTimeouts: Int,
+      declaredMaps: Int): Unit = {
+    val perMapExceeded = mapTimeouts >= perMapProducerTimeoutTolerance
+    val shuffleExceeded = shuffleTimeouts >= shuffleProducerTimeoutTolerance
+    if (perMapExceeded || shuffleExceeded) {
+      // Deliberately terse, and ordered with the facts first. The detail is sanitized and capped
+      // at MAX_INVALIDATION_DETAIL_CHARS before it reaches a log record, so prose placed ahead of
+      // the counts and of the key they derive from would be what survived. The reasoning belongs in
+      // this method's own documentation, to which no cap applies.
+      val observation = if (perMapExceeded) {
+        s"$mapTimeouts producer(s) of map index $mapIndex hit the " +
+          s"${StreamingShuffleCoordinator.PRODUCER_CONNECTION_TIMEOUT_MS} ms connection timeout, " +
+          s"at or past the per-map tolerance $perMapProducerTimeoutTolerance"
+      } else {
+        s"$shuffleTimeouts producer(s) of $declaredMaps map output(s) hit the " +
+          s"${StreamingShuffleCoordinator.PRODUCER_CONNECTION_TIMEOUT_MS} ms connection timeout, " +
+          s"at or past the shuffle-wide tolerance $shuffleProducerTimeoutTolerance"
+      }
+      declareFallback(shuffleId, capabilityToken,
+        StreamingShuffleFallbackReason.ConsumerTooSlow,
+        s"$observation derived from " +
+          s"${config.STAGE_MAX_CONSECUTIVE_ATTEMPTS.key}=$stageAttemptAllowance; yielding to " +
+          "sort-based shuffle")
+    } else if (debugEnabled) {
+      logDebug(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} has lost " +
+        log"${MDC(COUNT, mapTimeouts)} producer generation(s) of map index " +
+        log"${MDC(INDEX, mapIndex)} and ${MDC(NUM_EVENTS, shuffleTimeouts)} across the shuffle, " +
+        log"both inside the tolerances of ${MDC(THRESHOLD, perMapProducerTimeoutTolerance)} per " +
+        log"map output and ${MDC(MAX_ATTEMPTS, shuffleProducerTimeoutTolerance)} per shuffle; " +
+        log"recomputation continues on the streaming path")
+    }
+  }
+
+  /**
+   * Producer-liveness invalidations recorded against one map output of a shuffle, or zero when the
+   * shuffle is unknown. Exposed so a suite can observe the tally without being handed the registry
+   * entry, which would hand it the capability token as well.
+   *
+   * @param shuffleId shuffle to ask about
+   * @param mapIndex map output to ask about
+   * @return invalidations recorded for that map output
+   */
+  def producerTimeoutCount(shuffleId: Int, mapIndex: Int): Int = {
+    val state = shuffleStates.get(shuffleId)
+    if (state == null) 0 else state.producerTimeoutsOf(mapIndex)
+  }
+
+  /**
+   * Producer-liveness invalidations recorded across one whole shuffle, or zero when the shuffle is
+   * unknown.
+   *
+   * @param shuffleId shuffle to ask about
+   * @return invalidations recorded for that shuffle
+   */
+  def producerTimeoutTotal(shuffleId: Int): Int = {
+    val state = shuffleStates.get(shuffleId)
+    if (state == null) 0 else state.producerTimeoutTotal
+  }
+
+  /** Producer-liveness invalidations tolerated per map output before the shuffle stands down. */
+  def producerTimeoutTolerancePerMap: Int = perMapProducerTimeoutTolerance
+
+  /** Producer-liveness invalidations tolerated across a shuffle before it stands down. */
+  def producerTimeoutToleranceForShuffle: Int = shuffleProducerTimeoutTolerance
 
   /**
    * Drops all state for a shuffle. Driven from the streaming shuffle manager's `unregisterShuffle`
@@ -2231,8 +2504,12 @@ private[spark] class StreamingShuffleCoordinator(
       }
       false
     } else {
-      logInfo(log"Unregistered streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} holding " +
-        log"${MDC(COUNT, producerCount)} registered producers")
+      // On a window of its own, so that a burst of registrations cannot silence the withdrawals
+      // that balance them and leave a reader inferring a registered count that never comes down.
+      reportRegistrationBounded(
+        log"Unregistered streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} holding " +
+          log"${MDC(COUNT, producerCount)} registered producers",
+        unregistrationLogAggregator)
       true
     }
   }
@@ -3063,6 +3340,48 @@ private[spark] object StreamingShuffleCoordinator extends Logging {
    * window by one poll interval.
    */
   val REAPER_INTERVAL_MS: Long = PRODUCER_CONNECTION_TIMEOUT_MS
+
+  /**
+   * Fewest producer-liveness invalidations of one map output that may stand a shuffle down.
+   *
+   * Two, and it cannot sensibly be one: a single loss is the ordinary producer-failure flow, which
+   * the specification answers by invalidating the partial reads and recomputing the upstream stage,
+   * and standing a shuffle down for it would abandon the fast path for a fault the feature is
+   * designed to absorb. Two is the first count that says something a single loss cannot -- that the
+   * recomputation was lost the same way the original was.
+   */
+  val MIN_PRODUCER_TIMEOUT_TOLERANCE: Int = 2
+
+  /**
+   * Producer-liveness invalidations tolerated for one map output before a shuffle stands down.
+   *
+   * Derived from the scheduler's own consecutive-attempt allowance, less two: one attempt is the
+   * original and one is left for the sort-based recomputation the stand-down routes to, so the
+   * subsystem never spends the last attempt on a path that has already failed twice. Floored at
+   * [[MIN_PRODUCER_TIMEOUT_TOLERANCE]], so an installation that has tightened the allowance to one
+   * or zero cannot reduce this to a value that trips on the first ordinary producer failure.
+   *
+   * @param stageAttemptAllowance value of `spark.stage.maxConsecutiveAttempts`
+   * @return invalidations tolerated per map output
+   */
+  def perMapProducerTimeoutTolerance(stageAttemptAllowance: Int): Int =
+    math.max(MIN_PRODUCER_TIMEOUT_TOLERANCE, stageAttemptAllowance - 2)
+
+  /**
+   * Producer-liveness invalidations tolerated across a whole shuffle before it stands down.
+   *
+   * One below the scheduler's consecutive-attempt allowance, because each invalidation fails a
+   * reduce attempt and costs one recomputation: at the allowance less one the scheduler still has
+   * an attempt in hand, and that attempt is the one the sort-based delegate completes the job on.
+   * This is the bound that makes termination unconditional, since losses spread one per map index
+   * satisfy no per-index bound while spending an attempt each. Never below the per-map tolerance,
+   * so the two bounds can never be ordered the wrong way round.
+   *
+   * @param stageAttemptAllowance value of `spark.stage.maxConsecutiveAttempts`
+   * @return invalidations tolerated per shuffle
+   */
+  def shuffleProducerTimeoutTolerance(stageAttemptAllowance: Int): Int =
+    math.max(perMapProducerTimeoutTolerance(stageAttemptAllowance), stageAttemptAllowance - 1)
 
   /**
    * Epoch value meaning "no epoch has been assigned". Real epochs start at one, so this can never

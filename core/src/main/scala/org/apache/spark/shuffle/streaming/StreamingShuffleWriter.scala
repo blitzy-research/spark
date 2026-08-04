@@ -29,8 +29,8 @@ import org.apache.spark.{SparkConf, SparkEnv, SparkException, TaskContext}
 import org.apache.spark.internal.{config, Logging}
 import org.apache.spark.internal.LogKeys.{CONFIG, COUNT, DESCRIPTION, DURATION, EPOCH, FILE_NAME,
   INDEX, MAP_ID, MAX_ATTEMPTS, MAX_SIZE, MEMORY_SIZE, NUM_BLOCKS, NUM_BYTES, NUM_EVENTS,
-  NUM_PARTITIONS, NUM_SKIPPED, PARTITION_ID, REASON, RECORDS, SHUFFLE_ID, TASK_ATTEMPT_ID,
-  THRESHOLD, TIMEOUT, VALUE}
+  NUM_PARTITIONS, NUM_SKIPPED, NUM_TASKS, PARTITION_ID, REASON, RECORDS, SHUFFLE_ID,
+  TASK_ATTEMPT_ID, THRESHOLD, TIMEOUT, VALUE}
 import org.apache.spark.network.shuffle.protocol.streaming.DataBlockMessage
 import org.apache.spark.scheduler.MapStatus
 import org.apache.spark.serializer.{SerializationStream, SerializerInstance, SerializerManager}
@@ -1355,14 +1355,34 @@ private[spark] class StreamingShuffleWriter[K, V, C](
     // record has been buffered.
     val capacity = blockPayloadCapacity
     verifyBudgetContract()
-    logInfo(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} map " +
+    // Bounded per executor rather than emitted per map task: see [[budgetLogAggregator]] for why a
+    // per-task record is a log volume proportional to the workload's task rate. The admitted record
+    // states how many tasks it stands in for; the per-task form is restored by the debug key.
+    val entry = log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} map " +
       log"${MDC(TASK_ATTEMPT_ID, mapId)} streams ${MDC(NUM_PARTITIONS, declaredPartitions)} " +
       log"partitions with a buffer budget of " +
       log"${MDC(MEMORY_SIZE, spillManager.totalBudgetBytes)} bytes " +
       log"(${MDC(VALUE, bufferSizePercent)}% of executor memory), " +
       log"${MDC(NUM_BYTES, spillManager.perPartitionBudgetBytes)} bytes per partition, " +
       log"spilling at ${MDC(THRESHOLD, spillThresholdPercent)}% and framing blocks of at most " +
-      log"${MDC(COUNT, capacity)} bytes")
+      log"${MDC(COUNT, capacity)} bytes"
+    StreamingShuffleWriter.budgetLogAggregator.record(clock.getTimeMillis()) match {
+      case Some(summary) =>
+        logInfo(entry + log"; this executor has started " +
+          log"${MDC(NUM_TASKS, summary.occurrences)} streaming map task(s), " +
+          log"${MDC(NUM_SKIPPED, summary.unreported)} of whose identical report(s) were " +
+          log"suppressed to keep the executor inside its log budget")
+      case None =>
+        // Under the feature's own key the record is restored exactly as it was, at the level it was
+        // emitted at. That is this subsystem's established convention for opted-in detail -- the
+        // same one the egress handler's own construction record uses -- and it matters: routing
+        // opt-in detail to `logDebug` would additionally require the logging framework to be at
+        // DEBUG, so an operator who set the streaming debug key and expected the per-task line back
+        // would get nothing.
+        if (debugEnabled) {
+          logInfo(entry)
+        }
+    }
   }
 
   /**
@@ -2992,19 +3012,49 @@ private[spark] class StreamingShuffleWriter[K, V, C](
     }
   }
 
-  /** Emits the one summary line a successful streaming map task contributes to the executor log. */
+  /**
+   * Emits the summary a successful streaming map task contributes to the executor log, bounded per
+   * executor rather than per task.
+   *
+   * <b>Why the bytes-on-the-wire figure is gone from here.</b> It was structurally always zero, and
+   * reporting a figure that cannot be anything else invites exactly the misreading it invited: that
+   * the transport had carried nothing. This method runs inside the writer's `stop`, which is the
+   * end of the *map* task -- and the unmodified DAG scheduler submits no reduce task until the
+   * whole map stage has finished, so at this instant no consumer has subscribed and none can have
+   * been sent a byte. The egress this producer's output really does receive happens afterwards,
+   * through the executor-scoped `StreamingShuffleListener`, and it is measured there: see
+   * `StreamingShuffleListener.streamedBytes`, which accumulates across producers and survives their
+   * deregistration precisely so that "did this executor stream anything" is answerable after the
+   * fact rather than at the one instant the answer is guaranteed to be no.
+   *
+   * What remains here is what this task alone can answer for: what it produced, how it was framed,
+   * and which bounds it met while producing it.
+   */
   private def logStreamingSummary(): Unit = {
-    logInfo(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} map " +
+    val entry = log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} map " +
       log"${MDC(TASK_ATTEMPT_ID, mapId)} streamed ${MDC(RECORDS, recordsAppended)} records as " +
       log"${MDC(NUM_BLOCKS, blocksStreamedTotal)} blocks totalling " +
-      log"${MDC(NUM_BYTES, payloadBytesStreamedTotal)} payload bytes " +
-      log"(${MDC(MEMORY_SIZE, serverHandler.bytesWrittenToChannel)} bytes on the wire) across " +
+      log"${MDC(NUM_BYTES, payloadBytesStreamedTotal)} payload bytes across " +
       log"${MDC(NUM_PARTITIONS, activePartitions.length)} partitions, with " +
       log"${MDC(COUNT, spillsObservedTotal)} spill events, " +
       log"${MDC(NUM_EVENTS, spillManager.durabilityFlushCount)} durability flushes, " +
       log"${MDC(NUM_SKIPPED, durableAdmissionsObserved)} blocks written straight to disk, " +
       log"${MDC(VALUE, consumerStalls)} consumer stalls and " +
-      log"${MDC(MAX_ATTEMPTS, replayAttemptsTotal)} replay attempts")
+      log"${MDC(MAX_ATTEMPTS, replayAttemptsTotal)} replay attempts"
+    StreamingShuffleWriter.summaryLogAggregator
+      .record(clock.getTimeMillis(), payloadBytesStreamedTotal) match {
+      case Some(summary) =>
+        logInfo(entry + log"; this executor has now streamed " +
+          log"${MDC(MEMORY_SIZE, summary.volumeBytes)} payload byte(s) across " +
+          log"${MDC(NUM_TASKS, summary.occurrences)} map task(s), " +
+          log"${MDC(MAX_SIZE, summary.unreported)} of whose summaries were suppressed to keep " +
+          log"the executor inside its log budget")
+      case None =>
+        // At the level it was emitted at, under the feature's own key. See the budget record above.
+        if (debugEnabled) {
+          logInfo(entry)
+        }
+    }
     logEgressCeilings()
     logProtocolAnomalies()
   }
@@ -3743,14 +3793,50 @@ private[spark] object StreamingShuffleWriter {
     new MemorySpillManager.ExecutorLogAggregator(MemorySpillManager.LOG_AGGREGATION_WINDOW_MS)
 
   /**
+   * Executor-scoped aggregation of the two records every streaming map task would otherwise emit:
+   * the budget it starts with, and the summary of what it streamed.
+   *
+   * <b>Why these two had to be bounded.</b> They are per task, not per event, which reads as
+   * inherently modest -- and is exactly why they were the largest single contributor to this
+   * subsystem's log volume. An executor's task rate is set by the workload, not by this feature, so
+   * two records per task is a volume proportional to throughput: at a few hundred bytes each, an
+   * ordinary five map tasks per second per executor already exceeds the ten megabytes an hour this
+   * feature is allowed, and a task-dense workload exceeds it by more than an order of magnitude.
+   * Nothing about either record is per-record or per-block, so no amount of tuning inside a task
+   * helps; the count of tasks is the problem, and a per-executor window is the only bound that
+   * addresses it.
+   *
+   * <b>What is not lost.</b> Both records describe a condition that is identical across the tasks
+   * of a stage -- the same budget, derived from the same configuration, and a summary whose
+   * interesting figures are cumulative rather than per task. The admitted record therefore quotes
+   * the executor's running totals and states how many tasks it stands in for, so the aggregate says
+   * strictly more about the executor than any single task's line did. Per-task granularity is
+   * restored in full by `spark.shuffle.streaming.debug`, which is the contract the whole subsystem
+   * uses for detail.
+   *
+   * Two aggregators rather than one, because a stage's start records must not silence its
+   * summaries: a shared window would let whichever record arrived first in a window suppress the
+   * other for the rest of it, and the summary is the one an operator reads to learn what actually
+   * happened.
+   */
+  private[streaming] val budgetLogAggregator =
+    new MemorySpillManager.ExecutorLogAggregator(MemorySpillManager.LOG_AGGREGATION_WINDOW_MS)
+
+  private[streaming] val summaryLogAggregator =
+    new MemorySpillManager.ExecutorLogAggregator(MemorySpillManager.LOG_AGGREGATION_WINDOW_MS)
+
+  /**
    * Returns the executor-scoped log aggregation above to its initial state.
    *
    * Reached only through [[MemorySpillManager.resetSharedStateForTesting]], so that a suite has one
    * call to make rather than one per component, and never called in service for the reason set out
    * there: the bound belongs to the executor's lifetime.
    */
-  private[streaming] def resetLogAggregationForTesting(): Unit =
+  private[streaming] def resetLogAggregationForTesting(): Unit = {
     durableAdmissionLogAggregator.reset()
+    budgetLogAggregator.reset()
+    summaryLogAggregator.reset()
+  }
 
   /** Cadence of the maintenance pass: flow control, spill polling, liveness and telemetry. */
   val MAINTENANCE_INTERVAL_MS: Long = 100L

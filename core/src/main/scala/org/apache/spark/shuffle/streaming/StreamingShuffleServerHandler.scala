@@ -418,6 +418,17 @@ private[spark] class StreamingShuffleServerHandler(
   private val liveSessionSlots = new AtomicInteger(0)
 
   /**
+   * Consumer sessions this producer has ever accepted, as opposed to those it holds now.
+   *
+   * The cumulative figure is the one that evidences live egress. Every session is torn down by the
+   * time a shuffle ends, so [[sessionCount]] read afterwards is zero whether this producer served a
+   * thousand consumers or was never subscribed to at all -- and the difference between those two is
+   * exactly what distinguishes a working streaming transport from a dormant one. The executor's
+   * router accumulates this across producers as each is released, so the answer outlives them.
+   */
+  private val acceptedSessions = new AtomicLong(0L)
+
+  /**
    * Subscribers currently admitted per reduce partition.
    *
    * The number of sessions is bounded and one session's subscription map is bounded, but their
@@ -477,6 +488,7 @@ private[spark] class StreamingShuffleServerHandler(
   private val orderingDeferrals = new AtomicLong(0L)
   private val orderingLogGate =
     new MemorySpillManager.LogAggregationGate(MemorySpillManager.LOG_AGGREGATION_WINDOW_MS)
+
 
   /**
    * Emits one report through a window, or accounts it against that window and stays quiet.
@@ -1686,13 +1698,18 @@ private[spark] class StreamingShuffleServerHandler(
       val hasLiveSession = sessionsByConsumer.containsKey(consumerId)
       if (!hasLiveSession && silentForMs >= CONSUMER_EXPIRY_TIMEOUT_MS &&
           consumerLastSeenMs.remove(consumerId, entry.getValue)) {
-        expiredConsumers.incrementAndGet()
         retired += 1
         val freedBytes = retainedOutput.map(_.unregisterConsumer(consumerId)).getOrElse(0L)
-        logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} unregistered consumer " +
-          log"${MDC(SESSION_ID, consumerId)} after ${MDC(DURATION, silentForMs)} ms of silence, " +
-          log"beyond the ${MDC(TIMEOUT, CONSUMER_EXPIRY_TIMEOUT_MS)} ms expiry window, releasing " +
-          log"${MDC(NUM_BYTES, freedBytes)} byte(s); its spilled output stays readable")
+        // Through the window rather than direct: one expiry is worth a warning, and a remote peer
+        // deciding how many warnings this executor emits is not. `reportBounded` increments the
+        // counter itself, which is why the explicit increment above it is gone -- counting twice
+        // would double every reading of [[expiredConsumerCount]].
+        reportBounded(StreamingShuffleServerHandler.consumerExpiryLogGate, expiredConsumers,
+          log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} unregistered consumer " +
+            log"${MDC(SESSION_ID, consumerId)} after ${MDC(DURATION, silentForMs)} ms of " +
+            log"silence, beyond the ${MDC(TIMEOUT, CONSUMER_EXPIRY_TIMEOUT_MS)} ms expiry " +
+            log"window, releasing ${MDC(NUM_BYTES, freedBytes)} byte(s); its spilled output " +
+            log"stays readable")
       }
     }
     retired
@@ -2801,6 +2818,9 @@ private[spark] class StreamingShuffleServerHandler(
    */
   def claimedSessionSlots: Int = liveSessionSlots.get()
 
+  /** Consumer sessions this producer has accepted over its lifetime. See [[acceptedSessions]]. */
+  def acceptedSessionCount: Long = acceptedSessions.get()
+
   /** Blocks delayed because this executor had no room for another transient framing copy. */
   def framingBudgetRefusalCount: Long = framingBudgetRefusals.get()
 
@@ -2931,10 +2951,28 @@ private[spark] class StreamingShuffleServerHandler(
     // route was found, because a generation whose route was never installed -- an announcement the
     // driver declined, a hand-off that was refused -- still holds all of this.
     releaseAll()
-    logInfo(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} withdrew the producer generation " +
-      log"of map ${MDC(MAP_ID, mapId)} attempt ${MDC(TASK_ATTEMPT_ID, taskAttemptId)} because " +
-      log"${MDC(REASON, reason)}; routing withdrawn: ${MDC(STATUS, routed)}, retained output " +
-      log"withdrawn: ${MDC(STATUS, published)}")
+    // Bounded on an executor-scoped window rather than emitted per generation. A withdrawal happens
+    // once per map output, and every path that reaches it is a bulk one -- a shuffle being
+    // unregistered withdraws every producer it had, and a manager stopping withdraws every producer
+    // on the executor -- so the record's volume tracks the width of the shuffles a job ran rather
+    // than anything an operator can act on line by line. The window must be on the companion and
+    // not on this instance: there is one handler per map output, so an instance-scoped gate admits
+    // one record per map output, which is the volume being bounded rather than a bound on it.
+    val entry = log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} withdrew the producer " +
+      log"generation of map ${MDC(MAP_ID, mapId)} attempt " +
+      log"${MDC(TASK_ATTEMPT_ID, taskAttemptId)} because ${MDC(REASON, reason)}; routing " +
+      log"withdrawn: ${MDC(STATUS, routed)}, retained output withdrawn: ${MDC(STATUS, published)}"
+    StreamingShuffleServerHandler.withdrawalLogAggregator.record(clock.getTimeMillis()) match {
+      case Some(summary) =>
+        logInfo(entry + log"; ${MDC(NUM_EVENTS, summary.occurrences)} generation(s) withdrawn on " +
+          log"this executor, ${MDC(MAX_SIZE, summary.unreported)} of them not reported " +
+          log"individually so that the executor stays inside its log budget")
+      case None =>
+        // At the level it was emitted at, under the feature's own key. See `reportRegistration`.
+        if (debugEnabled) {
+          logInfo(entry)
+        }
+    }
     true
   }
 
@@ -3115,6 +3153,12 @@ private[spark] class StreamingShuffleServerHandler(
         // being the session being torn down, which is what stops a late teardown of the connection
         // that was lost from unindexing the one that replaced it.
         sessionsByConsumer.put(created.consumerId, created)
+        // Counted cumulatively as well as held live, because "how many consumers has this producer
+        // ever served" and "how many is it serving now" answer different questions and the second
+        // cannot answer the first: every session is gone by the time a shuffle is over, so a live
+        // count read afterwards is zero whether the producer served a thousand consumers or none.
+        // The cumulative figure is what evidences that live egress happened at all.
+        acceptedSessions.incrementAndGet()
         Some(created)
       }
     }
@@ -3399,6 +3443,38 @@ private[spark] object StreamingShuffleServerHandler {
    * passed as an argument and is never added to any shared file.
    */
   val TRANSPORT_MODULE_NAME: String = "shuffle-streaming"
+
+  /**
+   * Executor-scoped window bounding the consumer-expiry report, which was this subsystem's loudest
+   * record by a wide margin.
+   *
+   * The condition is a consumer that stopped acknowledging and stayed silent past the expiry
+   * window, and it is provoked entirely at the other end of the socket: a reduce task that gave up,
+   * a peer that was killed, a stage resubmitted while its consumers were mid-read. Each of those
+   * retires many consumers at once and keeps retiring them for as long as it lasts, so a report per
+   * consumer put this executor's log volume under the control of whatever had gone wrong remotely
+   * -- measured at roughly a hundred times the volume this feature is allowed, from this one
+   * record, on a degraded run.
+   *
+   * On the companion and not on a handler, because a handler exists per map output: an
+   * instance-scoped window still admits one report per map output, and a wide shuffle has as many
+   * map outputs as it has map tasks, so the volume would still scale with the shuffle. It keeps
+   * warning level -- a consumer expiring is worth an operator's attention -- and what it gives up
+   * is one line per consumer, with the admitted line stating how many it stands in for.
+   */
+  private[streaming] val consumerExpiryLogGate =
+    new MemorySpillManager.LogAggregationGate(MemorySpillManager.LOG_AGGREGATION_WINDOW_MS)
+
+  /**
+   * Executor-scoped aggregation of the producer-generation withdrawal record.
+   *
+   * On the companion rather than in a handler, for the reason the writer's own aggregators are: a
+   * handler exists per map output and the record fires once per handler, so an instance-scoped
+   * window would bound nothing. Reset only through the shared test seam, so that one suite cannot
+   * inherit another's open window.
+   */
+  private[streaming] val withdrawalLogAggregator =
+    new MemorySpillManager.ExecutorLogAggregator(MemorySpillManager.LOG_AGGREGATION_WINDOW_MS)
 
   /**
    * The key that enables operating system keep-alive for the streaming module only.
@@ -4753,6 +4829,45 @@ private[spark] class StreamingShuffleListener(
   /** Rounds of upkeep this listener has run, for diagnostics and for assertions in tests. */
   private val maintenanceRounds = new AtomicLong(0L)
 
+  /**
+   * The windows that bound the two per-map-task records this router makes: a producer becoming
+   * served, and a producer ceasing to be.
+   *
+   * Instance-scoped rather than object-scoped, unlike the writer's, and correctly so: there is
+   * exactly one listener per executor, so this instance's lifetime *is* the executor's and an
+   * instance field already gives a per-executor bound. Reusing the spill manager's aggregator type
+   * keeps every recurring record in the subsystem bounded by one mechanism and one window, so an
+   * operator learns a single aggregation convention.
+   */
+  private val registrationLogAggregator =
+    new MemorySpillManager.ExecutorLogAggregator(MemorySpillManager.LOG_AGGREGATION_WINDOW_MS)
+
+  private val withdrawalLogAggregator =
+    new MemorySpillManager.ExecutorLogAggregator(MemorySpillManager.LOG_AGGREGATION_WINDOW_MS)
+
+  /**
+   * Bytes and blocks this executor has put on the wire, and consumer sessions it has accepted,
+   * accumulated across every producer it has ever served.
+   *
+   * <b>Why the executor and not the producer owns this.</b> A producer's own counters are reachable
+   * only while it is registered, and a producer is deregistered when its shuffle is unregistered or
+   * its generation withdrawn -- so by the time anyone asks whether this executor streamed anything,
+   * the handlers that would have answered are gone. More fundamentally, the question is not
+   * answerable at the one moment a producing task could answer it: the unmodified scheduler starts
+   * no reduce task until the map stage has finished, so at a writer's `stop` the honest answer is
+   * always zero and always uninformative. Accumulating here, as each producer is released, makes
+   * "did the streaming transport actually carry this shuffle" a question with a real answer --
+   * which is what the stress suite asserts on, and what distinguishes a working transport from a
+   * dormant one.
+   */
+  private val streamedBytesTotal = new AtomicLong(0L)
+
+  private val streamedBlocksTotal = new AtomicLong(0L)
+
+  private val acknowledgedBlocksTotal = new AtomicLong(0L)
+
+  private val acceptedSessionsTotal = new AtomicLong(0L)
+
   /** Consumers the upkeep sweep has retired, session and logical expiry together. */
   private val retiredConsumers = new AtomicLong(0L)
 
@@ -4842,8 +4957,41 @@ private[spark] class StreamingShuffleListener(
       channelParticipants.values().asScala.foreach(_.remove(key, previous))
     }
     startMaintenance()
-    logInfo(log"Streaming shuffle listener is serving shuffle ${MDC(SHUFFLE_ID, shuffleId)} map " +
-      log"${MDC(MAP_ID, mapId)}; ${MDC(COUNT, producers.size())} producer(s) registered")
+    // Bounded per executor, because this fires once per streaming map task and the number of map
+    // tasks is the workload's to choose: a record apiece is a log volume proportional to
+    // throughput, which was the second largest contributor to this subsystem's output. The admitted
+    // record carries the figure that actually matters -- how many producers this executor is
+    // serving now -- and how many registrations it stands in for. Per-registration detail is on the
+    // debug key.
+    reportRegistration(
+      log"Streaming shuffle listener is serving shuffle ${MDC(SHUFFLE_ID, shuffleId)} map " +
+        log"${MDC(MAP_ID, mapId)}; ${MDC(COUNT, producers.size())} producer(s) registered",
+      registrationLogAggregator)
+  }
+
+  /**
+   * Reports one registration or withdrawal at default level at most once per window, and otherwise
+   * only under the debug key.
+   *
+   * @param entry the record to make
+   * @param aggregator the executor-scoped window this record is bounded by
+   */
+  private def reportRegistration(
+      entry: => MessageWithContext,
+      aggregator: MemorySpillManager.ExecutorLogAggregator): Unit = {
+    aggregator.record(clock.getTimeMillis()) match {
+      case Some(summary) =>
+        logInfo(entry + log"; ${MDC(NUM_EVENTS, summary.occurrences)} such change(s) on this " +
+          log"executor, ${MDC(NUM_SKIPPED, summary.unreported)} of them not reported " +
+          log"individually so that the executor stays inside its log budget")
+      case None =>
+        // At the level it was emitted at, under the feature's own key, which is this class's own
+        // convention for opted-in detail: `logDebug` would also demand the logging framework be at
+        // DEBUG, so setting the streaming debug key alone would restore nothing.
+        if (debugEnabled) {
+          logInfo(entry)
+        }
+    }
   }
 
   /**
@@ -4954,11 +5102,63 @@ private[spark] class StreamingShuffleListener(
     val removed = producers.remove(key, handler)
     if (removed) {
       channelParticipants.values().asScala.foreach(_.remove(key))
-      logInfo(log"Streaming shuffle listener stopped serving shuffle " +
-        log"${MDC(SHUFFLE_ID, shuffleId)} map ${MDC(MAP_ID, mapId)}; " +
-        log"${MDC(COUNT, producers.size())} producer(s) remain")
+      // Harvested before the handler becomes unreachable. This is the only point at which a
+      // producer's egress totals can be carried into the executor's, and it has to happen here
+      // rather than be read later, because after this line nothing holds a reference to the handler
+      // that owns them.
+      streamedBytesTotal.addAndGet(handler.bytesWrittenToChannel)
+      streamedBlocksTotal.addAndGet(handler.blocksWrittenToChannel)
+      acknowledgedBlocksTotal.addAndGet(handler.ackCount)
+      acceptedSessionsTotal.addAndGet(handler.acceptedSessionCount)
+      // Bounded on a window of its own rather than the registration window, so that a stage's
+      // registrations cannot silence its withdrawals or the reverse: the two are opposite halves of
+      // the same ledger, and an operator reading only one of them would infer a producer count that
+      // never comes back down.
+      reportRegistration(
+        log"Streaming shuffle listener stopped serving shuffle " +
+          log"${MDC(SHUFFLE_ID, shuffleId)} map ${MDC(MAP_ID, mapId)}; " +
+          log"${MDC(COUNT, producers.size())} producer(s) remain",
+        withdrawalLogAggregator)
     }
     removed
+  }
+
+  /**
+   * Payload and framing bytes this executor has put on the wire for streaming shuffle output, over
+   * every producer it has served.
+   *
+   * Live producers are included as well as released ones, so the figure is correct whether it is
+   * read during a shuffle or after one, and it never double counts: a producer contributes its
+   * running total while it is registered and its final total once, at the moment it is withdrawn.
+   *
+   * This is the reading that answers "did the streaming transport actually carry anything", which
+   * no producer-side figure can answer -- see [[streamedBytesTotal]] and
+   * `StreamingShuffleWriter.logStreamingSummary`.
+   */
+  def streamedBytes: Long = streamedBytesTotal.get() + sumOverProducers(_.bytesWrittenToChannel)
+
+  /** Data blocks this executor has put on the wire. See [[streamedBytes]]. */
+  def streamedBlocks: Long = streamedBlocksTotal.get() + sumOverProducers(_.blocksWrittenToChannel)
+
+  /**
+   * Acknowledgements consumers have returned to this executor's producers.
+   *
+   * The consumer's half of the exchange, and therefore the reading that distinguishes bytes this
+   * executor wrote into a socket from bytes a consumer confirmed it consumed. A non-zero
+   * [[streamedBytes]] with a zero here would mean output left but nothing came back.
+   */
+  def acknowledgedBlocks: Long =
+    acknowledgedBlocksTotal.get() + sumOverProducers(_.ackCount)
+
+  /** Consumer sessions this executor's producers have accepted. See [[streamedBytes]]. */
+  def acceptedSessions: Long =
+    acceptedSessionsTotal.get() + sumOverProducers(_.acceptedSessionCount)
+
+  /** Sums one counter across the producers currently registered. */
+  private def sumOverProducers(counter: StreamingShuffleServerHandler => Long): Long = {
+    var total = 0L
+    producers.values().asScala.foreach(handler => total += counter(handler))
+    total
   }
 
   /**
@@ -5029,6 +5229,22 @@ private[spark] class StreamingShuffleListener(
     }
     if (scheduler != null) {
       scheduler.shutdownNow()
+      // Awaited, not merely requested. `shutdownNow` interrupts a round in flight and returns at
+      // once, so without this the sweep's thread is still alive when this method returns and the
+      // manager's own release would report it as a thread that outlived the stop -- which it would
+      // have. The bound is generous against a round, which is a scan of this executor's producers
+      // on a one second cadence, so reaching it means a round is genuinely wedged.
+      val terminated = try {
+        scheduler.awaitTermination(MAINTENANCE_SHUTDOWN_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+      } catch {
+        case _: InterruptedException =>
+          Thread.currentThread().interrupt()
+          scheduler.isTerminated
+      }
+      if (!terminated) {
+        logWarning(log"The streaming shuffle listener's upkeep sweep did not terminate within " +
+          log"${MDC(TIMEOUT, MAINTENANCE_SHUTDOWN_TIMEOUT_MS)} ms of being asked to stop")
+      }
     }
   }
 
@@ -5421,6 +5637,15 @@ private[spark] object StreamingShuffleListener extends Logging {
    * the sweep would be the reason a bound was missed; a second gives both an order of magnitude.
    */
   val MAINTENANCE_INTERVAL_MS: Long = 1000L
+
+  /**
+   * The bound, in milliseconds, within which the upkeep sweep must be gone once it has been asked
+   * to stop.
+   *
+   * Five times the cadence, so an interrupted round has ample time to unwind before this is judged
+   * a straggler, while an executor's shutdown is still bounded by it.
+   */
+  val MAINTENANCE_SHUTDOWN_TIMEOUT_MS: Long = 5L * MAINTENANCE_INTERVAL_MS
 
   /**
    * Shortest interval between two abuse reports from one listener, in nanoseconds.

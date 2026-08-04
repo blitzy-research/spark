@@ -511,6 +511,19 @@ private[spark] class BackpressureProtocol(
   private val ingressWindow = new BackpressureProtocol.RateWindow(clock)
 
   /**
+   * The run of consecutive measurement intervals in which the link has read over capacity, and the
+   * interval the most recent of them was observed in.
+   *
+   * Two fields rather than one, because a run has both a length and an end: the length is what the
+   * sustained threshold is compared against, and the end is what distinguishes the next observation
+   * being a continuation of the run from it starting a new one. See [[recordSaturatedInterval]].
+   */
+  private val saturatedIntervals = new AtomicLong(0L)
+
+  private val lastSaturatedInterval =
+    new AtomicLong(BackpressureProtocol.NO_SATURATED_INTERVAL)
+
+  /**
    * The link capacity the operator declared, in bytes per second, or zero when none was declared.
    *
    * Read once from `spark.shuffle.streaming.maxBandwidthMBps`, whose absence expresses "unlimited"
@@ -2130,11 +2143,71 @@ private[spark] class BackpressureProtocol(
    * belongs to the fallback policy.
    */
   def isLinkSaturated: Boolean = {
-    val saturated = linkSaturationPercent > BackpressureProtocol.LINK_SATURATION_PERCENT
-    if (saturated) {
+    val over = linkSaturationPercent > BackpressureProtocol.LINK_SATURATION_PERCENT
+    val sustained = if (over) recordSaturatedInterval() else clearSaturatedIntervals()
+    if (sustained) {
       latchDegradation(BackpressureDegradationReason.LinkSaturation)
     }
-    saturated
+    sustained
+  }
+
+  /**
+   * Counts one measurement interval in which the link read as over-saturated, and reports whether
+   * enough consecutive intervals have now done so for the condition to be a sustained one.
+   *
+   * <b>Why a single over-capacity reading is not saturation.</b> The pacing bucket must be able to
+   * admit one maximum-sized block, so its burst allowance is at least
+   * `DataBlockMessage.MAX_ENCODED_FRAME_BYTES` however small the paced share is -- a bucket that
+   * could not hold one block would refuse every block forever, which is not a rate limit but a
+   * deadlock. A bucket that starts full therefore legitimately delivers its burst plus one
+   * interval's refill inside the first interval, and with several concurrent shuffles the sum of
+   * those bursts is a multiple of the administered capacity for exactly one interval. That is the
+   * shape this class already documents as "routine on an idle link", and treating it as saturation
+   * stood streaming down on a link that was never saturated -- measured at nearly twice the
+   * administered capacity with not one stream throttled, followed by every producer being
+   * invalidated and the shuffle recomputed on the sort-based path. The recomputation is the
+   * expensive part: it duplicated more than a quarter of the records the shuffle had already
+   * written.
+   *
+   * Requiring consecutive intervals is what distinguishes a burst from saturation, and it is the
+   * same shape the sustained-slowness condition already uses -- that one requires the ratio to hold
+   * for sixty seconds rather than for one observation, and for the same reason. A link that really
+   * is saturated stays over capacity interval after interval and trips within
+   * [[BackpressureProtocol.LINK_SATURATION_SUSTAINED_INTERVALS]] of them, which is a small multiple
+   * of one second and still far inside the sixty-second window; a burst clears on the very next
+   * interval.
+   *
+   * Intervals rather than observations: this is polled on a hundred-millisecond cadence and the
+   * rate is republished once a second, so counting observations would reach any threshold inside a
+   * single interval and count one burst several times over. Distinct intervals are identified by
+   * the instant at which each was observed, quantised to the sample window, on the injected clock
+   * -- so the bound is deterministic under test rather than dependent on polling speed.
+   *
+   * @return true when the link has read over capacity for enough consecutive intervals
+   */
+  private def recordSaturatedInterval(): Boolean = {
+    val interval = clock.getTimeMillis() / BackpressureProtocol.SATURATION_SAMPLE_WINDOW_MS
+    val previous = lastSaturatedInterval.getAndSet(interval)
+    val consecutive =
+      if (previous == interval) {
+        // Same interval as the last observation: already counted. Report the standing verdict
+        // rather than advancing, so a fast poll cannot reach the threshold inside one interval.
+        saturatedIntervals.get()
+      } else if (previous == interval - 1L) {
+        saturatedIntervals.incrementAndGet()
+      } else {
+        // A gap means at least one interval was not saturated, so the run restarts at this one.
+        saturatedIntervals.set(1L)
+        1L
+      }
+    consecutive >= BackpressureProtocol.LINK_SATURATION_SUSTAINED_INTERVALS
+  }
+
+  /** Ends any run of saturated intervals, because this observation was under capacity. */
+  private def clearSaturatedIntervals(): Boolean = {
+    saturatedIntervals.set(0L)
+    lastSaturatedInterval.set(BackpressureProtocol.NO_SATURATED_INTERVAL)
+    false
   }
 
   /**
@@ -2610,6 +2683,24 @@ private[spark] object BackpressureProtocol {
    * saturate is noticed well inside the sixty-second sustained-slowness window.
    */
   val SATURATION_SAMPLE_WINDOW_MS: Long = 1000L
+
+  /**
+   * Consecutive measurement intervals the link must read over capacity in before saturation is
+   * treated as sustained and streaming stands down.
+   *
+   * Three, which at a one-second sample window is three seconds. Sized against what it has to
+   * discriminate rather than picked round: the thing being excluded is the pacing buckets' burst
+   * allowance, which by construction can exceed the administered capacity for exactly one interval
+   * apiece and then cannot again until it has refilled at the paced rate, so two consecutive
+   * over-capacity intervals already rule a burst out and three leave margin for a second wave of
+   * limiters being created mid-shuffle. Against what it has to catch it costs almost nothing: a
+   * link that really is saturated stands streaming down three seconds in, twenty times faster than
+   * the sixty-second sustained-slowness condition beside it.
+   */
+  val LINK_SATURATION_SUSTAINED_INTERVALS: Long = 3L
+
+  /** The interval identifier meaning "no saturated interval has been observed". */
+  val NO_SATURATED_INTERVAL: Long = Long.MinValue
 
   /** The pause before the first replay attempt, which each further attempt doubles. */
   val RETRY_BASE_BACKOFF_MS: Long = 1000L

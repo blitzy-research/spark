@@ -1042,7 +1042,12 @@ class StreamingShuffleReaderSuite
    * @param compressShuffle whether the environment's serializer manager compresses shuffle payloads
    */
   private def startContext(compressShuffle: Boolean = false): Unit = {
-    val testConf = new SparkConf(false).set(SHUFFLE_COMPRESS, compressShuffle)
+    // Built on the shared envelope rather than on a bare SparkConf. This suite selects no shuffle
+    // manager -- it drives readers directly -- so it cannot use one of the manager fixtures, but it
+    // needs the same envelope for the same reasons: the managed-memory leak check has to be armed
+    // for the hundreds of contexts this suite starts, the web interface has to stay off, and the
+    // bind tolerance has to be the one every other Spark suite gets.
+    val testConf = testEnvelopeConf().set(SHUFFLE_COMPRESS, compressShuffle)
     sc = new SparkContext("local", "test", testConf)
   }
 
@@ -1573,9 +1578,20 @@ class StreamingShuffleReaderSuite
     assert(invalidation.generation == fixture.producer.generation,
       s"The invalidation must name the generation that could not be reached, but it named " +
         s"${invalidation.generation}")
-    assert(observedPartialReadInvalidations() == 0L,
-      s"Nothing was accepted from a producer that never answered, so no partial read may be " +
-        s"counted as invalidated, but ${observedPartialReadInvalidations()} was")
+    // One invalidation, counted, even though nothing had been accepted from this producer. The
+    // narrower reading -- "no blocks were accepted, so there is no partial read to invalidate" --
+    // is intuitive and was what this assertion previously encoded, but it is not the specified
+    // behaviour, and following it made the single most common invalidation an operator can hit
+    // invisible: a producer that cannot be reached at all incremented nothing, so runs containing
+    // five fetch failures reported zero invalidations. The specification defines a partial read
+    // invalidation as the atomic discard of ALL blocks from a failed producer, whether that set is
+    // empty or not, and lists incrementing this counter as a step of the connection-timeout flow
+    // itself. Every other invalidating path already counted; this one is now consistent with them,
+    // and the counter reads as "how many producers this consumer gave up on and asked to have
+    // recomputed" -- which is the question an operator is asking of it.
+    assert(observedPartialReadInvalidations() == 1L,
+      s"A producer given up on after the connect budget was spent is an invalidated partial read " +
+        s"and must be counted as one, but ${observedPartialReadInvalidations()} was")
 
     // Exhaustion is a failure like any other, so the task-completion listener must still release
     // everything the read claimed before it failed.

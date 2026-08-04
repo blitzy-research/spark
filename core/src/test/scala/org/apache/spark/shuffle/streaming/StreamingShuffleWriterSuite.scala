@@ -2846,12 +2846,17 @@ class StreamingShuffleWriterSuite
         stageId = 0, stageAttemptNumber = 0, taskAttemptId = defaultTaskAttemptId,
         attemptNumber = 0)
 
-      /**
-       * Subscribes one consumer and has exactly one block delivered to it.
-       *
-       * @param identity the consumer session identity
-       * @return the consumer and the sequence number it was sent
-       */
+      // Subscribes one consumer and has exactly one block delivered to it, returning the consumer
+      // and the sequence number it was sent.
+      //
+      // A line comment rather than a scaladoc block, and that is not a matter of taste. Scala emits
+      // "discarding unmoored doc comment" for a doc comment attached to a definition local to a
+      // block, because there is no member for scaladoc to attach it to. Under sbt that lint is
+      // fatal -- `SparkBuild.scala` compiles with `-Wconf:any:e` and carries no
+      // `cat=lint-doc-detached` filter, unlike `pom.xml` which relaxes the scaladoc category -- so
+      // a doc comment here fails `core/Test/compile` outright and with it every gate that runs
+      // through sbt, `dev/scalastyle` and `dev/mima` included. Local helpers in this tree therefore
+      // document themselves with `//`.
       def deliverOneBlockTo(identity: String): (ConsumerChannel, Long) = {
         val consumer = new ConsumerChannel(harness.serverHandler, identity)
         consumer.subscribe(partitionId = 0)
@@ -3055,8 +3060,12 @@ class StreamingShuffleWriterSuite
         sortWriterFactory = Some(() => delegate)),
       expectedReason = StreamingShuffleFallbackReason.NetworkSaturation,
       prepare = fixture => {
-        fixture.fallbackPolicy.recordLinkUtilization(
-          usedBytesPerSecond = 990.0d, capacityBytesPerSecond = 1000.0d)
+        // Sustained, because one over-capacity sample is a pacing bucket's legal burst rather
+        // than a saturated link: see the policy's SATURATION_SUSTAINED_SAMPLES.
+        (1L to StreamingShuffleFallbackPolicy.SATURATION_SUSTAINED_SAMPLES).foreach { _ =>
+          fixture.fallbackPolicy.recordLinkUtilization(
+            usedBytesPerSecond = 990.0d, capacityBytesPerSecond = 1000.0d)
+        }
         assert(fixture.fallbackPolicy.hasTripped,
           "the fixture's policy must have latched a trip before the first record")
       })
@@ -3599,14 +3608,16 @@ class StreamingShuffleWriterSuite
       val records = deterministicRecords(DegradationRecords, seed = 71L, keySpace = 64)
       // The trip is applied from inside the iterator, after the first record has been consumed, so
       // that it is observed while production is under way rather than before it starts. Link
-      // saturation is used because it needs no clock: a utilisation above the trip percentage is
+      // saturation is used because it needs no clock: a run of samples above the trip percentage is
       // enough on its own.
       var tripped = false
       val tripping = records.iterator.map { record =>
         if (!tripped) {
           tripped = true
-          fixture.fallbackPolicy.recordLinkUtilization(
-            usedBytesPerSecond = 990.0d, capacityBytesPerSecond = 1000.0d)
+          (1L to StreamingShuffleFallbackPolicy.SATURATION_SUSTAINED_SAMPLES).foreach { _ =>
+            fixture.fallbackPolicy.recordLinkUtilization(
+              usedBytesPerSecond = 990.0d, capacityBytesPerSecond = 1000.0d)
+          }
           assert(fixture.fallbackPolicy.hasTripped,
             "the link saturation condition must trip the policy the writer consults")
         }
@@ -3680,7 +3691,9 @@ class StreamingShuffleWriterSuite
       fixture.writer.write(records.iterator.map { record =>
         if (!tripped) {
           tripped = true
-          fixture.fallbackPolicy.recordLinkUtilization(990.0d, 1000.0d)
+          (1L to StreamingShuffleFallbackPolicy.SATURATION_SUSTAINED_SAMPLES).foreach { _ =>
+            fixture.fallbackPolicy.recordLinkUtilization(990.0d, 1000.0d)
+          }
         }
         record
       })

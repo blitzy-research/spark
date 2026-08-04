@@ -660,8 +660,12 @@ class StreamingShuffleManagerSuite extends SparkFunSuite
       (StreamingShuffleFallbackReason.MemoryPressure,
         policy => policy.recordAllocationGrant(requestedBytes = 1024L, grantedBytes = 512L)),
       (StreamingShuffleFallbackReason.NetworkSaturation,
-        policy => policy.recordLinkUtilization(
-          usedBytesPerSecond = 990.0d, capacityBytesPerSecond = 1000.0d)),
+        // A run of over-capacity samples rather than one: a single one is a pacing bucket's legal
+        // burst, and the policy requires the run before it calls the link saturated.
+        policy => (1L to StreamingShuffleFallbackPolicy.SATURATION_SUSTAINED_SAMPLES).foreach { _ =>
+          policy.recordLinkUtilization(
+            usedBytesPerSecond = 990.0d, capacityBytesPerSecond = 1000.0d)
+        }),
       (StreamingShuffleFallbackReason.ProtocolVersionMismatch,
         policy => policy.checkProtocolVersion((ProtocolVersion + 1).toByte)),
       (StreamingShuffleFallbackReason.ConsumerTooSlow, policy => {
@@ -838,8 +842,12 @@ class StreamingShuffleManagerSuite extends SparkFunSuite
 
     // The condition is applied to the very policy the service-provider methods consult, which is
     // what a writer or a reader on this executor would have done on observing it.
-    manager.degradationPolicy.recordLinkUtilization(
-      usedBytesPerSecond = 990.0d, capacityBytesPerSecond = 1000.0d)
+    // A run of over-capacity samples, because one is a pacing bucket's legal burst rather than a
+    // saturated link: see StreamingShuffleFallbackPolicy.SATURATION_SUSTAINED_SAMPLES.
+    (1L to StreamingShuffleFallbackPolicy.SATURATION_SUSTAINED_SAMPLES).foreach { _ =>
+      manager.degradationPolicy.recordLinkUtilization(
+        usedBytesPerSecond = 990.0d, capacityBytesPerSecond = 1000.0d)
+    }
     assert(manager.degradationPolicy.hasTripped &&
         manager.degradationPolicy.trippedReason
           .contains(StreamingShuffleFallbackReason.NetworkSaturation),
@@ -1010,8 +1018,12 @@ class StreamingShuffleManagerSuite extends SparkFunSuite
       (StreamingShuffleFallbackReason.MemoryPressure,
         policy => policy.recordAllocationGrant(requestedBytes = 1024L, grantedBytes = 512L)),
       (StreamingShuffleFallbackReason.NetworkSaturation,
-        policy => policy.recordLinkUtilization(
-          usedBytesPerSecond = 990.0d, capacityBytesPerSecond = 1000.0d)),
+        // A run of over-capacity samples rather than one: a single one is a pacing bucket's legal
+        // burst, and the policy requires the run before it calls the link saturated.
+        policy => (1L to StreamingShuffleFallbackPolicy.SATURATION_SUSTAINED_SAMPLES).foreach { _ =>
+          policy.recordLinkUtilization(
+            usedBytesPerSecond = 990.0d, capacityBytesPerSecond = 1000.0d)
+        }),
       (StreamingShuffleFallbackReason.ProtocolVersionMismatch,
         policy => policy.checkProtocolVersion((ProtocolVersion + 1).toByte)),
       (StreamingShuffleFallbackReason.ConsumerTooSlow, policy => {
