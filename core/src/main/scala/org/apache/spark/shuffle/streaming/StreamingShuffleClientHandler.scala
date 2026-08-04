@@ -623,7 +623,7 @@ private[spark] class StreamingShuffleClientHandler(
     var partitionId = startPartition
     while (partitionId < endPartition) {
       val state = partitionStateOf(partitionId)
-      if (writeHeartbeat(partitionId, buildHeartbeat(state, clock.getTimeMillis()))) {
+      if (writeHeartbeat(partitionId, buildHeartbeat(state))) {
         announced += 1
       }
       partitionId += 1
@@ -1027,12 +1027,20 @@ private[spark] class StreamingShuffleClientHandler(
    *     downstream would ever ask for it again.
    *
    * Ahead of all four sits one further check, which is not about this block but about the stream:
-   * a stream that has already ended accepts nothing more. Admitting a block past an accepted
+   * a stream that has already ended accepts no NEW block. Admitting a block past an accepted
    * terminator would put the stream's block count above the total that terminator fixed, which is
    * the total the reader completes against -- so the completion check would be comparing a
-   * consumed count against a total the data had already outgrown. The block is refused and the
+   * consumed count against a total the data had already outgrown. Such a block is refused and the
    * producer declared lost, exactly as a contradictory terminator is; see
    * [[rejectBlockAfterTermination]].
+   *
+   * That check is deliberately narrower than "anything after the terminator". A copy of a position
+   * this consumer has already accepted carries no new volume and moves no cursor, so it cannot put
+   * the stream past its total; it is the same redundant copy the live path discards, and it arrives
+   * after a terminator for the ordinary reason that a producer had already committed a repair to
+   * the wire when it ended the stream. Escalating it would fail the reduce stage of a shuffle whose
+   * output is complete and correct, and pay for the whole map stage again; see
+   * [[discardDuplicateBlock]].
    */
   private def handleDataBlock(block: DataBlockMessage): Unit = {
     val partitionId = block.partitionId()
@@ -1297,20 +1305,22 @@ private[spark] class StreamingShuffleClientHandler(
   /**
    * Records a producer heartbeat.
    *
-   * The protocol keeps the sender's timestamp for diagnostics and judges liveness from the local
-   * instant of arrival, because two hosts do not agree on the wall clock and a detector built on a
-   * remote reading would mistake skew for a failure.
+   * Liveness is judged from the local instant of arrival, and the heartbeat carries no time value
+   * at all: two hosts do not agree on the wall clock, so a detector built on a remote reading would
+   * mistake skew for a failure. What the message does carry is the next position its sender
+   * expects, which is recorded by the protocol.
    */
   private def handleHeartbeat(heartbeat: HeartbeatMessage): Unit = {
     val state = partitionStateOf(heartbeat.partitionId())
-    state.lastInboundMillis.set(clock.getTimeMillis())
-    state.remoteHeartbeatMillis.set(heartbeat.timestampMs())
+    val arrivedAtMillis = clock.getTimeMillis()
+    state.lastInboundMillis.set(arrivedAtMillis)
+    state.remoteHeartbeatMillis.set(arrivedAtMillis)
     backpressure.onHeartbeat(consumerKey(heartbeat.partitionId()), heartbeat)
     if (debugEnabled) {
       logDebug(log"Streaming shuffle received a heartbeat for shuffle " +
         log"${MDC(SHUFFLE_ID, shuffleId)} partition " +
-        log"${MDC(PARTITION_ID, heartbeat.partitionId())} stamped at " +
-        log"${MDC(TIMEOUT, heartbeat.timestampMs())}")
+        log"${MDC(PARTITION_ID, heartbeat.partitionId())} at position " +
+        log"${MDC(COUNT, heartbeat.sequenceNumber())}")
     }
   }
 
@@ -1675,7 +1685,7 @@ private[spark] class StreamingShuffleClientHandler(
       val channel = channelRef.get()
       if (channel != null && channel.isActive && channel.isWritable) {
         writeMessage(channel, new AckMessage(shuffleId, mapId, partitionId,
-          state.outboundSequenceNumber.getAndIncrement(), consumedSequenceNumber))
+          consumedSequenceNumber))
       } else {
         state.pendingAckPosition.set(consumedSequenceNumber)
         if (debugEnabled) {
@@ -1701,8 +1711,7 @@ private[spark] class StreamingShuffleClientHandler(
       partitions.values().asScala.toSeq.sortBy(_.partitionId).foreach { state =>
         val pending = state.pendingAckPosition.getAndSet(AckMessage.NOTHING_CONSUMED)
         if (pending > AckMessage.NOTHING_CONSUMED) {
-          writeMessage(channel, new AckMessage(shuffleId, mapId, state.partitionId,
-            state.outboundSequenceNumber.getAndIncrement(), pending))
+          writeMessage(channel, new AckMessage(shuffleId, mapId, state.partitionId, pending))
         }
       }
     }
@@ -1773,8 +1782,7 @@ private[spark] class StreamingShuffleClientHandler(
         case ReplayVerdict.Granted(attempt) =>
           state.quarantine(firstSequenceNumber, bounded)
           state.replayRequests.incrementAndGet()
-          val written = writeMessage(channel, new RetransmitRequestMessage(
-            shuffleId, mapId, partitionId, firstSequenceNumber, bounded))
+          val written = writeReplayRequests(channel, partitionId, firstSequenceNumber, bounded)
           if (written && debugEnabled) {
             logDebug(log"Streaming shuffle asked shuffle ${MDC(SHUFFLE_ID, shuffleId)} partition " +
               log"${MDC(PARTITION_ID, partitionId)} to replay position(s) " +
@@ -1784,6 +1792,40 @@ private[spark] class StreamingShuffleClientHandler(
           written
       }
     }
+  }
+
+  /**
+   * Asks the producer to replay every position in an inclusive run, one message per position.
+   *
+   * A retransmission request names a single block, because the position it asks for is the message
+   * header's own sequence number and a control message carries no field beyond that and the
+   * producer id -- which is what makes the frame a fixed twenty-five bytes and denies a peer the
+   * ability to name a range at all. A run is therefore requested as a run of requests, in ascending
+   * order so that the producer replays in the order the consumer will consume, and the whole run is
+   * charged as the one repair attempt it is.
+   *
+   * @param channel the producer's channel, already checked to be active and writable by the caller
+   * @param partitionId the stream being repaired
+   * @param first inclusive first position to replay
+   * @param last inclusive last position to replay, never below `first`
+   * @return true when at least one request reached the channel, which is what makes the repair
+   *         under way; false when none could be written
+   */
+  private def writeReplayRequests(
+      channel: Channel,
+      partitionId: Int,
+      first: Long,
+      last: Long): Boolean = {
+    var position = first
+    var written = false
+    while (position <= last) {
+      if (writeMessage(channel,
+          new RetransmitRequestMessage(shuffleId, mapId, partitionId, position))) {
+        written = true
+      }
+      position += 1L
+    }
+    written
   }
 
   /**
@@ -1814,8 +1856,7 @@ private[spark] class StreamingShuffleClientHandler(
             window.charge(nowMillis) match {
               case ReplayVerdict.Granted(_) =>
                 state.replayRequests.incrementAndGet()
-                if (writeMessage(channel, new RetransmitRequestMessage(
-                    shuffleId, mapId, state.partitionId, window.first, window.last))) {
+                if (writeReplayRequests(channel, state.partitionId, window.first, window.last)) {
                   sent += 1
                 }
               case _ =>
@@ -1877,7 +1918,7 @@ private[spark] class StreamingShuffleClientHandler(
           nowMillis - lastSent < BackpressureProtocol.HEARTBEAT_INTERVAL_MS) {
         false
       } else {
-        writeHeartbeat(partitionId, buildHeartbeat(state, nowMillis))
+        writeHeartbeat(partitionId, buildHeartbeat(state))
       }
     }
   }
@@ -1894,23 +1935,15 @@ private[spark] class StreamingShuffleClientHandler(
    *
    * The value is naturally non-negative, which matters because the message type refuses a negative
    * sequence number: a consumer that has received nothing announces zero, and the producer reads
-   * that as "serve me from the beginning" rather than as "I have consumed block zero". The
-   * timestamp is clamped for the same reason, since a wall clock adjusted backwards past the epoch
-   * would otherwise construct a message the type rejects.
+   * that as "serve me from the beginning" rather than as "I have consumed block zero".
    *
-   * The heartbeat also declares this consumer's stable identity, which is what makes the producer's
-   * resume handshake a resumption rather than a restart: the producer keys the position it has
-   * recorded for this consumer by that identity, and an identity taken from the connection would
-   * change on exactly the reconnection the handshake exists to serve.
+   * The position is also the whole of the resume handshake. A producer serves a returning consumer
+   * from the position its first heartbeat announces, so a reconnection resumes rather than restarts
+   * without the message having to carry an identity that the reconnection would in any case have
+   * changed.
    */
-  private def buildHeartbeat(state: PartitionState, nowMillis: Long): HeartbeatMessage = {
-    new HeartbeatMessage(
-      shuffleId,
-      mapId,
-      state.partitionId,
-      announcedPosition(state),
-      math.max(0L, nowMillis),
-      consumerId)
+  private def buildHeartbeat(state: PartitionState): HeartbeatMessage = {
+    new HeartbeatMessage(shuffleId, mapId, state.partitionId, announcedPosition(state))
   }
 
   /**
@@ -2529,11 +2562,20 @@ private[spark] object StreamingShuffleClientHandler {
   val INBOUND_LOW_WATER_BYTES: Long = 2L * DataBlockMessage.MAX_BLOCK_SIZE_BYTES
 
   /**
-   * Widest span a single replay request may name, so that an over-wide window is narrowed rather
-   * than refused. One below the message type's own maximum, because the window includes both of its
-   * ends.
+   * Widest run of positions a single repair may cover, so that an over-wide window is narrowed
+   * rather than refused.
+   *
+   * A repair of `n` positions puts `n` requests on the wire, one per position, because a
+   * retransmission request names a single block. The bound is therefore a bound on the work one
+   * repair may ask of a producer, and it is set generously rather than tightly: at the two-mebibyte
+   * block cap, 4096 blocks is eight gibibytes of replay, far more than a producer can be holding
+   * when buffers are capped at half of executor memory. It never narrows a window a real consumer
+   * would open, while narrowing every window no real consumer could.
    */
-  val MAX_REPLAY_WINDOW_SPAN: Long = RetransmitRequestMessage.MAX_REQUESTED_BLOCKS - 1L
+  val MAX_REPLAY_WINDOW_BLOCKS: Long = 4096L
+
+  /** Widest span between the two ends of a repair, the run being inclusive of both. */
+  val MAX_REPLAY_WINDOW_SPAN: Long = MAX_REPLAY_WINDOW_BLOCKS - 1L
 
   /**
    * Escalated failures reported at warning level before the rest drop to debug. A peer sending
@@ -2553,7 +2595,7 @@ private[spark] object StreamingShuffleClientHandler {
    * [[MAX_REPLAY_WINDOW_SPAN]] positions plus one, and the five-attempt budget means a stream that
    * needs more than a handful of windows is failing rather than repairing.
    */
-  val MAX_QUARANTINED_POSITIONS: Int = (4L * RetransmitRequestMessage.MAX_REQUESTED_BLOCKS).toInt
+  val MAX_QUARANTINED_POSITIONS: Int = (4L * MAX_REPLAY_WINDOW_BLOCKS).toInt
 
   /** Sentinel for a timestamp that has not been taken. */
   val NO_TIMESTAMP: Long = Long.MinValue
@@ -2853,19 +2895,13 @@ private[spark] object StreamingShuffleClientHandler {
      */
     val pendingAckPosition = new AtomicLong(AckMessage.NOTHING_CONSUMED)
 
-    /**
-     * Position stamped into this consumer's own outbound control messages. The consumer's direction
-     * has a sequence of its own, independent of the producer's block numbering.
-     */
-    val outboundSequenceNumber = new AtomicLong(0L)
-
     /** Instant of the last inbound event of any kind, from the injected clock. */
     val lastInboundMillis = new AtomicLong(NO_TIMESTAMP)
 
     /** Instant at which this consumer last emitted a heartbeat, from the injected clock. */
     val lastHeartbeatSentMillis = new AtomicLong(NO_TIMESTAMP)
 
-    /** Timestamp the producer stamped into its last heartbeat. Diagnostic only. */
+    /** Local instant at which the producer's last heartbeat arrived. Diagnostic only. */
     val remoteHeartbeatMillis = new AtomicLong(NO_TIMESTAMP)
 
     /**

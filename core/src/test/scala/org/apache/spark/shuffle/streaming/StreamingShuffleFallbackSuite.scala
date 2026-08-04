@@ -83,9 +83,6 @@ class StreamingShuffleFallbackSuite
 
   private val PartitionId: Int = 0
 
-  /** Sequence number stamped into the framed messages this suite builds. */
-  private val SequenceNumber: Long = 0L
-
   /** Partitions the end-to-end kill-switch job groups into. */
   private val PartitionCount: Int = DefaultPartitionCount
 
@@ -207,7 +204,7 @@ class StreamingShuffleFallbackSuite
   }
 
   private def framedMessage(): ByteBuffer = {
-    ack(ShuffleId, MapId, PartitionId, SequenceNumber, NothingConsumedPosition).toByteBuffer()
+    ack(ShuffleId, MapId, PartitionId, NothingConsumedPosition).toByteBuffer()
   }
 
   /**
@@ -711,14 +708,13 @@ class StreamingShuffleFallbackSuite
     assert(everyOtherVersion.forall(version => !StreamingShuffleMessage.isCompatible(version)),
       "no revision other than the current one may be considered compatible")
 
-    // The layout the version byte opens, stated as the sum of its parts so that this assertion
-    // describes the header rather than merely echoing a number, and asserted against the encoder's
-    // own constant so that it is the encoder being pinned rather than the fixture.
-    assert(StreamingShuffleMessage.HEADER_ENCODED_LENGTH == 1 + 4 + 8 + 4 + 8,
-      s"the shared header is a version byte, a shuffle id, a map id, a partition id and a " +
-        s"sequence number -- 25 bytes -- but the encoder reports " +
-        s"${StreamingShuffleMessage.HEADER_ENCODED_LENGTH}")
-    assert(StreamingShuffleMessage.FRAME_TYPE_PREFIX_LENGTH == 1,
+    // The layout the version byte opens, stated as the sum of its parts rather than as a literal so
+    // that this assertion describes the header rather than merely echoing a number.
+    assert(HeaderEncodedLength == 1 + 4 + 4 + 8,
+      "the shared header is a version byte, a shuffle id, a partition id and a sequence number")
+    assert(ProducerIdEncodedLength == 8,
+      "and the producer identifier that opens every body is an eight-byte map id")
+    assert(FrameTypePrefixLength == 1,
       "a framed message opens with exactly one type-discriminator byte")
   }
 

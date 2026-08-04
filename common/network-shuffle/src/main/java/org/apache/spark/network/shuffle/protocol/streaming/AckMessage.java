@@ -17,8 +17,6 @@
 
 package org.apache.spark.network.shuffle.protocol.streaming;
 
-import java.util.Objects;
-
 import io.netty.buffer.ByteBuf;
 
 import org.apache.spark.annotation.Private;
@@ -43,47 +41,54 @@ import org.apache.spark.annotation.Private;
  * supersedes it. The producer's reclamation rule is correspondingly simple: release every retained
  * block whose sequence number is not greater than the position just acknowledged.
  *
- * Two sequence-valued fields. The inherited {@link #sequenceNumber()} counts the acknowledgements
- * the consumer has sent, positioning this one within the consumer's own control-message stream;
- * {@code consumerPosition} is the value being acknowledged, a position in the stream of data blocks
- * travelling the other way. The two advance independently and neither can be derived from the
- * other.
- * Only {@code consumerPosition} is acted upon: the producer applies it monotonically and reclaims
- * every retained block at or below it, so a reordered or duplicated acknowledgement is absorbed
- * without consulting the header, and the counter is carried for diagnostics and for a future
- * revision that wants to validate acknowledgement ordering explicitly.
+ * One sequence-valued field, carried by the header. The inherited {@link #sequenceNumber()} is the
+ * <b>next</b> position this consumer expects to receive, so the position it has consumed through is
+ * exactly one less and {@link #consumerPosition()} reports it. Expressing the acknowledgement in
+ * the header's own field rather than in a field of its own is what keeps this message the fixed
+ * {@value StreamingShuffleMessage#CONTROL_MESSAGE_ENCODED_LENGTH} bytes the specification gives a
+ * control message, and it removes a second number space that nothing acted upon: the producer
+ * applies the position monotonically and reclaims every retained block at or below it, so a
+ * reordered or duplicated acknowledgement is absorbed by comparing that one value.
  *
- * Wire layout. The body is a single {@code long} placed immediately after the inherited header, so
- * the message is fixed size: {@value StreamingShuffleMessage#HEADER_ENCODED_LENGTH} bytes of header
- * plus eight of body, and one further byte for the type discriminator once framed by {@link
+ * A consumer that has consumed nothing announces the next position it expects, which is zero, and
+ * {@link #consumerPosition()} reads that back as {@link #NOTHING_CONSUMED}. That is why the
+ * header's non-negative domain and the sentinel coexist without contradiction.
+ *
+ * Wire layout. The body is the producer id and nothing else, so the message is fixed size at
+ * {@value StreamingShuffleMessage#CONTROL_MESSAGE_ENCODED_LENGTH} bytes -- {@value
+ * StreamingShuffleMessage#HEADER_ENCODED_LENGTH} of header plus eight of producer id -- and one
+ * further byte for the type discriminator once framed by {@link
  * StreamingShuffleMessage#toByteBuffer()}.
  *
  * <pre>
- *   +--------+-----------------+-----------+-----------+-------------+----------------+---------+
- *   | type   | protocolVersion | shuffleId | mapId     | partitionId | sequenceNumber | consumer |
- *   |        |                 |           |           |             |                | Position |
- *   | 1 byte | byte, 1         | int, 4    | long, 8   | int, 4      | long, 8        | long, 8  |
- *   +--------+-----------------+-----------+-----------+-------------+----------------+---------+
- *   framing prefix, then the inherited 25-byte header, then this message's 8-byte body
+ *   +--------+-----------------+-----------+-------------+----------------+-----------+
+ *   | type   | protocolVersion | shuffleId | partitionId | sequenceNumber | mapId     |
+ *   |        |                 |           |             | next expected  |           |
+ *   | 1 byte | byte, 1         | int, 4    | int, 4      | long, 8        | long, 8   |
+ *   +--------+-----------------+-----------+-------------+----------------+-----------+
+ *   framing prefix, then the inherited 17-byte header, then this message's 8-byte body
  * </pre>
  *
  * <b>The position's domain.</b> A consumer that has consumed nothing yet must still be able to say
- * so, and since sequence numbers are counted from zero it cannot say it with a non-negative number.
- * It says it with exactly one value, {@link #NOTHING_CONSUMED}, and every other negative number is
- * refused. Admitting the whole negative range instead -- as an earlier revision of this class did
- * -- would have handed a peer an unbounded supply of positions that pass validation and then flow
- * into the producer's buffer-reclamation arithmetic, where a value like {@link Long#MIN_VALUE} is
- * not a harmless small number but one that inverts comparisons and overflows window calculations.
- * One sentinel expresses the only thing the negative range was ever needed for, and closes the
- * rest.
+ * so, and since block sequence numbers are counted from zero it cannot say it with a non-negative
+ * position. It says it with exactly one value, {@link #NOTHING_CONSUMED}, and every other negative
+ * number is refused. Admitting the whole negative range instead -- as an earlier revision of this
+ * class did -- would have handed a peer an unbounded supply of positions that pass validation and
+ * then flow into the producer's buffer-reclamation arithmetic, where a value like {@link
+ * Long#MIN_VALUE} is not a harmless small number but one that inverts comparisons and overflows
+ * window calculations. One sentinel expresses the only thing the negative range was ever needed
+ * for, and closes the rest. The top of the range is closed for the same reason: the highest
+ * position that can be expressed is {@link #MAX_CONSUMER_POSITION}, because the next position after
+ * it is what travels on the wire and the successor of {@link Long#MAX_VALUE} is not a position at
+ * all.
  *
- * The sentinel is confined to this body field: the inherited header's {@code shuffleId},
- * {@code mapId}, {@code partitionId} and {@code sequenceNumber} are all required to be
- * non-negative and are
- * rejected centrally by {@link StreamingShuffleMessage}, on construction and on decode alike, so a
- * negative position sentinel never becomes a licence for a negative routing identity. What is also
- * checked is the length of the encoded body, because those bytes arrive from a remote peer and a
- * truncated frame has to be reported the same way in production as it is under test.
+ * On the wire the sentinel needs no negative encoding, because what is transmitted is the next
+ * expected position: the inherited {@code shuffleId}, {@code partitionId} and {@code
+ * sequenceNumber} are all required to be non-negative and are rejected centrally by {@link
+ * StreamingShuffleMessage}, on construction and on decode alike, so acknowledging nothing never
+ * becomes a licence for a negative routing identity. What is also checked is the length of the
+ * encoded body, because those bytes arrive from a remote peer and a truncated frame has to be
+ * reported the same way in production as it is under test.
  *
  * <b>What this class cannot decide, and the contract that covers it.</b> The syntactic domain above
  * still admits every non-negative {@code long} up to {@code Long.MAX_VALUE}, and it must: this
@@ -105,7 +110,7 @@ import org.apache.spark.annotation.Private;
  *   <li>{@code acknowledgesWithin(long)} against the highest sequence number the producer has
  *       actually sent on this stream. A message that fails it is a protocol violation, not a
  *       tolerable oddity, and the channel carrying it is closed.</li>
- *   <li>{@code supersedes(long)} against the highest control sequence number already applied for
+ *   <li>{@code supersedes(long)} against the highest next-expected position already applied for
  *       this stream. A message that fails it is stale and is discarded without effect.</li>
  * </ul>
  *
@@ -143,25 +148,25 @@ public final class AckMessage extends StreamingShuffleMessage {
   public static final long NOTHING_CONSUMED = -1L;
 
   /**
-   * Number of bytes this message adds to the inherited header, namely the eight of the single
-   * {@code long} that is its whole body.
+   * The highest position an acknowledgement can express.
+   *
+   * What travels on the wire is the next position the consumer expects, one above the position
+   * being acknowledged, so the acknowledgeable range stops one short of {@link Long#MAX_VALUE}.
+   * Naming the bound makes the refusal of the last value a stated domain rule rather than an
+   * arithmetic accident, and it is a rule worth having: a position that cannot be expressed is a
+   * position no producer should be asked to act upon.
+   */
+  public static final long MAX_CONSUMER_POSITION = Long.MAX_VALUE - 1L;
+
+  /**
+   * Number of bytes this message adds to the inherited header, namely the eight of the producer id
+   * that is its whole body.
    *
    * The count is named rather than written out twice so that {@link #encodedLength()} and the
    * length check in {@link #decode(ByteBuf)} cannot drift apart: the encoder promises exactly this
    * many bytes and the decoder requires exactly this many to be present.
    */
-  private static final int BODY_ENCODED_LENGTH = 8;
-
-  /**
-   * The highest data-block sequence number the sending consumer has consumed for this shuffle
-   * partition, acknowledging every lower one along with it.
-   *
-   * The value is reachable as a field, for parity with the message family in the parent package on
-   * which the streaming family is modelled, and equally through {@link #consumerPosition()}, for
-   * parity with the inherited header accessors, so that a call site may read every field of a
-   * streaming message uniformly through a method if it prefers to.
-   */
-  public final long consumerPosition;
+  private static final int BODY_ENCODED_LENGTH = PRODUCER_ID_ENCODED_LENGTH;
 
   /**
    * Creates an acknowledgement stamped with this build's protocol version. This is the constructor
@@ -171,19 +176,16 @@ public final class AckMessage extends StreamingShuffleMessage {
    * @param shuffleId identifier of the shuffle being acknowledged
    * @param mapId identifier of the map task whose output is being acknowledged
    * @param partitionId identifier of the shuffle partition being acknowledged
-   * @param sequenceNumber count of the acknowledgements the consumer has sent, positioning this one
-   *                       within the consumer's own control-message stream
    * @param consumerPosition highest data-block sequence number consumed so far, or
-   *                         {@link #NOTHING_CONSUMED} if nothing has been consumed yet
+   *                         {@link #NOTHING_CONSUMED} if nothing has been consumed yet; at most
+   *                         {@link #MAX_CONSUMER_POSITION}
    */
   public AckMessage(
       int shuffleId,
       long mapId,
       int partitionId,
-      long sequenceNumber,
       long consumerPosition) {
-    super(shuffleId, mapId, partitionId, sequenceNumber);
-    this.consumerPosition = checkConsumerPosition(consumerPosition);
+    super(shuffleId, mapId, partitionId, nextExpectedPosition(consumerPosition));
   }
 
   /**
@@ -195,7 +197,6 @@ public final class AckMessage extends StreamingShuffleMessage {
    * @param shuffleId identifier of the shuffle being acknowledged
    * @param mapId identifier of the map task whose output is being acknowledged
    * @param partitionId identifier of the shuffle partition being acknowledged
-   * @param sequenceNumber count of the acknowledgements the consumer has sent
    * @param consumerPosition highest data-block sequence number consumed so far
    */
   public AckMessage(
@@ -203,24 +204,25 @@ public final class AckMessage extends StreamingShuffleMessage {
       int shuffleId,
       long mapId,
       int partitionId,
-      long sequenceNumber,
       long consumerPosition) {
-    super(protocolVersion, shuffleId, mapId, partitionId, sequenceNumber);
-    this.consumerPosition = checkConsumerPosition(consumerPosition);
+    super(protocolVersion, shuffleId, mapId, partitionId, nextExpectedPosition(consumerPosition));
   }
 
   /**
-   * Creates an acknowledgement from a header just read off the wire, which is the form {@link
-   * #decode(ByteBuf)} uses: taking the header as one value rather than as five positional arguments
-   * removes any chance of transposing two same-typed fields on the way in.
+   * Creates an acknowledgement from a header just read off the wire, together with the producer id
+   * that opened the body. This is the form {@link #decode(ByteBuf)} uses: taking the header as one
+   * value rather than as four positional arguments removes any chance of transposing two same-typed
+   * fields on the way in.
+   *
+   * The acknowledged position needs no argument of its own, because the header already carries it
+   * as the next position this consumer expects.
    *
    * @param header the decoded header, which must not be null
-   * @param consumerPosition highest data-block sequence number consumed so far
+   * @param mapId identifier of the map task whose output is being acknowledged
    * @throws NullPointerException if header is null
    */
-  public AckMessage(Header header, long consumerPosition) {
-    super(header);
-    this.consumerPosition = checkConsumerPosition(consumerPosition);
+  public AckMessage(Header header, long mapId) {
+    super(header, mapId);
   }
 
   /**
@@ -228,10 +230,14 @@ public final class AckMessage extends StreamingShuffleMessage {
    * partition. A producer may release every retained block whose sequence number is not greater
    * than this value.
    *
-   * @return the acknowledged position, or a negative value if nothing has been consumed yet
+   * Derived from the header's next-expected position rather than stored a second time, so the two
+   * can never disagree and the message stays the fixed size a control message is specified to be.
+   *
+   * @return the acknowledged position, or {@link #NOTHING_CONSUMED} if nothing has been consumed
+   * yet
    */
   public long consumerPosition() {
-    return consumerPosition;
+    return sequenceNumber() - 1L;
   }
 
   /**
@@ -256,25 +262,25 @@ public final class AckMessage extends StreamingShuffleMessage {
    * @return true if the acknowledged position lies at or below that bound
    */
   public boolean acknowledgesWithin(long highestSentSequenceNumber) {
-    return consumerPosition == NOTHING_CONSUMED || consumerPosition <= highestSentSequenceNumber;
+    long position = consumerPosition();
+    return position == NOTHING_CONSUMED || position <= highestSentSequenceNumber;
   }
 
   /**
    * Whether this acknowledgement is newer than the last one already applied for its stream.
    *
-   * The comparison is on the inherited control {@link #sequenceNumber()}, which numbers the
-   * consumer's own outbound messages, and not on {@link #consumerPosition()}, which numbers the
-   * data travelling the other way. Two acknowledgements may report the same consumed position while
-   * being distinct messages, and a reordered pair may report positions in the wrong order, so
-   * freshness has to be decided on the control sequence and applied before the position is used.
-   * Strict inequality makes the test idempotent: a duplicate delivery is refused, not reapplied.
+   * The comparison is on the inherited {@link #sequenceNumber()}, the next position this consumer
+   * expects, which advances monotonically with the data it has consumed. A duplicate or a reordered
+   * delivery therefore reports a position that has already been applied, and strict inequality
+   * refuses it rather than reapplying it, which is what makes the gate idempotent as well as
+   * monotonic. Freshness is decided here and applied before the position is acted upon.
    *
-   * @param lastAppliedControlSequenceNumber highest control sequence number already applied for
-   *                                         this stream, or a negative value if none has been
+   * @param lastAppliedPosition highest next-expected position already applied for this stream, or a
+   *                            negative value if none has been
    * @return true if this message is newer and may be applied
    */
-  public boolean supersedes(long lastAppliedControlSequenceNumber) {
-    return sequenceNumber() > lastAppliedControlSequenceNumber;
+  public boolean supersedes(long lastAppliedPosition) {
+    return sequenceNumber() > lastAppliedPosition;
   }
 
   @Override
@@ -284,40 +290,40 @@ public final class AckMessage extends StreamingShuffleMessage {
 
   @Override
   public int hashCode() {
-    // The header hash is folded in rather than recomputed here, so that two acknowledgements
-    // differing only in a header field never collapse to one value.
-    return Objects.hash(headerHashCode(), consumerPosition);
+    // The header hash is the whole of this message's identity, the acknowledged position included,
+    // because the position is a header field rather than a field of this class.
+    return headerHashCode();
   }
 
   @Override
   public String toString() {
     return "AckMessage[" + headerToString() +
-        ",consumerPosition=" + consumerPosition + "]";
+        ",consumerPosition=" + consumerPosition() + "]";
   }
 
   @Override
   public boolean equals(Object other) {
     if (other instanceof AckMessage o) {
-      return headerEquals(o)
-        && consumerPosition == o.consumerPosition;
+      return headerEquals(o);
     }
     return false;
   }
 
   @Override
   public int encodedLength() {
-    // Twenty-five bytes of inherited header plus eight for consumerPosition, thirty-three in all,
-    // written as a sum of named parts in the surrounding convention of four bytes per int and eight
-    // per long so that it cannot drift from what encode(ByteBuf) actually writes.
+    // Seventeen bytes of inherited header plus eight for the producer id, twenty-five in all, which
+    // is the fixed size the specification gives a control message. Written as a sum of named parts
+    // so that it cannot drift from what encode(ByteBuf) actually writes.
     return HEADER_ENCODED_LENGTH + BODY_ENCODED_LENGTH;
   }
 
   @Override
   public void encode(ByteBuf buf) {
     // The header goes first, and is written by the parent class, so that its field order can never
-    // diverge from the order readHeader expects to find it in.
+    // diverge from the order readHeader expects to find it in; the producer id follows it, as it
+    // does in every message of this family.
     encodeHeader(buf);
-    buf.writeLong(consumerPosition);
+    encodeProducerId(buf);
   }
 
   /**
@@ -350,30 +356,38 @@ public final class AckMessage extends StreamingShuffleMessage {
         "exactly " + BODY_ENCODED_LENGTH + " byte(s) of body but " + buf.readableBytes() +
         " remain");
     }
-    long consumerPosition = buf.readLong();
-    return new AckMessage(header, consumerPosition);
+    long mapId = readProducerId(buf);
+    return new AckMessage(header, mapId);
   }
 
   /**
-   * Rejects a position outside its legitimate domain, returning it unchanged so that it can be
-   * assigned straight to the field.
+   * Converts an acknowledged position into the next-expected position the header carries, rejecting
+   * a position outside its legitimate domain on the way.
    *
-   * The domain is {@link #NOTHING_CONSUMED} together with every non-negative sequence number. This
-   * runs on every construction path, including {@link #decode(ByteBuf)}, so an acknowledgement that
-   * exists at all carries a position the producer can safely do arithmetic with -- which is the
-   * whole point of validating here rather than at each site that consumes the value.
+   * The domain is {@link #NOTHING_CONSUMED} together with every position from zero to {@link
+   * #MAX_CONSUMER_POSITION}. This runs on every locally built construction path, so an
+   * acknowledgement that exists at all carries a position the producer can safely do arithmetic
+   * with -- which is the whole point of validating here rather than at each site that consumes the
+   * value. A decoded message needs no conversion: the wire already carries the next-expected
+   * position, and the header's own non-negative domain check covers it.
    *
    * @param consumerPosition the candidate position
-   * @return consumerPosition, unchanged
+   * @return the next position the consumer expects, that is, one above the acknowledged position
    * @throws IllegalArgumentException if the position is negative and is not
-   *                                 {@link #NOTHING_CONSUMED}
+   *                                 {@link #NOTHING_CONSUMED}, or exceeds
+   *                                 {@link #MAX_CONSUMER_POSITION}
    */
-  private static long checkConsumerPosition(long consumerPosition) {
+  private static long nextExpectedPosition(long consumerPosition) {
     if (consumerPosition < 0L && consumerPosition != NOTHING_CONSUMED) {
       throw new IllegalArgumentException("Streaming shuffle acknowledgement carries an invalid " +
         "consumerPosition: " + consumerPosition + " is negative but is not the " +
         NOTHING_CONSUMED + " sentinel that states nothing has been consumed");
     }
-    return consumerPosition;
+    if (consumerPosition > MAX_CONSUMER_POSITION) {
+      throw new IllegalArgumentException("Streaming shuffle acknowledgement carries an invalid " +
+        "consumerPosition: " + consumerPosition + " exceeds the highest expressible position " +
+        MAX_CONSUMER_POSITION);
+    }
+    return consumerPosition + 1L;
   }
 }

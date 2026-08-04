@@ -213,13 +213,12 @@ class StreamingShuffleWriterSuite
      * @param nextPosition the next block position this consumer expects
      */
     def subscribe(shuffleId: Int, mapId: Long, partitionId: Int, nextPosition: Long = 0L): Unit = {
-      deliver(new HeartbeatMessage(shuffleId, mapId, partitionId, nextPosition,
-        ManualClockEpochMillis, consumerId))
+      deliver(new HeartbeatMessage(shuffleId, mapId, partitionId, nextPosition))
     }
 
     /** Acknowledges consumption through the given position, through a real ack frame. */
     def acknowledge(shuffleId: Int, mapId: Long, partitionId: Int, position: Long): Unit = {
-      deliver(new AckMessage(shuffleId, mapId, partitionId, position + 1L, position))
+      deliver(new AckMessage(shuffleId, mapId, partitionId, position))
     }
 
     /**
@@ -354,6 +353,8 @@ class StreamingShuffleWriterSuite
    * incompatible by construction and stays incompatible when the revision is bumped.
    */
   private val IncompatibleProtocolVersion: Byte = (ProtocolVersion + 1).toByte
+
+
 
   /**
    * Records every driver-facing operation a producer performs, and answers all of them.
@@ -630,7 +631,9 @@ class StreamingShuffleWriterSuite
      * Completes the task the way the executor would, then releases anything a failed test
      * left behind.
      *
-     * Marking the context complete is the honest teardown, because that is what fires the
+     * ==Two steps, and why the distinction matters==
+     *
+     * The first step is the honest teardown: marking the context complete is what fires the
      * task-completion listeners the writer registered, and those listeners are the mechanism by
      * which "no buffer, channel or spill file survives task completion" is met.
      *
@@ -723,8 +726,7 @@ class StreamingShuffleWriterSuite
       // A heartbeat states the NEXT position its sender expects, so a consumer that has taken
       // nothing announces zero. Built through the protocol's own constructor so the frame this
       // fixture pushes in is byte-for-byte the one the production client handler sends.
-      val frame = new HeartbeatMessage(shuffleId, mapId, partitionId, consumedThrough + 1L,
-        ManualClockEpochMillis)
+      val frame = new HeartbeatMessage(shuffleId, mapId, partitionId, consumedThrough + 1L)
       handler.receive(client, frame.toByteBuffer())
     }
 
@@ -802,11 +804,10 @@ class StreamingShuffleWriterSuite
      * Subscribes this consumer to one partition, which is what an in-progress block request is.
      *
      * @param partitionId the reduce partition to read
-     * @param timestampMs the clock reading the heartbeat is stamped with
      */
-    def subscribe(partitionId: Int, timestampMs: Long): Unit = {
+    def subscribe(partitionId: Int): Unit = {
       deliver(new HeartbeatMessage(handler.shuffleId, handler.mapId, partitionId,
-        nextOutboundSequence(), timestampMs, consumerId))
+        nextOutboundSequence()))
     }
 
     /**
@@ -816,8 +817,7 @@ class StreamingShuffleWriterSuite
      * @param position the highest data-block sequence number consumed
      */
     def acknowledge(partitionId: Int, position: Long): Unit = {
-      deliver(new AckMessage(handler.shuffleId, handler.mapId, partitionId,
-        nextOutboundSequence(), position))
+      deliver(new AckMessage(handler.shuffleId, handler.mapId, partitionId, position))
     }
 
     /** Hands one frame to the producer handler exactly as the transport would. */
@@ -968,6 +968,10 @@ class StreamingShuffleWriterSuite
    *                              fallback path -- and the cleanup it owes -- observable rather than
    *                              merely unreachable
    * @param clock time source every collaborator reads, manual by default
+   * @param maxBandwidthMBps egress cap, absent by default, which is the unlimited state
+   * @param sortWriterFactory the delegate a degradation reaches; loud by default, so a fixture that
+   *                          degraded unexpectedly fails rather than silently stopping the test
+   * @param registration the registration this producer was granted
    * @return the assembled fixture, whose `close()` the caller owns
    *
    * All three delegate parameters reach the same seam and only one may be supplied at a time; with
@@ -1458,51 +1462,101 @@ class StreamingShuffleWriterSuite
         protocolShuffleId, defaultMapId, 0, 0L, oversized)
     }
 
-    // Three of the five message types encode to the same number of bytes, so a discriminator must
+    // All four control message types encode to the same number of bytes, so a discriminator must
     // read the framing type byte or the concrete class and never the length.
     val fixedMessages = Seq(
-      ack(protocolShuffleId, defaultMapId, 0, 0L, 0L),
-      retransmitRequest(protocolShuffleId, defaultMapId, 0, 0L, 0L),
+      ack(protocolShuffleId, defaultMapId, 0, 0L),
+      heartbeat(protocolShuffleId, defaultMapId, 0, 0L),
+      retransmitRequest(protocolShuffleId, defaultMapId, 0, 0L),
       streamTermination(protocolShuffleId, defaultMapId, 0, 1L))
+    assert(FixedMessageEncodedLength === 25,
+      "A control message is the specified twenty-five bytes, stated as a literal so that the " +
+        "contract is asserted rather than echoed from the encoder")
     assert(fixedMessages.forall(_.encodedLength() == FixedMessageEncodedLength),
       s"Every fixed-size streaming message must encode to $FixedMessageEncodedLength bytes")
     assert(fixedMessages.map(typeOf).distinct.size === fixedMessages.size,
       "Fixed-size messages of equal length must still be distinguished by their type discriminator")
 
-    // Every block the writer frames respects the cap and carries a verifiable identity-bound stamp.
-    val partitions = 4
-    withHarness(newHarness(numPartitions = partitions)) { harness =>
-      harness.writer.write(deterministicRecords(400, seed = 4L, keySpace = 48).iterator)
-      assert(harness.writer.blocksStreamed > 0L, "The writer must have framed at least one block")
-      assert(harness.writer.blockPayloadCapacityBytes > 0,
-        "The writer must have derived a positive framing capacity")
-      assert(harness.writer.blockPayloadCapacityBytes <= MaxBlockSizeBytes,
-        "The writer must never frame above the protocol's block payload cap")
-      var verified = 0
-      harness.writer.streamedPartitions.foreach { partitionId =>
-        val blocks = harness.writer.nextSequenceNumberFor(partitionId)
-        assert(blocks > 0L, s"A streamed partition $partitionId must have framed a block")
-        var sequence = 0L
-        while (sequence < blocks) {
-          val retained = harness.spillManager.retainedPayload(partitionId, sequence)
-          assert(retained.isDefined,
-            s"Block $sequence of partition $partitionId must still be retained before the stop")
-          val bytes = retained.get
-          assert(bytes.length <= harness.writer.blockPayloadCapacityBytes,
-            s"Block $sequence of partition $partitionId carried ${bytes.length} bytes, above the " +
+    // ==The blocks the producer actually put on the wire==
+    //
+    // Everything above establishes that the checksum helper behaves; none of it establishes that
+    // the PRODUCER uses it. A writer that emitted an unstamped block, or one stamped against the
+    // partition or sequence number, would be invisible to a test that built its own frame from the
+    // retained payload and then checked that frame -- the assertion would be about the test's own
+    // arithmetic. So the frames are captured off a real channel and decoded through the protocol's
+    // single decoding entry point, and the value asserted is the one the writer stamped.
+    val partitions = 1
+    withHarness(newHarness(
+        numPartitions = partitions,
+        executorMemoryBytes = 4L * 1024L * 1024L)) { harness =>
+      val consumer = attachConsumer(harness)
+      try {
+        consumer.subscribe(harness.shuffleId, defaultMapId, partitionId = 0)
+        harness.writer.write(deterministicRecords(60000, seed = 4L, keySpace = 48).iterator)
+        assert(harness.writer.stop(success = true).isDefined,
+          "The successful stop must produce a status")
+        assert(harness.writer.blockPayloadCapacityBytes > 0,
+          "The writer must have derived a positive framing capacity")
+        assert(harness.writer.blockPayloadCapacityBytes <= MaxBlockSizeBytes,
+          "The writer must never frame above the protocol's block payload cap")
+
+        val emitted = consumer.drainOutbound().collect { case block: DataBlockMessage => block }
+        assert(emitted.size > 1,
+          s"The producer must have emitted more than one block for the consumer to check, yet it " +
+            s"emitted ${emitted.size}")
+        assert(emitted.size.toLong <= harness.writer.blocksStreamed,
+          "It cannot have emitted more blocks than it framed")
+
+        emitted.zipWithIndex.foreach { case (block, index) =>
+          val sequence = index.toLong
+          val emittedPayload = block.copyPayload()
+          assert(block.protocolVersion() === ProtocolVersion,
+            s"Block $sequence must be stamped with the protocol version this build speaks")
+          assert(block.shuffleId() === harness.shuffleId && block.mapId() === defaultMapId &&
+              block.partitionId() === 0,
+            s"Block $sequence must name the stream it belongs to, yet it named shuffle " +
+              s"${block.shuffleId()} map ${block.mapId()} partition ${block.partitionId()}")
+          assert(block.sequenceNumber() === sequence,
+            s"A partition's blocks must be numbered densely from zero, which is what the reader " +
+              s"reassembles on, yet block $index arrived as ${block.sequenceNumber()}")
+          assert(emittedPayload.length <= harness.writer.blockPayloadCapacityBytes,
+            s"Block $sequence carried ${emittedPayload.length} bytes, above the " +
               s"${harness.writer.blockPayloadCapacityBytes} byte framing capacity")
-          val framed = DataBlockMessage.withComputedChecksum(
-            harness.shuffleId, defaultMapId, partitionId, sequence, bytes)
-          assert(framed.verifyChecksum(),
-            s"Block $sequence of partition $partitionId must carry a verifiable CRC32C")
-          assert(framed.checksum() ===
-              blockChecksum(harness.shuffleId, defaultMapId, partitionId, sequence, bytes),
-            s"Block $sequence of partition $partitionId must be stamped through the shared helper")
-          verified += 1
-          sequence += 1L
+          assert(emittedPayload.length <= MaxBlockSizeBytes,
+            s"and above the protocol's own $MaxBlockSizeBytes byte cap")
+
+          // The decisive assertion: the frame verifies against the stamp the WRITER put on it,
+          // exactly as it came off the channel and with nothing recomputed.
+          assert(block.verifyChecksum(),
+            s"Block $sequence must verify against the checksum the producer stamped it with")
+          // And that stamp is the identity-bound CRC32C rather than a bare payload checksum, which
+          // is what makes a block delivered against the wrong stream detectable.
+          assert(block.checksum() ===
+              blockChecksum(harness.shuffleId, defaultMapId, 0, sequence, emittedPayload),
+            s"Block $sequence must be stamped through the shared identity-bound helper")
+          assert(block.checksum() !==
+              StreamingShuffleChecksum.compute(emittedPayload),
+            s"Block $sequence must not be stamped with a bare payload checksum, or a block " +
+              "delivered against the wrong stream would verify")
+          assert(block.checksum() !==
+              blockChecksum(harness.shuffleId, defaultMapId, 1, sequence, emittedPayload),
+            s"Block $sequence's stamp must cover its partition")
+          assert(block.checksum() !==
+              blockChecksum(harness.shuffleId, defaultMapId, 0, sequence + 1L, emittedPayload),
+            s"and its sequence number")
         }
+
+        // A single flipped byte in an emitted frame's payload must break its stamp, which is what
+        // makes the checksum a corruption detector rather than a decoration.
+        val original = emitted.head.copyPayload()
+        val tampered = original.clone()
+        tampered(tampered.length / 2) = (tampered(tampered.length / 2) ^ 0x01).toByte
+        assert(!StreamingShuffleChecksum.verifyBlock(harness.shuffleId, defaultMapId, 0,
+            emitted.head.sequenceNumber(), tampered, emitted.head.checksum()),
+          "One flipped byte in a block's payload must fail the stamp the producer emitted")
+      } finally {
+        consumer.close()
       }
-      assert(verified > 0, "At least one framed block must have been checksum verified")
     }
   }
 
@@ -1743,6 +1797,16 @@ class StreamingShuffleWriterSuite
         assert(failure != null,
           s"Requesting withdrawn block $blockId must be refused rather than answered")
       }
+
+      // Every block the retention window was holding has gone with it, read back through the same
+      // production accessor that proved they were there.
+      assert(retainedBlocks.forall { case (partitionId, sequence) =>
+          harness.spillManager.retainedPayload(partitionId, sequence).isEmpty
+        },
+        "No block may remain reachable in the retention window after the attempt failed")
+      assert(harness.writer.streamedPartitions.forall(harness.spillManager.retainedBlockCount(_)
+          == 0),
+        "No partition may retain a block after the attempt failed")
 
       // Every block the retention window was holding has gone with it, read back through the same
       // production accessor that proved they were there.
@@ -2459,10 +2523,10 @@ class StreamingShuffleWriterSuite
       assert(!backpressure.isWithinUnacknowledgedWindow(key, 1L),
         "A block that was never sent cannot be inside the unacknowledged window")
       assert(backpressure.canServeRetransmit(key,
-          retransmitRequest(harness.shuffleId, defaultMapId, 0, 0L, 0L)),
+          retransmitRequest(harness.shuffleId, defaultMapId, 0, 0L)),
         "A retransmission scoped to the unacknowledged window must be serviceable")
       assert(!backpressure.canServeRetransmit(key,
-          retransmitRequest(harness.shuffleId, defaultMapId, 0, 1L, 1L)),
+          retransmitRequest(harness.shuffleId, defaultMapId, 0, 1L)),
         "A retransmission outside the unacknowledged window must be refused, because those bytes " +
           "were released the moment the consumer acknowledged them")
 
@@ -2621,7 +2685,7 @@ class StreamingShuffleWriterSuite
     withHarness(newHarness(numPartitions = DegradationPartitions,
         executorMemoryBytes = DegradationExecutorMemoryBytes, clock = clock)) { harness =>
       val consumer = new ConsumerChannel(harness.serverHandler, consumerId)
-      consumer.subscribe(partitionId = 0, timestampMs = clock.getTimeMillis())
+      consumer.subscribe(partitionId = 0)
       assert(harness.serverHandler.liveConsumerCount === 1,
         "the in-progress block request must have opened exactly one consumer session")
 
@@ -2670,7 +2734,7 @@ class StreamingShuffleWriterSuite
     withHarness(newHarness(numPartitions = DegradationPartitions,
         executorMemoryBytes = DegradationExecutorMemoryBytes, clock = clock)) { harness =>
       val first = new ConsumerChannel(harness.serverHandler, consumerId)
-      first.subscribe(partitionId = 0, timestampMs = clock.getTimeMillis())
+      first.subscribe(partitionId = 0)
       harness.writer.write(deterministicRecords(StreamedRecordsPerConsumerCase, seed = 82L,
         keySpace = 8).iterator)
       val original = first.drainInboundBlocks()
@@ -2696,7 +2760,7 @@ class StreamingShuffleWriterSuite
 
       clock.advance(RetryBaseBackoffMillis)
       val resumed = new ConsumerChannel(harness.serverHandler, consumerId)
-      resumed.subscribe(partitionId = 0, timestampMs = clock.getTimeMillis())
+      resumed.subscribe(partitionId = 0)
       assert(harness.serverHandler.resumedSessionCount >= 1L,
         s"the returning consumer must be recognised as the same session and resumed, but the " +
           s"producer counted ${harness.serverHandler.resumedSessionCount} resume(s)")
@@ -2726,7 +2790,7 @@ class StreamingShuffleWriterSuite
     withHarness(newHarness(numPartitions = DegradationPartitions,
         executorMemoryBytes = DegradationExecutorMemoryBytes, clock = clock)) { harness =>
       val consumer = new ConsumerChannel(harness.serverHandler, consumerId)
-      consumer.subscribe(partitionId = 0, timestampMs = clock.getTimeMillis())
+      consumer.subscribe(partitionId = 0)
       harness.writer.write(deterministicRecords(StreamedRecordsPerConsumerCase, seed = 83L,
         keySpace = 8).iterator)
       val delivered = consumer.drainInboundBlocks()
@@ -2790,7 +2854,7 @@ class StreamingShuffleWriterSuite
        */
       def deliverOneBlockTo(identity: String): (ConsumerChannel, Long) = {
         val consumer = new ConsumerChannel(harness.serverHandler, identity)
-        consumer.subscribe(partitionId = 0, timestampMs = clock.getTimeMillis())
+        consumer.subscribe(partitionId = 0)
         consumer.drainInbound()
         val sequenceNumber = admitAndEnqueue(harness, partitionId = 0, priority = priority)
         val delivered = consumer.drainInboundBlocks().map(_.sequenceNumber())
@@ -3360,7 +3424,7 @@ class StreamingShuffleWriterSuite
           val highest = harness.writer.blocksStreamed - 1L
           if (highest > 0L) {
             harness.serverHandler.receive(consumer.client,
-              new RetransmitRequestMessage(harness.shuffleId, defaultMapId, 0, 0L, highest)
+              new RetransmitRequestMessage(harness.shuffleId, defaultMapId, 0, highest)
                 .toByteBuffer())
           }
           record
@@ -3421,7 +3485,7 @@ class StreamingShuffleWriterSuite
           val highest = harness.writer.blocksStreamed - 1L
           if (highest > 0L) {
             harness.serverHandler.receive(consumer.client,
-              new RetransmitRequestMessage(harness.shuffleId, defaultMapId, 0, 0L, highest)
+              new RetransmitRequestMessage(harness.shuffleId, defaultMapId, 0, highest)
                 .toByteBuffer())
           }
           record
@@ -4050,8 +4114,8 @@ class StreamingShuffleWriterSuite
           defaultTaskAttemptId, harness.spillManager),
         "the fixture must be able to publish its retained output before offering a block")
       val consumer = new ConsumerChannel(harness.serverHandler, consumerId)
-      consumer.subscribe(partitionId = 0, timestampMs = clock.getTimeMillis())
-      consumer.subscribe(partitionId = 1, timestampMs = clock.getTimeMillis())
+      consumer.subscribe(partitionId = 0)
+      consumer.subscribe(partitionId = 1)
       consumer.drainInbound()
 
       // Exhausting the egress bucket is what holds the queue: a paced producer queues a block it
@@ -4385,31 +4449,36 @@ class StreamingShuffleWriterSuite
 
       // 3. A channel that tries to rename itself mid-flight. A session that could be renamed could
       //    be talked into adopting the cursors -- and therefore the unread output -- of a consumer
-      //    that is not the peer holding the socket, so the second, different declaration is refused
-      //    and the channel closed.
+      //    that is not the peer holding the socket. No frame carries an identity to rename with: a
+      //    session takes its identity from the transport's authenticated client id when the channel
+      //    is announced and nothing on the wire restates it, so the property holds structurally
+      //    rather than by a refusal. Both halves are asserted -- that a heartbeat has no identity
+      //    field to carry one, and that a further heartbeat therefore refreshes the session that
+      //    sent it instead of replacing it or moving its subscription.
+      assert(!classOf[HeartbeatMessage].getMethods.exists(_.getName == "consumerId"),
+        "A heartbeat must carry no consumer identity, or a peer could restate one on a channel " +
+          "of its own and be served the cursors of the peer that identity belongs to")
       val renamer = new ProducerConsumerChannel(handler, s"$consumerId-renamer")
       renamer.activate()
       renamer.subscribe(harness.shuffleId, defaultMapId, 1)
       assert(handler.subscriberCount(1) === 1,
-        "The renaming channel must hold a subscription before it tries to rename itself")
+        "The channel must hold a subscription before a further frame is delivered on it")
       // Whatever its legitimate subscription earned it, taken off the channel first, so that the
-      // assertion after the refusal is about frames the refusal produced and not about frames the
+      // assertion below is about what the further heartbeat produced and not about frames the
       // subscription it was entitled to had already delivered.
       renamer.drainBlocks()
-      val conflictsBefore = handler.identityConflictCount
       val sessionsBefore = handler.sessionCount
-      renamer.deliver(new HeartbeatMessage(harness.shuffleId, defaultMapId, 1, 0L,
-        ManualClockEpochMillis, s"$consumerId-someone-else"))
-      assert(handler.identityConflictCount === conflictsBefore + 1L,
-        "A channel declaring a second, different identity must be recorded as a conflict")
-      assert(handler.sessionCount === sessionsBefore - 1,
-        "A channel that tried to rename itself must have had its session closed")
-      assert(handler.subscriberCount(1) === 0,
-        s"The renamed channel's subscriber slot must be returned, but " +
-          s"${handler.subscriberCount(1)} remain claimed")
-      assert(renamer.drainBlocks().isEmpty,
-        "A channel refused an identity change must not be served another block")
+      renamer.deliver(new HeartbeatMessage(harness.shuffleId, defaultMapId, 1, 0L))
+      assert(handler.sessionCount === sessionsBefore,
+        "A further heartbeat must refresh the session that sent it rather than creating or " +
+          "replacing one")
+      assert(handler.subscriberCount(1) === 1,
+        s"and must leave that session's subscription exactly where it was, but " +
+          s"${handler.subscriberCount(1)} are claimed")
       renamer.close()
+      assert(handler.subscriberCount(1) === 0,
+        s"The channel's subscriber slot must be returned when it goes, but " +
+          s"${handler.subscriberCount(1)} remain claimed")
 
       // 4. Fan-out: a partition is legitimately read by one reduce task, so the number of channels
       //    that may subscribe to it is bounded. The bound is enforced before a ledger, a queue
@@ -4454,8 +4523,8 @@ class StreamingShuffleWriterSuite
       alien.activate()
       val sessionsBeforeAlien = handler.sessionCount
       val slotsBeforeAlien = handler.claimedSessionSlots
-      val framed = new HeartbeatMessage(harness.shuffleId, defaultMapId, 0, 0L,
-        ManualClockEpochMillis, s"$consumerId-alien").toByteBuffer()
+      val framed =
+        new HeartbeatMessage(harness.shuffleId, defaultMapId, 0, 0L).toByteBuffer()
       val alienBytes = new Array[Byte](framed.remaining())
       framed.duplicate().get(alienBytes)
       // The protocol version is the first byte of the header, immediately after the frame type.
@@ -4477,23 +4546,27 @@ class StreamingShuffleWriterSuite
       assert(handler.acknowledgedPosition(0) === highestSent,
         s"The honest consumer must still be able to acknowledge through $highestSent")
 
-      // 6. Last, the boundary the reconnection path depends on: a *different* channel declaring a
-      //    live peer's identity is that peer coming back, not a second tenant. One reduce task
-      //    attempt reads through one connection at a time, so the older session is superseded and
-      //    released -- which is what stops two channels from both holding one consumer's credit and
-      //    both pinning its retained window.
-      val supersededBefore = handler.supersededSessionCount
+      // 6. Last, the boundary the reconnection path depends on: a consumer that comes back arrives
+      //    on a new channel and is therefore a new session, and what makes its resumption correct
+      //    is the position its first heartbeat announces rather than any identity it restates. The
+      //    returning channel is admitted, is served under a subscription of its own, and the slot
+      //    ledger still agrees with the session registry -- which is what would expose a
+      //    reconnection that leaked either a slot or a subscriber entry.
+      val sessionsBeforeReturn = handler.sessionCount
+      val subscribersBeforeReturn = handler.subscriberCount(0)
       val returning = new ProducerConsumerChannel(handler, consumerId)
       returning.activate()
       returning.subscribe(harness.shuffleId, defaultMapId, 0, nextPosition = highestSent + 1L)
-      assert(handler.supersededSessionCount === supersededBefore + 1L,
-        "A known consumer reconnecting on a new channel must supersede its previous session")
-      assert(handler.subscriberCount(0) === 1,
-        "One consumer identity may hold exactly one subscription to a partition, but " +
+      assert(handler.sessionCount === sessionsBeforeReturn + 1,
+        "A consumer reconnecting on a new channel must be admitted as a session of its own")
+      assert(handler.subscriberCount(0) === subscribersBeforeReturn + 1,
+        s"and must hold a subscription to the partition it resumed, but " +
           s"${handler.subscriberCount(0)} are claimed")
       assert(handler.claimedSessionSlots === handler.sessionCount,
-        "A superseded session must return its slot")
+        "Every live session must hold exactly one slot, and no more")
       returning.close()
+      assert(handler.subscriberCount(0) === subscribersBeforeReturn,
+        "and must return that subscription when its channel goes")
       honest.close()
     }
   }

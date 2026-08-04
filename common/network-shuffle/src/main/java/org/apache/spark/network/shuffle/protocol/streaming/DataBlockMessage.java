@@ -166,8 +166,9 @@ public final class DataBlockMessage extends StreamingShuffleMessage {
   /**
    * Bytes a data block occupies on the wire over and above its payload.
    *
-   * Thirty-eight bytes: the one-byte framing prefix, the twenty-five-byte header, the eight-byte
-   * CRC32C and the four-byte payload length prefix. This constant exists because payload bytes and
+   * Thirty-eight bytes: the one-byte framing prefix, the seventeen-byte header, the eight-byte
+   * producer id, the eight-byte CRC32C and the four-byte payload length prefix. This constant
+   * exists because payload bytes and
    * framed bytes are two different resources and confusing them is a real defect: a producer that
    * budgets
    * {@link #MAX_BLOCK_SIZE_BYTES} for a block it then puts on the network as
@@ -178,7 +179,8 @@ public final class DataBlockMessage extends StreamingShuffleMessage {
    */
   public static final int FRAMING_OVERHEAD_BYTES =
     StreamingShuffleMessage.FRAME_TYPE_PREFIX_LENGTH +
-      StreamingShuffleMessage.HEADER_ENCODED_LENGTH + CHECKSUM_ENCODED_LENGTH +
+      StreamingShuffleMessage.HEADER_ENCODED_LENGTH +
+      StreamingShuffleMessage.PRODUCER_ID_ENCODED_LENGTH + CHECKSUM_ENCODED_LENGTH +
       PAYLOAD_LENGTH_PREFIX_LENGTH;
 
   /**
@@ -319,11 +321,12 @@ public final class DataBlockMessage extends StreamingShuffleMessage {
   }
 
   /**
-   * Creates a data block from a header just read off the wire. Passing the header as a single value
-   * rather than as five positional arguments removes any chance of transposing {@code shuffleId}
-   * and {@code partitionId} on the way in.
+   * Creates a data block from a header just read off the wire, together with the producer id that
+   * opened the body. Passing the header as a single value rather than as four positional arguments
+   * removes any chance of transposing {@code shuffleId} and {@code partitionId} on the way in.
    *
    * @param header the decoded header; must not be null
+   * @param mapId identifier of the map task whose output this block belongs to
    * @param checksum the CRC32C value the producer computed for the block
    * @param payload the block's bytes; must not be null and must not exceed
    *                {@link #MAX_BLOCK_SIZE_BYTES}. The array is copied, so the caller may continue
@@ -331,11 +334,11 @@ public final class DataBlockMessage extends StreamingShuffleMessage {
    * @throws NullPointerException if header or payload is null
    * @throws IllegalArgumentException if payload is longer than {@link #MAX_BLOCK_SIZE_BYTES}
    */
-  public DataBlockMessage(Header header, long checksum, byte[] payload) {
+  public DataBlockMessage(Header header, long mapId, long checksum, byte[] payload) {
     // The base constructor rejects a null header, so the cap check below is the only guard this
     // constructor has to add of its own.
     this(Objects.requireNonNull(header, "header").protocolVersion(), header.shuffleId(),
-      header.mapId(), header.partitionId(), header.sequenceNumber(), checksum, payload, false);
+      mapId, header.partitionId(), header.sequenceNumber(), checksum, payload, false);
   }
 
   /**
@@ -541,18 +544,20 @@ public final class DataBlockMessage extends StreamingShuffleMessage {
 
   @Override
   public int encodedLength() {
-    // 25 (header) + 8 (checksum) + 4 (length prefix) + payload.length == 37 + payload.length.
-    // The one-byte type discriminator is not counted here: the encoder writes it outside this
-    // length, which is why FRAMING_OVERHEAD_BYTES is 38 rather than 37.
-    return HEADER_ENCODED_LENGTH + CHECKSUM_ENCODED_LENGTH +
+    // 17 (header) + 8 (producer id) + 8 (checksum) + 4 (length prefix) + payload.length, that is
+    // 37 + payload.length. The one-byte type discriminator is not counted here: the encoder writes
+    // it outside this length, which is why FRAMING_OVERHEAD_BYTES is 38 rather than 37.
+    return HEADER_ENCODED_LENGTH + PRODUCER_ID_ENCODED_LENGTH + CHECKSUM_ENCODED_LENGTH +
         Encoders.ByteArrays.encodedLength(payload);
   }
 
   @Override
   public void encode(ByteBuf buf) {
     // The header always goes first, and in the order the base class owns, so that it cannot drift
-    // apart from the read in decode below.
+    // apart from the read in decode below; the producer id follows it, as it does in every message
+    // of this family, so that a router finds it at one offset whatever the type.
     encodeHeader(buf);
+    encodeProducerId(buf);
     buf.writeLong(checksum);
     Encoders.ByteArrays.encode(buf, payload);
   }
@@ -583,20 +588,23 @@ public final class DataBlockMessage extends StreamingShuffleMessage {
     // readHeader rejects a null buffer, a header too short to be read, an unsupported protocol
     // version and a negative identifier.
     Header header = readHeader(buf);
-    // At least the checksum and the payload's length prefix must be present. Requiring both up
-    // front means the checksum is only read once there is a well-formed body behind it.
-    int minimumBody = CHECKSUM_ENCODED_LENGTH + PAYLOAD_LENGTH_PREFIX_LENGTH;
+    // At least the producer id, the checksum and the payload's length prefix must be present.
+    // Requiring all three up front means the checksum is only read once there is a well-formed body
+    // behind it.
+    int minimumBody =
+      PRODUCER_ID_ENCODED_LENGTH + CHECKSUM_ENCODED_LENGTH + PAYLOAD_LENGTH_PREFIX_LENGTH;
     if (buf.readableBytes() < minimumBody) {
       throw new IllegalArgumentException("Truncated streaming shuffle data block: expected at " +
         "least " + minimumBody + " body byte(s) but only " + buf.readableBytes() + " remain");
     }
+    long mapId = readProducerId(buf);
     long checksum = buf.readLong();
     checkPayloadLengthPrefix(buf);
     byte[] payload = Encoders.ByteArrays.decode(buf);
     // The array was allocated by the decoder a line ago and is reachable from nowhere else, so
     // handing ownership to the block is safe and saves copying up to two mebibytes per block on the
     // receive path.
-    return withOwnedPayload(header.protocolVersion(), header.shuffleId(), header.mapId(),
+    return withOwnedPayload(header.protocolVersion(), header.shuffleId(), mapId,
       header.partitionId(), header.sequenceNumber(), checksum, payload);
   }
 

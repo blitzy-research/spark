@@ -935,16 +935,17 @@ object StreamingShuffleTestHelper {
   /**
    * Bytes occupied by the header every streaming message carries.
    *
-   * The normative field order is protocol version (1), shuffle id (4), map id (8), partition id (4)
-   * and sequence number (8), so the header is 1 + 4 + 8 + 4 + 8 = 25 bytes.
-   *
-   * The map id is a header field, and not merely descriptive. A producer executor serves many map
-   * outputs at once and a consumer channel carries frames for whichever of them that reduce task is
-   * reading, so the producer-side registry demultiplexes an inbound frame by peeking the shuffle id
-   * and the map id out of the header before the frame is decoded. It is also what tells a
-   * speculative copy or a retry of the same map task apart from the attempt it supersedes.
+   * The header is protocol version, shuffle id, partition id and sequence number, which is one plus
+   * four plus four plus eight bytes. Producer identity is not a header field: it is the first field
+   * of every message body, so it sits at a fixed frame offset immediately after the header and can
+   * be peeked without decoding. That distinction matters because a speculative copy or a retry of
+   * the same map task is a separate flow which must still be told apart from the attempt it
+   * supersedes.
    */
-  val HeaderEncodedLength: Int = 25
+  val HeaderEncodedLength: Int = 17
+
+  /** Bytes the producer identifier occupies as the first field of every message body. */
+  val ProducerIdEncodedLength: Int = 8
 
   /** Bytes the framing layer prepends to carry the message-type discriminator. */
   val FrameTypePrefixLength: Int = 1
@@ -954,44 +955,36 @@ object StreamingShuffleTestHelper {
 
   /**
    * Bytes a data block spends on framing over and above its payload: the type discriminator (1),
-   * the shared header (25), the CRC32C checksum (8) and the payload length prefix (4).
+   * the shared header (17), the producer id that opens every body (8), the CRC32C checksum (8) and
+   * the payload length prefix (4).
    */
-  val DataBlockFramingOverheadBytes: Int = 1 + 25 + 8 + 4
+  val DataBlockFramingOverheadBytes: Int = 1 + 17 + 8 + 8 + 4
 
   /** Largest framed data block, that is a maximum payload plus header, checksum and framing. */
   val MaxEncodedFrameBytes: Int = 2 * 1024 * 1024 + 38
 
   /**
-   * Encoded length of the three fixed-size messages: acknowledgement, retransmission request and
-   * stream termination. Each adds one eight-byte field to the 25-byte header and nothing else.
+   * Encoded length of every control message: acknowledgement, heartbeat, retransmission request and
+   * stream termination. Each is the shared header followed by the producer identifier and nothing
+   * else, because each folds its one semantic value into the header's sequence number.
    *
    * All four are the same size, which is precisely why a decoder must never discriminate on length.
    * The framing type byte is the discriminator; [[messageTypeOf]] reads the concrete class instead,
    * which is the same decision expressed in Scala.
    */
-  val FixedMessageEncodedLength: Int = 25 + 8
+  val FixedMessageEncodedLength: Int = 25
 
-  /**
-   * Bytes a heartbeat's body occupies before its consumer identity: an eight-byte timestamp and a
-   * four-byte length prefix, so 12.
-   *
-   * The identity is on the wire rather than derived from the channel because a consumer that
-   * reconnects arrives on a new channel and must be recognised as the same consumer, which is what
-   * lets the producer resume its unacknowledged window instead of forcing a recomputation.
-   */
-  val HeartbeatFixedBodyLength: Int = 8 + 4
-
-  /** Encoded length of a heartbeat that names no consumer: the header plus the fixed body. */
-  val HeartbeatBaseEncodedLength: Int = 25 + 12
-
-  /** Longest consumer identifier a heartbeat may carry, in encoded bytes. */
-  val MaxConsumerIdEncodedBytes: Int = 256
+  /** Encoded length of a heartbeat, which is a control message like any other. */
+  val HeartbeatBaseEncodedLength: Int = FixedMessageEncodedLength
 
   /** Sentinel a consumer sends before it has consumed anything. */
   val NothingConsumedPosition: Long = -1L
 
-  /** Largest window a single retransmission request may span, in blocks. */
-  val MaxRequestedBlocks: Long = 4096L
+  /** Blocks a single retransmission request names, which is exactly one position. */
+  val RequestedBlocksPerRequest: Long = 1L
+
+  /** Largest span a consumer will ask a producer to replay, in blocks. */
+  val MaxReplayWindowBlocks: Long = StreamingShuffleClientHandler.MAX_REPLAY_WINDOW_BLOCKS
 
   /** Checksum algorithm every streaming block is stamped with. */
   val ChecksumAlgorithm: String = "CRC32C"
@@ -1024,27 +1017,27 @@ object StreamingShuffleTestHelper {
     check("data block framing overhead", DataBlockFramingOverheadBytes,
       DataBlockMessage.FRAMING_OVERHEAD_BYTES)
     check("max encoded frame", MaxEncodedFrameBytes, DataBlockMessage.MAX_ENCODED_FRAME_BYTES)
-    check("max consumer id bytes", MaxConsumerIdEncodedBytes,
-      HeartbeatMessage.MAX_CONSUMER_ID_ENCODED_BYTES)
+    check("producer id encoded length", ProducerIdEncodedLength,
+      StreamingShuffleMessage.PRODUCER_ID_ENCODED_LENGTH)
+    check("control message encoded length", FixedMessageEncodedLength,
+      StreamingShuffleMessage.CONTROL_MESSAGE_ENCODED_LENGTH)
     check("nothing consumed sentinel", NothingConsumedPosition, AckMessage.NOTHING_CONSUMED)
-    check("max requested blocks", MaxRequestedBlocks, RetransmitRequestMessage.MAX_REQUESTED_BLOCKS)
+    check("requested blocks per request", RequestedBlocksPerRequest,
+      RetransmitRequestMessage.REQUESTED_BLOCKS)
     check("checksum algorithm", ChecksumAlgorithm, StreamingShuffleChecksum.ALGORITHM)
     // Totals, taken from real messages so that a body change is caught as well as a header change.
     val payload = Array[Byte](1, 2, 3, 4)
     val payloadChecksum = StreamingShuffleChecksum.computeBlock(1, 2L, 3, 4L, payload)
     check("acknowledgement encoded length", FixedMessageEncodedLength,
-      new AckMessage(1, 2L, 3, 4L, 5L).encodedLength())
+      new AckMessage(1, 2L, 3, 5L).encodedLength())
     check("retransmission request encoded length", FixedMessageEncodedLength,
-      new RetransmitRequestMessage(1, 2L, 3, 4L, 5L).encodedLength())
-    // A terminator has to sit at exactly the position following the blocks it announces, so its two
-    // sequence values are the same number rather than two arbitrary ones.
+      new RetransmitRequestMessage(1, 2L, 3, 4L).encodedLength())
     check("stream termination encoded length", FixedMessageEncodedLength,
-      new StreamTerminationMessage(1, 2L, 3, 4L, 4L).encodedLength())
-    check("heartbeat encoded length naming no consumer", HeartbeatBaseEncodedLength,
-      new HeartbeatMessage(1, 2L, 3, 4L, 5L).encodedLength())
-    check("heartbeat encoded length naming a consumer", HeartbeatBaseEncodedLength + 6,
-      new HeartbeatMessage(1, 2L, 3, 4L, 5L, "abcdef").encodedLength())
-    check("data block encoded length", HeaderEncodedLength + 8 + 4 + payload.length,
+      new StreamTerminationMessage(1, 2L, 3, 4L).encodedLength())
+    check("heartbeat encoded length", HeartbeatBaseEncodedLength,
+      new HeartbeatMessage(1, 2L, 3, 4L).encodedLength())
+    check("data block encoded length",
+      HeaderEncodedLength + ProducerIdEncodedLength + 8 + 4 + payload.length,
       new DataBlockMessage(1, 2L, 3, 4L, payloadChecksum, payload).encodedLength())
     // Reported through an assertion rather than a thrown Error, which is both what the project's
     // style gate requires of test code and the right shape here: the caller is a test, and the
@@ -1260,19 +1253,6 @@ object StreamingShuffleTestHelper {
   def dataBlockEncodedLength(payloadLength: Int): Int = {
     require(payloadLength >= 0, s"payloadLength must be non-negative but was $payloadLength")
     DataBlockFramingOverheadBytes - FrameTypePrefixLength + payloadLength
-  }
-
-  /**
-   * Encoded length of a heartbeat naming a consumer whose identity occupies the given bytes.
-   *
-   * @param consumerIdByteLength encoded bytes of the consumer identity, zero when none is named
-   * @return bytes the heartbeat encodes to
-   */
-  def heartbeatEncodedLength(consumerIdByteLength: Int): Int = {
-    require(consumerIdByteLength >= 0 && consumerIdByteLength <= MaxConsumerIdEncodedBytes,
-      s"consumerIdByteLength must be in [0, $MaxConsumerIdEncodedBytes] " +
-        s"but was $consumerIdByteLength")
-    HeartbeatBaseEncodedLength + consumerIdByteLength
   }
 
   /**
@@ -1630,6 +1610,7 @@ trait StreamingShuffleTestHelper {
       }
       .groupByKey(numPartitions)
   }
+
   /**
    * A dataset of approximately [[TargetDatasetBytes]] spread evenly over `numPartitions`.
    *
@@ -2059,10 +2040,13 @@ trait StreamingShuffleTestHelper {
   /**
    * An acknowledgement reporting how far a consumer has got.
    *
+   * A control message carries no sequence number of its own: the position it reports IS its header
+   * sequence number, encoded as the next position the consumer expects. Suites therefore state only
+   * the consumed position, which is the one fact an acknowledgement asserts.
+   *
    * @param shuffleId shuffle being acknowledged
    * @param mapId producing map task
    * @param partitionId partition being acknowledged
-   * @param sequenceNumber sequence the acknowledgement is stamped with
    * @param consumerPosition highest sequence the consumer has consumed, or the nothing-consumed
    *                         sentinel before it has consumed anything
    * @return the acknowledgement
@@ -2071,62 +2055,61 @@ trait StreamingShuffleTestHelper {
       shuffleId: Int,
       mapId: Long,
       partitionId: Int,
-      sequenceNumber: Long,
       consumerPosition: Long): AckMessage =
-    new AckMessage(shuffleId, mapId, partitionId, sequenceNumber, consumerPosition)
+    new AckMessage(shuffleId, mapId, partitionId, consumerPosition)
 
   /**
-   * A liveness signal stamped with a caller-supplied instant.
+   * A liveness signal reporting the position the consumer has reached.
+   *
+   * A heartbeat is a control message of exactly the size of every other, so it carries neither an
+   * arrival timestamp nor a consumer identity on the wire. The receiver stamps arrival from its own
+   * clock -- a peer-supplied instant would be a peer-controlled input to a local timeout -- and
+   * identifies the sender from the connection it arrived on.
    *
    * @param shuffleId shuffle the stream belongs to
    * @param mapId producing map task
    * @param partitionId partition the stream belongs to
-   * @param sequenceNumber sequence the heartbeat is stamped with
-   * @param timestampMillis instant to stamp, normally read from an injected clock
+   * @param consumerPosition highest sequence the consumer has consumed, or the nothing-consumed
+   *                         sentinel before it has consumed anything
    * @return the heartbeat
    */
   def heartbeat(
       shuffleId: Int,
       mapId: Long,
       partitionId: Int,
-      sequenceNumber: Long,
-      timestampMillis: Long): HeartbeatMessage =
-    new HeartbeatMessage(shuffleId, mapId, partitionId, sequenceNumber, timestampMillis)
+      consumerPosition: Long): HeartbeatMessage =
+    new HeartbeatMessage(shuffleId, mapId, partitionId, consumerPosition)
 
   /**
-   * A request to replay an inclusive window of blocks.
+   * A request to replay one block.
+   *
+   * A request names exactly one position, so a consumer that has lost a run of blocks emits one
+   * request per position. That keeps every control message the same fixed size, and it keeps the
+   * producer's obligation per message unambiguous: replay this block or refuse it.
    *
    * @param shuffleId shuffle the stream belongs to
    * @param mapId producing map task
    * @param partitionId partition the stream belongs to
-   * @param firstSequenceNumber lower bound of the window, inclusive
-   * @param lastSequenceNumber upper bound of the window, inclusive
+   * @param sequenceNumber position of the block to replay
    * @return the request
    */
   def retransmitRequest(
       shuffleId: Int,
       mapId: Long,
       partitionId: Int,
-      firstSequenceNumber: Long,
-      lastSequenceNumber: Long): RetransmitRequestMessage =
-    new RetransmitRequestMessage(
-      shuffleId, mapId, partitionId, firstSequenceNumber, lastSequenceNumber)
+      sequenceNumber: Long): RetransmitRequestMessage =
+    new RetransmitRequestMessage(shuffleId, mapId, partitionId, sequenceNumber)
 
   /**
    * An orderly end-of-stream signal, placed at the only position the protocol permits.
    *
-   * The encoder enforces an invariant that is easy to violate by accident and worth stating here
-   * because every suite that builds a terminator has to satisfy it: a terminator's sequence number
-   * must EQUAL the number of blocks it announces. Only data blocks consume sequence numbers, and
-   * they are numbered densely from zero, so the position a terminator sits at is exactly the count
-   * that preceded it. The encoder rejects both directions of mismatch, and for asymmetric reasons:
-   * an inflated total makes a finished stream look permanently incomplete, while an undercount is
-   * worse because it is silent -- a consumer reconciles the two figures, concludes the stream
-   * completed, and hands a truncated result onward with every checksum intact.
-   *
-   * This factory therefore takes only the count and derives the position from it, so a suite cannot
-   * get the pair wrong. A suite that wants to prove the encoder REJECTS a mismatched pair should
-   * construct the message directly, which is the only way to present one.
+   * A terminator's position and the count it announces are one and the same field. Only data blocks
+   * consume sequence numbers, and they are numbered densely from zero, so the position a terminator
+   * sits at is exactly the count that preceded it. Carrying the pair as a single field makes the
+   * mismatch this invariant used to guard against unrepresentable rather than merely rejected --
+   * which matters, because an undercount was the silent direction: a consumer reconciles the two
+   * figures, concludes the stream completed, and hands a truncated result onward with every
+   * checksum intact.
    *
    * A total of zero is valid and means the partition was empty, which is a case a reader handles
    * rather than treats as an error.
@@ -2143,7 +2126,7 @@ trait StreamingShuffleTestHelper {
       partitionId: Int,
       totalBlocks: Long): StreamTerminationMessage = {
     require(totalBlocks >= 0L, s"totalBlocks must be non-negative but was $totalBlocks")
-    new StreamTerminationMessage(shuffleId, mapId, partitionId, totalBlocks, totalBlocks)
+    new StreamTerminationMessage(shuffleId, mapId, partitionId, totalBlocks)
   }
 
   def blockChecksum(

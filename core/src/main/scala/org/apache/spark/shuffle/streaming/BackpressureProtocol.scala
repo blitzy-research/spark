@@ -1413,8 +1413,12 @@ private[spark] class BackpressureProtocol(
   }
 
   /**
-   * Records a heartbeat that arrived on the wire, keeping the sender's timestamp for diagnostics
-   * while judging liveness from the local instant of arrival.
+   * Records a heartbeat that arrived on the wire, judging liveness from the local instant of
+   * arrival.
+   *
+   * A heartbeat carries no time value of its own: two hosts do not agree on the wall clock, so
+   * the arrival instant is the only sound reading, and it is recorded as both the local and the
+   * observed one so that a diagnostic never reports a peer's clock as though it were this one's.
    *
    * @param heartbeat the heartbeat received; a null message records nothing
    */
@@ -1422,14 +1426,16 @@ private[spark] class BackpressureProtocol(
     if (heartbeat != null && addresses(key, heartbeat)) {
       val ledger = streams.get(key)
       if (ledger != null) {
-        ledger.recordHeartbeat(clock.getTimeMillis(), heartbeat.timestampMs())
+        val arrivedAtMillis = clock.getTimeMillis()
+        ledger.recordHeartbeat(arrivedAtMillis, arrivedAtMillis)
       }
     }
   }
 
   /**
-   * The timestamp the peer stamped into the most recent heartbeat of this stream, or `None` when no
-   * heartbeat carrying one has been received. Diagnostic only: no liveness decision reads it.
+   * The local instant at which the most recent heartbeat of this stream arrived, or `None` when
+   * none has. Diagnostic only: no liveness decision reads it, and it is this executor's own clock
+   * rather than the peer's, because a heartbeat carries no time value.
    */
   def remoteHeartbeatTimestamp(key: BackpressureStreamKey): Option[Long] = {
     val ledger = streams.get(key)
@@ -1485,16 +1491,11 @@ private[spark] class BackpressureProtocol(
     if (ledger == null) {
       None
     } else {
-      val nowMillis = clock.getTimeMillis()
-      ledger.recordHeartbeatSent(nowMillis)
-      val declaredIdentity = key.role match {
-        case BackpressureStreamRole.Consumer => key.consumerId
-        case _ => HeartbeatMessage.NO_CONSUMER_ID
-      }
-      // The clock is the caller's contract with the message type, and a wall clock adjusted
-      // backwards past the epoch would otherwise construct a heartbeat the type itself rejects.
+      ledger.recordHeartbeatSent(clock.getTimeMillis())
+      // The position is clamped because the message type refuses a negative sequence number, and a
+      // side that has not started announces zero rather than a sentinel.
       Some(new HeartbeatMessage(key.shuffleId, key.mapId, key.partitionId,
-        math.max(0L, nextPosition), math.max(0L, nowMillis), declaredIdentity))
+        math.max(0L, nextPosition)))
     }
   }
 
@@ -2875,9 +2876,9 @@ private[spark] object BackpressureProtocol {
      * refusal into a partial replay that reorders the consumer's partition. Counting what is
      * actually there needs no such invariant.
      *
-     * The cost is bounded by the protocol, not by the window: a retransmission request may span at
-     * most [[RetransmitRequestMessage.MAX_REQUESTED_BLOCKS]] blocks, so the walk is over at most
-     * that many entries and is paid once per request rather than once per block.
+     * The cost is bounded by the protocol, not by the window: a retransmission request names a
+     * single block, so the walk is over one entry per request rather than over a range a peer
+     * chose.
      *
      * @param first inclusive lower bound
      * @param last inclusive upper bound; a value below `first` yields zero

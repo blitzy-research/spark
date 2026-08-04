@@ -106,9 +106,14 @@ public class StreamingShuffleMessageSuite {
 
   @Test
   public void testAckMessageEncodeDecode() {
-    AckMessage message = new AckMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, 40L);
+    AckMessage message = new AckMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, 40L);
     int len = message.encodedLength();
-    assertEquals(33, len);
+    // The specified fixed size of a control message: seventeen header bytes and eight of producer
+    // id. The literal is the contract; it is deliberately not derived from the implementation.
+    assertEquals(CONTROL_MESSAGE_BYTES, len);
+    assertEquals(25, len);
+    // The position acknowledged travels as the next position expected, one above it.
+    assertEquals(41L, message.sequenceNumber());
     ByteBuf buf = Unpooled.buffer(len);
     message.encode(buf);
     assertEquals(0, buf.writableBytes());
@@ -116,231 +121,102 @@ public class StreamingShuffleMessageSuite {
     AckMessage decoded = AckMessage.decode(buf);
     assertEquals(message, decoded);
     assertEquals(40L, decoded.consumerPosition());
-    assertEquals(40L, decoded.consumerPosition);
+    assertEquals(MAP_ID, decoded.mapId());
   }
 
   @Test
   public void testHeartbeatMessageEncodeDecode() {
     HeartbeatMessage message =
-        new HeartbeatMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, TIMESTAMP_MS);
+        new HeartbeatMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER);
     int len = message.encodedLength();
-    // Twenty-five header, eight timestamp, four identity length, and no identity bytes.
-    assertEquals(37, len);
+    // Seventeen header bytes and eight of producer id: one fixed size, with no variable-length
+    // field anywhere in the streaming control protocol for a peer to choose.
+    assertEquals(CONTROL_MESSAGE_BYTES, len);
+    assertEquals(25, len);
     ByteBuf buf = Unpooled.buffer(len);
     message.encode(buf);
     assertEquals(0, buf.writableBytes());
 
     HeartbeatMessage decoded = HeartbeatMessage.decode(buf);
     assertEquals(message, decoded);
-    assertEquals(TIMESTAMP_MS, decoded.timestampMs());
-    assertEquals(TIMESTAMP_MS, decoded.timestampMs);
-    assertEquals(HeartbeatMessage.NO_CONSUMER_ID, decoded.consumerId());
-    assertFalse(decoded.declaresConsumerId());
+    assertEquals(SEQUENCE_NUMBER, decoded.sequenceNumber());
+    assertEquals(MAP_ID, decoded.mapId());
   }
 
   @Test
-  public void testHeartbeatCarriesAStableConsumerIdentity() {
-    // The identity is what a producer keys its per-consumer cursor by, so it has to survive the
-    // wire exactly: a reconnection that announced a different identity would be served as a
-    // consumer that had never been seen.
-    String identity = "attempt-4096-partitions-7-11";
-    HeartbeatMessage message = new HeartbeatMessage(
-        SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, TIMESTAMP_MS, identity);
-    assertEquals(37 + identity.length(), message.encodedLength());
-    assertTrue(message.declaresConsumerId());
-
-    HeartbeatMessage decoded = (HeartbeatMessage) roundTrip(message);
-    assertEquals(message, decoded);
-    assertEquals(identity, decoded.consumerId());
-    assertEquals(identity, decoded.consumerId);
-    assertTrue(decoded.toString().contains(identity), decoded.toString());
-
-    // A multi-byte identity is measured in encoded bytes rather than in characters.
-    String wide = "consumer-\u00e9\u00e9"; // Two U+00E9, each two bytes once encoded.
-    HeartbeatMessage widened = new HeartbeatMessage(
-        SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, TIMESTAMP_MS, wide);
-    assertEquals(37 + wide.length() + 2, widened.encodedLength());
-    assertEquals(wide, ((HeartbeatMessage) roundTrip(widened)).consumerId());
-
-    // Identity takes part in equality, so two consumers of one stream are never one consumer.
-    assertNotEquals(message, new HeartbeatMessage(
-        SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, TIMESTAMP_MS, "attempt-4097"));
-    assertNotEquals(message, heartbeat());
-  }
-
-  @Test
-  public void testHeartbeatConsumerIdentityIsBounded() {
-    // The ceiling applies to a message built in memory as well as to one read off the wire, so no
-    // sender can construct a heartbeat a receiver would be obliged to refuse.
-    assertEquals(256, HeartbeatMessage.MAX_CONSUMER_ID_ENCODED_BYTES);
-    String longest = "x".repeat(HeartbeatMessage.MAX_CONSUMER_ID_ENCODED_BYTES);
-    assertDoesNotThrow(() -> new HeartbeatMessage(
-        SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, TIMESTAMP_MS, longest));
-    assertThrows(IllegalArgumentException.class, () -> new HeartbeatMessage(
-        SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, TIMESTAMP_MS, longest + "x"));
-    assertThrows(NullPointerException.class, () -> new HeartbeatMessage(
-        SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, TIMESTAMP_MS, null));
-    assertThrows(NullPointerException.class,
-        () -> new HeartbeatMessage(header(), TIMESTAMP_MS, null));
-  }
-
-  @Test
-  public void testHeartbeatConsumerIdentityRejectsRecordSeparators() {
-    // A consumer identity is chosen by a remote peer and written into the producer executor's log
-    // records, which are line-oriented artefacts read by operators and parsed by log pipelines. An
-    // identity carrying a record separator therefore ends a record early and starts one whose whole
-    // content the peer chose, which is how a peer forges log entries naming anything it likes. The
-    // length bound does not address that at all, so the character domain is bounded as well.
-    String[] hostile = {
-        "consumer\r\ninjected FATAL forged log record",  // CRLF, the canonical injection
-        "consumer\rcarriage-return-only",
-        "consumer\nline-feed-only",
-        "consumer\tindented",                            // tab, a field separator in many formats
-        "consumer\u0000truncating-nul",
-        "consumer\bbackspace",
-        "consumer\u001bescape-sequence",                 // rewrites what a terminal displays
-        "consumer\u001funit-separator",                  // top of the C0 block
-        "consumer\u007fdelete",
-        "consumer\u0085next-line",                       // C1 NEL, a line break to many readers
-        "consumer\u009fc1-top",
-        "consumer\u2028unicode-line-separator",
-        "consumer\u2029unicode-paragraph-separator",
-    };
-    for (String identity : hostile) {
-      // Refused in memory, so no sender can build one.
-      IllegalArgumentException constructed = assertThrows(IllegalArgumentException.class,
-          () -> new HeartbeatMessage(
-              SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, TIMESTAMP_MS, identity),
-          "A heartbeat must refuse the consumer identity " + describe(identity));
-      assertTrue(constructed.getMessage().contains("forbidden character"),
-          constructed.getMessage());
-      // The diagnostic must not echo the character it is refusing: this message becomes a log
-      // record of its own, so echoing would reproduce the very injection being refused.
-      assertFalse(constructed.getMessage().contains(identity), constructed.getMessage());
-
-      // And refused off the wire, which is the path that actually matters: a hostile peer does not
-      // use our constructors. The bytes are written by hand for exactly that reason.
-      byte[] encoded = identity.getBytes(StandardCharsets.UTF_8);
-      ByteBuf raw = Unpooled.buffer();
-      writeHeader(raw, SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER);
-      raw.writeLong(TIMESTAMP_MS);
-      raw.writeInt(encoded.length);
-      raw.writeBytes(encoded);
-      assertThrows(IllegalArgumentException.class, () -> HeartbeatMessage.decode(raw),
-          "A heartbeat decoded from the wire must refuse the consumer identity " +
-              describe(identity));
+  public void testEveryControlMessageIsFixedAtTheSpecifiedSize() {
+    // The four control messages have one size between them, and it is the specified one. Asserted
+    // against literals rather than against the production constants, so that a change to the wire
+    // layout has to be a deliberate change to this contract as well.
+    for (StreamingShuffleMessage message : fixedSizeMessages()) {
+      assertEquals(25, message.encodedLength(), message.getClass().getSimpleName());
+      assertEquals(26, message.toByteBuffer().remaining(), message.getClass().getSimpleName());
     }
-
-    // The bound is a character-domain bound and not an alphabet: every character a legitimate Spark
-    // identity is composed of stays acceptable, including the multi-byte ones and the punctuation
-    // an executor id and a socket address are joined by.
-    for (String legitimate : new String[] {
-        HeartbeatMessage.NO_CONSUMER_ID,
-        "app-20260803120000-0007/3@10.0.0.17:7337",
-        "executor-1@[2001:db8::1]:7337",
-        "consumer-\u00e9\u00e9",             // two e-acutes, a two-byte UTF-8 character
-        "consumer \u00a0with-nbsp",
-        " leading-and-trailing ",
-    }) {
-      assertDoesNotThrow(() -> new HeartbeatMessage(
-          SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, TIMESTAMP_MS, legitimate),
-          "A heartbeat must accept the legitimate consumer identity " + describe(legitimate));
-      HeartbeatMessage decoded = (HeartbeatMessage) roundTrip(new HeartbeatMessage(
-          SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, TIMESTAMP_MS, legitimate));
-      assertEquals(legitimate, decoded.consumerId());
-    }
-  }
-
-  /**
-   * Renders an identity so that a failed assertion names it without pasting its control characters
-   * into the build log -- which would be the same injection the assertion exists to prevent.
-   *
-   * @param identity the identity to describe
-   * @return the identity with every character outside the printable ASCII range escaped
-   */
-  private static String describe(String identity) {
-    StringBuilder described = new StringBuilder(identity.length() + 8).append('"');
-    for (int index = 0; index < identity.length(); index++) {
-      char candidate = identity.charAt(index);
-      if (candidate >= 0x20 && candidate < 0x7f) {
-        described.append(candidate);
-      } else {
-        described.append(String.format("\\u%04X", (int) candidate));
-      }
-    }
-    return described.append('"').toString();
-  }
-
-  @Test
-  public void testHeartbeatConsumerIdentityLengthIsBoundedOnDecode() {
-    // A length prefix is the classic unbounded-allocation lever, so it is refused before it is
-    // used to allocate: negative, beyond the ceiling, and beyond the bytes the frame carries.
-    for (int declared : new int[] {-1, Integer.MIN_VALUE,
-        HeartbeatMessage.MAX_CONSUMER_ID_ENCODED_BYTES + 1, Integer.MAX_VALUE}) {
-      ByteBuf buf = Unpooled.buffer();
-      writeHeader(buf, SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER);
-      buf.writeLong(TIMESTAMP_MS);
-      buf.writeInt(declared);
-      assertThrows(IllegalArgumentException.class, () -> HeartbeatMessage.decode(buf));
-    }
-    // A length inside the ceiling but beyond the frame is a truncation, not an allocation.
-    ByteBuf truncated = Unpooled.buffer();
-    writeHeader(truncated, SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER);
-    truncated.writeLong(TIMESTAMP_MS);
-    truncated.writeInt(16);
-    truncated.writeBytes(new byte[8]);
-    assertThrows(IllegalArgumentException.class, () -> HeartbeatMessage.decode(truncated));
-
-    // And a surplus is refused, so a peer cannot append bytes that survive the message boundary.
-    ByteBuf surplus = Unpooled.buffer();
-    writeHeader(surplus, SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER);
-    surplus.writeLong(TIMESTAMP_MS);
-    surplus.writeInt(0);
-    surplus.writeByte(1);
-    assertThrows(IllegalArgumentException.class, () -> HeartbeatMessage.decode(surplus));
+    // And a data block is the header, the producer id, the checksum, the length prefix and the
+    // payload -- thirty-seven bytes before a single payload byte.
+    assertEquals(37, dataBlock(0).encodedLength());
+    assertEquals(37 + 1024, dataBlock(1024).encodedLength());
   }
 
   @Test
   public void testRetransmitRequestMessageEncodeDecode() {
     RetransmitRequestMessage message =
-        new RetransmitRequestMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, 44L);
+        new RetransmitRequestMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER);
     int len = message.encodedLength();
-    assertEquals(33, len);
+    assertEquals(CONTROL_MESSAGE_BYTES, len);
+    assertEquals(25, len);
     ByteBuf buf = Unpooled.buffer(len);
     message.encode(buf);
     assertEquals(0, buf.writableBytes());
 
     RetransmitRequestMessage decoded = RetransmitRequestMessage.decode(buf);
     assertEquals(message, decoded);
+    // A request names exactly one position, so both ends of the interval a producer services are
+    // the header's own sequence number and the count is one.
     assertEquals(SEQUENCE_NUMBER, decoded.firstSequenceNumber());
-    assertEquals(44L, decoded.lastSequenceNumber());
-    assertEquals(3L, decoded.blockCount());
-    assertTrue(decoded.contains(43L));
-    assertFalse(decoded.contains(45L));
+    assertEquals(SEQUENCE_NUMBER, decoded.lastSequenceNumber());
+    assertEquals(1L, decoded.blockCount());
+    assertEquals(1L, RetransmitRequestMessage.REQUESTED_BLOCKS);
+    assertTrue(decoded.contains(SEQUENCE_NUMBER));
+    assertFalse(decoded.contains(SEQUENCE_NUMBER - 1L));
+    assertFalse(decoded.contains(SEQUENCE_NUMBER + 1L));
+    assertEquals(MAP_ID, decoded.mapId());
   }
 
   @Test
   public void testStreamTerminationMessageEncodeDecode() {
     StreamTerminationMessage message =
-        new StreamTerminationMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, 40L, 40L);
+        new StreamTerminationMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, 40L);
     int len = message.encodedLength();
-    assertEquals(33, len);
+    assertEquals(CONTROL_MESSAGE_BYTES, len);
+    assertEquals(25, len);
     ByteBuf buf = Unpooled.buffer(len);
     message.encode(buf);
     assertEquals(0, buf.writableBytes());
 
     StreamTerminationMessage decoded = StreamTerminationMessage.decode(buf);
     assertEquals(message, decoded);
+    // The announced total is the position the terminator sits at, so the two cannot disagree.
     assertEquals(40L, decoded.totalBlocks());
-    assertEquals(40L, decoded.totalBlocks);
+    assertEquals(40L, decoded.sequenceNumber());
+    assertEquals(MAP_ID, decoded.mapId());
   }
 
   // Group 2: header integrity.
 
   @Test
   public void testHeaderLayoutConstants() {
-    assertEquals(25, StreamingShuffleMessage.HEADER_ENCODED_LENGTH);
-    assertEquals(1 + 4 + 8 + 4 + 8, StreamingShuffleMessage.HEADER_ENCODED_LENGTH);
+    // The specified header: one version byte, a four-byte shuffle id, a four-byte partition id and
+    // an eight-byte sequence number. Seventeen bytes, and nothing else in it.
+    assertEquals(HEADER_BYTES, StreamingShuffleMessage.HEADER_ENCODED_LENGTH);
+    assertEquals(17, StreamingShuffleMessage.HEADER_ENCODED_LENGTH);
+    assertEquals(1 + 4 + 4 + 8, StreamingShuffleMessage.HEADER_ENCODED_LENGTH);
+    // The producer id is the first body field of every message, and a control message is the header
+    // plus that field: twenty-five bytes, twenty-six once framed.
+    assertEquals(8, StreamingShuffleMessage.PRODUCER_ID_ENCODED_LENGTH);
+    assertEquals(CONTROL_MESSAGE_BYTES, StreamingShuffleMessage.CONTROL_MESSAGE_ENCODED_LENGTH);
+    assertEquals(25, StreamingShuffleMessage.CONTROL_MESSAGE_ENCODED_LENGTH);
+    assertEquals(1, StreamingShuffleMessage.FRAME_TYPE_PREFIX_LENGTH);
     assertEquals(1, StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION);
   }
 
@@ -351,8 +227,14 @@ public class StreamingShuffleMessageSuite {
           StreamingShuffleMessage.Decoder.fromByteBuffer(message.toByteBuffer());
       assertEquals(StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION, decoded.protocolVersion());
       assertEquals(SHUFFLE_ID, decoded.shuffleId());
+      assertEquals(MAP_ID, decoded.mapId());
       assertEquals(PARTITION_ID, decoded.partitionId());
-      assertEquals(SEQUENCE_NUMBER, decoded.sequenceNumber());
+      // Every type states a position, and each states its own: a block and a heartbeat the position
+      // they concern, an acknowledgement the next position expected, a request the position asked
+      // for, and a terminator the block total. The value is whatever the message was built with.
+      assertEquals(message.sequenceNumber(), decoded.sequenceNumber(),
+          message.getClass().getSimpleName());
+      assertTrue(decoded.sequenceNumber() >= 0L);
     }
   }
 
@@ -361,8 +243,8 @@ public class StreamingShuffleMessageSuite {
     // A message built with an explicit version must round-trip that version rather than silently
     // adopting this build's own, which is what allows a mismatch to be reported precisely.
     AckMessage message = new AckMessage(
-        StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION, SHUFFLE_ID, MAP_ID, PARTITION_ID,
-        SEQUENCE_NUMBER, 40L);
+        StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION, SHUFFLE_ID, MAP_ID,
+        PARTITION_ID, 40L);
     assertEquals(StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION, message.protocolVersion());
     StreamingShuffleMessage decoded =
         StreamingShuffleMessage.Decoder.fromByteBuffer(message.toByteBuffer());
@@ -409,7 +291,7 @@ public class StreamingShuffleMessageSuite {
     // The version sits at a fixed offset of one byte into every framed message, so it can be
     // rewritten in place to simulate a peer built against a different revision.
     byte[] framed = toByteArray(new AckMessage(
-        SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, 40L).toByteBuffer());
+        SHUFFLE_ID, MAP_ID, PARTITION_ID, 40L).toByteBuffer());
     framed[1] = UNSUPPORTED_VERSION;
     assertThrows(IllegalArgumentException.class,
         () -> StreamingShuffleMessage.Decoder.fromByteBuffer(ByteBuffer.wrap(framed)));
@@ -749,12 +631,9 @@ public class StreamingShuffleMessageSuite {
   @Test
   public void testInequalityWhenAnySingleFieldDiffers() {
     AckMessage base = ack(40L);
-    assertNotEquals(base, new AckMessage(SHUFFLE_ID + 1, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER,
-        40L));
-    assertNotEquals(base, new AckMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID + 1, SEQUENCE_NUMBER,
-        40L));
-    assertNotEquals(base, new AckMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER + 1,
-        40L));
+    assertNotEquals(base, new AckMessage(SHUFFLE_ID + 1, MAP_ID, PARTITION_ID, 40L));
+    assertNotEquals(base, new AckMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, 41L));
+    assertNotEquals(base, new AckMessage(SHUFFLE_ID, MAP_ID + 1, PARTITION_ID, 40L));
     assertNotEquals(base, ack(41L));
 
     DataBlockMessage block = dataBlock(64);
@@ -771,21 +650,18 @@ public class StreamingShuffleMessageSuite {
 
   @Test
   public void testTheFourControlMessagesAreNeverEqualToEachOther() {
-    // Three of the four encode to exactly 33 bytes and carry a single long body, so length can
-    // never tell them apart, and a heartbeat's own body opens with the same long. Given identical
-    // header and body values they must still be distinct, which is what confirms each equals
-    // implementation checks the concrete type.
+    // All four encode to exactly twenty-five bytes over identical header and producer-id values, so
+    // neither length nor content can tell them apart on the wire. Given that, they must still be
+    // distinct in memory, which is what confirms each equals implementation checks the concrete
+    // type before it compares a field.
     StreamingShuffleMessage[] identical = {
-        new AckMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, SEQUENCE_NUMBER),
-        new HeartbeatMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, SEQUENCE_NUMBER),
-        new RetransmitRequestMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER,
-            SEQUENCE_NUMBER),
-        new StreamTerminationMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER,
-            SEQUENCE_NUMBER),
+        new AckMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER - 1L),
+        new HeartbeatMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER),
+        new RetransmitRequestMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER),
+        new StreamTerminationMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER),
     };
     for (int i = 0; i < identical.length; i++) {
-      int expectedLength = identical[i] instanceof HeartbeatMessage ? 37 : 33;
-      assertEquals(expectedLength, identical[i].encodedLength());
+      assertEquals(25, identical[i].encodedLength());
       for (int j = i + 1; j < identical.length; j++) {
         assertNotEquals(identical[i], identical[j]);
         assertNotEquals(identical[j], identical[i]);
@@ -892,262 +768,254 @@ public class StreamingShuffleMessageSuite {
 
   @Test
   public void testNegativeHeaderIdentifiersAreRejectedOnConstruction() {
-    assertThrows(IllegalArgumentException.class, () -> new AckMessage(-1, MAP_ID, PARTITION_ID, 0L,
-        0L));
-    assertThrows(IllegalArgumentException.class, () -> new AckMessage(SHUFFLE_ID, MAP_ID, -1, 0L,
-        0L));
     assertThrows(IllegalArgumentException.class,
-        () -> new AckMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, -1L, 0L));
+        () -> new AckMessage(-1, MAP_ID, PARTITION_ID, 0L));
+    assertThrows(IllegalArgumentException.class, () -> new AckMessage(SHUFFLE_ID, MAP_ID, -1, 0L));
     assertThrows(IllegalArgumentException.class,
-        () -> new HeartbeatMessage(-1, MAP_ID, 0, 0L, TIMESTAMP_MS));
-    assertThrows(IllegalArgumentException.class, () -> new RetransmitRequestMessage(-1, MAP_ID, 0,
-        0L, 0L));
-    assertThrows(IllegalArgumentException.class, () -> new StreamTerminationMessage(-1, MAP_ID, 0,
-        0L, 0L));
+        () -> new HeartbeatMessage(-1, MAP_ID, 0, 0L));
+    assertThrows(IllegalArgumentException.class,
+        () -> new HeartbeatMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, -1L));
+    assertThrows(IllegalArgumentException.class,
+        () -> new RetransmitRequestMessage(-1, MAP_ID, 0, 0L));
+    assertThrows(IllegalArgumentException.class,
+        () -> new RetransmitRequestMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, -1L));
+    assertThrows(IllegalArgumentException.class,
+        () -> new StreamTerminationMessage(-1, MAP_ID, 0, 0L));
+    assertThrows(IllegalArgumentException.class,
+        () -> new StreamTerminationMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, -1L));
     assertThrows(IllegalArgumentException.class,
         () -> DataBlockMessage.withComputedChecksum(-1, MAP_ID, 0, 0L, payload(8)));
-    // A negative map id is rejected wherever a message can be built, exactly as a negative shuffle
-    // or partition id is.
+    // A negative producer id is rejected wherever a message can be built, exactly as a negative
+    // shuffle or partition id is, even though it now travels in the body rather than the header.
     assertThrows(IllegalArgumentException.class,
-        () -> new AckMessage(SHUFFLE_ID, -1L, PARTITION_ID, 0L, 0L));
+        () -> new AckMessage(SHUFFLE_ID, -1L, PARTITION_ID, 0L));
     assertThrows(IllegalArgumentException.class,
-        () -> new HeartbeatMessage(SHUFFLE_ID, -1L, PARTITION_ID, 0L, TIMESTAMP_MS));
+        () -> new HeartbeatMessage(SHUFFLE_ID, -1L, PARTITION_ID, 0L));
     assertThrows(IllegalArgumentException.class,
-        () -> new RetransmitRequestMessage(SHUFFLE_ID, -1L, PARTITION_ID, 0L, 0L));
+        () -> new RetransmitRequestMessage(SHUFFLE_ID, -1L, PARTITION_ID, 0L));
     assertThrows(IllegalArgumentException.class,
-        () -> new StreamTerminationMessage(SHUFFLE_ID, -1L, PARTITION_ID, 0L, 0L));
+        () -> new StreamTerminationMessage(SHUFFLE_ID, -1L, PARTITION_ID, 0L));
     assertThrows(IllegalArgumentException.class,
         () -> DataBlockMessage.withComputedChecksum(SHUFFLE_ID, -1L, PARTITION_ID, 0L, payload(8)));
     assertThrows(IllegalArgumentException.class, () -> new StreamingShuffleMessage.Header(
-        StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION, SHUFFLE_ID, -1L, PARTITION_ID, 0L));
-    // Zero is the smallest legal value for all three and must be accepted.
-    assertDoesNotThrow(() -> new AckMessage(0, MAP_ID, 0, 0L, AckMessage.NOTHING_CONSUMED));
+        StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION, -1, PARTITION_ID, 0L));
+    // Zero is the smallest legal value for all of them and must be accepted.
+    assertDoesNotThrow(() -> new AckMessage(0, 0L, 0, AckMessage.NOTHING_CONSUMED));
   }
 
-  // Body domains: acknowledgement position, retransmission window, termination count.
+  // Body domains: acknowledgement position, retransmission position, termination count.
 
   @Test
   public void testAcknowledgementPositionDomain() {
     assertEquals(-1L, AckMessage.NOTHING_CONSUMED);
-    // The one legal negative, and it must survive a round trip.
+    // The one legal negative, and it must survive a round trip. On the wire it is the next position
+    // expected -- zero -- so nothing negative is ever encoded.
     AckMessage nothingConsumed =
-        new AckMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER,
-            AckMessage.NOTHING_CONSUMED);
+        new AckMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, AckMessage.NOTHING_CONSUMED);
     assertEquals(AckMessage.NOTHING_CONSUMED, nothingConsumed.consumerPosition());
+    assertEquals(0L, nothingConsumed.sequenceNumber());
     assertEquals(nothingConsumed, roundTrip(nothingConsumed));
-    // Non-negative positions are always legal.
+    // Non-negative positions up to the expressible maximum are legal.
     assertDoesNotThrow(() -> ack(0L));
-    assertDoesNotThrow(() -> ack(Long.MAX_VALUE));
+    assertDoesNotThrow(() -> ack(AckMessage.MAX_CONSUMER_POSITION));
+    assertEquals(Long.MAX_VALUE - 1L, AckMessage.MAX_CONSUMER_POSITION);
+    assertEquals(Long.MAX_VALUE, ack(AckMessage.MAX_CONSUMER_POSITION).sequenceNumber());
     // Every other negative is refused, because it would flow into the producer's buffer
     // reclamation arithmetic where it is not a small number but a broken comparison.
     for (long invalid : new long[] {-2L, -100L, Long.MIN_VALUE}) {
       assertThrows(IllegalArgumentException.class, () -> ack(invalid));
     }
+    // And so is a position whose successor is not a position: the next expected value is what
+    // travels, so Long.MAX_VALUE cannot be acknowledged.
+    assertThrows(IllegalArgumentException.class, () -> ack(Long.MAX_VALUE));
   }
 
   @Test
   public void testAcknowledgementPositionDomainIsEnforcedOnDecode() {
-    for (long invalid : new long[] {-2L, Long.MIN_VALUE}) {
+    // The wire carries the next expected position in the header, so a negative one is refused by
+    // the header's own domain check -- on the single path every decoder takes.
+    for (long invalid : new long[] {-1L, -2L, Long.MIN_VALUE}) {
       ByteBuf buf = Unpooled.buffer();
-      writeHeader(buf, SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER);
+      buf.writeByte(StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION);
+      buf.writeInt(SHUFFLE_ID);
+      buf.writeInt(PARTITION_ID);
       buf.writeLong(invalid);
+      buf.writeLong(MAP_ID);
       assertThrows(IllegalArgumentException.class, () -> AckMessage.decode(buf));
     }
   }
 
   @Test
-  public void testHeartbeatTimestampDomain() {
-    assertDoesNotThrow(() -> heartbeat());
-    assertDoesNotThrow(() -> new HeartbeatMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID,
-        SEQUENCE_NUMBER, 0L));
-    // A negative timestamp is not clock skew; it makes the receiver's elapsed-time subtraction
-    // enormous, or at Long.MIN_VALUE makes it overflow and change sign.
-    for (long invalid : new long[] {-1L, Long.MIN_VALUE}) {
-      assertThrows(IllegalArgumentException.class,
-          () -> new HeartbeatMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, invalid));
-    }
-  }
-
-  @Test
-  public void testRetransmissionWindowBounds() {
-    // A single-block window, where the bounds are equal, is legal.
+  public void testRetransmissionRequestNamesExactlyOneBlock() {
+    // A request names one position, which is what makes it a fixed-size control message and what
+    // denies a peer the ability to name a range for a producer to walk.
     RetransmitRequestMessage single =
-        new RetransmitRequestMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, 5L, 5L);
+        new RetransmitRequestMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, 5L);
     assertEquals(1L, single.blockCount());
+    assertEquals(5L, single.firstSequenceNumber());
+    assertEquals(5L, single.lastSequenceNumber());
     assertTrue(single.contains(5L));
     assertFalse(single.contains(4L));
     assertFalse(single.contains(6L));
     assertEquals(single, roundTrip(single));
-
-    // An inverted window is refused.
-    assertThrows(IllegalArgumentException.class,
-        () -> new RetransmitRequestMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, 5L, 4L));
-
-    // The width is bounded, so a peer cannot ask a producer to walk 2^63 positions.
-    assertEquals(4096L, RetransmitRequestMessage.MAX_REQUESTED_BLOCKS);
-    RetransmitRequestMessage widest = new RetransmitRequestMessage(SHUFFLE_ID, MAP_ID,
-        PARTITION_ID, 0L,
-        RetransmitRequestMessage.MAX_REQUESTED_BLOCKS - 1);
-    assertEquals(RetransmitRequestMessage.MAX_REQUESTED_BLOCKS, widest.blockCount());
-    assertThrows(IllegalArgumentException.class, () -> new RetransmitRequestMessage(
-        SHUFFLE_ID, MAP_ID, PARTITION_ID, 0L, RetransmitRequestMessage.MAX_REQUESTED_BLOCKS));
-    assertThrows(IllegalArgumentException.class,
-        () -> new RetransmitRequestMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, 0L,
-            Long.MAX_VALUE - 1L));
-    // The one pair for which counting the window rather than measuring its span overflows: an
-    // upper bound at Long.MAX_VALUE against a lower bound of zero. A count would wrap to
-    // Long.MIN_VALUE and read as small; the span is exact.
-    assertThrows(IllegalArgumentException.class,
-        () -> new RetransmitRequestMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, 0L, Long.MAX_VALUE));
+    assertEquals(25, single.encodedLength());
+    // Position zero is legal, since block numbering starts there.
+    assertDoesNotThrow(() -> new RetransmitRequestMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, 0L));
+    // The extreme is legal too: there is no arithmetic on the position, so nothing can overflow.
+    assertDoesNotThrow(
+        () -> new RetransmitRequestMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, Long.MAX_VALUE));
   }
 
   @Test
-  public void testRetransmissionWindowBoundsAreEnforcedOnDecode() {
-    ByteBuf inverted = Unpooled.buffer();
-    writeHeader(inverted, SHUFFLE_ID, PARTITION_ID, 5L);
-    inverted.writeLong(4L);
+  public void testRetransmissionRequestDomainIsEnforcedOnDecode() {
+    ByteBuf negative = Unpooled.buffer();
+    negative.writeByte(StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION);
+    negative.writeInt(SHUFFLE_ID);
+    negative.writeInt(PARTITION_ID);
+    negative.writeLong(-1L);
+    negative.writeLong(MAP_ID);
     assertThrows(IllegalArgumentException.class,
-        () -> RetransmitRequestMessage.decode(inverted));
+        () -> RetransmitRequestMessage.decode(negative));
 
-    ByteBuf tooWide = Unpooled.buffer();
-    writeHeader(tooWide, SHUFFLE_ID, PARTITION_ID, 0L);
-    tooWide.writeLong(Long.MAX_VALUE);
-    assertThrows(IllegalArgumentException.class, () -> RetransmitRequestMessage.decode(tooWide));
+    // A body of any size other than the producer id is a framing error rather than something to
+    // tolerate, in either direction.
+    ByteBuf surplus = Unpooled.buffer();
+    writeHeader(surplus, SHUFFLE_ID, PARTITION_ID, 5L);
+    surplus.writeLong(0L);
+    assertThrows(IllegalArgumentException.class, () -> RetransmitRequestMessage.decode(surplus));
   }
 
   @Test
   public void testStreamTerminationBlockCountRelation() {
     // Zero blocks is legal: an empty partition legitimately terminates having sent nothing.
-    assertDoesNotThrow(() -> new StreamTerminationMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, 0L,
-        0L));
+    assertDoesNotThrow(() -> new StreamTerminationMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, 0L));
+    assertEquals(0L, new StreamTerminationMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, 0L)
+        .totalBlocks());
     // Only data blocks consume sequence numbers -- a heartbeat and the terminator both report the
     // next unissued position without claiming it -- so the terminator's position equals the number
-    // of blocks that preceded it, and equality is the one legal relation.
-    assertDoesNotThrow(() -> new StreamTerminationMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, 10L,
-        10L));
-    // An undercount is the silent truncation case: a consumer that accepted ten blocks and is told
-    // the total was four reconciles the two, concludes the stream completed and hands a short
-    // result to the reduce task with every checksum intact. It must not be constructible.
+    // of blocks that preceded it. The two are now one field, so the relation cannot be violated at
+    // all: an undercount, which is the silent truncation case, is unrepresentable rather than
+    // merely refused.
+    StreamTerminationMessage ten = new StreamTerminationMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID,
+        10L);
+    assertEquals(10L, ten.totalBlocks());
+    assertEquals(10L, ten.sequenceNumber());
+    assertEquals(ten, roundTrip(ten));
+    // A negative count is refused by the header's own domain check.
     assertThrows(IllegalArgumentException.class,
-        () -> new StreamTerminationMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, 10L, 4L));
-    // Claiming more blocks than there are preceding positions is arithmetically impossible, and
-    // would leave a consumer waiting for blocks that were never sent.
+        () -> new StreamTerminationMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, -1L));
     assertThrows(IllegalArgumentException.class,
-        () -> new StreamTerminationMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, 10L, 11L));
-    assertThrows(IllegalArgumentException.class,
-        () -> new StreamTerminationMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, 10L, Long.MAX_VALUE));
-    assertThrows(IllegalArgumentException.class,
-        () -> new StreamTerminationMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, 10L, -1L));
+        () -> new StreamTerminationMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, Long.MIN_VALUE));
   }
 
   @Test
   public void testStreamTerminationBlockCountRelationIsEnforcedOnDecode() {
-    ByteBuf overcount = Unpooled.buffer();
-    writeHeader(overcount, SHUFFLE_ID, PARTITION_ID, 10L);
-    overcount.writeLong(11L);
+    // A peer cannot state a total that disagrees with the position, because there is one field for
+    // both; what it can state is a negative one, and that is refused where it enters.
+    ByteBuf negative = Unpooled.buffer();
+    negative.writeByte(StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION);
+    negative.writeInt(SHUFFLE_ID);
+    negative.writeInt(PARTITION_ID);
+    negative.writeLong(-1L);
+    negative.writeLong(MAP_ID);
     assertThrows(IllegalArgumentException.class,
-        () -> StreamTerminationMessage.decode(overcount));
-    // A frame arriving from a peer is rejected for an undercount too, because decode funnels
-    // through the same construction path the local producer uses.
-    ByteBuf undercount = Unpooled.buffer();
-    writeHeader(undercount, SHUFFLE_ID, PARTITION_ID, 10L);
-    undercount.writeLong(4L);
+        () -> StreamTerminationMessage.decode(negative));
+
+    ByteBuf surplus = Unpooled.buffer();
+    writeHeader(surplus, SHUFFLE_ID, PARTITION_ID, 10L);
+    surplus.writeLong(10L);
     assertThrows(IllegalArgumentException.class,
-        () -> StreamTerminationMessage.decode(undercount));
+        () -> StreamTerminationMessage.decode(surplus));
   }
 
-  // Shared acknowledgement predicates: the two number spaces, and the boundaries between them.
+  // Shared acknowledgement predicates, and the boundaries between them.
   //
   // acknowledgesWithin and supersedes are the protocol's own normative answers to "may this
   // acknowledgement be applied", published here so that every producer decides it the same way
-  // rather than each open-coding a comparison. They read two different fields -- one the data
-  // position travelling towards the producer, the other the consumer's outbound control counter --
-  // and confusing the two is silent rather than loud, because both are non-negative longs that
-  // grow. These tests pin each predicate to its own field and to its own boundary.
+  // rather than each open-coding a comparison. Both read the one position the message carries: one
+  // against the highest position the producer has issued, the other against the highest position it
+  // has already applied. These tests pin each predicate to its own boundary.
 
   @Test
   public void testAcknowledgesWithinAtBelowAndAboveTheBound() {
     // At the bound is legal: the consumer has consumed exactly what the producer has issued.
-    assertTrue(ackAt(4L, 10L).acknowledgesWithin(10L));
-    assertTrue(ackAt(4L, 9L).acknowledgesWithin(10L));
+    assertTrue(ack(10L).acknowledgesWithin(10L));
+    assertTrue(ack(9L).acknowledgesWithin(10L));
     // One block past the bound is not an optimistic guess but a claim on a block that was never
     // issued, and honouring it would drain the whole retained window.
-    assertFalse(ackAt(4L, 11L).acknowledgesWithin(10L));
+    assertFalse(ack(11L).acknowledgesWithin(10L));
     // The extremes behave the same way, since the comparison never adds anything.
-    assertTrue(ackAt(4L, Long.MAX_VALUE).acknowledgesWithin(Long.MAX_VALUE));
-    assertFalse(ackAt(4L, Long.MAX_VALUE).acknowledgesWithin(Long.MAX_VALUE - 1L));
+    assertTrue(ack(AckMessage.MAX_CONSUMER_POSITION)
+        .acknowledgesWithin(AckMessage.MAX_CONSUMER_POSITION));
+    assertFalse(ack(AckMessage.MAX_CONSUMER_POSITION)
+        .acknowledgesWithin(AckMessage.MAX_CONSUMER_POSITION - 1L));
   }
 
   @Test
   public void testAcknowledgesWithinTreatsNothingConsumedAsTheOnlySentinel() {
     // NOTHING_CONSUMED acknowledges no block, so it can overreach no bound.
     for (long bound : new long[] {AckMessage.NOTHING_CONSUMED, 0L, 7L, Long.MAX_VALUE}) {
-      assertTrue(ackAt(4L, AckMessage.NOTHING_CONSUMED).acknowledgesWithin(bound),
+      assertTrue(ack(AckMessage.NOTHING_CONSUMED).acknowledgesWithin(bound),
           "the sentinel must pass against every bound, including " + bound);
     }
     // A producer that has issued nothing passes the sentinel as its bound, which must then admit
     // only that same sentinel: no position can be acknowledged before a position exists.
-    assertFalse(ackAt(4L, 0L).acknowledgesWithin(AckMessage.NOTHING_CONSUMED));
+    assertFalse(ack(0L).acknowledgesWithin(AckMessage.NOTHING_CONSUMED));
   }
 
   @Test
-  public void testAcknowledgesWithinReadsThePositionAndNotTheControlSequence() {
-    // Same position, three different control sequence numbers: the answer may not move.
-    for (long control : new long[] {0L, 1L, Long.MAX_VALUE}) {
-      assertTrue(ackAt(control, 5L).acknowledgesWithin(5L));
-      assertFalse(ackAt(control, 6L).acknowledgesWithin(5L));
-    }
-    // And a message whose control number is far past the bound still passes on its position, which
-    // is the asymmetry that makes passing the wrong bound here undetectable by inspection.
-    assertTrue(ackAt(9_000L, 1L).acknowledgesWithin(2L));
+  public void testAcknowledgesWithinReadsTheAcknowledgedPositionAndNotTheWireValue() {
+    // The wire carries the next expected position, one above the acknowledged one, so a predicate
+    // that read the header field directly would be off by one at every boundary. These pairs pin
+    // the difference: position five is within a bound of five, and six is not.
+    assertTrue(ack(5L).acknowledgesWithin(5L));
+    assertFalse(ack(6L).acknowledgesWithin(5L));
+    assertEquals(6L, ack(5L).sequenceNumber());
+    // Two acknowledgements of the same position are the same message, because the position is the
+    // whole of what an acknowledgement says.
+    assertEquals(ack(5L), ack(5L));
+    assertNotEquals(ack(5L), ack(6L));
   }
 
   @Test
   public void testSupersedesIsStrictSoADuplicateIsRefused() {
-    AckMessage third = ackAt(3L, 100L);
-    assertTrue(third.supersedes(2L));
+    AckMessage atOneHundred = ack(100L);
+    assertTrue(atOneHundred.supersedes(100L));
     // Equal is refused, which is what makes applying an acknowledgement idempotent: a duplicate
-    // delivery must not be counted twice.
-    assertFalse(third.supersedes(3L));
+    // delivery must not be counted twice. The applied value is the wire position, one above the
+    // acknowledged one.
+    assertFalse(atOneHundred.supersedes(101L));
     // Older is refused, which is what makes it safe against reordering.
-    assertFalse(third.supersedes(4L));
-    assertFalse(third.supersedes(Long.MAX_VALUE));
+    assertFalse(atOneHundred.supersedes(102L));
+    assertFalse(atOneHundred.supersedes(Long.MAX_VALUE));
     // The extreme boundary, for the same reason as the position predicate.
-    assertTrue(ackAt(Long.MAX_VALUE, 0L).supersedes(Long.MAX_VALUE - 1L));
-    assertFalse(ackAt(Long.MAX_VALUE, 0L).supersedes(Long.MAX_VALUE));
+    assertTrue(ack(AckMessage.MAX_CONSUMER_POSITION).supersedes(Long.MAX_VALUE - 1L));
+    assertFalse(ack(AckMessage.MAX_CONSUMER_POSITION).supersedes(Long.MAX_VALUE));
   }
 
   @Test
   public void testSupersedesAdmitsTheFirstMessageAgainstTheNothingAppliedSeed() {
-    // A producer seeds its cursor with NOTHING_CONSUMED, and the first control sequence number a
-    // consumer emits on a stream is zero. If that pair did not admit, the very first
-    // acknowledgement of every stream would be discarded as a repeat.
-    assertTrue(ackAt(0L, AckMessage.NOTHING_CONSUMED).supersedes(AckMessage.NOTHING_CONSUMED));
-    assertTrue(ackAt(0L, 0L).supersedes(AckMessage.NOTHING_CONSUMED));
+    // A producer seeds its cursor with NOTHING_CONSUMED, and the first acknowledgement a consumer
+    // emits announces the next position it expects, which is at least zero. If that pair did not
+    // admit, the very first acknowledgement of every stream would be discarded as a repeat.
+    assertTrue(ack(AckMessage.NOTHING_CONSUMED).supersedes(AckMessage.NOTHING_CONSUMED));
+    assertTrue(ack(0L).supersedes(AckMessage.NOTHING_CONSUMED));
   }
 
   @Test
-  public void testSupersedesIsMonotonicOverARunAndIgnoresThePosition() {
-    // Fold a strictly increasing run of control numbers exactly as a producer does. Every message
-    // must be admitted once, and replaying the same run must admit none of them.
+  public void testSupersedesIsMonotonicOverARunAndRefusesAReplay() {
+    // Fold a strictly increasing run of positions exactly as a producer does. Every message must be
+    // admitted once, and replaying the same run must admit none of them.
     long applied = AckMessage.NOTHING_CONSUMED;
-    long[] control = {0L, 1L, 2L, 3L};
-    // Positions advance far faster than control numbers, because one acknowledgement covers many
-    // blocks. That is the whole reason freshness is decided on the control sequence: a producer
-    // that tested supersedes against the position it had recorded would admit the first message and
-    // then refuse every later one, and would refuse all of them outright after a reconnect, where
-    // the consumer restarts its counter at zero while its position resumes mid-stream.
     long[] positions = {40L, 90L, 140L, 190L};
-    for (int i = 0; i < control.length; i++) {
-      AckMessage message = ackAt(control[i], positions[i]);
-      assertTrue(message.supersedes(applied), "control " + control[i] + " must be admitted once");
+    for (long position : positions) {
+      AckMessage message = ack(position);
+      assertTrue(message.supersedes(applied), "position " + position + " must be admitted once");
       applied = message.sequenceNumber();
       assertFalse(message.supersedes(applied), "and must not be admitted a second time");
-      // The position is deliberately not consulted: against it, this message would be stale.
-      assertFalse(message.supersedes(positions[i]));
     }
-    for (int i = 0; i < control.length; i++) {
-      assertFalse(ackAt(control[i], positions[i]).supersedes(applied), "a replayed run is refused");
+    for (long position : positions) {
+      assertFalse(ack(position).supersedes(applied), "a replayed run is refused");
     }
   }
 
@@ -1221,10 +1089,9 @@ public class StreamingShuffleMessageSuite {
     // from two map tasks sharing a partition and a sequence number would be indistinguishable,
     // which is precisely the collision the field was added to prevent.
     AckMessage base = ack(40L);
-    assertNotEquals(base, new AckMessage(SHUFFLE_ID, MAP_ID + 1L, PARTITION_ID, SEQUENCE_NUMBER,
-        40L));
-    assertNotEquals(base.hashCode(), new AckMessage(SHUFFLE_ID, MAP_ID + 1L, PARTITION_ID,
-        SEQUENCE_NUMBER, 40L).hashCode());
+    assertNotEquals(base, new AckMessage(SHUFFLE_ID, MAP_ID + 1L, PARTITION_ID, 40L));
+    assertNotEquals(base.hashCode(),
+        new AckMessage(SHUFFLE_ID, MAP_ID + 1L, PARTITION_ID, 40L).hashCode());
     assertTrue(base.toString().contains("mapId=" + MAP_ID));
 
     // A frame that names another producer is refused at the binding boundary rather than being
@@ -1262,23 +1129,24 @@ public class StreamingShuffleMessageSuite {
   }
 
   @Test
-  public void testMapIdWidensTheHeaderByEightBytes() {
-    // The map id is a long, so every framed message grew by eight bytes. Asserted against the
-    // constant rather than a literal total so that the encoder and this expectation cannot drift.
-    for (StreamingShuffleMessage message : fixedSizeMessages()) {
-      assertEquals(StreamingShuffleMessage.HEADER_ENCODED_LENGTH + 8, message.encodedLength());
-      assertEquals(33, message.encodedLength(), message.getClass().getSimpleName());
-      assertEquals(34, message.toByteBuffer().remaining());
+  public void testProducerIdIsTheFirstBodyFieldOfEveryMessage() {
+    // The producer id is not a header field: the header is the seventeen bytes the specification
+    // fixes, and the id opens every body immediately after it. That placement is what lets a router
+    // read it at one offset for all five types without decoding a body.
+    for (StreamingShuffleMessage message : oneOfEachType()) {
+      byte[] body = encodedBody(message);
+      assertEquals(MAP_ID,
+          ByteBuffer.wrap(body).getLong(StreamingShuffleMessage.HEADER_ENCODED_LENGTH),
+          message.getClass().getSimpleName());
+      assertEquals(MAP_ID, ByteBuffer.wrap(body).getLong(17));
     }
-    // A heartbeat carries the same header and the same long, plus the length-prefixed identity
-    // that makes a reconnecting consumer recognisable.
-    assertEquals(StreamingShuffleMessage.HEADER_ENCODED_LENGTH + 8 + 4,
-        heartbeat().encodedLength());
-    assertEquals(38, heartbeat().toByteBuffer().remaining());
+    // And the four control messages are exactly the header plus that id: twenty-five bytes,
+    // twenty-six framed.
+    for (StreamingShuffleMessage message : fixedSizeMessages()) {
+      assertEquals(25, message.encodedLength(), message.getClass().getSimpleName());
+      assertEquals(26, message.toByteBuffer().remaining());
+    }
   }
-
-  // Stream-context binding.
-
   @Test
   public void testStreamContextBindingAcceptsTheMatchingStream() {
     for (StreamingShuffleMessage message : oneOfEachType()) {
@@ -1313,9 +1181,10 @@ public class StreamingShuffleMessageSuite {
   @Test
   public void testFramingConstantsFormOneConsistentContract() {
     assertEquals(1, StreamingShuffleMessage.FRAME_TYPE_PREFIX_LENGTH);
-    // One framing prefix + twenty-five header + eight checksum + four payload length prefix.
+    // One framing prefix + seventeen header + eight producer id + eight checksum + four payload
+    // length prefix.
     assertEquals(38, DataBlockMessage.FRAMING_OVERHEAD_BYTES);
-    assertEquals(1 + StreamingShuffleMessage.HEADER_ENCODED_LENGTH + 8 + 4,
+    assertEquals(1 + StreamingShuffleMessage.HEADER_ENCODED_LENGTH + 8 + 8 + 4,
         DataBlockMessage.FRAMING_OVERHEAD_BYTES);
     assertEquals(2097190, DataBlockMessage.MAX_ENCODED_FRAME_BYTES);
     // The relation is asserted rather than assumed, because a component that budgets the payload
@@ -1363,19 +1232,32 @@ public class StreamingShuffleMessageSuite {
 
   @Test
   public void testHeaderOccupiesFixedWireOffsetsInDeclaredOrder() {
-    AckMessage message = new AckMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, 7L);
+    AckMessage message = new AckMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, 7L);
     ByteBuffer framed = ByteBuffer.wrap(toByteArray(message.toByteBuffer()));
 
+    // The specified layout, read field by field in the order the specification fixes: one framing
+    // type byte, then the seventeen-byte header of version, shuffle id, partition id and sequence
+    // number, then the body -- which opens with the producer id in every message of the family.
     assertEquals(StreamingShuffleMessageType.ACK.id(), framed.get());
     assertEquals(StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION, framed.get());
     assertEquals(SHUFFLE_ID, framed.getInt());
-    // The map id is written between the shuffle id and the partition id, so that a router can read
-    // whose output a frame concerns from a fixed offset without decoding the body.
-    assertEquals(MAP_ID, framed.getLong());
     assertEquals(PARTITION_ID, framed.getInt());
-    assertEquals(SEQUENCE_NUMBER, framed.getLong());
-    assertEquals(7L, framed.getLong());
+    // An acknowledgement's sequence number is the next position it expects, one above the position
+    // it acknowledges.
+    assertEquals(8L, framed.getLong());
+    assertEquals(MAP_ID, framed.getLong());
     assertFalse(framed.hasRemaining(), "the frame carries no bytes beyond header and body");
+    // Twenty-six bytes framed: one type byte, seventeen of header and eight of producer id.
+    assertEquals(26, toByteArray(message.toByteBuffer()).length);
+    // The producer id sits at one offset in every type, which is what makes routing a peek: one
+    // type byte plus the whole header, that is offset eighteen.
+    for (StreamingShuffleMessage other : oneOfEachType()) {
+      ByteBuffer otherFramed = other.toByteBuffer();
+      assertEquals(MAP_ID, otherFramed.getLong(otherFramed.position() + 18),
+          other.getClass().getSimpleName());
+      assertEquals(MAP_ID, StreamingShuffleMessage.peekMapId(otherFramed));
+      assertEquals(SHUFFLE_ID, StreamingShuffleMessage.peekShuffleId(otherFramed));
+    }
   }
 
   @Test
@@ -1388,9 +1270,9 @@ public class StreamingShuffleMessageSuite {
     assertEquals(StreamingShuffleMessageType.DATA_BLOCK.id(), framed.get());
     assertEquals(StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION, framed.get());
     assertEquals(SHUFFLE_ID, framed.getInt());
-    assertEquals(MAP_ID, framed.getLong());
     assertEquals(PARTITION_ID, framed.getInt());
     assertEquals(SEQUENCE_NUMBER, framed.getLong());
+    assertEquals(MAP_ID, framed.getLong());
     assertEquals(StreamingShuffleChecksum.computeBlock(
         SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, contents), framed.getLong());
     assertEquals(contents.length, framed.getInt());
@@ -1402,41 +1284,37 @@ public class StreamingShuffleMessageSuite {
 
   @Test
   public void testShuffleIdAndPartitionIdAreNeverTransposed() {
-    // Two int fields in one header are a transposition hazard whether or not they sit next to each
-    // other: the map id encoded between them means a decoder that reads the two in the wrong order
-    // also mis-reads the eight bytes separating them. Assert they survive a real round trip rather
-    // than trusting encoder and decoder to agree.
-    AckMessage decoded = (AckMessage) roundTrip(new AckMessage(1, MAP_ID, 2, 3L, 4L));
+    // Two adjacent int fields in one header are a transposition hazard, so assert they survive a
+    // real round trip rather than trusting encoder and decoder to agree with each other.
+    AckMessage decoded = (AckMessage) roundTrip(new AckMessage(1, MAP_ID, 2, 4L));
     assertEquals(1, decoded.shuffleId());
     assertEquals(2, decoded.partitionId());
-    assertEquals(3L, decoded.sequenceNumber());
+    assertEquals(5L, decoded.sequenceNumber());
     assertEquals(4L, decoded.consumerPosition());
     // And the swapped identity is a different message, so a transposition could not go unnoticed.
-    assertNotEquals(decoded, new AckMessage(2, MAP_ID, 1, 3L, 4L));
+    assertNotEquals(decoded, new AckMessage(2, MAP_ID, 1, 4L));
   }
 
   @Test
-  public void testHeaderRecordCarriesTheFiveFieldsInOrder() {
+  public void testHeaderRecordCarriesTheFourFieldsInOrder() {
     // The record exists so a decoder cannot transpose two same-typed fields; that guarantee is
-    // only worth anything if the constructor taking it preserves the mapping. All five components
+    // only worth anything if the constructor taking it preserves the mapping. All four components
     // are asserted, because a mapping that drops one is exactly as wrong as one that swaps two.
     StreamingShuffleMessage.Header header = header();
-    AckMessage fromHeader = new AckMessage(header, 55L);
+    AckMessage fromHeader = new AckMessage(header, MAP_ID);
 
     assertEquals(StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION, fromHeader.protocolVersion());
     assertEquals(SHUFFLE_ID, fromHeader.shuffleId());
     assertEquals(MAP_ID, fromHeader.mapId());
     assertEquals(PARTITION_ID, fromHeader.partitionId());
     assertEquals(SEQUENCE_NUMBER, fromHeader.sequenceNumber());
-    assertEquals(55L, fromHeader.consumerPosition());
-    assertEquals(new AckMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, 55L),
+    assertEquals(SEQUENCE_NUMBER - 1L, fromHeader.consumerPosition());
+    assertEquals(new AckMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER - 1L),
         fromHeader);
     // The same header drives every control message, so each must read it identically.
-    assertEquals(heartbeat(),
-        new HeartbeatMessage(header, TIMESTAMP_MS, HeartbeatMessage.NO_CONSUMER_ID));
-    assertEquals(retransmit(44L), new RetransmitRequestMessage(header, 44L));
-    assertEquals(termination(SEQUENCE_NUMBER),
-        new StreamTerminationMessage(header, SEQUENCE_NUMBER));
+    assertEquals(heartbeat(), new HeartbeatMessage(header, MAP_ID));
+    assertEquals(retransmit(SEQUENCE_NUMBER), new RetransmitRequestMessage(header, MAP_ID));
+    assertEquals(termination(SEQUENCE_NUMBER), new StreamTerminationMessage(header, MAP_ID));
   }
 
   // Buffer position discipline: a receive buffer rarely starts at zero.
@@ -1458,8 +1336,8 @@ public class StreamingShuffleMessageSuite {
   public void testDecodeHonoursAnOffsetPositionWithoutDisturbingTheCaller() {
     // A receive buffer rarely starts at position zero, so the decoder has to honour position and
     // limit rather than assuming it owns the whole backing array.
-    byte[] framed = toByteArray(new AckMessage(
-        SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, 9L).toByteBuffer());
+    byte[] framed =
+        toByteArray(new AckMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, 9L).toByteBuffer());
     ByteBuffer buffer = ByteBuffer.allocate(framed.length + 6);
     buffer.position(3);
     buffer.put(framed);
@@ -1520,7 +1398,8 @@ public class StreamingShuffleMessageSuite {
     assertThrows(NullPointerException.class,
         () -> new DataBlockMessage(StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION,
             SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, 0L, null));
-    assertThrows(NullPointerException.class, () -> new DataBlockMessage(header(), 0L, null));
+    assertThrows(NullPointerException.class,
+        () -> new DataBlockMessage(header(), MAP_ID, 0L, null));
     assertThrows(NullPointerException.class,
         () -> DataBlockMessage.withOwnedPayload(StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION,
             SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, 0L, null));
@@ -1529,12 +1408,12 @@ public class StreamingShuffleMessageSuite {
 
   @Test
   public void testNullHeaderIsRejectedByEveryConstructionRoute() {
-    assertThrows(NullPointerException.class, () -> new AckMessage(null, 0L));
+    assertThrows(NullPointerException.class, () -> new AckMessage(null, MAP_ID));
+    assertThrows(NullPointerException.class, () -> new HeartbeatMessage(null, MAP_ID));
+    assertThrows(NullPointerException.class, () -> new RetransmitRequestMessage(null, MAP_ID));
+    assertThrows(NullPointerException.class, () -> new StreamTerminationMessage(null, MAP_ID));
     assertThrows(NullPointerException.class,
-        () -> new HeartbeatMessage(null, TIMESTAMP_MS, HeartbeatMessage.NO_CONSUMER_ID));
-    assertThrows(NullPointerException.class, () -> new RetransmitRequestMessage(null, 0L));
-    assertThrows(NullPointerException.class, () -> new StreamTerminationMessage(null, 0L));
-    assertThrows(NullPointerException.class, () -> new DataBlockMessage(null, 0L, payload(4)));
+        () -> new DataBlockMessage(null, MAP_ID, 0L, payload(4)));
   }
 
   @Test
@@ -1573,15 +1452,16 @@ public class StreamingShuffleMessageSuite {
     // Header and checksum present, length prefix absent or partial. The body minimum is checked
     // as one quantity ahead of any read, so the checksum is never consumed off a body that cannot
     // also carry the prefix behind it, and the diagnostic names the shortfall in body bytes.
-    for (int bodyBytesAfterHeader : new int[] {0, 8, 9, 11}) {
+    for (int bodyBytesAfterHeader : new int[] {0, 8, 16, 17, 19}) {
       ByteBuf buf = Unpooled.buffer();
-      writeHeader(buf, SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER);
+      buf.writeByte(StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION);
+      buf.writeInt(SHUFFLE_ID);
+      buf.writeInt(PARTITION_ID);
+      buf.writeLong(SEQUENCE_NUMBER);
       buf.writeBytes(new byte[bodyBytesAfterHeader]);
       IllegalArgumentException error =
           assertThrows(IllegalArgumentException.class, () -> DataBlockMessage.decode(buf));
-      assertTrue(error.getMessage().contains("Truncated streaming shuffle data block"),
-          error.getMessage());
-      assertTrue(error.getMessage().contains("12"), error.getMessage());
+      assertTrue(error.getMessage().contains("Truncated streaming shuffle"), error.getMessage());
     }
     // Exactly the minimum body is a zero-length payload, which is legal, so the bound is not
     // off by one in the refusing direction.
@@ -1614,10 +1494,11 @@ public class StreamingShuffleMessageSuite {
   public void testZeroIsAValidHeaderIdentity() {
     // The bound is non-negative, not positive: shuffle 0, partition 0, sequence 0 is the first
     // block of the first partition of the first shuffle and must round trip.
-    AckMessage first = new AckMessage(0, MAP_ID, 0, 0L, 0L);
+    AckMessage first = new AckMessage(0, 0L, 0, AckMessage.NOTHING_CONSUMED);
     assertEquals(first, roundTrip(first));
     assertEquals(0, first.shuffleId());
     assertEquals(0, first.partitionId());
+    assertEquals(0L, first.mapId());
     assertEquals(0L, first.sequenceNumber());
     DataBlockMessage firstBlock = DataBlockMessage.withComputedChecksum(0, MAP_ID, 0, 0L,
         payload(8));
@@ -1644,17 +1525,18 @@ public class StreamingShuffleMessageSuite {
   public void testExtremeLegalHeaderValuesSurviveRoundTrip() {
     // The largest values each field admits are not rejected, so they must survive faithfully
     // rather than being silently normalised or wrapped.
-    AckMessage extreme = new AckMessage(
-        Integer.MAX_VALUE, MAP_ID, Integer.MAX_VALUE, Long.MAX_VALUE, Long.MAX_VALUE);
+    AckMessage extreme = new AckMessage(Integer.MAX_VALUE, Long.MAX_VALUE, Integer.MAX_VALUE,
+        AckMessage.MAX_CONSUMER_POSITION);
     AckMessage decoded = (AckMessage) roundTrip(extreme);
     assertEquals(Integer.MAX_VALUE, decoded.shuffleId());
     assertEquals(Integer.MAX_VALUE, decoded.partitionId());
+    assertEquals(Long.MAX_VALUE, decoded.mapId());
     assertEquals(Long.MAX_VALUE, decoded.sequenceNumber());
-    assertEquals(Long.MAX_VALUE, decoded.consumerPosition());
+    assertEquals(AckMessage.MAX_CONSUMER_POSITION, decoded.consumerPosition());
 
-    HeartbeatMessage beat = new HeartbeatMessage(0, MAP_ID, 0, Long.MAX_VALUE, Long.MAX_VALUE);
+    HeartbeatMessage beat = new HeartbeatMessage(0, Long.MAX_VALUE, 0, Long.MAX_VALUE);
     assertEquals(beat, roundTrip(beat));
-    assertEquals(Long.MAX_VALUE, ((HeartbeatMessage) roundTrip(beat)).timestampMs());
+    assertEquals(Long.MAX_VALUE, roundTrip(beat).sequenceNumber());
   }
 
   // Rendering: every message names its own body field and stays bounded.
@@ -1662,9 +1544,9 @@ public class StreamingShuffleMessageSuite {
   @Test
   public void testControlMessagesRenderTheirOwnBodyFieldAndStayBounded() {
     assertTrue(ack(40L).toString().contains("consumerPosition=40"), ack(40L).toString());
-    assertTrue(heartbeat().toString().contains("timestampMs=" + TIMESTAMP_MS),
+    assertTrue(heartbeat().toString().contains("sequenceNumber=" + SEQUENCE_NUMBER),
         heartbeat().toString());
-    assertTrue(retransmit(44L).toString().contains("lastSequenceNumber=44"),
+    assertTrue(retransmit(44L).toString().contains("sequenceNumber=44"),
         retransmit(44L).toString());
     assertTrue(termination(40L).toString().contains("totalBlocks=40"), termination(40L).toString());
     for (StreamingShuffleMessage message : oneOfEachType()) {
@@ -1672,7 +1554,8 @@ public class StreamingShuffleMessageSuite {
       assertTrue(rendered.startsWith(message.getClass().getSimpleName()), rendered);
       assertTrue(rendered.contains(String.valueOf(SHUFFLE_ID)), rendered);
       assertTrue(rendered.contains(String.valueOf(PARTITION_ID)), rendered);
-      assertTrue(rendered.contains(String.valueOf(SEQUENCE_NUMBER)), rendered);
+      assertTrue(rendered.contains(String.valueOf(MAP_ID)), rendered);
+      assertTrue(rendered.contains(String.valueOf(message.sequenceNumber())), rendered);
       // These strings reach diagnostics on every backpressure event, so none may be unbounded.
       assertTrue(rendered.length() < 200, "toString is too long: " + rendered);
     }
@@ -1753,21 +1636,22 @@ public class StreamingShuffleMessageSuite {
     // Three control messages encode to byte-identical bodies when their single body field happens
     // to match, so the framing byte is the only thing that tells the decoder which one it is
     // holding. If routing ever fell back on anything else it would silently mis-decode here.
-    // The one value legal in all three body domains at once: at or above the sequence number for a
-    // retransmission window's upper bound, equal to it for a termination's block count, and
-    // non-negative for an acknowledgement position.
-    long sharedBodyValue = SEQUENCE_NUMBER;
+    // Every control message is the header plus the producer id, so four messages built over one
+    // identity encode to byte-for-byte identical bodies. Only the framing discriminator tells them
+    // apart on the wire, and the decoder must therefore rely on it alone.
     StreamingShuffleMessage[] messages = {
-        ack(sharedBodyValue),
-        new RetransmitRequestMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER,
-            sharedBodyValue),
-        termination(sharedBodyValue),
+        ack(SEQUENCE_NUMBER - 1L),
+        heartbeat(),
+        new RetransmitRequestMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER),
+        termination(SEQUENCE_NUMBER),
     };
     byte[] reference = encodedBody(messages[0]);
+    assertEquals(25, reference.length);
     for (StreamingShuffleMessage message : messages) {
-      assertEquals(33, message.encodedLength());
+      assertEquals(25, message.encodedLength());
       assertArrayEquals(reference, encodedBody(message), message.toString());
       byte[] framed = toByteArray(message.toByteBuffer());
+      assertEquals(26, framed.length);
       // Identical bodies, distinct type bytes, and each still decodes back to its own class.
       assertArrayEquals(reference, Arrays.copyOfRange(framed, 1, framed.length));
       StreamingShuffleMessage decoded =
@@ -1775,14 +1659,6 @@ public class StreamingShuffleMessageSuite {
       assertSame(message.getClass(), decoded.getClass());
       assertEquals(message, decoded);
     }
-    // A heartbeat opens its body with the same long and is nevertheless not one of them: its
-    // identity field makes the body longer, so routing on length alone would mis-decode it too.
-    HeartbeatMessage beat =
-        new HeartbeatMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, sharedBodyValue);
-    byte[] beatBody = encodedBody(beat);
-    assertEquals(reference.length + 4, beatBody.length);
-    assertArrayEquals(reference, Arrays.copyOfRange(beatBody, 0, reference.length));
-    assertSame(HeartbeatMessage.class, roundTrip(beat).getClass());
   }
 
   @Test
@@ -1802,7 +1678,7 @@ public class StreamingShuffleMessageSuite {
     // decoded message reports the revision its peer actually spoke. What must not happen is such
     // a message being accepted back off the wire as if it were current.
     AckMessage foreign =
-        new AckMessage(UNSUPPORTED_VERSION, SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, 40L);
+        new AckMessage(UNSUPPORTED_VERSION, SHUFFLE_ID, MAP_ID, PARTITION_ID, 40L);
     assertEquals(UNSUPPORTED_VERSION, foreign.protocolVersion());
     assertEquals(40L, foreign.consumerPosition());
     // The version participates in identity, so a foreign-version message is not the current one.
@@ -1818,7 +1694,7 @@ public class StreamingShuffleMessageSuite {
     body.writeInt(SHUFFLE_ID);
     body.writeInt(PARTITION_ID);
     body.writeLong(SEQUENCE_NUMBER);
-    body.writeLong(40L);
+    body.writeLong(MAP_ID);
     assertThrows(IllegalArgumentException.class, () -> AckMessage.decode(body));
   }
 
@@ -1874,20 +1750,18 @@ public class StreamingShuffleMessageSuite {
     };
   }
 
-  /** The three messages whose encoded form is exactly 33 bytes. */
+  /** The four control messages, every one of which encodes to exactly twenty-five bytes. */
   private StreamingShuffleMessage[] fixedSizeMessages() {
     return new StreamingShuffleMessage[] {
-        ack(40L), retransmit(44L), termination(SEQUENCE_NUMBER)};
+        ack(40L), heartbeat(), retransmit(44L), termination(SEQUENCE_NUMBER)};
   }
 
   /**
-   * Every message whose decoder demands an exact body: the three fixed-size ones and a heartbeat,
-   * whose body is variable in the identity it carries but exact once that identity's length has
-   * been read.
+   * Every message whose decoder demands an exact body, which is all four control messages: each of
+   * them carries the header and the producer id and nothing else, so its body has one legal size.
    */
   private StreamingShuffleMessage[] exactBodyMessages() {
-    return new StreamingShuffleMessage[] {
-        ack(40L), heartbeat(), retransmit(44L), termination(SEQUENCE_NUMBER)};
+    return fixedSizeMessages();
   }
 
   private DataBlockMessage dataBlock(int payloadLength) {
@@ -1898,36 +1772,25 @@ public class StreamingShuffleMessageSuite {
   /** A header carrying this suite's standard identity, for the header-taking constructors. */
   private StreamingShuffleMessage.Header header() {
     return new StreamingShuffleMessage.Header(StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION,
-        SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER);
+        SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER);
   }
 
   private AckMessage ack(long consumerPosition) {
-    return new AckMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, consumerPosition);
-  }
-
-  /**
-   * An acknowledgement whose control sequence number and consumed position are chosen separately,
-   * because the predicates that read them are only meaningfully tested when the two differ.
-   */
-  private AckMessage ackAt(long controlSequenceNumber, long consumerPosition) {
-    return new AckMessage(
-        SHUFFLE_ID, MAP_ID, PARTITION_ID, controlSequenceNumber, consumerPosition);
+    return new AckMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, consumerPosition);
   }
 
   private HeartbeatMessage heartbeat() {
-    return new HeartbeatMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, TIMESTAMP_MS);
+    return new HeartbeatMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER);
   }
 
-  private RetransmitRequestMessage retransmit(long lastSequenceNumber) {
-    return new RetransmitRequestMessage(
-        SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, lastSequenceNumber);
+  private RetransmitRequestMessage retransmit(long sequenceNumber) {
+    return new RetransmitRequestMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, sequenceNumber);
   }
 
   private StreamTerminationMessage termination(long totalBlocks) {
     // Only data blocks consume sequence numbers, so a terminator's own position is exactly the
-    // number of blocks that preceded it: the two values are one value here.
-    return new StreamTerminationMessage(
-        SHUFFLE_ID, MAP_ID, PARTITION_ID, totalBlocks, totalBlocks);
+    // number of blocks that preceded it: the two values are one value, carried by the header.
+    return new StreamTerminationMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, totalBlocks);
   }
 
   /**
@@ -1962,17 +1825,19 @@ public class StreamingShuffleMessageSuite {
   }
 
   /**
-   * Writes a header by hand, in exactly the field order {@code encodeHeader} uses, so that a frame
-   * carrying a value the constructors would refuse can still be presented to a decoder. The map id
-   * is written between the shuffle id and the partition id, matching the wire layout.
+   * Writes a header and the producer id that opens every body, by hand and in exactly the field
+   * order the encoders use, so that a frame carrying a value the constructors would refuse can be
+   * presented to a decoder anyway. The seventeen header bytes come first -- version, shuffle id,
+   * partition id, sequence number -- and the eight-byte producer id follows them as the first body
+   * field, which is the layout the specification fixes.
    */
   private static void writeHeader(
       ByteBuf buf, int shuffleId, long mapId, int partitionId, long sequence) {
     buf.writeByte(StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION);
     buf.writeInt(shuffleId);
-    buf.writeLong(mapId);
     buf.writeInt(partitionId);
     buf.writeLong(sequence);
+    buf.writeLong(mapId);
   }
 
   /**
@@ -1989,6 +1854,15 @@ public class StreamingShuffleMessageSuite {
     return buf;
   }
 
+  /** The specified encoded size of every control message: the header plus the producer id. */
+  private static final int CONTROL_MESSAGE_BYTES = 25;
+
+  /** The specified encoded size of the shared header. */
+  private static final int HEADER_BYTES = 17;
+
+  /** The specified encoded size of a data block with an empty payload. */
+  private static final int EMPTY_DATA_BLOCK_BYTES = 37;
+
   private static void decodeAckWithHeader(int shuffleId, int partitionId, long sequence) {
     decodeAckWithHeader(shuffleId, MAP_ID, partitionId, sequence);
   }
@@ -1998,7 +1872,6 @@ public class StreamingShuffleMessageSuite {
       int shuffleId, long mapId, int partitionId, long sequence) {
     ByteBuf buf = Unpooled.buffer();
     writeHeader(buf, shuffleId, mapId, partitionId, sequence);
-    buf.writeLong(0L);
     AckMessage.decode(buf);
   }
 

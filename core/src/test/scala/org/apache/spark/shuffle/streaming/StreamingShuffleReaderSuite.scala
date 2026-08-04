@@ -3044,7 +3044,7 @@ class StreamingShuffleReaderSuite
     val directed = new ReaderFixture()
     val directedRecords = directed.reader.read()
     val directedStream = directed.connector.onlyStream
-    directedStream.deliver(ack(directed.shuffleId, ProducerMapId, directed.partitionId, 0L, 0L))
+    directedStream.deliver(ack(directed.shuffleId, ProducerMapId, directed.partitionId, 0L))
     val refused = intercept[FetchFailedException] {
       withTaskContext(directed.context) {
         readRecords(directedRecords)

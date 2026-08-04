@@ -315,18 +315,21 @@ class BackpressureProtocolSuite extends SparkFunSuite
     assert(protocol.tryAdmit(key, blockBytes, 0L),
       "one block is admitted so there is something to ack")
 
-    // The framing of an acknowledgement, asserted against literals rather than against the
-    // encoder's own constants: a value read from the encoder agrees with it by construction and so
-    // states nothing, whereas these numbers are the format this suite is entitled to expect a peer
-    // to speak. verifyWireContractAgainstEncoder() is what couples the two, and it runs below.
+    // The framing of an acknowledgement: the shared seventeen-byte header plus the eight-byte
+    // producer identifier that opens every body, and one further byte of type discriminator once
+    // it is framed for the wire. The literals below are the specified contract, stated separately
+    // from the encoder so that a change to either side is caught rather than mirrored;
+    // verifyWireContractAgainstEncoder() is what couples the two, and it runs here.
     verifyWireContractAgainstEncoder()
-    val acknowledgement = ack(firstShuffleId, mapId, partitionId, 1L, 0L)
-    assert(acknowledgement.encodedLength() === 33,
-      s"an acknowledgement is 33 bytes: a 25-byte header and an eight-byte consumed " +
-        s"position, but encoded to ${acknowledgement.encodedLength()}")
-    assert(framedLength(acknowledgement.encodedLength()) === 34,
-      s"a framed acknowledgement is 34 bytes, the encoded 33 plus one type-discriminator " +
-        s"byte, but framed to ${framedLength(acknowledgement.encodedLength())}")
+    val acknowledgement = ack(firstShuffleId, mapId, partitionId, 0L)
+    assert(HeaderEncodedLength === 17,
+      "the streaming wire header is seventeen bytes: version, shuffle, partition, sequence")
+    assert(FixedMessageEncodedLength === 25,
+      "a control message is twenty-five bytes: the header plus the producer identifier")
+    assert(acknowledgement.encodedLength() === FixedMessageEncodedLength,
+      "an acknowledgement is the header plus the producer identifier and nothing more")
+    assert(framedLength(acknowledgement.encodedLength()) === acknowledgement.encodedLength() + 1,
+      "framing adds exactly the one-byte type discriminator")
     assert(acknowledgement.consumerPosition() === 0L,
       "the message must carry the position it was built with")
     assert(acknowledgement.sequenceNumber() === 1L,
@@ -339,7 +342,7 @@ class BackpressureProtocolSuite extends SparkFunSuite
     // The stream key is supplied by the handler that owns the channel, because the wire carries
     // only a shuffle, a map and a partition and those three do not identify a stream. A frame whose
     // identity contradicts the key it arrived as is refused rather than applied to another ledger.
-    val misaddressed = ack(secondShuffleId, mapId, partitionId, 1L, 0L)
+    val misaddressed = ack(secondShuffleId, mapId, partitionId, 0L)
     assert(protocol.tryAcknowledge(key, misaddressed).isEmpty,
       "a frame naming another shuffle must never be applied to this ledger")
     assert(protocol.misaddressedFrameCount === 1L,
@@ -764,10 +767,12 @@ class BackpressureProtocolSuite extends SparkFunSuite
     assert(message.partitionId() === partitionId, "including its reduce partition")
     assert(message.mapId() === mapId, "and the producer whose stream it paces")
 
-    assert(heartbeatEncodedLength(0) === HeartbeatBaseEncodedLength,
-      "a heartbeat naming no consumer is the header plus its fixed body")
-    assert(message.encodedLength() === heartbeatEncodedLength(consumerId.length),
-      "and one naming a consumer is that plus the identity's encoded bytes")
+    // The framing of a heartbeat: the shared header plus the producer identifier, exactly as every
+    // other control message, so no decoder can tell them apart by length.
+    assert(HeartbeatBaseEncodedLength === FixedMessageEncodedLength,
+      "a heartbeat is the same fixed size as every other control message")
+    assert(message.encodedLength() === 25,
+      "which the specification fixes at twenty-five bytes")
     assert(framedLength(message.encodedLength()) === message.encodedLength() + 1,
       "framing adds exactly the one-byte type discriminator")
 
@@ -782,8 +787,7 @@ class BackpressureProtocolSuite extends SparkFunSuite
     clock.advance(ProducerConnectionTimeoutMillis)
     assert(protocol.isProducerTimedOut(key), "the producer has fallen silent")
     val arrivalInstant = clock.getTimeMillis()
-    protocol.onHeartbeat(key,
-      heartbeat(firstShuffleId, mapId, partitionId, 8L, arrivalInstant))
+    protocol.onHeartbeat(key, heartbeat(firstShuffleId, mapId, partitionId, 8L))
     assert(!protocol.isProducerTimedOut(key), "and is alive again the moment its heartbeat arrives")
     assert(protocol.millisSinceInbound(key) === Some(0L),
       "liveness is judged from the local instant of arrival")
@@ -794,11 +798,11 @@ class BackpressureProtocolSuite extends SparkFunSuite
     // encoded length: every control message encodes to exactly the same length, so a codec that
     // tried to use length would silently read one message as another.
     assert(protocol.onControlMessage(
-      key, heartbeat(firstShuffleId, mapId, partitionId, 9L, clock.getTimeMillis())) ===
+      key, heartbeat(firstShuffleId, mapId, partitionId, 9L)) ===
         Some(StreamingShuffleMessageType.HEARTBEAT), "a heartbeat dispatches as a heartbeat")
     protocol.onDataReceived(key, 0L, blockBytes)
     assert(protocol.onControlMessage(
-      key, ack(firstShuffleId, mapId, partitionId, 1L, 0L)) ===
+      key, ack(firstShuffleId, mapId, partitionId, 0L)) ===
         Some(StreamingShuffleMessageType.ACK), "an acknowledgement dispatches as an ack")
     assert(protocol.acknowledgedPosition(key) === 0L, "and is applied on the way through")
     assert(protocol.onControlMessage(
@@ -831,13 +835,15 @@ class BackpressureProtocolSuite extends SparkFunSuite
     assert(protocol.tryAdmit(key, blockBytes, 0L), "one block is sent and retained")
     assert(protocol.isWithinUnacknowledgedWindow(key, 0L), "so it can still be replayed")
     assert(!protocol.isWithinUnacknowledgedWindow(key, 1L), "a block never sent cannot be")
-    val retained = retransmitRequest(firstShuffleId, mapId, partitionId, 0L, 0L)
+    val retained = retransmitRequest(firstShuffleId, mapId, partitionId, 0L)
+    assert(retained.blockCount() === RequestedBlocksPerRequest,
+      "a request names exactly one block, which is what keeps every control message one size")
     assert(protocol.canServeRetransmit(key, retained),
-      "a request naming only retained blocks is serviceable")
-    val unretained = retransmitRequest(firstShuffleId, mapId, partitionId, 1L, 2L)
+      "a request naming a retained block is serviceable")
+    val unretained = retransmitRequest(firstShuffleId, mapId, partitionId, 1L)
     assert(!protocol.canServeRetransmit(key, unretained),
-      "a request that is not entirely serviceable is refused as a whole, because splicing a " +
-        "partial replay into a consumer's input would reorder its partition")
+      "a request naming a block that was never retained is refused, because splicing a partial " +
+        "replay into a consumer's input would reorder its partition")
 
     assert(protocol.nextRetryBackoffMillis(key) === Some(RetryBaseBackoffMillis),
       "a stream that has made no attempt is owed the first pause")

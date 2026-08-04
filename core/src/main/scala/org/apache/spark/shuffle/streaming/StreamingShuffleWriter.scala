@@ -162,10 +162,11 @@ private[spark] case class StreamingShuffleWriterComponents(
  *    whose consumer kept pace has nothing retained and nothing written; a partition nobody read is
  *    written whole, because the alternative is to lose it.
  *
- * The overlap is exercised whenever a consumer is in fact attached: a reconnecting consumer asking
- * for a replay of the window it has not acknowledged, and any subscriber a scheduler that
- * submitted consumers earlier would provide. In that case this writer streams to it with no disk
- * involved at all, and the durability step at the stop writes only what was not taken.
+ * The overlap is exercised whenever a consumer is in fact attached: a reduce attempt reading while
+ * a superseded or speculative map attempt is still producing, a consumer resuming after a channel
+ * loss, and every shuffle under a scheduler that submits consumers earlier. In that case this
+ * writer streams to it with no disk involved at all, and the durability step at the stop writes
+ * only what was not taken.
  *
  * ==Wire contract==
  *
@@ -1196,6 +1197,21 @@ private[spark] class StreamingShuffleWriter[K, V, C](
    * generation at once and releases the buffers and spill files behind it. Deferring it to [[stop]]
    * would not do: a delegated attempt's stop belongs entirely to the sort-based writer, so this
    * writer's own stop sequence is deliberately not run at all.
+   *
+   * '''The generation is withdrawn before the delegate is adopted, and that ordering is the whole
+   * point.''' Two registrations exist before this writer does -- the routing entry this executor's
+   * listener holds and the producer address the driver publishes -- and both are made by
+   * [[StreamingShuffleManager]] on the way to constructing this writer, because a consumer must be
+   * routable the instant it can resolve an address. A delegation that left them standing would
+   * leave a producer a consumer can resolve, connect to, and then wait on until its own five-second
+   * detector fires, for an attempt that will never send it a byte: the sort-based writer publishes
+   * this map output, so the streaming address is not merely unnecessary but wrong. Withdrawing
+   * through [[releaseAfterFailure]] is what makes the unwind complete rather than partial -- one
+   * operation retires the driver registration, the routing entry, the retained-output registration
+   * and the handler's sessions, in that order -- and it is idempotent, so the task-completion
+   * listener that follows changes nothing. The undrawn framing reservation goes back with it,
+   * because the delegated [[stop]] returns through the sort-based writer and never reaches the
+   * `finally` that would otherwise have returned it.
    *
    * @param reason the trip condition to record, one of the four the feature specifies
    * @param detail operator-facing context, recorded with the declaration on the driver

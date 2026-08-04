@@ -400,8 +400,6 @@ private[spark] class StreamingShuffleServerHandler(
   private val duplicateAcks = new AtomicLong(0L)
   private val expiredSessions = new AtomicLong(0L)
   private val expiredConsumers = new AtomicLong(0L)
-  private val supersededSessions = new AtomicLong(0L)
-  private val identityConflicts = new AtomicLong(0L)
   private val refusedSessions = new AtomicLong(0L)
   private val untrackedConsumers = new AtomicLong(0L)
   private val deferredBlocks = new AtomicLong(0L)
@@ -1215,7 +1213,7 @@ private[spark] class StreamingShuffleServerHandler(
         log"recomputes rather than waiting for bytes that no longer exist")
       guard {
         writeControl(session, new StreamTerminationMessage(
-          shuffleId, mapId, partitionId, committedBlocks, committedBlocks))
+          shuffleId, mapId, partitionId, committedBlocks))
       }
       errorNotifier.setError(new SparkException(s"Streaming shuffle $shuffleId map $mapId " +
         s"partition $partitionId could not serve block $sequenceNumber to a consumer that had " +
@@ -1298,8 +1296,7 @@ private[spark] class StreamingShuffleServerHandler(
       // maintenance sweep would send another beat.
       val stamped = backpressure
         .heartbeatFor(consumerLedgerKey(partitionId, session.consumerId), nextPosition)
-        .getOrElse(new HeartbeatMessage(
-          shuffleId, mapId, partitionId, nextPosition, clock.getTimeMillis()))
+        .getOrElse(new HeartbeatMessage(shuffleId, mapId, partitionId, nextPosition))
       writeControl(session, stamped)
       sent = true
     }
@@ -1424,7 +1421,7 @@ private[spark] class StreamingShuffleServerHandler(
         if (ready && session.claimTermination(partitionId)) {
           val totalBlocks = stream.totalBlocksAtTermination.get()
           val future = writeControl(session, new StreamTerminationMessage(
-            shuffleId, mapId, partitionId, stream.nextSequenceNumber.get(), totalBlocks))
+            shuffleId, mapId, partitionId, totalBlocks))
           future.addListener(new ChannelFutureListener {
             override def operationComplete(completed: ChannelFuture): Unit = {
               if (completed.isSuccess) {
@@ -2386,10 +2383,11 @@ private[spark] class StreamingShuffleServerHandler(
     sessionFor(client)
       .filter { session =>
         session.stampHeartbeat(clock.getTimeMillis())
-        // Identity before subscription, because the identity is what the retained store's cursor
-        // and this partition's credit ledger are keyed by: subscribing first would open both
-        // under the connection's provisional identity and abandon them once it adopted its own.
-        adoptIdentity(client, session, heartbeat.consumerId())
+        // The session's own identity is tracked here, before subscription, because it is what the
+        // retained store's cursor and this partition's credit ledger are keyed by: subscribing
+        // first would open both before the consumer they belong to was known to be live.
+        trackConsumer(session.consumerId, clock.getTimeMillis())
+        true
       }
       .foreach { session =>
         if (session.subscribedTo(partitionId)) {
@@ -2418,19 +2416,20 @@ private[spark] class StreamingShuffleServerHandler(
           releaseSubscriberSlot(partitionId)
         }
         reportHeartbeat(session, heartbeat)
-        // A drain unconditionally, and this is load bearing rather than tidy. Every consumer of a
-        // completed map output subscribes *after* the producing task has ended -- the scheduler
-        // starts no reduce task before its map stage finishes -- so this heartbeat is frequently
-        // the only event that will ever occur on this stream, with no producer thread left to flush
-        // anything. A pass here is what delivers the deferred end of stream markers for the two
-        // cases [[resumeFrom]] leaves undrained: a partition this map produced nothing for, and a
-        // consumer whose position already covers everything retained.
+        // A drain unconditionally, and this is load bearing rather than tidy. A consumer that
+        // subscribes while the producer is still running will be drained again by the writer's next
+        // block, but one that subscribes to a completed map output has no producer thread left to
+        // flush anything, so this heartbeat can be the only event that will ever occur on its
+        // stream. Under the unmodified DAG scheduler -- which submits a reduce stage only once its
+        // map stage reports available output, and which this feature may not modify -- that is the
+        // ordinary case. A pass here is what delivers the deferred end of stream markers for the
+        // two cases [[resumeFrom]] leaves undrained: a partition this map produced nothing for, and
+        // a consumer whose position already covers everything retained.
         drain()
         if (debugEnabled) {
           logInfo(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} partition " +
             log"${MDC(PARTITION_ID, partitionId)} saw a heartbeat from consumer " +
-            log"${MDC(SESSION_ID, session.consumerId)} stamped " +
-            log"${MDC(VALUE, heartbeat.timestampMs())} at position " +
+            log"${MDC(SESSION_ID, session.consumerId)} at position " +
             log"${MDC(COUNT, heartbeat.sequenceNumber())}")
         }
       }
@@ -2778,12 +2777,6 @@ private[spark] class StreamingShuffleServerHandler(
   /** Logical consumers unregistered for going silent for longer than the expiry window. */
   def expiredConsumerCount: Long = expiredConsumers.get()
 
-  /** Sessions released because the same consumer declared its identity on a newer channel. */
-  def supersededSessionCount: Long = supersededSessions.get()
-
-  /** Channels closed for attempting to change the consumer identity of a live session. */
-  def identityConflictCount: Long = identityConflicts.get()
-
   /**
    * Egress channels that closed while still owing their consumer bytes, either unacknowledged or
    * undelivered.
@@ -3033,11 +3026,11 @@ private[spark] class StreamingShuffleServerHandler(
   /**
    * The session key of one consumer channel.
    *
-   * The channel's own id, not the consumer's identity: a reconnection is a different channel and
-   * must be a different session, so that a late teardown of the connection that was lost cannot
-   * dispossess the one that replaced it. The consumer identity lives inside the session and is what
-   * the retained store's cursors are keyed by, which is what makes the resumption work across the
-   * two channels.
+   * The channel's own id: a reconnection is a different channel and must be a different session,
+   * so that a late teardown of the connection that was lost cannot dispossess the one that replaced
+   * it. The session's identity, which is what the retained store's cursors are keyed by, is derived
+   * from the same connection; resumption across two channels works from the position the returning
+   * consumer announces rather than from a name it carries.
    */
   private def sessionKeyOf(client: TransportClient): String = {
     client.getChannel().id().asLongText()
@@ -3046,13 +3039,14 @@ private[spark] class StreamingShuffleServerHandler(
   /**
    * The session for one consumer channel, created on first use.
    *
-   * The session opens under a '''provisional''' identity taken from the transport's authenticated
-   * client id when there is one and from the socket when authentication is off. That is the honest
-   * binding available at this instant: with `spark.authenticate` on, the identity has been
-   * established by SASL before this handler sees a single frame, and with it off nothing stronger
-   * exists to bind to than the connection. It is provisional because neither form is stable across
-   * connections, and stability is what a resumption needs -- so the consumer's own logical identity
-   * is adopted from its first heartbeat by [[adoptIdentity]], which is the frame that can carry it.
+   * The session's identity is taken from the transport's authenticated client id when there is one
+   * and from the socket when authentication is off. That is the honest binding available at this
+   * instant: with `spark.authenticate` on, the identity has been established by SASL before this
+   * handler sees a single frame, and with it off nothing stronger exists to bind to than the
+   * connection. Neither form is stable across connections, and it does not need to be: a consumer
+   * that reconnects announces the position it has reached on its first heartbeat, and the retained
+   * window is replayed from that position, so resumption is a property of the position rather than
+   * of the identity.
    *
    * Either way a session may only ever affect the partitions it subscribed to on its own channel,
    * which is the invariant that does not depend on the operator's authentication choice.
@@ -3111,6 +3105,16 @@ private[spark] class StreamingShuffleServerHandler(
         releaseSessionSlot()
         Some(raced)
       } else {
+        // Indexed by identity as well as by channel, and here rather than on a later frame, because
+        // a session's identity is settled the moment its channel is announced: there is no frame
+        // that carries or changes one. The index is what [[liveConsumerCount]] reports and what the
+        // stale-consumer sweep consults before it retires a consumer's retained output, so a
+        // session missing from it would be invisible to both -- the sweep would treat a consumer it
+        // is actively serving as gone. A reconnection is a new channel and therefore a new session,
+        // so the later one takes the entry; the removals are all conditional on the mapped value
+        // being the session being torn down, which is what stops a late teardown of the connection
+        // that was lost from unindexing the one that replaced it.
+        sessionsByConsumer.put(created.consumerId, created)
         Some(created)
       }
     }
@@ -3258,73 +3262,14 @@ private[spark] class StreamingShuffleServerHandler(
   }
 
   /**
-   * Binds one session to the logical identity its consumer declares, once.
-   *
-   * <b>Why the consumer names itself rather than being named.</b> Everything about a connection
-   * changes when a reduce task reconnects -- the channel, the ephemeral port, and therefore any
-   * identity derived from either -- while the entitlement being resumed belongs to the reduce task,
-   * which has not changed at all. A cursor keyed by the connection is consequently a cursor that
-   * is abandoned by the very event it exists to survive. The consumer's heartbeat therefore carries
-   * the one identifier that is stable across its connections, and this is where that identifier
-   * becomes the key the retained store's cursors and this handler's ledgers are held under.
-   *
-   * Three outcomes, and each is a decision rather than a default:
-   *
-   *  - <b>Nothing declared.</b> A peer that names no identity keeps its provisional one. It is
-   *    then a fresh consumer on every connection, which is the prior behaviour and is safe: it can
-   *    never adopt another consumer's cursor, it merely cannot resume against its own.
-   *  - <b>First declaration.</b> Adopted, and recorded as the session now serving that consumer.
-   *    Any session still registered for the same identity on a different channel is stale by
-   *    construction -- one reduce task attempt reads through one connection at a time -- and is
-   *    evicted, which is what stops a superseded connection from continuing to hold credit, queue
-   *    blocks and pin a retained window.
-   *  - <b>A second, different declaration on the same channel.</b> Refused, and the channel closed.
-   *    A session that could be renamed mid-flight could be talked into adopting the cursors, and
-   *    therefore the unread output, of a consumer that is not the peer holding the socket.
-   *
-   * @return true when the session may go on to subscribe, false when the channel has been closed
-   */
-  private def adoptIdentity(
-      client: TransportClient,
-      session: ConsumerSession,
-      declared: String): Boolean = {
-    if (declared == null || declared.isEmpty || declared == session.consumerId) {
-      trackConsumer(session.consumerId, clock.getTimeMillis())
-      true
-    } else if (!session.declareIdentity(declared)) {
-      identityConflicts.incrementAndGet()
-      misaddressedMessages.incrementAndGet()
-      logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} refused a consumer identity " +
-        log"change from ${MDC(SESSION_ID, session.consumerId)} to " +
-        log"${MDC(DESCRIPTION, declared)} on the channel from " +
-        log"${MDC(HOST_PORT, client.getSocketAddress())}: " +
-        log"${MDC(REASON, "a session may declare its identity once")}; closing it")
-      closeSession(client)
-      false
-    } else {
-      val superseded = sessionsByConsumer.put(declared, session)
-      trackConsumer(declared, clock.getTimeMillis())
-      if (superseded != null && superseded.ne(session)) {
-        supersededSessions.incrementAndGet()
-        evictSession(superseded)
-        logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} superseded the egress " +
-          log"session of consumer ${MDC(SESSION_ID, declared)}: it has reconnected on a new " +
-          log"channel, so the previous one has been released and its output will be replayed")
-      }
-      true
-    }
-  }
-
-  /**
    * Replaces every character that could break a log record with a single visible substitute.
    *
    * Applied to the one identity this producer derives rather than receives -- the transport
-   * handshake identity -- because every identity that arrives on the wire is already refused at the
-   * protocol boundary by `HeartbeatMessage`'s own validation. The two together mean no consumer
-   * identity holding a record separator can exist anywhere in this subsystem, which is a stronger
-   * guarantee than sanitising at each of the many sites that log one: a sanitiser omitted at a
-   * single site would reinstate the whole problem, and there is no correct value for a sanitiser to
-   * miss here.
+   * handshake identity -- and that is now the only identity there is: no frame carries a consumer
+   * identity, so sanitising the handshake value means no consumer identity holding a record
+   * separator can exist anywhere in this subsystem. That is a stronger guarantee than sanitising at
+   * each of the many sites that log one, because a sanitiser omitted at a single site would
+   * reinstate the whole problem, and there is no correct value for a sanitiser to miss here.
    *
    * The substitute is a single question mark per offending character rather than an escape
    * sequence, so the result stays a stable map key of predictable length and two identities
@@ -4040,11 +3985,12 @@ private[spark] object StreamingShuffleServerHandler {
   /**
    * Everything one consumer's channel is owed, and everything it has confirmed.
    *
-   * A session exists per channel, not per consumer identity: a reconnection is a new channel and so
-   * a new session, which is what stops a late teardown of the connection that was lost from
-   * dispossessing the one that replaced it. The consumer identity is carried inside, because it is
-   * what the retained store's release cursors are keyed by, and that is what lets a reconnecting
-   * consumer resume from exactly the position its predecessor reached.
+   * A session exists per channel: a reconnection is a new channel and so a new session, which is
+   * what stops a late teardown of the connection that was lost from dispossessing the one that
+   * replaced it. Resumption does not depend on recognising the returning consumer as the same
+   * logical peer, because the first heartbeat it sends states the position it has reached and the
+   * retained window is replayed from there -- so the position, not an identity, is the resume
+   * handshake, and nothing a reconnection changes takes part in it.
    *
    * Two properties of this class are load-bearing for correctness rather than tidiness:
    *
@@ -4057,52 +4003,17 @@ private[spark] object StreamingShuffleServerHandler {
    *    would allow and which would make the slowest reader the pace of the whole map output.
    *
    * @param sessionKey the channel's own identifier, this session's identity in the registry
-   * @param provisionalId the identity to answer with until the consumer declares its own, taken
-   *                      from the transport's authenticated client id where there is one
+   * @param consumerIdentity the identity this session's cursors are keyed by, taken from the
+   *                         transport's authenticated client id where there is one and from the
+   *                         socket otherwise
    * @param channel the consumer's channel, used for writes and for writability
    * @param createdAtMs the instant the session was opened, which seeds its activity stamps
    */
   private final class ConsumerSession(
       val sessionKey: String,
-      provisionalId: String,
+      val consumerId: String,
       val channel: Channel,
       createdAtMs: Long) {
-
-    /**
-     * The identity this session's cursors are keyed by.
-     *
-     * Provisional until the consumer declares one on a heartbeat, and settled from then on. It has
-     * to be settleable rather than fixed at construction because the identity that matters is the
-     * consumer's own logical one -- stable across the connections a reduce task makes -- and the
-     * first frame that can carry it is the first frame the consumer sends, which arrives after the
-     * session exists. It has to be settleable exactly '''once''' because a session whose identity
-     * could change mid-flight could be talked into adopting another consumer's cursors.
-     */
-    private val identity: AtomicReference[String] = new AtomicReference[String](provisionalId)
-
-    /** Latched when a declared identity has been adopted, so a second, different one is refused. */
-    private val identityDeclared: AtomicBoolean = new AtomicBoolean(false)
-
-    /** The identity this session's retained-store cursors and ledgers are keyed by. */
-    def consumerId: String = identity.get()
-
-    /** Whether this session is keyed by an identity the consumer itself declared. */
-    def hasDeclaredIdentity: Boolean = identityDeclared.get()
-
-    /**
-     * Adopts the identity a consumer declares on its heartbeat.
-     *
-     * @return true when the session now answers to `declared`, false when it had already adopted a
-     *         different identity -- a mid-session identity change, which is refused
-     */
-    def declareIdentity(declared: String): Boolean = {
-      if (identityDeclared.compareAndSet(false, true)) {
-        identity.set(declared)
-        true
-      } else {
-        identity.get() == declared
-      }
-    }
 
     /** Blocks queued for this consumer, ordered by the egress priority they were queued under. */
     val queue: PriorityBlockingQueue[PendingBlock] =

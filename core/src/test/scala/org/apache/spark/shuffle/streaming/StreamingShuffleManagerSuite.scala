@@ -1312,8 +1312,8 @@ class StreamingShuffleManagerSuite extends SparkFunSuite
       // entirely: stale rather than hostile, so it is dropped and counted without charging the
       // channel, because a consumer legitimately holds an address until its own liveness timer
       // says otherwise.
-      val unroutable = heartbeat(shuffleId = 3, mapId = 5L, partitionId = 1, sequenceNumber = 0L,
-        timestampMillis = ManualClockEpochMillis).toByteBuffer()
+      val unroutable = heartbeat(shuffleId = 3, mapId = 5L, partitionId = 1,
+        consumerPosition = 0L).toByteBuffer()
       listener.receive(innocentClient, unroutable)
       assert(listener.unroutableFrameCount === 1L,
         s"a frame naming an unserved producer must be counted as unroutable, but " +
@@ -2103,8 +2103,7 @@ class StreamingShuffleManagerSuite extends SparkFunSuite
         // A well-formed frame for a producer this executor does not host. What it proves is that
         // the frame crossed an authenticated channel and reached the routing layer: an
         // unauthenticated channel would never have been established for it to cross.
-        val heartbeat = new HeartbeatMessage(4711, 1L, 0, 0L, ManualClockEpochMillis,
-          "auth-consumer")
+        val heartbeat = new HeartbeatMessage(4711, 1L, 0, 0L)
         client.send(heartbeat.toByteBuffer())
         eventually(timeout(10.seconds), interval(50.milliseconds)) {
           assert(listener.unroutableFrameCount > unroutableBefore,
