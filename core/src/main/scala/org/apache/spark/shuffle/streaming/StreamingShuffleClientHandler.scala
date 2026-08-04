@@ -60,14 +60,14 @@ import org.apache.spark.util.{Clock, SystemClock}
  * <b>How the three layers of backpressure cooperate.</b> The streaming shuffle holds a producer
  * back in three ways at once, and this handler owns the third of them.
  *
- *  - Application-level credit. [[BackpressureProtocol]] keeps a per-stream ledger and answers
- *    `hasCredit`; a producer whose credit is spent must stop and wait for an acknowledgement.
- *  - Rate limiting. A token bucket paces egress and is consulted by the producer, never here.
- *  - TCP-level throttling. When credit is spent, or when this handler's own hand-off queue is at
- *    its high-water mark, `autoRead` is turned off: Netty stops reading from the socket, the
- *    receive window closes, and the pressure reaches the producer through TCP itself rather than
- *    through any message this subsystem has to invent. An acknowledgement that advances the
- *    consumer position, or a queue that has drained, turns it back on.
+ * - Application-level credit. [[BackpressureProtocol]] keeps a per-stream ledger and answers
+ * `hasCredit`; a producer whose credit is spent must stop and wait for an acknowledgement.
+ * - Rate limiting. A token bucket paces egress and is consulted by the producer, never here.
+ * - TCP-level throttling. When credit is spent, or when this handler's own hand-off queue is at
+ * its high-water mark, `autoRead` is turned off: Netty stops reading from the socket, the
+ * receive window closes, and the pressure reaches the producer through TCP itself rather than
+ * through any message this subsystem has to invent. An acknowledgement that advances the
+ * consumer position, or a queue that has drained, turns it back on.
  *
  * Every transition into the throttled state belongs to [[BackpressureProtocol]], which owns the
  * `shuffle.streaming.backpressureEvents` counter and advances it from the one place a throttling
@@ -78,17 +78,17 @@ import org.apache.spark.util.{Clock, SystemClock}
  *
  * <b>The thread model, which is binding.</b> Two kinds of thread touch this class.
  *
- *  - A Netty event-loop thread runs every `channel*` callback. It may decode a frame, update the
- *    lock-free bookkeeping, enqueue a block and write an acknowledgement, and it may do nothing
- *    else. In particular it never calls a `ShuffleReadMetricsReporter` method -- that interface
- *    documents itself as single-threaded -- it never parks, blocks or sleeps, and it never lets an
- *    exception escape a callback.
- *  - The reduce task's own thread drains the queue, performs the authoritative checksum
- *    verification, updates the read metrics and throws. A failure this handler observes on an I/O
- *    thread is handed to [[StreamingShuffleErrorNotifier]], whose first-error-wins latch the task
- *    thread reads inside `read()`. Without that bridge a failure seen only on an I/O thread would
- *    be swallowed and the task would wait forever for input that is never going to arrive, because
- *    `ShuffleReader` exposes only `read()` and its `stop()` is commented out.
+ * - A Netty event-loop thread runs every `channel*` callback. It may decode a frame, update the
+ * lock-free bookkeeping, enqueue a block and write an acknowledgement, and it may do nothing
+ * else. In particular it never calls a `ShuffleReadMetricsReporter` method -- that interface
+ * documents itself as single-threaded -- it never parks, blocks or sleeps, and it never lets an
+ * exception escape a callback.
+ * - The reduce task's own thread drains the queue, performs the authoritative checksum
+ * verification, updates the read metrics and throws. A failure this handler observes on an I/O
+ * thread is handed to [[StreamingShuffleErrorNotifier]], whose first-error-wins latch the task
+ * thread reads inside `read()`. Without that bridge a failure seen only on an I/O thread would
+ * be swallowed and the task would wait forever for input that is never going to arrive, because
+ * `ShuffleReader` exposes only `read()` and its `stop()` is commented out.
  *
  * Because that trait has no lifecycle hook, release is not something this handler can schedule for
  * itself. It exposes an idempotent [[close]] instead, which the reader registers on
@@ -116,28 +116,28 @@ import org.apache.spark.util.{Clock, SystemClock}
  * can provoke.
  *
  * @param conf the executor's configuration, read once at construction and then held immutably,
- *             which is what makes "a configuration change requires an executor restart" true by
- *             construction
+ * which is what makes "a configuration change requires an executor restart" true by
+ * construction
  * @param shuffleId the shuffle this channel serves; every frame that names another shuffle is
- *                  refused at the boundary
+ * refused at the boundary
  * @param mapId the map output this channel carries, which together with the task attempt is the
- *              producer generation the receiving ledger is keyed by
+ * producer generation the receiving ledger is keyed by
  * @param taskAttemptId the producing attempt, so a superseded attempt cannot share accounting with
- *                      the attempt that replaced it
+ * the attempt that replaced it
  * @param consumerId this consumer session's identity, which is what the producer's retained store
- *                   keys its per-consumer acknowledgement cursor by
+ * keys its per-consumer acknowledgement cursor by
  * @param startPartition the first reduce partition this task reads, inclusive. Together with
- *                       `endPartition` it is the *authenticated* request: a frame naming a
- *                       partition outside it is refused before any state is allocated for it, so
- *                       the metadata a remote peer can cause this handler to hold is bounded by
- *                       what the task itself asked for rather than by what the peer chooses to send
+ * `endPartition` it is the *authenticated* request: a frame naming a
+ * partition outside it is refused before any state is allocated for it, so
+ * the metadata a remote peer can cause this handler to hold is bounded by
+ * what the task itself asked for rather than by what the peer chooses to send
  * @param endPartition one past the last reduce partition this task reads
  * @param backpressure the flow-control protocol that owns the credit ledger, the liveness timers
- *                     and the backpressure-event counter; must not be null
+ * and the backpressure-event counter; must not be null
  * @param errorNotifier the bridge that carries a failure observed on this I/O thread to the task
- *                      thread; must not be null
+ * thread; must not be null
  * @param clock the single time source for every timer in this class, so each one advances with
- *              that clock rather than with wall time and nothing here sleeps
+ * that clock rather than with wall time and nothing here sleeps
  */
 private[spark] class StreamingShuffleClientHandler(
     conf: SparkConf,
@@ -1041,23 +1041,28 @@ private[spark] class StreamingShuffleClientHandler(
 
     state.lastInboundMillis.set(clock.getTimeMillis())
 
+    val expected = state.expectedSequenceNumber.get()
+    val payloadLength = block.payloadLength().toLong
+    val staleDuplicate = sequenceNumber < expected && !state.isQuarantined(sequenceNumber)
+
     if (state.terminated.get()) {
-      rejectBlockAfterTermination(state, sequenceNumber)
+      // A stream that has ended is still reachable by a repair the producer had already committed
+      // to the wire, and the two cases that can arrive are not the same event. A position this
+      // consumer has already accepted is a redundant copy of output it holds: discarding it is
+      // exactly the answer the live path gives the same frame, it loses nothing, and the partition
+      // stays complete. A position at or beyond the frontier the terminator fixed is the
+      // contradiction this stream cannot be completed around -- either the terminator or the block
+      // is wrong -- and that is what escalates.
+      if (staleDuplicate) {
+        discardDuplicateBlock(state, sequenceNumber, expected, payloadLength)
+      } else {
+        rejectBlockAfterTermination(state, sequenceNumber)
+      }
       return
     }
 
-    val expected = state.expectedSequenceNumber.get()
-    val payloadLength = block.payloadLength().toLong
-    if (sequenceNumber < expected && !state.isQuarantined(sequenceNumber)) {
-      // Liveness and the link bytes, but not the window charge and not the stream's received total.
-      backpressure.onDiscardedData(consumerKey(partitionId), payloadLength)
-      if (debugEnabled) {
-        logDebug(log"Streaming shuffle discarded a duplicate block " +
-          log"${MDC(BLOCK_ID, blockIdOf(partitionId, sequenceNumber))} of shuffle " +
-          log"${MDC(SHUFFLE_ID, shuffleId)} because position " +
-          log"${MDC(COUNT, expected)} has already been accepted")
-      }
-      state.duplicateBlocks.incrementAndGet()
+    if (staleDuplicate) {
+      discardDuplicateBlock(state, sequenceNumber, expected, payloadLength)
     } else {
       backpressure.onDataReceived(consumerKey(partitionId), sequenceNumber, payloadLength)
       if (sequenceNumber > expected) {
@@ -1068,6 +1073,45 @@ private[spark] class StreamingShuffleClientHandler(
         admitBlock(state, block)
       }
     }
+  }
+
+  /**
+   * Discards a block for a position this consumer has already accepted.
+   *
+   * Delivery on this protocol is idempotent by design rather than by accident. A producer may put a
+   * position on the wire a second time -- a resume records a run from the position a consumer
+   * announced, a queue ceiling defers a block that is later re-queued, and a repair replays a run
+   * that spans the boundary between what has been delivered and what has not -- so a copy of
+   * something already held is a routine event and not a fault. It is accounted for exactly as much
+   * as it deserves: the arrival stamps producer liveness and the bytes count as link traffic
+   * through `onDiscardedData`, while the receive window is not charged, the stream's received total
+   * does not move, and the sequence cursor stays where it is.
+   *
+   * Shared by the live path and the ended-stream path deliberately. The same frame arriving a
+   * millisecond either side of a terminator is the same redundant copy of the same output, and
+   * giving the two arrivals different answers -- discard on one side, escalate to a fetch failure
+   * and an upstream recomputation on the other -- is what turned a producer's harmless repair into
+   * a spurious producer-loss report.
+   *
+   * @param state the partition the block belongs to
+   * @param sequenceNumber the position the duplicate carried
+   * @param expected the frontier the duplicate is judged against
+   * @param payloadBytes the payload the duplicate carried
+   */
+  private def discardDuplicateBlock(
+      state: PartitionState,
+      sequenceNumber: Long,
+      expected: Long,
+      payloadBytes: Long): Unit = {
+    // Liveness and the link bytes, but not the window charge and not the stream's received total.
+    backpressure.onDiscardedData(consumerKey(state.partitionId), payloadBytes)
+    if (debugEnabled) {
+      logDebug(log"Streaming shuffle discarded a duplicate block " +
+        log"${MDC(BLOCK_ID, blockIdOf(state.partitionId, sequenceNumber))} of shuffle " +
+        log"${MDC(SHUFFLE_ID, shuffleId)} because position " +
+        log"${MDC(COUNT, expected)} has already been accepted")
+    }
+    state.duplicateBlocks.incrementAndGet()
   }
 
   /**
@@ -1135,6 +1179,9 @@ private[spark] class StreamingShuffleClientHandler(
           state.highestReceivedSequenceNumber.set(sequenceNumber)
         }
         state.acceptedBlocks.incrementAndGet()
+        // An admission is the only event that can advance the position a held end-of-stream is
+        // waiting for, so this is where a deferred terminator is applied.
+        applyDeferredTermination(state)
         if (debugEnabled) {
           logDebug(log"Streaming shuffle accepted block " +
             log"${MDC(BLOCK_ID, blockIdOf(partitionId, sequenceNumber))} of " +
@@ -1310,7 +1357,19 @@ private[spark] class StreamingShuffleClientHandler(
     val state = partitionStateOf(partitionId)
     state.lastInboundMillis.set(clock.getTimeMillis())
     val expected = state.expectedSequenceNumber.get()
-    if (totalBlocks != expected) {
+    if (totalBlocks > expected && state.hasOutstandingRepairs) {
+      // A terminator that names MORE blocks than this consumer has reached, while a repair of this
+      // partition is still outstanding, is not a contradiction: it is the truth arriving before the
+      // blocks that make it true. The producer committed every one of those positions -- some of
+      // them were quarantined here for a replay that has been asked for and is still on its way --
+      // so refusing the terminator would report a producer that has done nothing wrong as lost and
+      // pay for it with a recomputation of the whole upstream stage. It is held instead, and
+      // applied by [[applyDeferredTermination]] the moment the repairs close the gap. The wait is
+      // bounded by the reader's own producer-liveness timer, which raises a fetch failure if
+      // nothing arrives for [[PRODUCER_CONNECTION_TIMEOUT_MS]], and by the replay budget, whose
+      // exhaustion escalates.
+      deferTermination(state, totalBlocks)
+    } else if (totalBlocks != expected) {
       rejectTermination(state, totalBlocks, expected)
     } else if (state.terminated.compareAndSet(false, true)) {
       // Written before the flag is observable to anyone else, and never written again: this is the
@@ -1338,6 +1397,51 @@ private[spark] class StreamingShuffleClientHandler(
   }
 
   /**
+   * Holds an end-of-stream that is ahead of this consumer's position while a repair is outstanding.
+   *
+   * The total is recorded rather than applied, so nothing observes the stream as ended: the reader
+   * keeps polling, the replay protocol keeps working, and the announced total is available to the
+   * admission path that will eventually reach it. A repeated terminator naming the same total is
+   * absorbed by the deferral itself; one naming a different total contradicts the first and is
+   * refused, because a producer may commit to exactly one total.
+   */
+  private def deferTermination(state: PartitionState, totalBlocks: Long): Unit = {
+    if (!state.deferTermination(totalBlocks)) {
+      rejectTermination(state, totalBlocks, state.deferredTerminationTotal)
+    } else {
+      state.deferredTerminations.incrementAndGet()
+      reportRepair(log"Streaming shuffle is holding the end-of-stream of shuffle " +
+        log"${MDC(SHUFFLE_ID, shuffleId)} partition ${MDC(PARTITION_ID, state.partitionId)} at " +
+        log"${MDC(COUNT, totalBlocks)} block(s) while ${MDC(THRESHOLD, state.quarantinedCount)} " +
+        log"position(s) are still being repaired")
+    }
+  }
+
+  /**
+   * Applies a held end-of-stream once the repairs that delayed it have closed the gap.
+   *
+   * Called after every admission, which is the only event that can advance the position a deferred
+   * terminator is waiting for. Does nothing in the ordinary case -- one atomic read -- and
+   * completes the stream exactly as [[handleTermination]] would have, through the same latch, so a
+   * deferred completion and an immediate one are indistinguishable to the reader.
+   */
+  private def applyDeferredTermination(state: PartitionState): Unit = {
+    val deferred = state.deferredTerminationTotal
+    if (deferred != NO_BLOCK_TOTAL && deferred == state.expectedSequenceNumber.get() &&
+        state.terminated.compareAndSet(false, true)) {
+      state.announcedBlocks.set(deferred)
+      if (state.completionSignalled.compareAndSet(false, true)) {
+        enqueue(StreamCompleted(state.partitionId, deferred), 0L)
+      }
+      if (debugEnabled) {
+        logDebug(log"Streaming shuffle applied the held end-of-stream of shuffle " +
+          log"${MDC(SHUFFLE_ID, shuffleId)} partition ${MDC(PARTITION_ID, state.partitionId)} " +
+          log"after its repairs completed ${MDC(COUNT, deferred)} block(s)")
+      }
+    }
+  }
+
+  /**
    * Refuses a terminator that does not describe this stream, and declares the producer lost.
    *
    * Escalation rather than a dropped frame, for the reason [[handleTermination]] states: a stream
@@ -1350,7 +1454,7 @@ private[spark] class StreamingShuffleClientHandler(
    * @param state the partition whose stream was being ended
    * @param claimedTotal the block total the terminator claimed
    * @param reconciledTotal the total the claim is refused against -- the position this consumer has
-   *                        actually reached, or the total an accepted terminator already
+   * actually reached, or the total an accepted terminator already
    * established
    */
   /**
@@ -1539,8 +1643,8 @@ private[spark] class StreamingShuffleClientHandler(
    *
    * @param partitionId the reduce partition being acknowledged
    * @param consumedSequenceNumber the highest block position the task has consumed, or
-   *                               `AckMessage.NOTHING_CONSUMED` to state that it has consumed
-   *                               nothing
+   * `AckMessage.NOTHING_CONSUMED` to state that it has consumed
+   * nothing
    * @return true if this call advanced the acknowledged position
    */
   def acknowledge(partitionId: Int, consumedSequenceNumber: Long): Boolean = {
@@ -1929,7 +2033,12 @@ private[spark] class StreamingShuffleClientHandler(
       cause: Throwable,
       partitionId: Int,
       invalidation: StreamingShuffleInvalidationReason): Unit = {
-    signalProducerLost(partitionId, cause.getClass.getSimpleName, cause, invalidation)
+    // The reason carried on the marker becomes the operator-facing text of the fetch failure the
+    // reader raises from it, so it is the cause's own message -- which for a typed streaming
+    // condition names the condition, the disagreeing numbers and the SQLSTATE. Reporting the class
+    // name here left the scheduler's failure reason reading "was lost: SparkException." and put
+    // everything actionable behind a getCause() walk.
+    signalProducerLost(partitionId, describeCause(cause), cause, invalidation)
     errorNotifier.setError(cause)
     val reported = escalationsReported.incrementAndGet()
     if (reported <= MAX_REPORTED_ESCALATIONS) {
@@ -1940,6 +2049,21 @@ private[spark] class StreamingShuffleClientHandler(
       logDebug(log"Streaming shuffle consumer failed again for shuffle " +
         log"${MDC(SHUFFLE_ID, shuffleId)} partition ${MDC(PARTITION_ID, partitionId)} after " +
         log"${MDC(COUNT, reported)} reported failure(s): ${MDC(ERROR, cause.getMessage)}")
+    }
+  }
+
+  /**
+   * The operator-facing rendering of a failure, phrased so that it composes into the fetch-failure
+   * reason the reader builds from it: the cause's own message without its terminating full stop, or
+   * the cause's simple type name when it carries no message at all.
+   */
+  private def describeCause(cause: Throwable): String = {
+    val message = if (cause == null) null else cause.getMessage
+    if (message == null || message.trim.isEmpty) {
+      if (cause == null) "no cause was reported" else cause.getClass.getSimpleName
+    } else {
+      val trimmed = message.trim
+      if (trimmed.endsWith(".")) trimmed.dropRight(1) else trimmed
     }
   }
 
@@ -1974,6 +2098,16 @@ private[spark] class StreamingShuffleClientHandler(
   }
 
   // Observability, all of it derived from state this handler already keeps.
+
+  /**
+   * How many failures this handler has recorded on the shared error notifier.
+   *
+   * Read by the reader to attribute a latched failure to the producer whose channel produced it.
+   * The count is the honest answer to "did this handler report anything", which a marker on the
+   * hand-off queue is not: a marker is raised once per partition and can be refused by a full
+   * queue, whereas every escalation increments this.
+   */
+  def reportedEscalationCount: Long = escalationsReported.get()
 
   /** Whether this channel is currently reading from its socket. */
   def isAutoReadEnabled: Boolean = autoReadEnabled.get()
@@ -2675,6 +2809,39 @@ private[spark] object StreamingShuffleClientHandler {
 
     /** The replay budget of each requested range, keyed by the range's first position. */
     private val replayWindows = new ConcurrentHashMap[java.lang.Long, ReplayWindow]()
+
+    /**
+     * An end-of-stream this consumer has been told about but cannot apply yet, or
+     * [[StreamingShuffleClientHandler.NO_BLOCK_TOTAL]] when there is none.
+     *
+     * A producer that has committed every position it names may announce the end of its stream
+     * while a replay this consumer asked for is still in flight. The announcement is true and must
+     * not be refused; it simply cannot be applied until the repair lands, so it is held here and
+     * applied by the admission that closes the gap.
+     */
+    private val deferredTermination = new AtomicLong(NO_BLOCK_TOTAL)
+
+    /** How many end-of-stream announcements had to be held for a repair. */
+    val deferredTerminations = new AtomicLong(0L)
+
+    /**
+     * Records a held end-of-stream total, or refuses one that contradicts the total already held.
+     *
+     * @return true when the total is the one being held afterwards
+     */
+    def deferTermination(totalBlocks: Long): Boolean =
+      deferredTermination.compareAndSet(NO_BLOCK_TOTAL, totalBlocks) ||
+        deferredTermination.get() == totalBlocks
+
+    /** The held end-of-stream total, or the sentinel when none is held. */
+    def deferredTerminationTotal: Long = deferredTermination.get()
+
+    /**
+     * Whether a repair of this partition is still outstanding: a position is quarantined awaiting a
+     * replacement, or a replay window has been recorded and not yet discarded. Either means blocks
+     * the producer committed are still expected to arrive.
+     */
+    def hasOutstandingRepairs: Boolean = !quarantined.isEmpty || !replayWindows.isEmpty
 
     /** Highest position acknowledged, or the nothing-consumed sentinel. */
     val acknowledgedPosition = new AtomicLong(AckMessage.NOTHING_CONSUMED)

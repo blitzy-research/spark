@@ -243,14 +243,26 @@ private[spark] case class StreamingShuffleMapStage(
  *
  * @param reasonName name of the latched [[StreamingShuffleFallbackReason]], or
  *                   [[StreamingShuffleCoordinator.NO_FALLBACK_REASON]] while streaming is in force
+ * The declared detail travels with the reason for a reason of its own. The set of conditions is
+ * closed at four members, so a declaration whose true condition is narrower than any of them has to
+ * pick the member it belongs under -- and the member's own prose would then be the only thing an
+ * operator ever saw, stating a measurement that was never taken. Carrying the declarer's own
+ * sentence alongside the name keeps the name a stable machine identifier while the prose an
+ * operator reads is the one the declaring component actually meant.
+ *
+ * @param reasonName name of the latched [[StreamingShuffleFallbackReason]], or
+ *                   [[StreamingShuffleCoordinator.NO_FALLBACK_REASON]] while streaming is in force
  * @param declaredAtEpoch coordinator epoch the shuffle advanced to when the fallback was declared,
  *                        or [[StreamingShuffleCoordinator.NO_EPOCH]] while streaming is in force.
  *                        A consumer holding locations from an earlier epoch can tell from this that
  *                        everything it holds predates the decision
+ * @param detail the declaring component's own sanitised account of the condition, or
+ *               [[StreamingShuffleCoordinator.NO_INVALIDATION_DETAIL]] when it gave none
  */
 private[spark] case class StreamingShuffleFallbackState(
     reasonName: String = StreamingShuffleCoordinator.NO_FALLBACK_REASON,
-    declaredAtEpoch: Long = StreamingShuffleCoordinator.NO_EPOCH) {
+    declaredAtEpoch: Long = StreamingShuffleCoordinator.NO_EPOCH,
+    detail: String = StreamingShuffleCoordinator.NO_INVALIDATION_DETAIL) {
 
   /** Whether the shuffle has stood streaming down for every participant. */
   def fallenBack: Boolean = reasonName != StreamingShuffleCoordinator.NO_FALLBACK_REASON
@@ -262,6 +274,26 @@ private[spark] case class StreamingShuffleFallbackState(
    */
   def reason: Option[StreamingShuffleFallbackReason] =
     StreamingShuffleFallbackReason.fromName(reasonName)
+
+  /**
+   * The operator-facing account of this verdict: the declarer's own detail when it gave one, this
+   * build's prose for the latched member when it did not, and the bare name only for a name this
+   * build cannot resolve.
+   *
+   * Preferring the detail is what stops a declaration from being reported as a condition nobody
+   * measured. Three of the four members name a resource condition -- a throughput ratio held for a
+   * minute, a refused buffer reservation, a share of an administered link -- so rendering one of
+   * them for a declaration that observed none of those things tells an operator to go and tune
+   * something that was never the matter.
+   */
+  def condition: String = {
+    if (detail != null && detail.nonEmpty &&
+        detail != StreamingShuffleCoordinator.NO_INVALIDATION_DETAIL) {
+      detail
+    } else {
+      reason.map(_.description).getOrElse(reasonName)
+    }
+  }
 }
 
 /**
@@ -956,12 +988,16 @@ private[spark] case class StreamingShuffleState(
    * sort-based path, and a completion record surviving the declaration would tell a consumer that
    * output it must no longer read is still available.
    */
-  def withFallback(reasonName: String, epoch: Long): StreamingShuffleState = {
+  def withFallback(
+      reasonName: String,
+      epoch: Long,
+      detail: String = StreamingShuffleCoordinator.NO_INVALIDATION_DETAIL)
+    : StreamingShuffleState = {
     if (fallback.fallenBack) {
       this
     } else {
       copy(
-        fallback = StreamingShuffleFallbackState(reasonName, epoch),
+        fallback = StreamingShuffleFallbackState(reasonName, epoch, detail),
         mapStage = mapStage.cleared,
         coordinatorEpoch = epoch)
     }
@@ -1923,7 +1959,7 @@ private[spark] class StreamingShuffleCoordinator(
           declared = true
           droppedProducers = existing.producers.size
           epoch = epochCounter.incrementAndGet()
-          state = StreamingShuffleFallbackState(reason.toString, epoch)
+          state = StreamingShuffleFallbackState(reason.toString, epoch, recordedDetail)
           // Every live producer is dropped and its generation retired in the same update that
           // latches the reason, so there is no interleaving in which a producer survives the
           // declaration or re-registers immediately after it.
@@ -1932,7 +1968,7 @@ private[spark] class StreamingShuffleCoordinator(
               accumulated.withoutProducer(entry.location.mapIndex)
                 .withRetiredGeneration(entry.location.generation)
             }
-            .withFallback(reason.toString, epoch)
+            .withFallback(reason.toString, epoch, recordedDetail)
             .copy(lastActivityMs = nowMs)
         }
       })
@@ -2707,7 +2743,7 @@ private[spark] class StreamingShuffleCoordinator(
    */
   private def fallbackDeclaredReason(fallback: StreamingShuffleFallbackState): String = {
     s"the shuffle stood streaming down at epoch ${fallback.declaredAtEpoch} because " +
-      s"${fallback.reason.map(_.description).getOrElse(fallback.reasonName)}, so its producers " +
+      s"${fallback.condition}, so its producers " +
       "must use the sort-based shuffle"
   }
 

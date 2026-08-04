@@ -33,7 +33,7 @@ import org.apache.spark.{SharedSparkContext, SparkConf, SparkException, SparkFun
 import org.apache.spark.internal.config.{SHUFFLE_STREAMING_BUFFER_SIZE_PERCENT, SHUFFLE_STREAMING_MAX_BANDWIDTH_MBPS, SHUFFLE_STREAMING_SPILL_THRESHOLD}
 import org.apache.spark.network.client.{TransportClient, TransportResponseHandler}
 import org.apache.spark.network.protocol.OneWayMessage
-import org.apache.spark.network.shuffle.protocol.streaming.{AckMessage, DataBlockMessage, HeartbeatMessage, StreamingShuffleChecksum, StreamingShuffleMessage, StreamingShuffleMessageType, StreamTerminationMessage}
+import org.apache.spark.network.shuffle.protocol.streaming.{AckMessage, DataBlockMessage, HeartbeatMessage, RetransmitRequestMessage, StreamingShuffleChecksum, StreamingShuffleMessage, StreamingShuffleMessageType, StreamTerminationMessage}
 import org.apache.spark.scheduler.MapStatus
 import org.apache.spark.shuffle.{FetchFailedException, ShuffleWriter}
 import org.apache.spark.storage.BlockManagerId
@@ -1157,9 +1157,9 @@ class StreamingShuffleWriterSuite
    *
    * @param spillManager the store to fill
    * @param nextSequence the next sequence number to admit for each partition, indexed by partition
-   *                     id and advanced in place, so a caller may fill, evict and fill again
-   *                     without
-   *                     breaking the gap-free ascending run each partition requires
+   * id and advanced in place, so a caller may fill, evict and fill again
+   * without
+   * breaking the gap-free ascending run each partition requires
    * @param targetPercent utilisation, as a percentage of the aggregate allowance, to reach
    * @param blockBytes payload size of each admitted block
    * @return the number of blocks this call admitted
@@ -3323,6 +3323,199 @@ class StreamingShuffleWriterSuite
           s"${fixture.spillManager.bufferedBytes} and ${fixture.spillManager.scratchBytes} bytes")
       assert(fixture.spillFiles().isEmpty,
         "a refused attempt cannot have written a spill file")
+    }
+  }
+
+  test("a replay request never lets a block overtake a position the consumer is still owed") {
+    // The invariant the whole retransmission protocol rests on: for one partition and one consumer,
+    // the first delivery of each position is strictly ascending. It was violated by the two paths
+    // that queue a block racing each other -- a replay request or a subscription, serviced on the
+    // event-loop thread that delivered it, against the guarded drain loop paying the same owed run
+    // down -- because taking a position off the run and queueing it are two steps and the egress
+    // order is decided by the ticket taken in the second. One block leaving ahead of its
+    // predecessor is enough: the consumer quarantines the position, asks for the run again, and the
+    // producer's honest end-of-stream is then refused against a position the consumer never
+    // reached, reported as a lost producer and paid for with a recomputation of the whole map
+    // stage.
+    withHarness(newHarness(numPartitions = 1,
+        executorMemoryBytes = 4L * 1024L * 1024L)) { harness =>
+      val consumer = attachConsumer(harness)
+      try {
+        consumer.subscribe(harness.shuffleId, defaultMapId, partitionId = 0)
+        val firstDeliveryOrder = mutable.ArrayBuffer.empty[Long]
+        val seen = mutable.HashSet.empty[Long]
+        // A replay of everything delivered so far is asked for from inside the write, over and
+        // over,
+        // so the owed run is being paid down by the drain at the same time as production is adding
+        // to it -- which is exactly the interleaving that used to reorder egress.
+        val ordered = deterministicRecords(60000, seed = 23L, keySpace = 40)
+        val records = ordered.iterator.map { record =>
+          consumer.drainOutbound().foreach {
+            case block: DataBlockMessage =>
+              if (seen.add(block.sequenceNumber())) {
+                firstDeliveryOrder += block.sequenceNumber()
+              }
+            case _ => ()
+          }
+          val highest = harness.writer.blocksStreamed - 1L
+          if (highest > 0L) {
+            harness.serverHandler.receive(consumer.client,
+              new RetransmitRequestMessage(harness.shuffleId, defaultMapId, 0, 0L, highest)
+                .toByteBuffer())
+          }
+          record
+        }
+        harness.writer.write(records)
+        harness.writer.stop(success = true)
+        consumer.drainOutbound().foreach {
+          case block: DataBlockMessage =>
+            if (seen.add(block.sequenceNumber())) {
+              firstDeliveryOrder += block.sequenceNumber()
+            }
+          case _ => ()
+        }
+
+        assert(firstDeliveryOrder.size > 1,
+          s"the fixture must deliver more than one block for an ordering claim to mean anything, " +
+            s"but it delivered ${firstDeliveryOrder.size}")
+        val outOfOrder = firstDeliveryOrder.toSeq.sliding(2)
+          .collect { case Seq(previous: Long, next: Long) if next <= previous => (previous, next) }
+          .toSeq
+        assert(outOfOrder.isEmpty,
+          s"every position must reach the consumer for the first time in ascending order, but " +
+            s"${outOfOrder.mkString(", ")} arrived out of sequence out of " +
+            s"${firstDeliveryOrder.size} first deliveries")
+        assert(firstDeliveryOrder.head === 0L,
+          s"and the run must start at the first block, but it started at " +
+            s"${firstDeliveryOrder.head}")
+      } finally {
+        consumer.close()
+      }
+    }
+  }
+
+  test("a stream ends only after every block a consumer is owed has been delivered") {
+    // A terminator states a total, and the consumer reconciles what it received against that total
+    // and closes the stream. Emitting it while the consumer is still owed blocks therefore promises
+    // an end that has not happened: the drain pays the owed run down afterwards, the blocks arrive
+    // at a stream that has already ended, and the consumer -- which cannot tell an obsolete repair
+    // from a producer contradicting its own end of stream -- reports the producer lost and the
+    // upstream stage is recomputed although every byte of it was correct. Readiness is therefore
+    // read from the owed run as well as from the queue.
+    withHarness(newHarness(numPartitions = 1,
+        executorMemoryBytes = 4L * 1024L * 1024L)) { harness =>
+      val consumer = attachConsumer(harness)
+      try {
+        consumer.subscribe(harness.shuffleId, defaultMapId, partitionId = 0)
+        val outbound = mutable.ArrayBuffer.empty[String]
+        def collectOutbound(): Unit = consumer.drainOutbound().foreach {
+          case block: DataBlockMessage => outbound += s"block ${block.sequenceNumber()}"
+          case end: StreamTerminationMessage => outbound += s"end of stream ${end.totalBlocks()}"
+          case _ => ()
+        }
+        // Replays asked for from inside the write keep an owed run alive right up to the moment the
+        // stream finishes, which is the only window in which the ordering can be got wrong.
+        val ordered = deterministicRecords(30000, seed = 71L, keySpace = 40)
+        val records = ordered.iterator.map { record =>
+          collectOutbound()
+          val highest = harness.writer.blocksStreamed - 1L
+          if (highest > 0L) {
+            harness.serverHandler.receive(consumer.client,
+              new RetransmitRequestMessage(harness.shuffleId, defaultMapId, 0, 0L, highest)
+                .toByteBuffer())
+          }
+          record
+        }
+        harness.writer.write(records)
+        harness.writer.stop(success = true)
+        collectOutbound()
+
+        val terminators = outbound.zipWithIndex.filter(_._1.startsWith("end of stream"))
+        assert(terminators.size === 1,
+          s"the partition must be ended exactly once, but the consumer saw " +
+            s"${terminators.size}: ${outbound.mkString(", ")}")
+        val afterTermination = outbound.drop(terminators.head._2 + 1)
+        assert(afterTermination.isEmpty,
+          s"and nothing may follow the end of stream, but " +
+            s"${afterTermination.size} frame(s) did: ${afterTermination.mkString(", ")}")
+      } finally {
+        consumer.close()
+      }
+    }
+  }
+
+  test("an admission refused after eviction has spilled trips the memory-pressure fallback") {
+    // The second specified trip condition, on the path the whole subsystem actually takes. Memory
+    // pressure that eviction *rescues* is ordinary flow control and must not cost the job its fast
+    // path -- that is the direct-to-disk case above, where nothing was ever resident and no
+    // spilling could have helped. This is the other half: output IS resident, eviction runs and
+    // moves bytes to disk, and the reservation is still refused. That is "memory pressure prevents
+    // buffer allocation", it is the Spilling-to-Degraded transition the state machine names, and
+    // leaving it unreported made the documented degradation inert exactly when it was needed --
+    // ninety-nine percent buffer utilisation and dozens of spill events with the policy reporting
+    // that nothing had tripped, while the job absorbed repeated map-stage recomputation instead of
+    // yielding.
+    val delegate = new RecordingSortShuffleWriter(DegradationPartitions)
+    val harness = newHarness(
+      numPartitions = DegradationPartitions,
+      executorMemoryBytes = DegradationExecutorMemoryBytes,
+      spillThreshold = 50,
+      sortWriterFactory = Some(() => delegate))
+    withHarness(harness) { fixture =>
+      val records = deterministicRecords(DegradationRecords, seed = 71L, keySpace = 64)
+      var reservedBytes = 0L
+      // The squeeze begins only once eviction has genuinely moved bytes out of memory, so the
+      // condition under test is a refusal that spilling could not repair rather than an allowance
+      // that was never there. Everything resident is evicted first and the allowance is then taken
+      // whole, which is the state an executor reaches when its other tasks claim the budget while
+      // this one is mid-stream: spilling has already happened, and there is nothing left for
+      // another round of it to free.
+      val squeezing = records.iterator.map { record =>
+        if (reservedBytes == 0L && fixture.spillManager.memoryBytesSpilled > 0L) {
+          fixture.spillManager.spillAllRetained()
+          reservedBytes = fixture.reserveRemainingAllowance()
+          assert(reservedBytes > 0L,
+            "the fixture must be able to take what eviction released, or the admissions below " +
+              "would simply succeed and the refusal under test would never happen")
+        }
+        record
+      }
+      try {
+        fixture.writer.write(squeezing)
+      } finally {
+        if (reservedBytes > 0L) {
+          fixture.quota.release(reservedBytes)
+        }
+      }
+
+      assert(fixture.spillManager.memoryBytesSpilled > 0L,
+        "eviction must have moved bytes out of memory, or this case is the direct-to-disk " +
+          "one and proves nothing about a refusal spilling could not repair")
+      assert(fixture.spillManager.durableAdmissionCount > 0L,
+        "an admission must have been refused after those rounds, or nothing reported pressure")
+      assert(fixture.fallbackPolicy.hasTripped,
+        "a reservation refused after eviction had spilled must trip the fallback policy")
+      assert(fixture.fallbackPolicy.trippedReason
+          .contains(StreamingShuffleFallbackReason.MemoryPressure),
+        s"and it must trip as memory pressure, but it tripped as " +
+          s"${fixture.fallbackPolicy.trippedReason}")
+      assert(fixture.gateway.declaredFallbacks.contains(
+          StreamingShuffleFallbackReason.MemoryPressure),
+        s"the trip must be declared shuffle-wide so every participant stands down, but the " +
+          s"gateway saw ${fixture.gateway.declaredFallbacks.mkString(", ")}")
+      // Degradation, not failure: the attempt finishes its own map output through the sort-based
+      // writer, which is what makes "zero regression for a memory-bound workload" a completed job
+      // rather than a retry budget.
+      assert(delegate.writeCallCount === 1,
+        s"the attempt must be finished by exactly one sort-based write, but the delegate was " +
+          s"written to ${delegate.writeCallCount} time(s)")
+      assert(delegate.recordsWritten.groupBy(identity).map(entry => (entry._1, entry._2.size)) ===
+          records.groupBy(identity).map(entry => (entry._1, entry._2.size)),
+        "the sort-based writer must receive this map task's input exactly, every duplicate " +
+          "preserved: a record lost or repeated here is a data loss no reduce task could detect")
+      val status = fixture.writer.stop(success = true)
+      assert(status.isDefined,
+        "a degraded attempt must still report a map status for the write path's dereference")
     }
   }
 

@@ -2628,6 +2628,183 @@ class StreamingShuffleReaderSuite
         s"${fixture.coordinatorRef.invalidationsSent.size} invalidation(s) were sent")
   }
 
+  test("an end of stream that arrives while a repair is outstanding is applied when the repair " +
+      "lands") {
+    startContext()
+    // A producer that has committed every position it names may announce the end of its stream
+    // while a replay this consumer asked for is still in flight -- which is the ordinary state of
+    // affairs the moment one block arrives out of order, because the consumer does not deliver the
+    // ones that followed it either. Refusing that terminator against the position the consumer has
+    // reached reports a producer that has done nothing wrong as lost, and the recomputation of the
+    // whole upstream stage is paid for a stream that was seconds from completing. The announcement
+    // is held instead and applied by the admission that closes the gap.
+    val fixture = new ReaderFixture()
+    val payload = fixture.encodePartition(StreamedRecords)
+    val blocks = fixture.dataBlocksOf(payload, BlockCount)
+    assert(blocks.size >= 3, s"the case needs a gap with blocks on both sides of it, but the " +
+      s"fixture cut ${blocks.size}")
+
+    val records = fixture.reader.read()
+    val stream = fixture.connector.onlyStream
+    // Position 1 is withheld, so every block after it is out of order and is quarantined for a
+    // replay rather than delivered.
+    stream.deliver(blocks.head)
+    blocks.drop(2).foreach(block => stream.deliver(block))
+    // The producer announces the end of a stream it really did produce in full.
+    stream.deliver(fixture.terminator(blocks.size.toLong))
+    // The replay lands: the withheld position, then the positions that were quarantined behind it.
+    blocks.drop(1).foreach(block => stream.deliver(block))
+
+    val read = withTaskContext(fixture.context)(readRecords(records))
+    assert(read == expectedRecords,
+      s"every record must be read once the repair completed the stream, but ${read.size} of " +
+        s"${expectedRecords.size} were")
+    assert(observedPartialReadInvalidations() == 0L,
+      s"nothing may be invalidated for a stream that completed, but " +
+        s"${observedPartialReadInvalidations()} invalidation(s) were recorded")
+    assert(fixture.coordinatorRef.invalidationsSent.isEmpty,
+      s"and no producer generation may be invalidated, but " +
+        s"${fixture.coordinatorRef.invalidationsSent.size} were")
+    assert(fixture.context.fetchFailed.isEmpty,
+      "and no fetch failure may be reported, because the producer was never lost")
+  }
+
+  test("a duplicate block that arrives after the stream ended is discarded rather than reported " +
+      "as a lost producer") {
+    startContext()
+    // Delivery on this protocol is idempotent by design: a resume replays from the position a
+    // consumer announced, a queue ceiling defers a block that is re-queued later, and a repair
+    // replays a run that can span what has already been delivered. A copy of a position this
+    // consumer already holds is therefore routine, and the live path discards it. The same frame
+    // arriving just after the terminator is the same redundant copy of the same output, so it must
+    // get the same answer -- treating it as proof of an unsound producer failed reduce stages of
+    // shuffles whose output was complete and correct, and paid for a whole map stage again.
+    val fixture = new ReaderFixture()
+    val payload = fixture.encodePartition(StreamedRecords)
+    val blocks = fixture.dataBlocksOf(payload, BlockCount)
+    assert(blocks.size >= 2, s"the case needs a block to re-deliver behind the frontier, but the " +
+      s"fixture cut ${blocks.size}")
+
+    val records = fixture.reader.read()
+    val stream = fixture.connector.onlyStream
+    blocks.foreach(block => stream.deliver(block))
+    stream.deliver(fixture.terminator(blocks.size.toLong))
+    // The producer had already committed these two positions to the wire when it ended the stream.
+    stream.deliver(blocks.head)
+    stream.deliver(blocks(blocks.size - 2))
+
+    val read = withTaskContext(fixture.context)(readRecords(records))
+    assert(read == expectedRecords,
+      s"every record must still be read exactly once, but ${read.size} of " +
+        s"${expectedRecords.size} were")
+    assert(stream.handler.duplicateBlockCount(fixture.partitionId) == 2L,
+      s"both redundant copies must be counted as duplicates, but " +
+        s"${stream.handler.duplicateBlockCount(fixture.partitionId)} were")
+    assert(stream.handler.blocksAfterTerminationCount(fixture.partitionId) == 0L,
+      s"and none of them may be counted as a block past the end of stream, but " +
+        s"${stream.handler.blocksAfterTerminationCount(fixture.partitionId)} were")
+    assert(observedPartialReadInvalidations() == 0L,
+      s"nothing may be invalidated for a stream that completed, but " +
+        s"${observedPartialReadInvalidations()} invalidation(s) were recorded")
+    assert(fixture.coordinatorRef.invalidationsSent.isEmpty,
+      s"and no producer generation may be invalidated, but " +
+        s"${fixture.coordinatorRef.invalidationsSent.size} were")
+    assert(fixture.context.fetchFailed.isEmpty,
+      "and no fetch failure may be reported, because the producer was never lost")
+  }
+
+  test("a producer failure whose hand-off marker never arrived still escalates to a fetch " +
+      "failure") {
+    startContext()
+    // A channel failure is reported twice by design, and only one of the two reports is guaranteed
+    // to arrive: the hand-off marker can be refused by a full queue, a second failure on an
+    // already-signalled partition raises no further marker, and a failure observed on a channel
+    // callback before this reader bound the stream names no partition at all. What remains in every
+    // one of those cases is a bare throwable on the notifier -- and a bare throwable propagates as
+    // an ordinary task failure, so the scheduler counts it against `spark.task.maxFailures` and
+    // aborts the job instead of recomputing the stage that produced the unreadable bytes. The read
+    // must therefore escalate a latched producer failure to a fetch failure on its own account.
+    val fixture = new ReaderFixture()
+    val payload = fixture.encodePartition(StreamedRecords)
+    val blocks = fixture.dataBlocksOf(payload, BlockCount)
+
+    val records = fixture.reader.read()
+    val stream = fixture.connector.onlyStream
+
+    val injected = StreamingShuffleErrors.invalidSequenceNumber(
+      shuffleId = fixture.shuffleId, partitionId = fixture.partitionId, expected = 0L, actual = 1L)
+    injectFromIoThread(stream, injected)
+    // The marker is taken off the hand-off queue here rather than by the read, which is exactly the
+    // state a queue that refused it leaves behind: the failure is latched and nothing on the queue
+    // will ever mention it.
+    var drained = stream.handler.poll()
+    while (drained.isDefined) {
+      drained = stream.handler.poll()
+    }
+    // Blocks are re-offered afterwards so the read has input to advance over: a read that could not
+    // advance at all would refuse for want of data rather than for the latched failure.
+    blocks.foreach(block => stream.deliver(block))
+
+    val failure = intercept[FetchFailedException] {
+      withTaskContext(fixture.context) {
+        records.hasNext
+      }
+    }
+    assert(fetchFailedReasonOf(failure).shuffleId == fixture.shuffleId,
+      "A latched producer failure must recover through stage recomputation, which means a fetch " +
+        s"failure naming the shuffle being read, but it named " +
+        s"${fetchFailedReasonOf(failure).shuffleId}")
+    assert(fetchFailedReasonOf(failure).reduceId == fixture.partitionId,
+      s"and it must name the partition being read, but it named " +
+        s"${fetchFailedReasonOf(failure).reduceId}")
+    assert(diagnosisOf(failure).contains(injected),
+      s"The escalated failure must carry the cause the I/O thread observed, but it carried " +
+        s"${diagnosisOf(failure).map(_.getMessage).mkString("[", ", ", "]")}")
+    // The operator-facing text of the failure the scheduler reports must be the typed condition
+    // itself, not the name of the class that carried it: a reason reading "was lost:
+    // SparkException" hides the shuffle, the partition and the positions that disagree behind a
+    // getCause() walk.
+    assert(failure.getMessage.contains("STREAMING_SHUFFLE_INVALID_SEQUENCE_NUMBER"),
+      s"The fetch failure must state the typed condition, but it read: ${failure.getMessage}")
+    assert(!failure.getMessage.contains("was lost: SparkException"),
+      s"and it must not report the cause by class name, but it read: ${failure.getMessage}")
+    assert(fixture.context.fetchFailed.isDefined,
+      "The fetch failure must be asserted on the task context, because that is what the executor " +
+        "consults when it chooses between FetchFailed and ExceptionFailure")
+    assert(observedPartialReadInvalidations() == 1L,
+      s"Escalating must invalidate the partial read exactly once, but " +
+        s"${observedPartialReadInvalidations()} was recorded")
+    assert(fixture.coordinatorRef.invalidationsSent.size == 1,
+      s"and it must invalidate exactly one producer generation, but " +
+        s"${fixture.coordinatorRef.invalidationsSent.size} were invalidated")
+  }
+
+  test("a wrapped failure reports the cause's message rather than its class name") {
+    // The wrapper is what a task sees when a checked failure has no producer to attribute it to, so
+    // its text is the whole of what an operator reads. A typed streaming condition states the
+    // condition name, the shuffle and partition, the values that disagree and the SQLSTATE in its
+    // message; reporting `(org.apache.spark.SparkException)` in its place discards all of it.
+    val notifier = new StreamingShuffleErrorNotifier(shuffleId = 11, debugEnabled = false)
+    val typed = StreamingShuffleErrors.invalidSequenceNumber(
+      shuffleId = 11, partitionId = 2, expected = 4L, actual = 6L)
+    notifier.setError(typed)
+    val raised = intercept[SparkException](notifier.throwIfError())
+    assert(raised.getCause eq typed,
+      "The cause must be attached so the full diagnosis survives")
+    assert(raised.getMessage.contains("STREAMING_SHUFFLE_INVALID_SEQUENCE_NUMBER"),
+      s"The wrapper must carry the cause's message, but it read: ${raised.getMessage}")
+    assert(!raised.getMessage.contains("(org.apache.spark.SparkException)"),
+      s"and it must not name the cause's class in its place, but it read: ${raised.getMessage}")
+
+    val silent = new StreamingShuffleErrorNotifier(shuffleId = 12, debugEnabled = false)
+    val messageless = new java.io.IOException()
+    silent.setError(messageless)
+    val fallback = intercept[SparkException](silent.throwIfError())
+    assert(fallback.getMessage.contains(classOf[java.io.IOException].getName),
+      s"A cause with no message at all must still be named, but the report read: " +
+        s"${fallback.getMessage}")
+  }
+
   test("the error notifier keeps the first failure and suppresses the rest") {
     val notifier = new StreamingShuffleErrorNotifier(shuffleId = 0, debugEnabled = false)
     val first = new IllegalStateException("the first failure any thread observed")

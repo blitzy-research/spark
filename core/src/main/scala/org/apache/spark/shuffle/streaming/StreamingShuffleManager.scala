@@ -482,9 +482,26 @@ private[spark] class StreamingShuffleManager(conf: SparkConf, isDriver: Boolean)
           // has the coordinator withdraw the streamed map output, so the sort-based reader below
           // reports a missing map output, the scheduler recomputes the map stage on the sort-based
           // path, and the narrowed read is served from materialised files.
-          declareFallbackFor(streaming, StreamingShuffleFallbackReason.ConsumerTooSlow,
+          //
+          // On the reason this declaration carries. The set of conditions is closed at four members
+          // and is not this file's to extend -- a fifth would be a fifth specified, tested and
+          // documented way to leave the fast path, and a name outside the set is refused by the
+          // coordinator outright, which would leave a rolling upgrade unable to stand a shuffle
+          // down at all. The condition here is a compatibility failure between the two ends of one
+          // shuffle, detected by an explicit check rather than inferred from a failure to read,
+          // which is the member below and is already how a partition-count disagreement is
+          // declared. The three remaining members each assert a *measurement* -- a throughput ratio
+          // sustained for a minute, a refused buffer reservation, a share of an administered link
+          // -- that nothing on this path ever took, and reporting one of those sends an operator to
+          // tune something that was never the matter. This was previously declared as a consumer
+          // held at 2x behind for a minute, which is exactly that mistake. The detail below travels
+          // with the verdict and is preferred by every operator-facing rendering, so the record
+          // states the real condition rather than the member's prose.
+          declareFallbackFor(streaming,
+            StreamingShuffleFallbackReason.ProtocolVersionMismatch,
             s"a consumer requested the narrowed map range [$startMapIndex, $endMapIndex), which " +
-              "streaming cannot serve")
+              "the streaming shuffle protocol cannot serve because a producer registration names " +
+              "a map id rather than a map index")
           sortShuffleManager.getReader(handle, startMapIndex, endMapIndex, startPartition,
             endPartition, context, metrics)
         }

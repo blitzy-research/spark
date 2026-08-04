@@ -473,6 +473,12 @@ private[spark] class StreamingShuffleServerHandler(
   private val framingBudgetRefusals = new AtomicLong(0L)
   private val framingBudgetLogGate =
     new MemorySpillManager.LogAggregationGate(MemorySpillManager.LOG_AGGREGATION_WINDOW_MS)
+  private val throttleReports = new AtomicLong(0L)
+  private val throttleLogGate =
+    new MemorySpillManager.LogAggregationGate(MemorySpillManager.LOG_AGGREGATION_WINDOW_MS)
+  private val orderingDeferrals = new AtomicLong(0L)
+  private val orderingLogGate =
+    new MemorySpillManager.LogAggregationGate(MemorySpillManager.LOG_AGGREGATION_WINDOW_MS)
 
   /**
    * Emits one report through a window, or accounts it against that window and stays quiet.
@@ -692,12 +698,27 @@ private[spark] class StreamingShuffleServerHandler(
       var queued = 0
       sessions.values().asScala.foreach { session =>
         if (session.subscribedTo(partitionId)) {
-          val pending = PendingBlock(partitionId, sequenceNumber, framedBytes, priority,
-            egressTicket.getAndIncrement(), replay)
-          if (session.offer(pending)) {
-            queued += 1
-          } else if (session.deferOwed(partitionId, sequenceNumber, sequenceNumber)) {
-            deferredBlocks.incrementAndGet()
+          if (session.owedBlocksFor(partitionId) > 0L) {
+            // Order before immediacy. This consumer is already owed earlier positions of this
+            // partition, and an owed position is queued with a fresh ticket when the drain pays the
+            // run down -- so queueing this block now would give it a *lower* ticket than the
+            // positions that must precede it and put it on the wire out of sequence. A consumer
+            // that receives a block ahead of its predecessor cannot deliver it: it quarantines the
+            // position, asks for the run to be replayed, and a repair that should never have been
+            // needed ends in the producer being reported lost. Joining the owed run instead keeps
+            // one ascending sequence per partition per consumer, which is the invariant the whole
+            // retransmission protocol rests on.
+            if (session.deferOwed(partitionId, sequenceNumber, sequenceNumber)) {
+              deferredBlocks.incrementAndGet()
+            }
+          } else {
+            val pending = PendingBlock(partitionId, sequenceNumber, framedBytes, priority,
+              egressTicket.getAndIncrement(), replay)
+            if (session.offer(pending)) {
+              queued += 1
+            } else if (session.deferOwed(partitionId, sequenceNumber, sequenceNumber)) {
+              deferredBlocks.incrementAndGet()
+            }
           }
         }
       }
@@ -877,7 +898,16 @@ private[spark] class StreamingShuffleServerHandler(
       var written = 0L
       var flushNeeded = false
       var keepGoing = true
-      var throttled = false
+      // Two refusals, two retry strategies, and the distinction is what keeps a throttled channel
+      // from spinning. A pacing refusal is repaired by the passage of time, so it schedules a
+      // wake-up at the bucket's own next refill instant. A refusal for want of consumer credit is
+      // repaired only by an acknowledgement -- which drains this session as it is applied -- and by
+      // channel writability, which does the same, so scheduling a timer for it would poll a
+      // condition no clock can change. With an unlimited bucket the refill instant is *now*, so
+      // that timer used to re-enter this method every millisecond for as long as the consumer
+      // stayed behind, burning a core and emitting one record per pass.
+      var pacingDelayMs = 0L
+      var budgetDelayed = false
       while (keepGoing) {
         if (!channel.isWritable()) {
           // The socket's outbound buffer is full. Leaving the block queued is correct: writability
@@ -892,16 +922,20 @@ private[spark] class StreamingShuffleServerHandler(
           }
           if (pending == null) {
             keepGoing = false
+          } else if (leavesSequenceHole(session, pending)) {
+            deferSequenceHole(session, pending)
           } else if (!admitForEgress(session, pending)) {
             session.queue.offer(pending)
             throttles.incrementAndGet()
-            throttled = true
-            if (debugEnabled) {
-              logInfo(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} partition " +
+            pacingDelayMs = math.max(pacingDelayMs,
+              rateLimiter.millisUntilAvailable(pending.framedBytes.toLong))
+            reportBounded(throttleLogGate, throttleReports,
+              log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} partition " +
                 log"${MDC(PARTITION_ID, pending.partitionId)} is throttled holding " +
                 log"${MDC(NUM_BYTES, pending.framedBytes)} framed byte(s); " +
-                log"${MDC(VALUE, rateLimiter.availableTokens)} token(s) available")
-            }
+                log"${MDC(VALUE, rateLimiter.availableTokens)} token(s) available and " +
+                log"${MDC(THRESHOLD, session.outstandingFor(pending.partitionId))} " +
+                log"block(s) unacknowledged by the consumer")
             keepGoing = false
           } else if (!StreamingShuffleServerHandler.EgressFramingBudget
               .tryReserve(pending.framedBytes.toLong)) {
@@ -914,7 +948,7 @@ private[spark] class StreamingShuffleServerHandler(
             // replay this queue is about to perform unserviceable.
             session.queue.offer(pending)
             throttles.incrementAndGet()
-            throttled = true
+            budgetDelayed = true
             reportBounded(framingBudgetLogGate, framingBudgetRefusals,
               log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} partition " +
                 log"${MDC(PARTITION_ID, pending.partitionId)} is holding " +
@@ -936,8 +970,14 @@ private[spark] class StreamingShuffleServerHandler(
         channel.flush()
       }
       emitDeferredTerminations(session)
-      if (throttled) {
-        scheduleRefillDrain(session)
+      if (pacingDelayMs > 0L) {
+        scheduleRetryDrain(session, pacingDelayMs)
+      } else if (budgetDelayed) {
+        // The executor-wide framing ceiling is released by write completions rather than by a
+        // clock, and a completion releases the budget without draining anything, so this one
+        // condition does need a timer. It is a coarse one: the ceiling is measured in mebibytes and
+        // clears as soon as a socket accepts what is already in flight.
+        scheduleRetryDrain(session, FRAMING_BUDGET_RETRY_WAIT_MS)
       }
       writeNanos.addAndGet(math.max(0L, clock.nanoTime() - startedAtNanos))
       written
@@ -945,19 +985,86 @@ private[spark] class StreamingShuffleServerHandler(
   }
 
   /**
-   * Arranges for one more drain attempt once the egress bucket has refilled.
+   * Whether writing this block would leave a gap in its partition's sequence for this consumer.
    *
-   * The delay comes from the bucket itself, so the wake-up lands when tokens are actually available
-   * rather than at an interval this handler guessed. It is scheduled on the session's own event
-   * loop, which needs no thread of this handler's own and serialises naturally with every other
-   * callback on that channel. One outstanding wake-up per session is enough, because a drain that
-   * is still throttled schedules the next one before it returns.
+   * The frontier a consumer has reached is the higher of what it has been sent and what it has
+   * acknowledged -- the second matters on a reconnection, where the session is new and has sent
+   * nothing but the consumer's cursor says where it is -- and a block more than one position beyond
+   * that frontier would arrive before its predecessors.
+   *
+   * Cheap and unconditional: two atomic reads per block, on a path that is already reading the
+   * session's ledgers.
    */
-  private def scheduleRefillDrain(session: ConsumerSession): Unit = {
+  private def leavesSequenceHole(session: ConsumerSession, pending: PendingBlock): Boolean = {
+    val frontier = math.max(session.sentPosition(pending.partitionId),
+      session.ackPosition(pending.partitionId))
+    pending.sequenceNumber > frontier + 1L
+  }
+
+  /**
+   * Puts a block that would have left a gap back onto the owed run, together with the run it
+   * skipped.
+   *
+   * <b>Why this guard exists at all.</b> Every path that queues a block queues it in ascending
+   * order, and yet the ordering is not thereby guaranteed: the owed run is paid down by taking a
+   * position and then queueing it as two steps, so a position taken by one thread can be queued
+   * after a position taken later by another, and the egress order is decided by the ticket taken at
+   * queueing time. Rather than serialise every producer of queue entries against every other --
+   * which would put a lock on the egress hot path -- the invariant is enforced where it is cheap
+   * and absolute: at the one point a block is about to leave. A block that would arrive out of
+   * sequence is not written at all; the whole run from the consumer's frontier to that block is
+   * recorded as owed, and the drain loop's own top-up queues it in ascending order on the next
+   * pass. Nothing is lost, because the bytes live in the retained store and an owed run is
+   * precisely a claim on them.
+   *
+   * The deferral is reported through the aggregation window rather than per occurrence: it is a
+   * repair of an internal race, so its volume matters to an operator and its individual instances
+   * do not.
+   */
+  private def deferSequenceHole(session: ConsumerSession, pending: PendingBlock): Unit = {
+    val partitionId = pending.partitionId
+    val frontier = math.max(session.sentPosition(partitionId), session.ackPosition(partitionId))
+    val firstMissing = math.max(0L, frontier + 1L)
+    // The reference this pass polled is not going back on the queue -- the owed run below covers
+    // its position and the top-up will queue it in sequence -- so its charge against the queue's
+    // two ceilings has to be returned here, exactly as [[writeBlock]] returns the charge of a block
+    // that leaves for good. Holding the charge for a reference nobody will ever write would shrink
+    // this consumer's queue permanently, one entry per repair, until the ceiling refused every
+    // block and every position had to travel as an owed run.
+    session.releasePending(pending)
+    session.deferOwed(partitionId, firstMissing, pending.sequenceNumber)
+    reportBounded(orderingLogGate, orderingDeferrals,
+      log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} partition " +
+        log"${MDC(PARTITION_ID, partitionId)} held block " +
+        log"${MDC(COUNT, pending.sequenceNumber)} for consumer " +
+        log"${MDC(SESSION_ID, session.consumerId)} because position " +
+        log"${MDC(THRESHOLD, firstMissing)} has not been sent yet; the run is queued in sequence " +
+        log"instead")
+  }
+
+  /**
+   * Arranges for one more drain attempt after the given delay.
+   *
+   * Called only for a condition a clock can repair -- a pacing refusal, whose delay comes from the
+   * bucket itself so the wake-up lands when tokens are actually available, or the executor-wide
+   * framing ceiling, which is released by write completions. A refusal for want of consumer credit
+   * schedules nothing: the acknowledgement that grants credit drains this session as it is applied,
+   * and so does channel writability, so a timer would only poll a condition time cannot change --
+   * which, with an unlimited bucket, meant re-entering the drain every millisecond for as long as a
+   * consumer stayed behind.
+   *
+   * It is scheduled on the session's own event loop, which needs no thread of this handler's own
+   * and serialises naturally with every other callback on that channel. One outstanding wake-up per
+   * session is enough, because a drain that is still delayed schedules the next one before it
+   * returns.
+   *
+   * @param session the session to drain again
+   * @param requestedDelayMs how long to wait, clamped into [1, [[MAX_REFILL_WAIT_MS]]]
+   */
+  private def scheduleRetryDrain(session: ConsumerSession, requestedDelayMs: Long): Unit = {
     if (!closed.get() && !session.isClosed &&
         session.refillScheduled.compareAndSet(false, true)) {
-      val delayMs = math.max(1L,
-        math.min(rateLimiter.millisUntilAvailable(session.headFramedBytes), MAX_REFILL_WAIT_MS))
+      val delayMs = math.max(1L, math.min(requestedDelayMs, MAX_REFILL_WAIT_MS))
       try {
         session.channel.eventLoop().schedule(new Runnable {
           override def run(): Unit = {
@@ -1291,6 +1398,19 @@ private[spark] class StreamingShuffleServerHandler(
    * delivery is recorded only in a successful listener. A terminator marked sent on the strength of
    * an enqueue that never reached the socket would leave the consumer waiting out its producer
    * liveness detector for a stream that will never be terminated again.
+   *
+   * <b>Why an owed run holds the terminator back as firmly as a queued block.</b> A block this
+   * consumer is owed is output this producer has undertaken to deliver and has not yet queued --
+   * the queue ceiling refused it, or a resume recorded a run that is still being paid down a page
+   * at a time. Reading emptiness from the queue alone therefore reports a stream as finished while
+   * delivery is still outstanding, and the drain that follows pays the owed run down *after* the
+   * terminator has left: the consumer, which has by then reconciled its count against the total the
+   * terminator fixed and closed the stream, sees blocks arrive past an end it was told about, and
+   * the only reading available to it is that its producer is unsound. That is the spurious
+   * producer-loss condition -- a healthy shuffle failing its reduce stage and recomputing an intact
+   * map stage -- and the ordering rule that prevents it is stated here once: a stream ends for a
+   * consumer only when nothing is queued for it, nothing is owed to it, and everything offered has
+   * been sent.
    */
   private def emitDeferredTerminations(session: ConsumerSession): Unit = {
     if (terminationRequests.get() > 0 && !session.isClosed && session.channel.isActive()) {
@@ -1299,6 +1419,7 @@ private[spark] class StreamingShuffleServerHandler(
         val ready = stream.terminationRequested.get() &&
           session.subscribedTo(partitionId) &&
           session.pendingBlocksFor(partitionId) <= 0L &&
+          session.owedBlocksFor(partitionId) <= 0L &&
           session.caughtUpWith(partitionId, stream.highestOffered.get())
         if (ready && session.claimTermination(partitionId)) {
           val totalBlocks = stream.totalBlocksAtTermination.get()
@@ -1498,10 +1619,21 @@ private[spark] class StreamingShuffleServerHandler(
    * forcing the whole upstream stage to be recomputed, and the position it resumes from is exactly
    * the cursor this method declines to touch.
    *
-   * A session with a live channel is left alone however quiet it is, because silence on an open
-   * connection is what a consumer that is busy reducing looks like; the ten-second window is
-   * measured from the last frame *received*, which a healthy consumer refreshes with its own
-   * heartbeats.
+   * <b>A live channel is given the whole replay budget, not the liveness window.</b> Silence on an
+   * open connection is what a consumer that is busy reducing looks like: it sends a frame when it
+   * acknowledges a block or when a heartbeat comes due while it waits, and it sends nothing at all
+   * while it is deserialising and aggregating what it already has. Retiring such a session at the
+   * ten-second mark took its queue, its credit ledgers and its retry budget away mid-stream, and
+   * the reconnection that followed was observed by the consumer as a reset connection and by the
+   * producer as a failed egress channel -- a producer loss manufactured out of a healthy consumer's
+   * silence. The window is therefore applied to what it can actually diagnose: a channel that is
+   * closed or no longer active has stopped answering, and that is retired at the liveness window. A
+   * channel that is still active is retired only once it has been silent for
+   * [[CONSUMER_EXPIRY_TIMEOUT_MS]] -- the liveness window plus every backoff the failure protocol
+   * would have spent on a repair -- which is the point past which no repair remains outstanding and
+   * a half-open socket is the only remaining explanation. Memory is still reclaimed, on the same
+   * bound the logical-consumer expiry uses; what is no longer reclaimed is a session that was
+   * working.
    *
    * @return the number of sessions retired
    */
@@ -1509,15 +1641,19 @@ private[spark] class StreamingShuffleServerHandler(
     var retired = 0
     sessions.values().asScala.toSeq.foreach { session =>
       val silentForMs = nowMs - session.lastInboundMs
-      if (silentForMs >= CONSUMER_LIVENESS_TIMEOUT_MS) {
+      val channelAnswering = !session.isClosed && session.channel.isActive()
+      val toleranceMs =
+        if (channelAnswering) CONSUMER_EXPIRY_TIMEOUT_MS else CONSUMER_LIVENESS_TIMEOUT_MS
+      if (silentForMs >= toleranceMs) {
         expiredSessions.incrementAndGet()
         retired += 1
         evictSession(session)
         logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} released the egress " +
           log"session of consumer ${MDC(SESSION_ID, session.consumerId)} after " +
           log"${MDC(DURATION, silentForMs)} ms without a frame, beyond the " +
-          log"${MDC(TIMEOUT, CONSUMER_LIVENESS_TIMEOUT_MS)} ms liveness window; its position is " +
-          log"retained so a reconnection resumes from it")
+          log"${MDC(TIMEOUT, toleranceMs)} ms tolerated for a channel that was " +
+          log"${MDC(REASON, if (channelAnswering) "still open" else "no longer answering")}; its " +
+          log"position is retained so a reconnection resumes from it")
       }
     }
     retired
@@ -1798,20 +1934,34 @@ private[spark] class StreamingShuffleServerHandler(
           log"upstream stage recomputed")
       0
     } else {
-      session.deferOwed(partitionId, firstSequenceNumber, lastSequenceNumber)
-      val queued = topUpOwed(session, partitionId, REPLAY_PAGE_BLOCKS)
-      if (queued > 0) {
+      // Recorded as owed and then drained, rather than queued here. This method runs on whichever
+      // event-loop thread delivered the subscription or the retransmission request, while the drain
+      // loop pays the owed run down under the session's own guard -- and taking a position off that
+      // run and queueing it are two steps, so two threads doing it at once can queue an earlier
+      // position after a later one. The ticket taken at queueing time is what orders egress, so
+      // that race put a block on the wire ahead of its predecessor: the consumer quarantined the
+      // position, asked for a replay of the run, and the producer's honest end-of-stream was then
+      // refused against a position the consumer had never reached -- reported as a lost producer
+      // and paid for with a full recomputation of the map stage. Leaving the transfer to the
+      // guarded drain makes one thread the only queuer of a session's blocks, which is what keeps a
+      // partition's egress strictly ascending.
+      val owed = if (session.deferOwed(partitionId, firstSequenceNumber, lastSequenceNumber)) {
+        math.max(0L, lastSequenceNumber - firstSequenceNumber + 1L)
+      } else {
+        0L
+      }
+      if (owed > 0L) {
         // A consumer may ask for the same window several times inside its retry budget, and every
         // partition it reads can do so, so the per-replay record is detail. The producer reports
         // the replay total at default level in its summary, and an exhausted budget escalates.
         if (debugEnabled) {
           logInfo(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} partition " +
-            log"${MDC(PARTITION_ID, partitionId)} is replaying ${MDC(NUM_BLOCKS, queued)} " +
+            log"${MDC(PARTITION_ID, partitionId)} is replaying ${MDC(NUM_BLOCKS, owed)} " +
             log"retained block(s) to consumer ${MDC(SESSION_ID, session.consumerId)}")
         }
         drainSession(session)
       }
-      queued
+      math.min(owed, Int.MaxValue.toLong).toInt
     }
   }
 
@@ -3648,6 +3798,18 @@ private[spark] object StreamingShuffleServerHandler {
   val MAX_REFILL_WAIT_MS: Long = 1000L
 
   /**
+   * How long a drain waits before retrying a block the executor-wide framing ceiling refused.
+   *
+   * Unlike pacing, this ceiling is released by write completions rather than by the passage of
+   * time, so there is no instant a bucket can name and the wait has to be chosen. It is chosen
+   * coarse: the ceiling is measured in mebibytes and clears as soon as the sockets already holding
+   * it accept their bytes, so retrying sooner would burn passes for nothing, and retrying later
+   * would idle a link that had become free. Twenty milliseconds is two orders of magnitude below
+   * the consumer liveness window, so no consumer can time a producer out across one of these waits.
+   */
+  val FRAMING_BUDGET_RETRY_WAIT_MS: Long = 20L
+
+  /**
    * Attributes of the task attempt that produced a block, which decide flush order.
    *
    * This is the concrete meaning of prioritising shuffle traffic over speculative execution in a
@@ -5151,7 +5313,7 @@ private[spark] class StreamingShuffleListener(
    * which keeps failing is disconnected rather than merely un-logged.
    *
    * @param client the channel the frame arrived on, charged for the failure and closed past the
-   *               threshold
+   * threshold
    * @param operation what was being attempted, for the report
    * @param body the frame-handling work
    */

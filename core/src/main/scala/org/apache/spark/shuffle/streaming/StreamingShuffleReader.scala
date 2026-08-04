@@ -92,8 +92,12 @@ import org.apache.spark.util.collection.ExternalSorter
  * thread would never reach the scheduler. The one thing an I/O thread may hand across is a failure,
  * and it does so through [[StreamingShuffleErrorNotifier]]: first error wins, later ones are
  * suppressed onto it, and the task thread re-throws it. Without that bridge a channel failure would
- * be swallowed and the task would block for ever on input that will never arrive, which is why
- * `errorNotifier.throwIfError()` is called on every single iterator advance.
+ * be swallowed and the task would block for ever on input that will never arrive, which is why the
+ * failure funnel [[checkForFailure]] is entered on every single iterator advance. That funnel is
+ * also what guarantees the *type* of what is raised: it converts every signalled producer loss and
+ * escalates any remaining producer-side failure into a `FetchFailedException` before the notifier
+ * is consulted, so an unreadable stream asks for its upstream stage to be recomputed instead of
+ * spending one of the reduce task's own retries.
  *
  * <b>Cleanup.</b> The `ShuffleReader` trait exposes `read()` and nothing else -- its `stop()` is
  * commented out upstream -- so this class declares no `stop()`. Every resource it acquires is
@@ -409,8 +413,10 @@ private[spark] class StreamingShuffleReader[K, C](
    */
   override def read(): Iterator[Product2[K, C]] = {
     // A failure latched on an I/O thread before the task thread got here must surface now, not be
-    // overwritten by whatever the first fetch attempt happens to hit.
-    errorNotifier.throwIfError()
+    // overwritten by whatever the first fetch attempt happens to hit. It goes through the funnel so
+    // that a producer-side failure is raised as the fetch failure it is even here, where no stream
+    // of this read has been opened yet and the funnel has nothing to attribute it to.
+    checkForFailure(startPartition)
 
     // Makes this shuffle visible to the executor-wide ledger, which is what lets the protocol
     // arbitrate between concurrent shuffles and what the token bucket's refill rate is divided by.
@@ -453,8 +459,7 @@ private[spark] class StreamingShuffleReader[K, C](
     // Streams are open by now, so a producer lost while this read was being assembled is converted
     // before the notifier is consulted -- otherwise the transport error latched alongside the loss
     // would be raised here, one step before the iterator's own conversion could run.
-    convertSignalledProducerLossEverywhere()
-    errorNotifier.throwIfError()
+    checkForFailure(startPartition)
 
     resultIter match {
       case _: InterruptibleIterator[Product2[K, C]] => resultIter
@@ -619,7 +624,7 @@ private[spark] class StreamingShuffleReader[K, C](
     var resolved: Option[StreamingShuffleProducerLocations] = None
     var lastReply: Option[StreamingShuffleProducerLocations] = None
     while (resolved.isEmpty && attempts < COORDINATOR_LOOKUP_MAX_ATTEMPTS && !cleanedUp.get()) {
-      errorNotifier.throwIfError()
+      checkForFailure(startPartition)
       val reply = lookupProducers()
       // The shuffle-wide verdict is honoured before the addresses are, and on every attempt rather
       // than once: a fallback declared while this consumer was polling withdraws the streaming path
@@ -704,7 +709,7 @@ private[spark] class StreamingShuffleReader[K, C](
       case None => None
     }
     state.filter(_.fallenBack).foreach { latched =>
-      val description = latched.reason.map(_.description).getOrElse(latched.reasonName)
+      val description = latched.condition
       logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} stood streaming down at " +
         log"epoch ${MDC(EPOCH, latched.declaredAtEpoch)} because ${MDC(REASON, description)}; " +
         log"failing this fetch so that the upstream stage is recomputed on the sort-based path")
@@ -728,6 +733,93 @@ private[spark] class StreamingShuffleReader[K, C](
       streamsLock.synchronized(producerStreams.toSeq)
         .foreach(stream => stream.convertSignalledProducerLoss())
     }
+  }
+
+  /**
+   * The single failure funnel of this reader: every consult of the notifier goes through here.
+   *
+   * Three things happen, in an order that is the whole of why this method exists.
+   *
+   * First, every producer loss the I/O threads have already signalled is converted, on this thread,
+   * into the atomic per-producer invalidation plus the [[FetchFailedException]] that the unmodified
+   * scheduler recovers from. That has to precede the notifier, because a channel failure is
+   * reported twice by design -- as a marker on the hand-off queue and as a raw throwable on the
+   * notifier -- and only the marker can be turned into a fetch failure.
+   *
+   * Second, a failure still latched with no fetch failure to show for it is escalated to one
+   * anyway. A marker is not guaranteed to arrive: the hand-off queue can be full when the loss is
+   * signalled, a second failure on an already-signalled partition raises no further marker, and a
+   * failure observed on a channel callback before this reader has bound the stream names no
+   * partition at all. Those paths used to leave a bare `SparkException` on the notifier, which
+   * propagated as an ordinary task failure -- so the scheduler counted it against
+   * `spark.task.maxFailures` and aborted the job instead of recomputing the upstream stage that
+   * produced the unreadable bytes. Escalating here restores the guarantee that every unrecoverable
+   * producer-side condition, corruption and lost sequence included, terminates in a working
+   * shuffle.
+   *
+   * Third, and only if neither of the two above found anything to raise, the notifier is consulted
+   * as before, so a failure that belongs to nothing this reader opened -- a rendezvous error,
+   * say -- still surfaces with its own type intact.
+   *
+   * Cheap on the hot path: when no failure has been recorded the whole method is one volatile read.
+   *
+   * @param awaitedPartition the partition whose input the caller is waiting for, used to attribute
+   *                         a failure that names no partition of its own
+   */
+  private def checkForFailure(awaitedPartition: Int): Unit = {
+    if (errorNotifier.hasError) {
+      convertSignalledProducerLossEverywhere()
+      escalateLatchedFailure(awaitedPartition)
+    }
+    errorNotifier.throwIfError()
+  }
+
+  /**
+   * Escalates a latched failure that no producer-loss marker accounted for into a fetch failure.
+   *
+   * Does nothing unless a failure is latched and none of it is a fetch failure already, so the
+   * common paths -- a converted marker, an explicit fetch failure raised by this thread -- reach
+   * this method having nothing to do.
+   *
+   * The stream that is failed is the one whose handler reported the failure, identified by the
+   * handler's own escalation count, so the fetch failure names the producer that actually broke and
+   * the coordinator invalidates that producer's generation and no other. When no handler admits to
+   * it -- which is what a failure raised before any channel was bound looks like -- the first
+   * stream that has not finished is failed instead, because that is the producer whose input this
+   * read is
+   * still waiting for; and when this reader has opened no stream at all there is nothing to
+   * attribute, so the latched failure is left to propagate as it stands.
+   *
+   * [[ProducerStream.failProducer]] returns `Nothing`: it discards everything taken from the
+   * producer, records the invalidation, and throws. This method therefore either throws or returns
+   * having found nothing to escalate.
+   */
+  private def escalateLatchedFailure(awaitedPartition: Int): Unit = {
+    if (errorNotifier.hasError && errorNotifier.fetchFailure.isEmpty) {
+      val streams = streamsLock.synchronized(producerStreams.toSeq)
+      val reporter = streams.find(_.hasReportedFailure).orElse(streams.find(!_.isDrained))
+      reporter.foreach { stream =>
+        val partitionId = stream.firstUnfinishedPartition.getOrElse(
+          if (stream.readsPartition(awaitedPartition)) awaitedPartition else startPartition)
+        val detail = errorNotifier.error.map(describeFailure)
+          .getOrElse("a streaming shuffle failure was reported without a cause")
+        stream.failProducer(partitionId, StreamingShuffleInvalidationReason.ProtocolViolation,
+          detail, errorNotifier.error.orNull)
+      }
+    }
+  }
+
+  /**
+   * The operator-facing rendering of a failure: its message, or its type when it carries none.
+   *
+   * A typed streaming shuffle condition puts everything an operator needs -- the condition name,
+   * the shuffle and partition, the numbers that disagree and the SQLSTATE -- in its message, so
+   * the message is what a failure report has to carry. A throwable with no message at all is
+   * rendered by its class name, because an empty report would be worse than a terse one.
+   */
+  private def describeFailure(cause: Throwable): String = {
+    val message = cause.getMessage
+    if (message != null && message.nonEmpty) message else cause.getClass.getName
   }
 
   /**
@@ -1046,7 +1138,11 @@ private[spark] class StreamingShuffleReader[K, C](
         attempt <= BackpressureProtocol.MAX_RETRY_ATTEMPTS) {
       // A failure already latched on an I/O thread outranks a further attempt: spending the rest of
       // the budget on a read that has failed only delays the fetch failure it has already earned.
-      errorNotifier.throwIfError()
+      // Through the funnel, because the producers opened before this one are already streaming: a
+      // corruption or a lost sequence observed on one of them while this connect was in progress
+      // has to be raised as the fetch failure that recomputes its map task, not as a bare
+      // exception that fails this attempt and asks for nothing to be recomputed.
+      checkForFailure(startPartition)
       opened = connectOnce(location)
       if (opened.isEmpty && attempt < BackpressureProtocol.MAX_RETRY_ATTEMPTS) {
         val backoffMillis = BackpressureProtocol.retryBackoffMillis(attempt)
@@ -1480,6 +1576,33 @@ private[spark] class StreamingShuffleReader[K, C](
       consumerKey(location, partitionId)
 
     /**
+     * Whether this producer's handler has reported a failure of its own.
+     *
+     * Read by [[escalateLatchedFailure]] to attribute a latched failure to the producer that
+     * actually broke, rather than to whichever producer this read happened to be waiting on. It is
+     * the handler's escalation tally, which counts every failure the handler recorded on the shared
+     * notifier -- including the ones whose hand-off marker could not be queued, which is precisely
+     * the case attribution would otherwise have no way of resolving.
+     */
+    def hasReportedFailure: Boolean = handler.reportedEscalationCount > 0L
+
+    /** Whether every partition of this producer has ended, so nothing further is expected of it. */
+    def isDrained: Boolean = firstUnfinishedPartition.isEmpty
+
+    /**
+     * The lowest partition of this producer whose stream has not ended, if any.
+     *
+     * That is the partition a failure of this producer is about: the ones that have ended delivered
+     * everything they promised and are no longer waiting on the channel.
+     */
+    def firstUnfinishedPartition: Option[Int] =
+      partitionIds.find(partitionId => !inboxOf(partitionId).terminated)
+
+    /** Whether this reduce task reads the given partition at all. */
+    def readsPartition(partitionId: Int): Boolean =
+      StreamingShuffleReader.this.servesPartition(partitionId)
+
+    /**
      * The records this producer contributes, partition by partition in ascending order.
      *
      * Lazy throughout: no channel is read until the caller asks for a record, and no more than one
@@ -1529,9 +1652,11 @@ private[spark] class StreamingShuffleReader[K, C](
       var finished = false
       while (!finished) {
         // Producer loss is converted into a fetch failure before the notifier is consulted, so a
-        // transport error latched alongside the loss can never be what this task raises.
+        // transport error latched alongside the loss can never be what this task raises. The funnel
+        // covers the loss of a *different* producer of the same read as well, whose marker this
+        // partition's queue never carried.
         convertSignalledProducerLoss(partitionId)
-        errorNotifier.throwIfError()
+        checkForFailure(partitionId)
         checkFallbackWhileReading(partitionId)
         if (inbox.blocks.nonEmpty) {
           result = Some(acceptNext(inbox))
@@ -1755,7 +1880,7 @@ private[spark] class StreamingShuffleReader[K, C](
         }
         // Consulted last, so that a producer loss this poll window revealed is raised as the fetch
         // failure it is rather than as whatever transport error accompanied it.
-        errorNotifier.throwIfError()
+        checkForFailure(awaitedPartition)
       }
     }
 
@@ -2387,14 +2512,14 @@ private[spark] class StreamingShuffleReader[K, C](
 
     override def hasNext: Boolean = {
       stream.convertSignalledProducerLoss(partitionId)
-      errorNotifier.throwIfError()
+      checkForFailure(partitionId)
       initialize()
       delegate.hasNext
     }
 
     override def next(): (Any, Any) = {
       stream.convertSignalledProducerLoss(partitionId)
-      errorNotifier.throwIfError()
+      checkForFailure(partitionId)
       initialize()
       if (!delegate.hasNext) {
         throw new NoSuchElementException(
@@ -3229,18 +3354,17 @@ private[spark] class NettyStreamingShuffleProducerConnector(
    * This is the single point at which a channel becomes this connector's to release. Three
    * conditions are settled here, in the order that makes each one meaningful:
    *
-   *  1. '''The connector must still be open.''' Publishing into registries [[close]] has emptied
-   *     would leave a channel nothing releases, so the registration is refused and the channel is
-   *     closed here instead. The check is repeated after the registration too, because closure can
-   *     be decided between the two -- and then the entries this method just made are withdrawn and
-   *     the channel closed, which is the same outcome reached the other way round.
-   *  2. '''The registration happens before the terminal check.''' A callback that arrives once the
-   *     entries exist routes itself through them in the ordinary way, so the only callbacks the
-   * next     step has to account for are the ones that arrived *before* this point.
-   *  3. '''A terminal callback that arrived in the interval is replayed.''' It found no
-   * registration     and could not deliver itself, so this thread delivers it -- which is what
-   * turns "the reduce     task waits out its five-second timeout on a channel that was already
-   * dead" into "the reduce     task is told at once".
+   * 1. '''The connector must still be open.''' Publishing into registries [[close]] has emptied
+   * would leave a channel nothing releases, so the registration is refused and the channel is
+   * closed here instead. The check is repeated after the registration too, because closure can be
+   * decided between the two -- and then the entries this method just made are withdrawn and the
+   * channel closed, which is the same outcome reached the other way round. 2. '''The registration
+   * happens before the terminal check.''' A callback that arrives once the entries exist routes
+   * itself through them in the ordinary way, so the only callbacks the next step has to account for
+   * are the ones that arrived *before* this point. 3. '''A terminal callback that arrived in the
+   * interval is replayed.''' It found no registration and could not deliver itself, so this thread
+   * delivers it -- which is what turns "the reduce task waits out its five-second timeout on a
+   * channel that was already dead" into "the reduce task is told at once".
    *
    * @param client the transport client the factory returned
    * @param handler the consumer handler that owns it

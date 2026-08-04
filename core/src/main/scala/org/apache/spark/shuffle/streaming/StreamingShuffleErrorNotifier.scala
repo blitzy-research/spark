@@ -409,6 +409,14 @@ private[spark] class StreamingShuffleErrorNotifier(
    * re-thrown as it stands so that downstream matchers still see its exact type. Only a remaining
    * checked exception is wrapped in a SparkException naming the shuffle, with the original attached
    * as the cause.
+   *
+   * <b>What the wrapper says.</b> The wrapper carries the cause's own '''message''', not its class
+   * name. A typed streaming shuffle condition states everything an operator needs in that
+   * message -- the condition name, the shuffle and the partition, the two numbers that disagree,
+   * and the
+   * SQLSTATE -- and reporting `org.apache.spark.SparkException` in its place hid all of it behind a
+   * `getCause()` walk that only a debugger performs. The class name is used only when the cause
+   * carries no message at all, because a terse report is better than an empty one.
    */
   def throwIfError(): Unit = {
     val recorded = firstError.get()
@@ -432,8 +440,8 @@ private[spark] class StreamingShuffleErrorNotifier(
         case unchecked: RuntimeException => throw unchecked
         case checked =>
           throw new SparkException(
-            s"Streaming shuffle $shuffleId failed while reading pipelined map output " +
-              s"(${checked.getClass.getName})$droppedFailureSuffix", checked)
+            s"Streaming shuffle $shuffleId failed while reading pipelined map output: " +
+              s"${StreamingShuffleErrorNotifier.describe(checked)}$droppedFailureSuffix", checked)
       }
     }
   }
@@ -544,4 +552,23 @@ private[spark] object StreamingShuffleErrorNotifier {
    * offset, a length, a sequence number -- comes later.
    */
   val MaxSuppressionKeyMessageChars: Int = 256
+
+  /**
+   * The operator-facing rendering of a failure: its own message, or its type when it has none.
+   *
+   * Used wherever a streaming shuffle failure is reported inside another failure's message. A typed
+   * condition puts the actionable text in its message, so the message is what has to be carried;
+   * falling back to the class name keeps a report that would otherwise be empty informative.
+   *
+   * @param cause the failure to render; a null is rendered as an explicit absence rather than as
+   *              the word "null", because a report that reads "null" tells an operator nothing
+   */
+  def describe(cause: Throwable): String = {
+    if (cause == null) {
+      "no cause was reported"
+    } else {
+      val message = cause.getMessage
+      if (message != null && message.trim.nonEmpty) message.trim else cause.getClass.getName
+    }
+  }
 }

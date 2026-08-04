@@ -1686,23 +1686,50 @@ private[spark] class StreamingShuffleWriter[K, V, C](
     }
     if (!admitted) {
       val requested = payload.length.toLong + MemorySpillManager.PER_BLOCK_OVERHEAD_BYTES
-      // Reported through the *non-degrading* signal, deliberately, and not through
-      // [[BackpressureProtocol.reportBufferAllocationFailure]]. The distinction is the whole point:
-      // that method declares the subsystem degraded and records that streaming should yield to the
-      // sort-based implementation, and a producer that went on streaming afterwards would be
-      // contradicting its own published state. Standing the shuffle down here would also be the
-      // wrong answer twice over on its own terms: the verdict is shuffle-wide, so it would tell
-      // consumers to read output this producer has already streamed from a sort-based path that has
-      // none of it, which is only consistent if the whole map stage is recomputed -- and a task
-      // that fails to force that recomputation takes the job with it wherever retries are
-      // unavailable. The specified answer to a full buffer is to spill, so that is what happens:
-      // the block skips memory and goes straight to disk, the map output stays complete, the
-      // condition is visible in the backpressure telemetry an operator consults, and the shuffle
-      // keeps the streaming path it is already committed to with no participant standing down. The
-      // spill manager counts that write as the spill event it is, on `shuffle.streaming.spillCount`
-      // as well as on `diskBytesSpilled`, so an operator never sees this path produce disk volume
-      // with no spill behind it.
+      // Reported through the *non-degrading* transport signal rather than through
+      // [[BackpressureProtocol.reportBufferAllocationFailure]], which would declare the subsystem
+      // degraded from inside an accounting call. The output itself is never abandoned here: the
+      // specified answer to a full buffer is to spill, so the block skips memory and goes straight
+      // to local disk, the map output stays complete, and the spill manager counts that write as
+      // the spill event it is -- on `shuffle.streaming.spillCount` as well as on `diskBytesSpilled`
+      // -- so an operator never sees this path produce disk volume with no spill behind it.
       backpressure.reportDurableSpillAdmission(producerKey(state.partitionId))
+      // The fallback policy is told, but only about the condition it is specified to act on, and
+      // the two conditions that reach this branch are not the same event.
+      //
+      // The first is a buffer that was *being used* and could not be freed: this attempt has
+      // resident output, eviction ran, bytes went to disk, and the reservation is still refused
+      // after every recovery round. That is the specified second trip condition -- "memory pressure
+      // prevents buffer allocation" -- and it is the transition the state machine names, Spilling
+      // to Degraded when allocation still fails. Leaving it unreported is what made the documented
+      // graceful degradation inert on the integrated path: buffer utilisation at ninety-nine
+      // percent, dozens of spill events and a stream of pressure warnings, while the policy
+      // reported that nothing had tripped and the job absorbed repeated map-stage recomputation
+      // instead of yielding to the sort-based shuffle. Reporting it trips the policy; the next
+      // block boundary reads that trip in [[checkFallbackPolicy]] and stands this attempt down
+      // through the in-place degradation path, which reconstructs the complete map output through
+      // the sort-based writer without failing the task, while the coordinator withdraws the
+      // streamed output shuffle-wide so no consumer is left reading a path this executor has
+      // abandoned.
+      //
+      // The second is an allowance that was never available to this attempt at all -- nothing
+      // resident, nothing evicted, so no spilling ever happened and no amount of it could have
+      // helped. A block larger than what the configured percentage can ever hold, or a budget
+      // wholly committed elsewhere on the executor, is answered by the specified route for a full
+      // buffer: the block goes straight to local disk and the shuffle keeps the streaming path its
+      // consumers are already reading. Degrading there would abandon a working stream over a
+      // condition that is structural rather than a shortage, which is why the report is gated on
+      // evidence that memory really was in play.
+      val spillingWasInPlay =
+        spillManager.bufferedBytes > 0L || spillManager.memoryBytesSpilled > 0L
+      if (spillingWasInPlay) {
+        // Zero, because the reservation was refused outright: a grant of nothing against a request
+        // for something is what a short grant means at its limit.
+        fallbackPolicy.recordAllocationGrant(requested, 0L)
+        // The sticky signal is consumed by the report so that a later rescue is judged on its own
+        // evidence rather than on this one; the policy's own verdict is latched and unaffected.
+        spillManager.clearMemoryPressure()
+      }
       if (!spillManager.admitDurably(state.partitionId, sequenceNumber, payload)) {
         logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} could not reserve " +
           log"${MDC(MEMORY_SIZE, requested)} bytes for partition " +
@@ -2291,16 +2318,17 @@ private[spark] class StreamingShuffleWriter[K, V, C](
    * task's output is complete and discarding correct work would benefit nobody.
    */
   private def checkFallbackPolicy(): Unit = {
-    // What does NOT reach here, and why. A buffer allowance this producer has met once production
-    // has begun is recorded as the backpressure protocol's memory-pressure observation but never
-    // trips this policy: it is answered by writing the block to local disk, which is what the
-    // specification asks of a full buffer, and the shuffle keeps the streaming path its consumers
-    // are already reading. Only a verdict that is *shuffle-wide* belongs here, because only a
-    // shuffle-wide verdict withdraws streamed output -- and withdrawing output that has already
-    // been produced is exactly the situation in which this attempt must fail so that the map stage
-    // is recomputed. Pre-flight memory pressure keeps its place as trip 2: a task that cannot frame
-    // at all stands the shuffle down before it consumes a record, where the delegation is total and
-    // nothing has been produced that a recomputation would have to replace.
+    // What reaches here, and what does not. Pressure that eviction *rescued* does not: a partial
+    // grant the spill manager reversed is ordinary flow control, counted as a brush and nothing
+    // more, and it must not cost a job its fast path. Pressure that eviction could not rescue does:
+    // a reservation still refused after every recovery round is the specified second trip
+    // condition, it is reported to the policy at that point by [[admitBlock]], and it is read here.
+    // Standing down mid-production is safe because it is not a failure: the degradation below
+    // reconstructs the complete map output through the sort-based writer in place, and the
+    // shuffle-wide declaration withdraws the streamed output so no consumer is left reading a path
+    // this executor has abandoned. Pre-flight memory pressure keeps its place too: a task that
+    // cannot frame at all stands the shuffle down before it consumes a record, where the delegation
+    // is total and nothing has been produced that a recomputation would have to replace.
     //
     // Two independent facts, and both must stand this producer down. The local latch is this
     // executor's own verdict on whether streaming is sustainable here; the cached shuffle-wide

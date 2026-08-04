@@ -898,6 +898,103 @@ class StreamingShuffleManagerSuite extends SparkFunSuite
     assertNoDataLoss(observed, baseline, "a shuffle run after the manager stood streaming down")
   }
 
+  test("a fallback verdict reports the declarer's own account before the member's prose") {
+    // The set of conditions is closed at four, so a declaration whose true condition is narrower
+    // than any member has to pick the member it belongs under -- and the member's prose would then
+    // be the only thing an operator ever read, stating a measurement nobody took. The declarer's
+    // sentence therefore travels with the verdict and is what a rendering prefers, while the name
+    // stays the stable machine identifier.
+    val withDetail = StreamingShuffleFallbackState(
+      StreamingShuffleFallbackReason.ProtocolVersionMismatch.toString,
+      declaredAtEpoch = 7L,
+      detail = "a consumer requested the narrowed map range [1, 3)")
+    assert(withDetail.condition === "a consumer requested the narrowed map range [1, 3)",
+      s"a verdict carrying a detail must report it, but reported ${withDetail.condition}")
+    assert(withDetail.reason.contains(StreamingShuffleFallbackReason.ProtocolVersionMismatch),
+      "and the name must still resolve onto this build's closed set")
+
+    val withoutDetail = StreamingShuffleFallbackState(
+      StreamingShuffleFallbackReason.ConsumerTooSlow.toString, declaredAtEpoch = 7L)
+    assert(withoutDetail.condition === StreamingShuffleFallbackReason.ConsumerTooSlow.description,
+      s"a verdict with no detail must fall back to this build's prose for the member, but " +
+        s"reported ${withoutDetail.condition}")
+
+    val unresolvable = StreamingShuffleFallbackState("SomethingThisBuildCannotResolve", 7L)
+    assert(unresolvable.condition === "SomethingThisBuildCannotResolve",
+      s"and a name this build cannot resolve must be reported verbatim rather than as prose it " +
+        s"cannot produce, but reported ${unresolvable.condition}")
+
+    val stillStreaming = StreamingShuffleFallbackState()
+    assert(!stillStreaming.fallenBack,
+      "a verdict for a shuffle that is still streaming must not read as fallen back")
+    assert(stillStreaming.condition === StreamingShuffleCoordinator.NO_FALLBACK_REASON,
+      s"and it must describe no condition at all, because there is none to describe, but " +
+        s"described '${stillStreaming.condition}'")
+  }
+
+  test("a narrowed map range is declined as a compatibility failure and never as consumer " +
+      "slowness") {
+    // A live producer location names a map id and a task attempt id but no map index, so "map
+    // indexes 1 to 3" cannot be served from producers that are still running and the read must be
+    // declined. What is asserted here is the ATTRIBUTION of that decline. It used to be declared as
+    // a consumer held at 2x behind the producer for more than a minute -- a measurement nothing on
+    // this path takes -- which told an operator reading the driver log to go and tune consumer
+    // throughput for a condition that was purely structural. The decline is a compatibility failure
+    // between what a consumer asked for and what the protocol can serve, which is the same member a
+    // partition-count disagreement is declared under, and the detail carries the specifics.
+    val baseline = sortBaselineGroupedOutput(numPartitions = 4)
+    sc = new SparkContext(
+      withLocalMaster(streamingConf(), "streaming-shuffle-manager-narrowed-range", "local[2]"))
+    val manager = SparkEnv.get.shuffleManager.asInstanceOf[StreamingShuffleManager]
+    val coordinatorRef = RpcUtils.makeDriverRef(
+      StreamingShuffleCoordinator.ENDPOINT_NAME, sc.conf, SparkEnv.get.rpcEnv)
+    val context = fakeTaskContext(sc)
+
+    val dependency = shuffleDependencyFor(sc, sc.conf, numPartitions = 4, numRecords = 20)
+    val handle = dependency.shuffleHandle.asInstanceOf[StreamingShuffleHandle[Int, Int, Int]]
+    // The full range still streams, so the decline below is attributable to the narrowing alone.
+    assert(manager.getReader[Int, Int](handle, 0, Int.MaxValue, 0, 1, context,
+        context.taskMetrics().createTempShuffleReadMetrics())
+        .isInstanceOf[StreamingShuffleReader[_, _]],
+      "the whole map range must still be served by the streaming reader, or the narrowed case " +
+        "below proves nothing")
+
+    val narrowedReader = manager.getReader[Int, Int](handle, 1, 3, 0, 1, context,
+      context.taskMetrics().createTempShuffleReadMetrics())
+    withSortManager(sc.conf) { sort =>
+      val sortReader = sort.getReader[Int, Int](handle, 1, 3, 0, 1, context,
+        context.taskMetrics().createTempShuffleReadMetrics())
+      assert(narrowedReader.getClass === sortReader.getClass,
+        s"a narrowed map range must be served by the sort delegate's own reader, but was served " +
+          s"by ${narrowedReader.getClass.getName} against ${sortReader.getClass.getName}")
+    }
+
+    val declared = coordinatorRef.askSync[StreamingShuffleFallbackState](
+      GetStreamingShuffleFallbackState(handle.shuffleId, handle.capabilityToken))
+    assert(declared.fallenBack,
+      "the decline must stand the shuffle down for every participant, or the recomputation would " +
+        "land on producers that cannot serve the narrowed range either")
+    assert(declared.reasonName !== StreamingShuffleFallbackReason.ConsumerTooSlow.toString,
+      "a structural decline must not be attributed to sustained consumer slowness, which is a " +
+        "measurement this path never takes")
+    assert(declared.reason.contains(StreamingShuffleFallbackReason.ProtocolVersionMismatch),
+      s"it must be declared as the compatibility failure it is, but was declared as " +
+        s"${declared.reasonName}")
+    assert(declared.detail.contains("narrowed map range [1, 3)"),
+      s"the declaration must carry the requested range, but carried '${declared.detail}'")
+    assert(declared.condition === declared.detail,
+      s"and an operator must read that account rather than the member's prose, but would read " +
+        s"'${declared.condition}'")
+    assert(!declared.condition.contains("slower") && !declared.condition.contains("60 seconds"),
+      s"nothing an operator reads may claim a throughput condition, but the rendering was " +
+        s"'${declared.condition}'")
+
+    // The definitive statement: the workload still completes, on the sort-based path, with the
+    // baseline's output.
+    val observed = groupedOutputAsSet(sc, numPartitions = 4)
+    assertNoDataLoss(observed, baseline, "a shuffle whose narrowed read stood streaming down")
+  }
+
   test("each fallback condition routes a live manager's writer reader and unregister to sort") {
     // One live application, one executor-side manager per condition. A manager is needed per
     // condition because a trip latches: the first condition observed is the one the policy holds

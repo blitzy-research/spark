@@ -813,10 +813,12 @@ private[spark] class StreamingShuffleFallbackPolicy(
   /** How many shuffle-wide verdicts this executor has cached, bounded by the tracking bound. */
   def knownShuffleFallbackCount: Int = shuffleFallbacks.size()
 
-  /** An operator-facing rendering of a verdict, preferring this build's prose to a bare name. */
-  private def describeFallback(state: StreamingShuffleFallbackState): String = {
-    state.reason.map(_.description).getOrElse(state.reasonName)
-  }
+  /**
+   * An operator-facing rendering of a verdict: the declarer's own account when it gave one, this
+   * build's prose for the latched member otherwise, and the bare name only for a name this build
+   * cannot resolve.
+   */
+  private def describeFallback(state: StreamingShuffleFallbackState): String = state.condition
 
   // Lifecycle.
 
