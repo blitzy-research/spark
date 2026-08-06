@@ -31,7 +31,7 @@ import org.apache.spark.executor.ShuffleWriteMetrics
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.LogKeys.{BLOCK_ID, BYTE_SIZE, CLASS_NAME, COUNT, DURATION,
   FILE_NAME, MAX_SIZE, MEMORY_SIZE, NUM_BYTES, NUM_EVENTS, NUM_PARTITIONS, NUM_SKIPPED,
-  PARTITION_ID, PATH, REASON, THREAD_NAME, THRESHOLD, TIMEOUT}
+  PARTITION_ID, REASON, THREAD_NAME, THRESHOLD, TIMEOUT}
 import org.apache.spark.internal.config.{CPUS_PER_TASK, EXECUTOR_CORES, EXECUTOR_MEMORY,
   SHUFFLE_FILE_BUFFER_SIZE, SHUFFLE_STREAMING_BUFFER_SIZE_PERCENT, SHUFFLE_STREAMING_DEBUG,
   SHUFFLE_STREAMING_SPILL_THRESHOLD}
@@ -1806,6 +1806,55 @@ private[spark] class MemorySpillManager(
   }
 
   /**
+   * Makes up to `maxBytes` of the retained window durable ahead of the end of the task, without
+   * waiting for the buffer threshold and without counting as a pressure spill.
+   *
+   * '''What this is for.''' A producer whose output nobody is taking will have to write the whole
+   * retained window at its successful stop, because task-managed execution memory does not survive
+   * task completion. Deferring all of that to the stop makes the write a burst that begins only
+   * after the last record has been serialised, so the map task's own duration contains a whole
+   * output disk write with nothing overlapping it -- which is the map-stage materialisation cost
+   * the feature exists to remove, and the one part of it that is reachable without changing when a
+   * consumer is scheduled. Bringing the write forward in bounded slices while records are still
+   * being produced lets the operating system's write-back proceed against the same device while the
+   * task serialises its next records, which is exactly how the sort-based path behaves, and it
+   * lowers the peak this executor ever holds at the same time.
+   *
+   * '''Why it is not a spill, and must not be counted as one.''' Nothing about the buffer threshold
+   * is involved: the caller decides when to call this, and it is called precisely when there is no
+   * pressure. The eviction is therefore performed as the end-of-stream durability flush it is, and
+   * advances [[durabilityFlushCount]] and not [[spillCount]] -- an operator watching the spill
+   * counter is watching a pressure signal against the configured threshold, and an event that has
+   * nothing to do with that threshold would make the signal unreadable. The volumes land on the
+   * existing `memoryBytesSpilled` and `diskBytesSpilled` accumulators exactly as the stop-time
+   * flush would have, because the same bytes really do leave memory for local disk; only the moment
+   * they do so moves.
+   *
+   * '''What the caller owes this method.''' The judgement about whether the window is worth holding
+   * belongs to the caller, not here: a consumer that is keeping pace releases its blocks through
+   * acknowledgement long before any of this would help, and writing them out from underneath it
+   * would replace a memory hand-off with a disk round trip. The producer therefore calls this only
+   * while no consumer is registered to acknowledge, and only on a cadence, so a stream that is
+   * being consumed live is never written at all. See
+   * `StreamingShuffleWriter.flushRetainedOutputAhead`.
+   *
+   * @param maxBytes the most this call may move out of memory; a non-positive figure is a no-op
+   * @return bytes moved to disk by this call, which is zero when nothing was held in memory
+   */
+  def flushRetainedForDurability(maxBytes: Long): Long = {
+    if (closed.get() || maxBytes <= 0L) {
+      0L
+    } else {
+      val held = bufferedBytes
+      if (held <= 0L) {
+        0L
+      } else {
+        evictAndRelease(math.min(held, maxBytes), durabilityFlush = true)
+      }
+    }
+  }
+
+  /**
    * Releases memory on behalf of another consumer under pressure, which is the callback
    * `TaskMemoryManager` invokes when the task as a whole cannot satisfy an allocation.
    *
@@ -2396,7 +2445,7 @@ private[spark] class MemorySpillManager(
     } catch {
       case NonFatal(e) =>
         spillFailureTotal.incrementAndGet()
-        reportSpillFailure(partitionId, spillBlockId, file, e)
+        reportSpillFailure(partitionId, spillBlockId, e)
         None
     } finally {
       if (!succeeded) {
@@ -2413,16 +2462,36 @@ private[spark] class MemorySpillManager(
     }
   }
 
-  /** Reports one bounded spill-write failure without exposing local paths at default log level. */
+  /**
+   * Reports one bounded spill-write failure without ever disclosing where the executor keeps its
+   * local directories or what its call stack looks like.
+   *
+   * '''Why the debug branch is sanitised too, and not only the default-level one.''' The two
+   * branches differ in how often they may speak, not in what they are allowed to say. A spill
+   * destination is a path inside the executor's configured local directories, and a raw throwable
+   * from a failed write carries both that path in its message and the subsystem's internal call
+   * stack in its trace -- so emitting either would put the executor's storage layout and internal
+   * structure into a log an operator routinely ships off the host, and would do so on exactly the
+   * path an attacker can provoke by filling or unmounting a local directory. Turning the debug key
+   * on asks for more detail about the streaming shuffle, not for a different disclosure policy.
+   *
+   * What the caller loses is nothing it can act on: the generated block id identifies the
+   * destination uniquely within the shuffle, the exception class names the failure mode, and the
+   * running totals bound how much of this is being suppressed. Neither the absolute path nor the
+   * stack trace distinguishes one remedy from another.
+   *
+   * @param partitionId the reduce partition whose eviction failed
+   * @param spillBlockId the generated destination block, or `null` when allocation itself failed
+   * @param failure what went wrong, reported by class rather than by message or trace
+   */
   private def reportSpillFailure(
       partitionId: Int,
       spillBlockId: TempShuffleBlockId,
-      file: File,
       failure: Throwable): Unit = {
+    val destination =
+      if (spillBlockId == null) "an unallocated spill block" else spillBlockId.name
     spillFailureLogAggregator.record(clock.getTimeMillis()) match {
       case Some(summary) =>
-        val destination =
-          if (spillBlockId == null) "an unallocated spill block" else spillBlockId.name
         logError(log"Failed to evict streaming shuffle partition " +
           log"${MDC(PARTITION_ID, partitionId)} to spill block " +
           log"${MDC(BLOCK_ID, destination)}: ${MDC(CLASS_NAME, failure.getClass.getName)} " +
@@ -2430,9 +2499,9 @@ private[spark] class MemorySpillManager(
           log"${MDC(NUM_SKIPPED, summary.unreported)} not reported individually)")
       case None =>
         if (debugEnabled) {
-          val target = if (file == null) "an unallocated spill file" else file.getAbsolutePath
           logError(log"Failed to evict streaming shuffle partition " +
-            log"${MDC(PARTITION_ID, partitionId)} to spill file ${MDC(PATH, target)}", failure)
+            log"${MDC(PARTITION_ID, partitionId)} to spill block " +
+            log"${MDC(BLOCK_ID, destination)}: ${MDC(CLASS_NAME, failure.getClass.getName)}")
         }
     }
   }
@@ -2519,6 +2588,15 @@ private[spark] class MemorySpillManager(
 
   /** The consumers currently entitled to acknowledge. */
   def registeredConsumers: Set[String] = lock.synchronized(consumerPositions.keySet.toSet)
+
+  /**
+   * How many consumers are currently entitled to acknowledge.
+   *
+   * The same question [[registeredConsumers]] answers, without materialising a set for it. It is
+   * asked on the producer's maintenance cadence, where "is anybody taking this output" decides
+   * whether the retained window is worth holding in memory at all, so the answer must cost nothing.
+   */
+  def registeredConsumerCount: Int = lock.synchronized(consumerPositions.size)
 
   /** Consumer registrations refused by the per-store or executor-wide identity cap. */
   def rejectedConsumerRegistrationCount: Long = rejectedConsumerRegistrations.get()
@@ -3302,9 +3380,11 @@ private[spark] class MemorySpillManager(
         spillFileDeletionFailureTotal.incrementAndGet()
         // Cleanup walks every retained spill file of every task, so one undeletable directory
         // produces one line per file per task. Bounding it executor-wide is what stops a cleanup
-        // path from being noisier than the work it is cleaning up after, and the default-level
-        // line names the file rather than its absolute path so the executor's storage layout stays
-        // out of ordinary logs.
+        // path from being noisier than the work it is cleaning up after, and BOTH lines name the
+        // file rather than its absolute path -- and report the failure by class rather than by
+        // message or trace -- so neither the executor's storage layout nor the subsystem's call
+        // stack reaches a log on a path an operator can provoke by unmounting a local directory.
+        // The debug key asks for more streaming detail, not for a wider disclosure policy.
         spillFileDeletionLogAggregator.record(clock.getTimeMillis()) match {
           case Some(summary) =>
             logWarning(log"Failed to delete streaming shuffle spill file " +
@@ -3314,7 +3394,8 @@ private[spark] class MemorySpillManager(
           case None =>
             if (debugEnabled) {
               logWarning(log"Failed to delete streaming shuffle spill file " +
-                log"${MDC(PATH, file.getAbsolutePath)}", e)
+                log"${MDC(FILE_NAME, file.getName)}: " +
+                log"${MDC(CLASS_NAME, e.getClass.getName)}")
             }
         }
     }

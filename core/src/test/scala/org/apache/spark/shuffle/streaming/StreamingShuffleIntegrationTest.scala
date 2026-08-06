@@ -1683,19 +1683,27 @@ class StreamingShuffleIntegrationTest
   //    shuffle never stood down, and Spark's own write and read reporters were populated by the
   //    streaming writer and reader, which is what makes a streaming shuffle visible on every
   //    existing observability surface; and
-  //  * neither half was retried, so nothing above was reached through a recomputation.
+  //  * neither half was retried, so nothing above was reached through a recomputation; and
+  //  * the scheduled vertical really exercises the durability path, on Spark's own spill
+  //    accumulators, which is what a reduce task submitted after its map stage reads from.
   //
   // -- and then MEASURES the one thing that is not inside the boundary, instead of asserting it in
   // prose: the reduce stage's first submission does not precede the map stage's completion. That
   // ordering belongs to the DAG scheduler and to task scheduling, which AAP 0.2.1 and 0.2.2 place
   // under zero modifications and AAP 0.8.2 Tier 1 restates file by file for `scheduler/**`. It is
-  // the reason an ordinary single-attempt map stage has no consumer subscribed while it produces,
-  // and therefore the reason the retained window at task end is the whole map output in a scheduled
-  // vertical while it is a fraction of it whenever a consumer keeps pace. Closing that gap would
-  // take either a scheduler change or an intermediate staging tier -- a component AAP 0.8.2 Tier 3
-  // excludes along with anything else not enumerated in AAP 0.1.2, and one that would contradict
-  // FR-2's "pipeline buffered data directly to consumer executors" besides. So it is recorded here
-  // as a measurement an operator can reproduce, beside the accounting it produces.
+  // the reason an ordinary single-attempt map stage has no consumer subscribed while it produces.
+  //
+  // What that ordering does NOT decide, and used to, is when the retained output is written. A map
+  // task nobody is consuming secures its unclaimed output to local disk in bounded slices while it
+  // is still framing records, so the successful stop transfers a bounded tail instead of performing
+  // a whole-output write with the task waiting on it -- which takes the shuffle's materialisation
+  // work out of the map task's critical path, and so out of the map stage's, and so out of the
+  // delay before the reduce stage the scheduler submits after it. That is the part of the
+  // materialisation cost reachable from inside the shuffle abstraction, and it is asserted where
+  // the producer's own counters are observable, by `StreamingShuffleWriterSuite`, "output nobody
+  // has come for is secured while producing, not in a burst at the stop". A cluster job cannot see
+  // those counters, so what it asserts here is the consequence it CAN see: that the volumes reach
+  // Spark's existing accumulators, and that the barrier is where the scheduler puts it.
   // ---------------------------------------------------------------------------------------------
 
   test("a scheduled job is carried by the streaming path and its stage barrier is measured") {
@@ -1763,17 +1771,29 @@ class StreamingShuffleIntegrationTest
         "mean the scheduler had changed, which this feature is forbidden to arrange and this " +
         "assertion exists to notice")
 
-    // 4. The accounting that ordering produces, recorded rather than asserted as a target: with no
-    // consumer subscribed during production, the retained window at each map task's end is its
-    // whole output, which the attached-consumer case above shows as a small fraction instead.
+    // 4. The durability path, asserted on Spark's own accumulators rather than logged. With no
+    // consumer subscribed during production, this vertical's output has to be made durable for the
+    // reduce stage to read it at all, and the accumulators are where an operator sees that happen.
+    // Asserting them is what makes the volumes below a measurement of the production path rather
+    // than a number nobody checked.
+    assert(recorder.memoryBytesSpilled > 0L,
+      s"a scheduled vertical whose reduce stage starts after its map stage must have moved its " +
+        s"retained output out of task memory, and that must appear on " +
+        s"TaskMetrics.memoryBytesSpilled, which reads ${recorder.memoryBytesSpilled}")
+    assert(recorder.diskBytesSpilled > 0L,
+      s"and its committed volume must appear on TaskMetrics.diskBytesSpilled, which reads " +
+        s"${recorder.diskBytesSpilled}")
+
+    // 5. The accounting, recorded beside the assertions above so an operator can reproduce it.
     logInfo(log"Scheduled streaming vertical: map stage ${MDC(COUNT, mapStageId)} wrote " +
       log"${MDC(BYTE_SIZE, recorder.bytesWrittenByStage(mapStageId))} byte(s) and reduce stage " +
       log"${MDC(NUM_PARTITIONS, reduceStageId)} read " +
       log"${MDC(NUM_BYTES, recorder.bytesReadByStage(reduceStageId))} byte(s); " +
-      log"${MDC(MEMORY_SIZE, recorder.diskBytesSpilled)} byte(s) were made durable at task end " +
-      log"because the reduce stage was submitted ${MDC(TIME_UNITS, reduceSubmittedAt -
-        mapCompletedAt)} ms after the map stage completed, which is the stage barrier this " +
-      log"feature may not move")
+      log"${MDC(MEMORY_SIZE, recorder.diskBytesSpilled)} byte(s) were made durable so the reduce " +
+      log"stage could read them -- whatever of that the producers had not already secured while " +
+      log"framing is what their stops wrote; the reduce stage was submitted " +
+      log"${MDC(TIME_UNITS, reduceSubmittedAt - mapCompletedAt)} ms after the map stage " +
+      log"completed, which is the stage barrier this feature may not move")
   }
 
   // ---------------------------------------------------------------------------------------------

@@ -4699,6 +4699,167 @@ class StreamingShuffleReaderSuite
     }
   }
 
+  test("a contended receive window ends obeying its participants, never the schedule") {
+    // The rule above, asserted under contention rather than in sequence. Every case before this one
+    // drives the gate one call at a time, and a state machine whose steps are individually atomic
+    // passes all of them while still being wrong: recording an intent, computing the union, moving
+    // the applied state and writing the socket only mean anything performed TOGETHER, and two
+    // transitions interleaved between those steps let the thread that finishes last decide the
+    // socket regardless of what the participants actually want.
+    //
+    // Both failure modes that produces are reachable from this barrier, and both matter:
+    //
+    //  * a socket left READING while a participant is out of credit delivers into a bounded queue
+    //    the consumer cannot drain, which is the resource exhaustion the layer exists to prevent;
+    //  * a socket left CLOSED with no participant throttling is a window no living participant can
+    //    reopen, and because the channel is shared it stalls every other producer multiplexed onto
+    //    it until each of them times out its own perfectly healthy peer.
+    //
+    // The invariant asserted after every round is the whole contract in one line: the socket reads
+    // if and only if no participant is throttling, and what the gate believes it applied is what
+    // the channel actually has.
+    val rounds = 400
+    val throttledOutcomes = new AtomicInteger(0)
+    val openOutcomes = new AtomicInteger(0)
+    val channel = new EmbeddedChannel(DefaultChannelId.newInstance())
+    val executor = ThreadUtils.newDaemonFixedThreadPool(2, "streaming-shuffle-read-gate-race")
+    try {
+      (0 until rounds).foreach { round =>
+        // A fresh gate per round, sharing one channel: adopting a channel applies the standing
+        // state to it, so each round starts from a socket agreeing with an empty participant set.
+        val gate = new StreamingShuffleChannelReadGate
+        val contender = new Object
+        val bystander = new Object
+        gate.attach(channel)
+        assert(channel.config().isAutoRead,
+          s"round $round must start from a reading socket, or it measures the wrong transition")
+
+        // The contender is throttling and the bystander is not, so the round races the two
+        // transitions that disagree about the socket: one participant leaving the throttled set
+        // while another enters it.
+        gate.throttle(contender, "the contender is out of credit")
+        assert(!channel.config().isAutoRead, s"round $round must start from a closed window")
+
+        val barrier = new CyclicBarrier(2)
+        val resumeTask: Runnable = () => {
+          barrier.await(RaceBarrierTimeoutSeconds, TimeUnit.SECONDS)
+          gate.resume(contender)
+        }
+        val throttleTask: Runnable = () => {
+          barrier.await(RaceBarrierTimeoutSeconds, TimeUnit.SECONDS)
+          gate.throttle(bystander, "the bystander's queue filled up")
+        }
+        val resume = executor.submit(resumeTask)
+        val throttle = executor.submit(throttleTask)
+        resume.get(RaceBarrierTimeoutSeconds, TimeUnit.SECONDS)
+        throttle.get(RaceBarrierTimeoutSeconds, TimeUnit.SECONDS)
+
+        // The bystander always ends up throttling, whichever thread landed last, so the window must
+        // end closed. Stated through the general invariant rather than as a constant, so the
+        // assertion still means something if a future change alters which transitions race.
+        val participants = gate.throttlingParticipantCount
+        assert(gate.isReadEnabled == (participants == 0),
+          s"round $round left the gate reporting reading=${gate.isReadEnabled} with " +
+            s"$participants throttling participant(s): the socket must read if and only if none is")
+        assert(channel.config().isAutoRead == gate.isReadEnabled,
+          s"round $round left the channel at autoRead=${channel.config().isAutoRead} while the " +
+            s"gate believed it had applied ${gate.isReadEnabled}")
+        assert(participants == 1,
+          s"round $round must end with the bystander alone throttling, but $participants were")
+        if (gate.isReadEnabled) {
+          openOutcomes.incrementAndGet()
+        } else {
+          throttledOutcomes.incrementAndGet()
+        }
+
+        // Withdrawing the last participant must reopen the window, which is what proves the round
+        // left no latched state behind for the next one to inherit.
+        gate.withdraw(bystander)
+        assert(gate.isReadEnabled && channel.config().isAutoRead,
+          s"round $round must leave a reopened socket once its last participant departs")
+      }
+    } finally {
+      executor.shutdownNow()
+      channel.close()
+    }
+    assert(throttledOutcomes.get() == rounds,
+      s"every round ends with one participant throttling, so every round must end with a closed " +
+        s"window, but ${openOutcomes.get()} of $rounds ended open")
+  }
+
+  test("a departed participant can never re-state a throttle into a shared channel") {
+    // The other half of the same defect, on the handler rather than on the gate. A handler used to
+    // keep a flag of its own for its intent and update it in a compare-and-set separate from the
+    // gate call, so the flag and the gate's record could diverge: a handler could end up recorded
+    // as throttling while its own flag said it was reading, after which no living path would ever
+    // withdraw it. Departure is the sharpest form of that -- a throttle stated after the handler
+    // withdrew stands in a gate it no longer participates in -- so that is the case asserted.
+    //
+    // The frames delivered here would throttle the handler; they race its close. Either outcome is
+    // legal for the handler, and only one is legal for the CHANNEL: the participant that remains
+    // must be able to read.
+    val conf = streamingConf()
+    val clock = newManualClock()
+    val rounds = 60
+    val executor = ThreadUtils.newDaemonFixedThreadPool(2, "streaming-shuffle-departure-race")
+    try {
+      (0 until rounds).foreach { round =>
+        val connector = new BarrieredStreamingShuffleProducerConnector(conf)
+        val leaving = newConnectorHandler(conf, clock, mapId = ProducerMapId)
+        val staying = newConnectorHandler(conf, clock, mapId = ProducerMapId + 1L)
+        try {
+          val client = connector.connect(connectorLocation(leaving.mapId), leaving).getOrElse(
+            fail(s"round $round must have opened a channel to race against"))
+          assert(connector.connect(connectorLocation(staying.mapId), staying).contains(client),
+            s"round $round must have joined both producers onto one channel")
+          val channel = client.getChannel()
+          val payload = payloadOfLength(leaving.mapId, 64)
+          val barrier = new CyclicBarrier(2)
+
+          val deliverTask: Runnable = () => {
+            barrier.await(RaceBarrierTimeoutSeconds, TimeUnit.SECONDS)
+            (0 to BlocksPastHighWaterMark).foreach { index =>
+              val block =
+                dataBlock(leaving.shuffleId, leaving.mapId, ReducePartition, index.toLong, payload)
+              leaving.receive(client, block.toByteBuffer())
+            }
+          }
+          val closeTask: Runnable = () => {
+            barrier.await(RaceBarrierTimeoutSeconds, TimeUnit.SECONDS)
+            connector.release(leaving, client)
+          }
+          val deliver = executor.submit(deliverTask)
+          val close = executor.submit(closeTask)
+          deliver.get(RaceBarrierTimeoutSeconds, TimeUnit.SECONDS)
+          close.get(RaceBarrierTimeoutSeconds, TimeUnit.SECONDS)
+          assert(leaving.awaitDataPlaneIdle(RaceBarrierTimeoutSeconds * 1000L),
+            s"round $round must settle the departing handler's data plane before it is read")
+
+          // The departed handler holds nothing, whether it throttled before withdrawing or never
+          // reached the transition at all.
+          assert(!staying.currentReadGate.isThrottling(leaving),
+            s"round $round left the departed handler recorded as throttling a channel it no " +
+              "longer participates in")
+          // And the participant that remains is unthrottled, so the socket must be readable by it.
+          assert(staying.isAutoReadEnabled,
+            s"round $round throttled a handler that received nothing, cause " +
+              s"${staying.currentThrottleCause}")
+          assert(staying.throttlingParticipantCount == 0,
+            s"round $round left ${staying.throttlingParticipantCount} participant(s) holding the " +
+              "shared window shut with no living participant able to clear it")
+          assert(staying.isChannelReadEnabled && channel.config().isAutoRead,
+            s"round $round wedged the shared socket shut for the surviving producer")
+        } finally {
+          connector.close()
+          leaving.close()
+          staying.close()
+        }
+      }
+    } finally {
+      executor.shutdownNow()
+    }
+  }
+
   test("a producer-local session teardown leaves the other producers of a shared channel alive") {
     // The serving side of the same channel. A consumer channel reaches several producers, so a
     // producer that closed the socket when ITS OWN session ended -- superseded, expired, or refused

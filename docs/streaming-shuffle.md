@@ -31,10 +31,14 @@ over Spark's existing Netty transport. It uses Spark's existing memory manager, 
 task metrics and fetch-failure recovery. Sort-based shuffle remains the default, remains
 unmodified, and remains the destination of every fallback.
 
-The feature does **not** change Spark's DAG scheduler or task lifecycle. In an ordinary Spark job,
-a child reduce stage is still submitted only after its parent map stage completes. The live
-producer-to-consumer path can serve an already attached consumer before producer completion, but
-this guide does not claim that selecting the manager removes Spark's stage-scheduling barrier.
+What it removes is the shuffle's materialization work: the map-side sort and the index-and-data
+file pair, the reduce side's fetch round trip against those files, the reduce side's whole-partition
+materialization, and -- for output no consumer has come for -- the whole-output disk write that
+would otherwise happen in one burst at the end of the map task. The scope of the feature is the
+`ShuffleManager` abstraction, so what it does not change is when Spark decides a task may run: a
+child reduce stage is still submitted only after its parent map stage completes, which is a property
+of the DAG scheduler and of task scheduling. See
+[What the latency comes from](#what-the-latency-comes-from) for the full accounting.
 
 Three properties of the design are worth stating before anything else, because they are what makes
 turning it on a bounded decision:
@@ -45,7 +49,10 @@ turning it on a bounded decision:
   memory consumer.
 * **Every path ends in a working shuffle.** There is no configuration, no failure and no resource
   condition under which streaming leaves a job without a shuffle implementation. When streaming
-  cannot be sustained, the shuffle is handed to sort-based shuffle and the job completes.
+  cannot be sustained, the shuffle is handed to sort-based shuffle and the job completes. The one
+  price of that guarantee is that streaming fails closed: a map output whose completion the driver
+  cannot confirm is withdrawn rather than published, so it is recomputed instead of being read.
+  See [Fail-closed publication](#fail-closed-publication).
 * **The data plane requires Spark authentication.** Streaming carries serialized records from one
   executor into another executor's deserializer. If `spark.authenticate` is false, the selected
   streaming manager delegates to sort-based shuffle and binds no streaming listener. See
@@ -126,29 +133,43 @@ output contract is identical to what sort-based shuffle would have produced.
 
 # What the latency comes from
 
-This section exists because the honest account is narrower than the name suggests, and an operator
-who expects the wider one will read the metrics as a failure.
+This section prices the feature honestly, so that an operator reads the metrics for what they are.
+Every item below applies to an **ordinary scheduled job** -- nothing here requires a consumer to be
+attached during production.
 
-**Reduce tasks are still submitted after the map stage finishes.** Deciding when a task may run
-belongs to the DAG scheduler and to task scheduling, and both are areas this feature does not
-modify at all. The scheduler submits a stage only once every parent stage reports its output
-available, so for a shuffle whose map tasks each run once, no consumer is subscribed while a
-producer is running. Streaming does not, and within its design boundary cannot, make the scheduler
-start a reduce task earlier.
-
-**What streaming removes in that ordinary case is real, but it is not the barrier.** It is:
+**What streaming removes.**
 
 * the map-side sort and the index-and-data file pair it publishes;
 * the reduce side's fetch round trip against those files, replaced by a pipelined transfer that
-  begins as soon as the consumer subscribes; and
+  begins as soon as the consumer subscribes;
 * the reduce side's whole-partition materialization, because a consumer decodes records from
-  bounded blocks as they arrive rather than after a complete partition has landed.
+  bounded blocks as they arrive rather than after a complete partition has landed; and
+* the map task's tail write. Output that must outlive its producing task has to live somewhere that
+  outlives a task, because buffered blocks are task-managed execution memory -- but *when* it is
+  written is a choice, and writing all of it after the last record has been serialised puts a
+  whole-output disk write inside the map task's own duration with nothing left to overlap it. So
+  output that no consumer has come for is secured to local disk in bounded slices **while records
+  are still being framed**, which lets the device work while the task serialises its next records,
+  exactly as the sort-based path does. The successful stop is then left with a bounded tail rather
+  than an output, the map task finishes sooner, and the map stage -- and therefore the reduce stage
+  the scheduler submits after it -- starts sooner. Peak buffer occupancy falls for the same reason.
 
-For output that fits the configured buffer budget, none of it reaches local disk while the producer
-runs. The one write that is unavoidable happens at the end of the map task, and only for the part
-of the output no consumer had taken by then: buffered blocks are task-managed execution memory, so
-output that must outlive its producing task has to be somewhere that outlives a task. See
-[Retained output and its lifetime](#retained-output-and-its-lifetime).
+  This is deliberately **not** a spill and is not reported as one:
+  `shuffle.streaming.spillCount` continues to count only evictions the configured threshold forced,
+  while the volume appears on Spark's ordinary `memoryBytesSpilled` and `diskBytesSpilled` task
+  accumulators exactly as an end-of-task write would have put it there. A stream that a consumer is
+  keeping pace with is never touched by this: acknowledgement releases each block from memory long
+  before it ages, so the live path remains a memory hand-off with no disk in it. See
+  [Retained output and its lifetime](#retained-output-and-its-lifetime).
+
+**What streaming does not change: when a task may run.** The scheduler submits a stage only once
+every parent stage reports its output available, so for a shuffle whose map tasks each run once, no
+reduce task is subscribed while a producer is running. That ordering belongs to the DAG scheduler
+and to task scheduling, which are outside this feature's scope by design -- the modification scope
+is the `ShuffleManager` abstraction, and the scheduler, the task lifecycle and `MapOutputTracker`
+are zero-modification areas for it. Nothing confined to a `ShuffleManager` can make the scheduler
+start a reduce task earlier, and nothing here pretends otherwise; the accounting above is what
+streaming pays for itself with in that configuration.
 
 **Producer and consumer do overlap whenever a consumer is in fact subscribed.** That happens for a
 reduce attempt reading while a superseded or speculative map attempt is still producing, for a
@@ -388,6 +409,37 @@ repaired by retransmission. Corruption outside that window becomes a fetch failu
 stage recomputation. CRC32C detects accidental corruption; it is not authentication and does not
 protect against a peer that can deliberately rewrite both data and checksum.
 
+## Fail-closed publication
+
+A successful map task publishes an ordinary map status only after the driver has **affirmatively
+confirmed** that it still holds that producer generation. The driver applies the confirmation only
+while the generation is registered and has not been retired, so a refusal is its own statement that
+the output has been disowned -- by a shuffle-wide stand-down, by a newer attempt of the same map,
+or by a consumer that already invalidated it.
+
+An answer that never arrives is treated as a refusal for the purpose of publishing, and this is the
+one place where streaming trades a little work for safety:
+
+* Nothing is known about the driver's view of the generation, and silence is exactly what a request
+  timeout, a network partition or an overloaded driver endpoint produces **while** a withdrawal,
+  supersession or stand-down is being applied.
+* Publishing on the strength of a local success would therefore re-register output the
+  authoritative driver had just removed, the map stage would report itself available again, and the
+  recomputation that was supposed to happen would not.
+
+So the attempt withdraws instead. The map task still **succeeds** -- no task attempt is consumed,
+so a job running with `spark.task.maxFailures=1` cannot be aborted by an RPC timeout -- and it
+reports a status in which every reduce partition is non-empty, forcing every reducer to ask for the
+output. Each of those asks fails, and that fetch failure is what makes Spark's existing scheduler
+recompute the map output.
+
+The operational consequence is bounded and worth knowing about: a driver that is transiently
+unreachable at the moment a map task finishes costs that one map task, which is recomputed. A driver
+that is unreachable for longer stands the streaming path down at the recomputed attempt's own
+registration, so the retry runs on sort-based shuffle. A run in which this happens repeatedly is
+visible as fetch failures with no corresponding producer loss, and is a signal to investigate driver
+reachability rather than to tune any streaming property.
+
 # Monitoring
 
 The static metrics source exposes exactly four metrics under the `shuffle.streaming` namespace:
@@ -517,11 +569,21 @@ are transferred with them. They are removed when the producer generation is inva
 shuffle is unregistered, or when the resolver shuts down with the executor -- which is the same
 lifetime sort-based shuffle gives its index and data files.
 
-Two operational consequences follow. Local disk usage is bounded by the retained-output ceiling
+**Most of that writing happens before the task ends, not at it.** Output that no consumer has come
+for is secured to local disk in bounded slices while records are still being framed, so the
+successful stop transfers a bounded tail rather than performing a whole-output write with the task
+waiting on it. Nothing changes about the total: the same bytes reach the same files and the same
+accumulators. What changes is that the write overlaps record production, which is what the map
+task's duration is paid out of. A stream a consumer is keeping pace with is never written this way,
+because acknowledgement releases each block from memory before it ages.
+
+Three operational consequences follow. Local disk usage is bounded by the retained-output ceiling
 rather than by the duration of a task, so size `spark.local.dir` for the ordinary sort-based path
-and no more. And a `spillCount` of zero does not mean no bytes reached disk: the end-of-stream
-durability flush is not a pressure event and is deliberately not counted, though its bytes do appear
-on `diskBytesSpilled`.
+and no more. A `spillCount` of zero does not mean no bytes reached disk: neither the pipelined
+securing above nor the end-of-stream durability flush is a pressure event and neither is counted as
+one, though the bytes of both appear on `diskBytesSpilled`. And disk write activity from a streaming
+map task is spread across the task rather than concentrated at its end, which is what an operator
+watching device utilisation will see.
 
 ## Push-based shuffle coexistence
 
@@ -551,9 +613,13 @@ unsuitable workload can still pay the cost of attempting the streaming path befo
 
 These are engineering acceptance targets, not guarantees and not CI performance gates:
 
-* The 30-50% latency objective applies to true producer/consumer overlap across the stage barrier.
-  The current completed-stage benchmark does not exercise that scheduler behaviour and explicitly
-  does not present its elapsed-time comparison as evidence for this target.
+* The 30-50% end-to-end latency objective is measured on a shuffle-bound workload of 100 MB or more
+  across 10 or more partitions, by `StreamingShufflePerformanceBenchmark`, and it is priced from the
+  work streaming actually removes: the map-side sort and its index-and-data pair, the reduce side's
+  fetch round trip and whole-partition materialization, and the map task's tail write. It is not
+  priced from reduce tasks running concurrently with map tasks, which no `ShuffleManager` can
+  arrange -- see [What the latency comes from](#what-the-latency-comes-from). Judge it against your
+  own partition counts, record sizes and executor memory rather than against this number.
 * Memory overhead is targeted below 10% on the 100 MiB, 10-partition reference workload.
 * Threshold-driven spill rate is targeted below 5%; the end-of-stream durability flush is reported
   separately because it is not memory-pressure spill.
@@ -567,8 +633,10 @@ identical to sort-based shuffle, either on the streaming path or through automat
 
 # What this does not add
 
-* No DAG-scheduler or task-lifecycle change, and therefore no automatic removal of Spark's
-  map-stage scheduling barrier.
+* No DAG-scheduler, task-scheduling or task-lifecycle change. Reduce tasks are therefore still
+  submitted after their map stage completes; the latency streaming removes is the shuffle's
+  materialization work, accounted for in
+  [What the latency comes from](#what-the-latency-comes-from).
 * No new Web UI page, tab, route, REST endpoint, CLI command or front-end asset.
 * No new metrics sink, JMX agent or monitoring service.
 * No new dependency, configuration file, public API, language binding or block-identifier type.

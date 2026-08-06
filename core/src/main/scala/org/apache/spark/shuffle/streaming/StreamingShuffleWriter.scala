@@ -674,6 +674,16 @@ private[spark] class StreamingShuffleWriter[K, V, C](
 
   private var spillsObservedTotal: Long = 0L
 
+  // Instant of the last pipelined durability pass, seeded from the injected clock when streaming is
+  // initialised. Seeded rather than left at zero deliberately: the cadence is then a function of
+  // elapsed time, so a suite holding its clock still observes no pass at all and measures exactly
+  // the stop-time behaviour it means to.
+  private var lastRetainedDurabilityMillis: Long = 0L
+
+  private var retainedDurabilityBytesTotal: Long = 0L
+
+  private var retainedDurabilityPassesTotal: Long = 0L
+
   private var reclamationBreaches: Long = 0L
 
   private var memoryPressureBrushes: Long = 0L
@@ -995,7 +1005,8 @@ private[spark] class StreamingShuffleWriter[K, V, C](
    *     framing, and -- the load-bearing half -- so that the driver's answer is the last thing this
    *     sequence learns before it publishes. A refusal means the driver has disowned this
    *     generation, and an ordinary status published after that would re-register output a
-   *     shuffle-wide withdrawal has just removed. See [[requirePublishableGeneration]].
+   *     shuffle-wide withdrawal has just removed. An answer that never arrived authorises nothing
+   *     either: only an affirmative confirmation does. See [[requirePublishableGeneration]].
    *
    * @return the placeholder map status, always non-empty
    */
@@ -1052,10 +1063,19 @@ private[spark] class StreamingShuffleWriter[K, V, C](
    * already raised the fetch failure which recomputes the stage -- and the honest answer there is
    * to fail, exactly as [[standDownIfRetired]] fails it when its own pass finds the same thing.
    *
-   * '''An unreachable driver is not a refusal.''' Nothing is known in that case, and withholding a
-   * map output on the strength of nothing would fail a task whose output is perfectly readable. It
-   * is recorded and the status is published, which is the same direction every other unreachable
-   * answer in this subsystem is resolved in.
+   * '''An unreachable driver is not a refusal, and it is not a confirmation either.''' Publication
+   * is authorised by an affirmative answer and by nothing else. This is where the barrier would
+   * otherwise leak: an answer that never arrived is indistinguishable from the answer produced when
+   * a partition, a timeout or an overloaded endpoint coincides with the very withdrawal,
+   * supersession or shuffle-wide stand-down this check exists to observe, so treating silence as
+   * permission would let a retired generation republish output the driver has disowned -- with the
+   * additional certainty that whoever caused the silence chose when to cause it. So an unconfirmed
+   * completion withdraws, through the same terminus every other stand-down uses: the void status is
+   * unskippable, the attempt still SUCCEEDS so no task attempt is consumed, and the fetch failure
+   * that follows is the recomputation. That is fail-closed at a bounded price -- one recomputed map
+   * task for a transient loss -- and it is the only direction in which "every path ends in a
+   * working shuffle" stays true, because a driver that is genuinely unreachable stands the
+   * streaming path down when the recomputed attempt cannot register either.
    *
    * @return `None` when this generation may publish its ordinary status, or the status to report
    *         instead when it may not
@@ -1066,12 +1086,33 @@ private[spark] class StreamingShuffleWriter[K, V, C](
     reportMapOutputComplete() match {
       case Some(true) => None
       case None =>
+        // Nothing is known, so nothing is authorised. An unreachable driver is not a refusal, but
+        // it is not a confirmation either, and publishing on the strength of a local success is
+        // what turned the completion report from a barrier into a formality: the answer that never
+        // arrived is exactly the answer a partition, a timeout or an overloaded endpoint produces
+        // while a withdrawal, a supersession or a shuffle-wide stand-down is being applied on the
+        // driver, and in every one of those cases an ordinary map status re-registers output the
+        // authoritative owner has disowned. So this attempt withdraws instead, by the same terminus
+        // every other stand-down uses and for the same reasons: the void status is unskippable, so
+        // every reducer asks and every ask fails; the task SUCCEEDS, so no task attempt is consumed
+        // and a master permitting one failure -- which a plain local[n] forces -- cannot abort the
+        // job over an RPC timeout; and the fetch failure that follows is the recomputation, which
+        // the unmodified scheduler performs. A transient loss therefore costs one map task, and a
+        // driver that is genuinely unreachable stands the streaming path down at the recomputed
+        // attempt's own registration, so the retry still terminates in a working shuffle.
+        val signal = new StreamingShuffleWriter.StandDownSignal(
+          StreamingShuffleStandDownCause.ProducerUnavailable,
+          s"the driver could not confirm the completion of map index ${context.partitionId()} " +
+            s"attempt ${context.taskAttemptId()}, so nothing is known about whether it still " +
+            "holds this producer generation and its output must not be published as readable")
         logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} map " +
-          log"${MDC(TASK_ATTEMPT_ID, mapId)} could not confirm its completion with the driver, " +
-          log"so its map status is published on the strength of a local success; nothing is " +
-          log"known about the driver's view of this generation, and a lost report is recovered " +
-          log"by the consumer's own poll and timeout")
-        None
+          log"${MDC(TASK_ATTEMPT_ID, mapId)} could not confirm its completion with the driver; " +
+          log"its output is withdrawn rather than published, because an answer that never " +
+          log"arrived is what a withdrawal, a supersession or a stand-down racing this stop also " +
+          log"looks like, and the map stage is recomputed instead")
+        completeStandDown(signal)
+        mapStatus = voidMapStatus()
+        Option(mapStatus)
       case Some(false) if fallbackPolicy.shuffleHasFallenBack(shuffleId) =>
         // Read across the whole closed set, for the reason every other stand-down here reads it
         // that way: the shuffle-wide verdict may be a structural decline, and re-labelling it as
@@ -1499,6 +1540,7 @@ private[spark] class StreamingShuffleWriter[K, V, C](
     lastHeartbeatMillis = nowMillis
     lastCoordinatorHeartbeatMillis = nowMillis
     throughputWindowOpenedMillis = nowMillis
+    lastRetainedDurabilityMillis = nowMillis
     // Forces the derivation, so it either succeeds and is logged once, or refuses before a single
     // record has been buffered.
     val capacity = blockPayloadCapacity
@@ -2037,6 +2079,9 @@ private[spark] class StreamingShuffleWriter[K, V, C](
       backpressure.reportBufferUtilization(
         shuffleId, spillManager.executorReservedBytes, spillManager.totalBudgetBytes)
       pollSpill()
+      // After the threshold poll and before the liveness duties: pressure has first claim on the
+      // eviction machinery, and securing unclaimed output must not delay a heartbeat.
+      flushRetainedOutputAhead(nowMillis)
       sendHeartbeatsIfDue(nowMillis)
       handleConsumerStalls(nowMillis)
       reportProducerThroughput(nowMillis)
@@ -2251,6 +2296,75 @@ private[spark] class StreamingShuffleWriter[K, V, C](
       recordSpillObserved()
     } else if (backpressure.shouldYield(shuffleId) && spillManager.maybeSpill()) {
       recordSpillObserved()
+    }
+  }
+
+  /**
+   * Secures output that no consumer has come for, in bounded slices, while records are still being
+   * produced.
+   *
+   * '''The cost this removes.''' A map output has to be recoverable after the task that produced it
+   * ends, and buffered blocks are task-managed execution memory, so whatever of the retained window
+   * is still resident at the successful stop has to be written to local disk then. When a consumer
+   * is subscribed that is almost nothing, because acknowledgement releases each block as it is
+   * taken. When none is -- which is what the unmodified scheduler produces for a map stage running
+   * once, since a reduce task is submitted only after the map stage completes, and task submission
+   * is a preservation zone this feature may not touch (AAP 0.2.1, 0.2.2 and 0.8.2 Tier 1) -- it is
+   * the whole output. Writing all of it at the stop puts a whole-output disk write inside the map
+   * task's own duration with nothing left to overlap it: the records have all been serialised, so
+   * the device works alone while the task waits. That serialised write is the map-stage
+   * materialisation cost, and it is the part of it that IS reachable from inside the shuffle
+   * abstraction.
+   *
+   * Bringing the write forward removes it. Each pass moves a bounded slice out of memory while the
+   * task carries on serialising records, so the operating system's write-back for the slice just
+   * written proceeds against the device while the next records are being framed -- which is how the
+   * sort-based path has always behaved, and it is why that path does not pay this cost. By
+   * the time the stop runs, the durability step has a bounded tail to write instead of an output,
+   * so the map task finishes sooner and the map stage -- and therefore the reduce stage the
+   * scheduler submits after it -- starts sooner. Peak buffer occupancy falls by the same mechanism,
+   * which is the second reason to do it.
+   *
+   * '''Three conditions, and each one is load bearing.'''
+   *
+   *  1. '''No consumer registered to acknowledge.''' A consumer that is keeping pace takes blocks
+   *     from memory and releases them by acknowledging, and writing them out from underneath it
+   *     would replace that hand-off with a disk round trip -- turning the one path that genuinely
+   *     avoids materialisation into one that does not. So a stream that is being consumed live is
+   *     never touched by this, and the live-overlap behaviour is exactly what it was.
+   *  2. '''An interval since the last pass.''' The interval is the ageing rule: a block a consumer
+   *     is about to come for is gone from memory before it elapses. It is measured on the injected
+   *     clock, so a caller that holds its clock still sees no pass at all.
+   *  3. '''A bounded slice.''' So one pass costs a predictable fraction of the maintenance cadence
+   *     rather than stalling record production behind an arbitrarily large write.
+   *
+   * '''Why this is not a spill.''' It is not driven by the buffer threshold and does not report
+   * itself against it: [[MemorySpillManager.flushRetainedForDurability]] performs it as the
+   * end-of-stream durability flush it is, so `shuffle.streaming.spillCount` still reports only
+   * evictions the configured threshold forced -- the reading AAP 0.9.4 fixes -- while the volumes
+   * land on Spark's existing spill accumulators exactly as the stop-time write would have put them
+   * there. The same bytes reach the same place; only the moment moves.
+   *
+   * @param nowMillis the current time, already read by the maintenance pass
+   */
+  private def flushRetainedOutputAhead(nowMillis: Long): Unit = {
+    if (finished || standDownReason.isDefined || spillManager.isClosed ||
+        spillManager.registeredConsumerCount > 0 ||
+        nowMillis - lastRetainedDurabilityMillis < RETAINED_DURABILITY_INTERVAL_MS) {
+      return
+    }
+    lastRetainedDurabilityMillis = nowMillis
+    val moved = spillManager.flushRetainedForDurability(RETAINED_DURABILITY_BYTES_PER_PASS)
+    if (moved > 0L) {
+      retainedDurabilityBytesTotal += moved
+      retainedDurabilityPassesTotal += 1L
+      if (debugEnabled) {
+        logDebug(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} map " +
+          log"${MDC(TASK_ATTEMPT_ID, mapId)} secured ${MDC(NUM_BYTES, moved)} unclaimed byte(s) " +
+          log"while producing, ${MDC(MEMORY_SIZE, retainedDurabilityBytesTotal)} byte(s) over " +
+          log"${MDC(COUNT, retainedDurabilityPassesTotal)} pass(es); no consumer has subscribed, " +
+          log"so this is the write the stop would otherwise perform in one burst")
+      }
     }
   }
 
@@ -2895,8 +3009,13 @@ private[spark] class StreamingShuffleWriter[K, V, C](
    * shuffle-wide stand-down, by a newer attempt, or by a consumer that invalidated it. Publishing
    * an ordinary map status after a refusal would re-register output the driver has just withdrawn,
    * which is why [[completeSuccessfully]] asks for this answer immediately before it builds that
-   * status and acts on it. An unreachable driver is a different answer again and is not a refusal:
-   * nothing is known, and the consumer's own poll and timeout recover a report that was lost.
+   * status and acts on it.
+   *
+   * '''Only `Some(true)` authorises publication.''' An unreachable driver is a third answer and it
+   * is not a refusal, but it is not permission either: nothing is known, and "nothing is known" is
+   * precisely what a withdrawal, a supersession or a stand-down racing this stop looks like from
+   * here. [[requirePublishableGeneration]] therefore withdraws on it rather than publishing, which
+   * is documented at that method with the reasoning and the cost.
    *
    * @return `Some(true)` when the driver applied the report, `Some(false)` when it refused it, and
    *         `None` when the driver could not be asked
@@ -3802,6 +3921,16 @@ private[spark] class StreamingShuffleWriter[K, V, C](
   /** Times a buffer reservation had to be retried after an eviction pass. */
   def admissionRetryCount: Long = admissionRetries
 
+  /**
+   * Bytes this writer secured to local disk while it was still producing, because no consumer had
+   * subscribed to take them. These are bytes the successful stop would otherwise have written in
+   * one burst after the last record; see [[flushRetainedOutputAhead]].
+   */
+  def retainedDurabilityBytesAheadOfStop: Long = retainedDurabilityBytesTotal
+
+  /** Pipelined durability passes this writer performed while producing. */
+  def retainedDurabilityPassCount: Long = retainedDurabilityPassesTotal
+
   /** Streams that crossed the consumer-liveness window without acknowledgement progress. */
   def consumerStallCount: Long = consumerStalls
 
@@ -4264,6 +4393,29 @@ private[spark] object StreamingShuffleWriter {
   /** Acknowledgement gap after which a consumer is treated as unresponsive. */
   val CONSUMER_LIVENESS_TIMEOUT_MS: Long =
     StreamingShuffleServerHandler.CONSUMER_LIVENESS_TIMEOUT_MS
+
+  /**
+   * How long a retained block may sit unclaimed before the producer starts making it durable rather
+   * than waiting for its own stop to do it.
+   *
+   * Five times the maintenance cadence, and the multiple is what makes this an ageing rule rather
+   * than a write-through. A consumer that is keeping pace acknowledges a block within a small
+   * multiple of the maintenance interval, so its blocks are released from memory long before this
+   * elapses and are never written at all -- which is the property that keeps a live stream's egress
+   * a memory hand-off. Only output that nobody has come for by then is secured early, and for that
+   * output the write is unavoidable: it is the write the successful stop would otherwise perform in
+   * one burst after the last record, with nothing left to overlap it.
+   */
+  val RETAINED_DURABILITY_INTERVAL_MS: Long = 5L * MAINTENANCE_INTERVAL_MS
+
+  /**
+   * Most this producer moves out of memory in one pipelined durability pass.
+   *
+   * Bounded so the pass costs a predictable slice of the maintenance cadence rather than stalling
+   * record production behind an arbitrarily large write, and expressed as a block count times the
+   * protocol's block ceiling so the bound tracks the framing rather than a figure of its own.
+   */
+  val RETAINED_DURABILITY_BYTES_PER_PASS: Long = 8L * MemorySpillManager.MAX_BLOCK_PAYLOAD_BYTES
 
   /**
    * Longest the successful stop waits for paced egress to release what is still queued.

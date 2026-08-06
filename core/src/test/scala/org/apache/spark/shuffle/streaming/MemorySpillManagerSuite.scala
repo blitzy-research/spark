@@ -2119,6 +2119,85 @@ class MemorySpillManagerSuite
       s"the partition must still admit sequence $nextSequence after the failed eviction")
   }
 
+  test("a spill failure names the block and the failure class, never a path or a stack trace") {
+    // Error disclosure, asserted on the branch an operator actually reaches. A spill destination is
+    // a file inside the executor's configured local directories, and a raw throwable from a failed
+    // write carries that absolute path in its message and the subsystem's internal call stack in
+    // its trace. Emitting either puts the executor's storage layout and internal structure into a
+    // log that is routinely shipped off the host, on a path an attacker can provoke by filling or
+    // unmounting a local directory.
+    //
+    // Both report branches are exercised, because they differ in how OFTEN they may speak and must
+    // not differ in WHAT they may say. Two partitions are evicted by one failing eviction, so the
+    // executor-wide aggregation window admits the first failure at default level and suppresses the
+    // second into the debug-level record -- the branch that only exists when the streaming debug
+    // key is on, and the branch this case exists for.
+    val context = newTrackedTaskContext()
+    val manager = new FailingDeviceSpillManager(memoryManagerOf(context),
+      streamingConfWithOverrides(debug = true), newManualClock(), newQuota(roomyMemoryBytes),
+      failAfterWrites = 0)
+    manager.registerPartitionCount(reducePartitions)
+    manager.registerCleanup(context)
+    openManagers += manager
+    val trigger = new NoopMemoryConsumer(memoryManagerOf(context))
+
+    bufferBlocks(manager, 0, 2)
+    bufferBlocks(manager, 1, 2)
+
+    // Attached to the root logger at its ordinary level: both records are emitted at ERROR, so no
+    // level has to be lowered to see them, and nothing else in the subsystem is made noisy in order
+    // to assert that this path is quiet.
+    val appender = new LogAppender("streaming shuffle spill failure diagnostics")
+    withLogAppender(appender) {
+      assert(manager.spill(Long.MaxValue, trigger) === 0L,
+        "an eviction whose every write fails must report no reclaimed bytes")
+    }
+    assert(manager.spillFailureCount === 2L,
+      s"both partitions must have failed to spill, but ${manager.spillFailureCount} did")
+    assert(manager.openedWriters.size === 2,
+      s"one writer per partition must have been opened, not ${manager.openedWriters.size}")
+
+    val records = appender.loggingEvents
+      .filter(_.getMessage.getFormattedMessage.contains("Failed to evict streaming shuffle"))
+    assert(records.size === 2,
+      s"both failures must still be reported -- sanitising a diagnostic must not silence it -- " +
+        s"but ${records.size} record(s) named the eviction failure")
+
+    // 1. No throwable, on either branch. A stack trace is the disclosure, whether or not the
+    //    message alongside it is sanitised.
+    records.foreach { record =>
+      assert(record.getThrown === null,
+        s"no spill-failure record may carry a throwable, yet one carried " +
+          s"${Option(record.getThrown).map(_.getClass.getName).getOrElse("none")}")
+    }
+
+    // 2. No absolute path, and nothing that leads to one. Asserted against the real destinations
+    //    this eviction opened and against every local directory the executor is configured with,
+    //    which is stronger than a substring guess: the basename of a temporary shuffle block IS the
+    //    block id and is deliberately still reported, so a path predicate that merely forbade the
+    //    file name would forbid the sanitised form as well.
+    val forbidden = manager.openedWriters.flatMap { writer =>
+      Seq(writer.file.getAbsolutePath, writer.file.getParent)
+    } ++ SparkEnv.get.blockManager.diskBlockManager.localDirs.toSeq.map(_.getAbsolutePath)
+    records.foreach { record =>
+      val rendered = record.getMessage.getFormattedMessage
+      forbidden.foreach { path =>
+        assert(!rendered.contains(path),
+          s"a spill-failure record disclosed the local path $path: $rendered")
+      }
+    }
+
+    // 3. What remains is what an operator can act on: the destination block identifies the write
+    //    uniquely within the shuffle and the exception class names the failure mode.
+    val blockNames = manager.openedWriters.map(_.file.getName)
+    blockNames.foreach { blockName =>
+      assert(records.exists(_.getMessage.getFormattedMessage.contains(blockName)),
+        s"the destination block $blockName must still be named, or the record identifies nothing")
+    }
+    assert(records.forall(_.getMessage.getFormattedMessage.contains(classOf[IOException].getName)),
+      "and every record must name the failure by class, which is the actionable half of a trace")
+  }
+
   test("a spill failure is never observed on a healthy device and nothing is left behind") {
     val context = newTrackedTaskContext()
     val manager = newManager(context, newManualClock(), newQuota(roomyMemoryBytes))

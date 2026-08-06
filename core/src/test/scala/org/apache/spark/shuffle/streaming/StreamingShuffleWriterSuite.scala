@@ -87,6 +87,17 @@ class StreamingShuffleWriterSuite
 
   private val defaultPartitions = 4
 
+  // Fixture for the pipelined-durability cases. The executor-memory figure is small on purpose: the
+  // framing capacity is a share of the per-partition allowance, so a small allowance cuts small
+  // blocks, and a block boundary is where the maintenance pass -- and therefore the cadence under
+  // test -- runs. A larger allowance would frame the whole dataset into one block and the cases
+  // would assert nothing.
+  private val PipelinedDurabilityExecutorMemoryBytes: Long = 1024L * 1024L
+
+  private val PipelinedDurabilityBufferPercent: Int = 50
+
+  private val PipelinedDurabilityRecords: Int = 60000
+
   /**
    * Returns the process-scoped state to zero on BOTH edges of every case.
    *
@@ -2532,6 +2543,145 @@ class StreamingShuffleWriterSuite
     }
   }
 
+  test("output nobody has come for is secured while producing, not in a burst at the stop") {
+    // The other half of where materialisation happens, and the half that decides how long a map
+    // task takes. The case above establishes that a within-budget output touches disk nowhere
+    // while a producer streams and is written at the stop; that is correct, and for a producer
+    // NOBODY is consuming it is also the whole output being written after the last record was
+    // serialised, with the device working alone while the task waits. That serialised write sits
+    // inside the map task's own duration, and so inside the map stage's, and so ahead of the reduce
+    // stage the scheduler submits once the map stage completes -- which makes it the one part of
+    // the map-stage materialisation cost that IS reachable from inside the shuffle abstraction.
+    // (The other part, a consumer subscribed during production, is not: that is task submission,
+    // which AAP 0.2.1, 0.2.2 and 0.8.2 Tier 1 place under zero modifications.)
+    //
+    // So output no consumer has come for is secured in bounded slices as it ages, while records are
+    // still being framed. Two properties are asserted, and both matter:
+    //
+    //  * it really happens DURING the write, so the write overlaps record production rather than
+    //    following it; and
+    //  * it is not a spill. `shuffle.streaming.spillCount` reports evictions the configured
+    //    threshold forced -- the reading AAP 0.9.4 fixes -- and an event unrelated to that
+    //    threshold must not appear in it.
+    //
+    // The clock is advanced BY THE ITERATOR, so the cadence is exercised with no sleep and no
+    // race: consuming a record is what makes time pass, so the maintenance pass at the next block
+    // boundary always finds the interval elapsed.
+    val partitions = 2
+    val clock = newManualClock()
+    withHarness(newHarness(numPartitions = partitions,
+        executorMemoryBytes = PipelinedDurabilityExecutorMemoryBytes,
+        bufferSizePercent = PipelinedDurabilityBufferPercent, clock = clock)) { harness =>
+      val spillManager = harness.spillManager
+      assert(spillManager.registeredConsumerCount === 0,
+        "no consumer may be registered, or this case would be measuring the live path")
+
+      var consumed = 0
+      val source = deterministicRecords(PipelinedDurabilityRecords, seed = 77L, keySpace = 128)
+      val advancing = source.iterator.map { record =>
+        consumed += 1
+        if (consumed % 64 == 0) {
+          clock.advance(StreamingShuffleWriter.RETAINED_DURABILITY_INTERVAL_MS)
+        }
+        record
+      }
+      harness.writer.write(advancing)
+      assert(harness.writer.blocksStreamed > 1L,
+        s"the fixture must frame several blocks for the cadence to have anything to secure, but " +
+          s"framed ${harness.writer.blocksStreamed} at a capacity of " +
+          s"${harness.writer.blockPayloadCapacityBytes} bytes")
+
+      // 1. It happened while producing. Both counters are advanced only from the maintenance pass,
+      //    which runs inside `write`, so a non-zero reading cannot have come from the stop.
+      assert(harness.writer.retainedDurabilityPassCount > 0L,
+        "a producer nobody is consuming must secure its unclaimed output while it produces, but " +
+          "no pipelined durability pass ran")
+      val securedAhead = harness.writer.retainedDurabilityBytesAheadOfStop
+      assert(securedAhead > 0L,
+        s"the passes must have moved bytes, but moved $securedAhead")
+
+      // 2. Most of the output is already durable, so the stop writes a tail and not an output.
+      //    Measured on the charge, which is the resource the budget accounts.
+      val residentBeforeStop = spillManager.bufferedBytes
+      assert(securedAhead > residentBeforeStop,
+        s"the stop must be left with a bounded tail: $securedAhead byte(s) were secured while " +
+          s"producing against $residentBeforeStop still resident")
+
+      // 3. None of it is a pressure signal. Utilisation never reached the threshold, so a spill
+      //    event here would tell an operator to raise a buffer budget that was never short.
+      assert(spillManager.bufferUtilizationPercent < DefaultSpillThresholdPercent.toLong,
+        s"the fixture must stay below the ${DefaultSpillThresholdPercent}% threshold, or this " +
+          "case would be measuring eviction under pressure")
+      assert(spillManager.spillCount === 0L,
+        s"securing unclaimed output is not a spill and must not advance the operator-visible " +
+          s"spill count, yet ${spillManager.spillCount} event(s) were counted")
+      assert(spillManager.durableAdmissionCount === 0L,
+        "nor may any block have bypassed the buffer, which is a different event again")
+      assert(spillManager.durabilityFlushCount > 0L,
+        "it must be counted as the durability flush it is, so the two remain distinguishable")
+      assert(spillManager.diskBytesSpilled > 0L,
+        "and its volume must still land on Spark's existing spill accumulator")
+
+      // 4. The output is complete and servable afterwards: securing early must not lose a byte.
+      assert(harness.writer.stop(success = true).isDefined,
+        "the successful stop must still produce a status")
+      assert(spillManager.bufferedBytes === 0L,
+        "nothing may be resident afterwards, because task memory cannot outlive the task")
+      assert(spillManager.spillFilesTransferred,
+        "file ownership must have moved to the executor-scoped resolver")
+      assert(harness.blockResolver.getBlocksForShuffle(harness.shuffleId, defaultMapId).nonEmpty,
+        "and the resolver must be able to serve the whole output to a consumer that arrives later")
+      val streamed = harness.writer.getPartitionLengths().sum
+      assert(streamed > 0L, "the attempt must report the bytes it streamed")
+    }
+  }
+
+  test("a producer whose consumer keeps pace is never written ahead of its stop") {
+    // The complement, and the property that keeps the pipelined durability pass above from becoming
+    // a write-through. A consumer that is subscribed takes blocks from memory and releases them by
+    // acknowledging, so writing them out from underneath it would replace a memory hand-off with a
+    // disk round trip -- turning the one path that genuinely avoids materialisation into one that
+    // does not. The pass is therefore gated on there being no consumer registered to acknowledge,
+    // and this case holds the clock past the interval to prove the gate and not the timer is what
+    // stops it.
+    val partitions = 2
+    val clock = newManualClock()
+    withHarness(newHarness(numPartitions = partitions,
+        executorMemoryBytes = PipelinedDurabilityExecutorMemoryBytes,
+        bufferSizePercent = PipelinedDurabilityBufferPercent, clock = clock)) { harness =>
+      val spillManager = harness.spillManager
+      // The consumer is admitted to the acknowledgement protocol directly, which is exactly the
+      // state a subscription establishes and is the state the gate reads. Driving it through a live
+      // channel instead would additionally arm the consumer-liveness timer, and a consumer that is
+      // registered but silent while this case fast-forwards the clock would be escalated as lost --
+      // which is correct behaviour and a different case entirely.
+      assert(spillManager.registerConsumer(consumerId),
+        "a store that still serves its retained output must admit a consumer")
+      assert(spillManager.registeredConsumerCount > 0,
+        "the registration must be visible to the gate the producer consults")
+
+      var consumed = 0
+      val source = deterministicRecords(PipelinedDurabilityRecords, seed = 78L, keySpace = 128)
+      val advancing = source.iterator.map { record =>
+        consumed += 1
+        if (consumed % 64 == 0) {
+          clock.advance(4L * StreamingShuffleWriter.RETAINED_DURABILITY_INTERVAL_MS)
+        }
+        record
+      }
+      harness.writer.write(advancing)
+      assert(harness.writer.blocksStreamed > 1L,
+        s"the fixture must frame several blocks, or the gate is not what stopped the pass, but " +
+          s"framed ${harness.writer.blocksStreamed}")
+
+      assert(harness.writer.retainedDurabilityPassCount === 0L,
+        s"a subscribed consumer must stop the pipelined pass however much time passes, yet " +
+          s"${harness.writer.retainedDurabilityPassCount} pass(es) ran")
+      assert(harness.writer.retainedDurabilityBytesAheadOfStop === 0L,
+        "and nothing may have been written out from underneath a consumer that is taking it")
+    }
+  }
+
   test("a producer handed to the sort-based writer withdraws every owner it published") {
     // What this proves is an ownership hand-off, not the existence of a delegate. The manager
     // publishes four owners of a producer generation *before* the writer exists -- the shuffle's
@@ -2781,25 +2931,94 @@ class StreamingShuffleWriterSuite
     }
   }
 
-  test("a completion the driver could not be asked about still publishes its status") {
-    // The third answer, and the one a refusal must never be confused with. An unreachable driver
-    // knows nothing about this generation, and withholding a map output on the strength of nothing
-    // would fail a task whose output is perfectly readable -- the same direction every other
-    // unreachable answer in this subsystem resolves in, and the direction `heartbeatProducer`
-    // documents for itself.
+  test("a completion the driver could not confirm withdraws instead of publishing") {
+    // The third answer, and the one that must fail CLOSED. An unreachable driver is not a refusal
+    // -- nothing is known -- but "nothing is known" is not permission, and this is the exact
+    // point at which the completion barrier would otherwise leak. An answer that never arrived is
+    // indistinguishable from the answer produced when a timeout, a partition or an overloaded
+    // endpoint coincides with the withdrawal, supersession or shuffle-wide stand-down the barrier
+    // exists to observe -- with the additional certainty that whoever caused the silence chose when
+    // to cause it -- so publishing an ordinary map status on it re-registers output the
+    // authoritative driver may have just disowned, and the recomputation that was meant to happen
+    // never does.
+    //
+    // The terminus is the one every other stand-down uses, and it is what keeps "every path ends in
+    // a working shuffle" true: the void status is unskippable, so every reducer asks and every ask
+    // fails; the attempt still SUCCEEDS, so no task attempt is consumed and a master permitting one
+    // failure -- which a plain local[n] forces -- cannot abort the job over an RPC timeout; and the
+    // fetch failure that follows is the recomputation the unmodified scheduler performs.
     val unreachable = new RecordingCoordinatorGateway(completionAnswer = None)
     val harness = newHarness(registration = RegistrationFixture(gateway = unreachable))
     withHarness(harness) { fixture =>
       fixture.writer.write(deterministicRecords(96, seed = 213L, keySpace = 24).iterator)
       val status = fixture.writer.stop(success = true)
-      assert(status.isDefined && status.get.mapId === defaultMapId,
-        "an unreachable driver must not cost a producer its map status")
-      assert(fixture.writer.getPartitionLengths().exists(_ > 0L),
-        "and the status must describe output that was really streamed")
-      assert(fixture.routes.withdrawals.isEmpty,
-        s"nothing may be withdrawn on the strength of an answer that was never received, yet the " +
+      assert(fixture.gateway.completions.nonEmpty,
+        "the writer must have asked the driver to accept its completion before deciding anything")
+
+      // A status is still produced, because the shared write path dereferences it unconditionally,
+      // and it is the void one -- a promise of nothing rather than a promise of output.
+      assert(status.isDefined,
+        "the successful stop must still produce a status, or the shared write path's dereference " +
+          "would throw")
+      val reported = status.get
+      assert(reported.mapId === defaultMapId, "and it must describe this map attempt")
+      (0 until defaultPartitions).foreach { partitionId =>
+        assert(reported.getSizeForBlock(partitionId) > 0L,
+          s"partition $partitionId of an unconfirmed output must be unskippable, or a reducer " +
+            "would silently produce a result short of data instead of raising a fetch failure")
+      }
+
+      // Withdrawn from every owner on this executor, which is what makes the void status honest:
+      // every ask for this output now fails, and that fetch failure recomputes the map stage.
+      assert(fixture.routes.withdrawals.nonEmpty,
+        s"an unconfirmed generation must be withdrawn from every owner on this executor, yet the " +
           s"routing table saw ${fixture.routes.withdrawals}")
+      assert(!fixture.serverHandler.servesRetainedOutput,
+        "and it must serve nothing further, because the output it held is being recomputed")
+      assert(fixture.writer.standDownFallbackReason.contains(
+          StreamingShuffleStandDownCause.ProducerUnavailable),
+        s"the withdrawal must be recorded as the structural decline it is -- a rendezvous that " +
+          s"could not be confirmed is none of the four specified fallback conditions -- but was " +
+          s"${fixture.writer.standDownFallbackReason}")
+
+      // Not a failure: no task attempt may be consumed by an RPC timeout.
       assertNoPublishedFailure(fixture.errorNotifier, "a producer whose driver was unreachable")
+    }
+  }
+
+  test("an unconfirmed completion reports no readable output for a partition it streamed") {
+    // The same rule, asserted where an ordinary status and a withdrawn one actually differ. Both
+    // are non-empty, so `isDefined` cannot tell them apart; what distinguishes them is that an
+    // ordinary status reports the bytes that were streamed -- including zero for a partition this
+    // attempt produced nothing for, which entitles a reducer to SKIP it -- while a withdrawn one
+    // reports every declared partition as unskippable so that every reducer asks and every ask
+    // fails.
+    //
+    // The keys are chosen so that only one reduce partition receives anything, which leaves the
+    // others at zero streamed bytes and makes the distinction observable.
+    val unreachable = new RecordingCoordinatorGateway(completionAnswer = None)
+    val harness = newHarness(registration = RegistrationFixture(gateway = unreachable))
+    withHarness(harness) { fixture =>
+      // Every key is a multiple of the partition count, and the fixture's partitioner is a hash
+      // over the key, so every record lands in partition zero and the rest stream nothing.
+      val oneBucket = (0 until 64).map(index => (index * defaultPartitions, index))
+      fixture.writer.write(oneBucket.iterator)
+      val status = fixture.writer.stop(success = true)
+      assert(status.isDefined, "the stop must still answer with a status")
+
+      val streamed = fixture.writer.getPartitionLengths()
+      val emptyPartitions = (0 until defaultPartitions).filter(streamed(_) == 0L)
+      assert(emptyPartitions.nonEmpty,
+        s"the fixture must leave at least one partition unstreamed for this case to distinguish " +
+          s"anything, but every one of ${streamed.mkString(", ")} received bytes")
+      emptyPartitions.foreach { partitionId =>
+        assert(status.get.getSizeForBlock(partitionId) > 0L,
+          s"partition $partitionId streamed no byte, so an ordinary status would report it as " +
+            "skippable; a withdrawn output must report it as unskippable so the reducer asks and " +
+            "the ask fails")
+      }
+      assert(fixture.routes.withdrawals.nonEmpty,
+        "and the generation must have been withdrawn rather than re-registered")
     }
   }
 

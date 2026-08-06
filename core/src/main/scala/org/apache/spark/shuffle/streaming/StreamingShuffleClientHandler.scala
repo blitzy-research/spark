@@ -345,18 +345,32 @@ private[spark] class StreamingShuffleClientHandler(
   // thread can acknowledge, request a replay and close without having to be handed a context.
   private val channelRef = new AtomicReference[Channel](null)
 
-  // This handler's OWN intent for the receive window, not the state of the socket. The socket is a
-  // shared resource -- several handlers of one consumer are multiplexed onto one channel -- so the
-  // physical state is the union of every participant's intent and belongs to the gate below. Every
-  // transition of this cell is a compare-and-set, so an episode is entered and left exactly once
-  // however many threads observe the same condition.
-  private val autoReadEnabled = new AtomicBoolean(true)
+  // The one monitor under which this handler's participation in a receive window is transitioned:
+  // entering and leaving a throttling episode, moving between gates, and departing on close. This
+  // handler keeps NO flag of its own for that intent -- the gate's participant record is the single
+  // source of truth, asked through `isThrottling` -- because a second cell updated in a separate
+  // atomic step is how an intent and its record diverge: a compare-and-set that moved while another
+  // thread's gate call had not yet landed left this handler believing it was reading while the gate
+  // still held its throttle, with no living path able to withdraw it. Reading the record and acting
+  // on it under one monitor is what makes an episode entered and left exactly once.
+  //
+  // Held only across the gate call. Everything a transition then causes -- the backpressure poll,
+  // the per-stream notes, the counters and the log records -- is issued after it is released, so no
+  // thread can hold one handler's monitor while a callback reaches for another's.
+  private val gateLock = new Object
+
+  // Whether this handler has left its gate for good. Guarded by `gateLock`. A closed handler that
+  // could still state a throttle would leave one standing in a gate it no longer participates in,
+  // which for a shared channel is a window wedged shut for every producer multiplexed onto it.
+  private var gateDeparted = false
 
   // The receive window of the physical channel, shared with every other handler multiplexed onto
   // it. A handler starts with a gate of its own, because a frame can be delivered synchronously on
   // the connecting thread before the connector has published the channel's share, and a handler
   // must be able to close its window at that point too. The connector swaps in the channel's shared
-  // gate when it binds or joins this handler, carrying this handler's standing intent across.
+  // gate when it binds or joins this handler, carrying this handler's standing intent across. The
+  // reference is swapped under `gateLock` and kept in an atomic so the accessors can read it
+  // without taking the monitor.
   private val readGate =
     new AtomicReference[StreamingShuffleChannelReadGate](new StreamingShuffleChannelReadGate)
 
@@ -1034,7 +1048,7 @@ private[spark] class StreamingShuffleClientHandler(
    */
   private def evaluateAutoRead(): Unit = {
     if (!closed.get()) {
-      if (autoReadEnabled.get()) {
+      if (isAutoReadEnabled) {
         val cause = throttleCauseNow()
         if (cause != null) {
           disableAutoRead(cause)
@@ -1087,14 +1101,29 @@ private[spark] class StreamingShuffleClientHandler(
    * closed receive window are one episode seen from two ends.
    */
   private def disableAutoRead(cause: String): Unit = {
-    if (autoReadEnabled.compareAndSet(true, false)) {
-      throttleCause.set(cause)
+    // The intent record and the socket update are one transition, taken under this handler's own
+    // monitor so that a concurrent resume cannot land between reading the record and stating the
+    // new intent.
+    // A handler that has departed states nothing: its throttle would stand in a gate it no longer
+    // participates in, which for a shared channel is a window no living participant could reopen.
+    val transitioned = gateLock.synchronized {
+      val gate = readGate.get()
+      if (gateDeparted || gate.isThrottling(this)) {
+        false
+      } else {
+        throttleCause.set(cause)
+        gate.throttle(this, cause)
+        true
+      }
+    }
+    if (transitioned) {
       throttleTransitions.incrementAndGet()
-      readGate.get().throttle(this, cause)
       backpressure.pollOnce()
       // Reported after the poll, so a stale episode is closed before this one is opened. Only the
       // partitions actually in flight on this channel are named: an unknown stream is ignored, and
       // this runs on an event-loop thread, so the scan stays bounded by what is being consumed.
+      // Outside the monitor, because the protocol may re-enter another handler of this channel and
+      // holding one participant's monitor while reaching for another's is how a cycle forms.
       partitions.keySet().asScala.foreach { partitionId =>
         backpressure.noteThrottled(consumerKey(partitionId), cause)
       }
@@ -1115,9 +1144,17 @@ private[spark] class StreamingShuffleClientHandler(
    * as one.
    */
   private def enableAutoRead(): Unit = {
-    if (autoReadEnabled.compareAndSet(false, true)) {
-      throttleCause.set(null)
-      readGate.get().resume(this)
+    val transitioned = gateLock.synchronized {
+      val gate = readGate.get()
+      if (gateDeparted || !gate.isThrottling(this)) {
+        false
+      } else {
+        throttleCause.set(null)
+        gate.resume(this)
+        true
+      }
+    }
+    if (transitioned) {
       partitions.keySet().asScala.foreach { partitionId =>
         backpressure.noteResumed(consumerKey(partitionId))
       }
@@ -1145,19 +1182,29 @@ private[spark] class StreamingShuffleClientHandler(
    */
   private[streaming] def joinReadGate(gate: StreamingShuffleChannelReadGate): Unit = {
     if (gate != null) {
-      val previous = readGate.getAndSet(gate)
-      if (previous ne gate) {
-        // Withdrawn from the gate being left, or its throttle would outlive this handler's
-        // participation in it -- which for a private gate costs nothing and for a shared one would
-        // wedge a window shut with no participant able to clear it.
-        previous.withdraw(this)
-      }
-      val channel = channelRef.get()
-      if (channel != null) {
-        gate.attach(channel)
-      }
-      if (!autoReadEnabled.get()) {
-        gate.throttle(this, Option(throttleCause.get()).getOrElse(THROTTLE_CAUSE_QUEUE))
+      // Under the same monitor as an ordinary transition, and for the same reason: the intent is
+      // read
+      // from the gate being left and re-stated on the gate being joined, and a throttle or resume
+      // landing between those two steps would either be applied to a gate this handler has already
+      // abandoned or be lost altogether. A departed handler joins nothing.
+      gateLock.synchronized {
+        if (!gateDeparted) {
+          val previous = readGate.getAndSet(gate)
+          val wasThrottling = previous.isThrottling(this)
+          if (previous ne gate) {
+            // Withdrawn from the gate being left, or its throttle would outlive this handler's
+            // participation in it -- which for a private gate costs nothing and for a shared one
+            // would wedge a window shut with no participant able to clear it.
+            previous.withdraw(this)
+          }
+          val channel = channelRef.get()
+          if (channel != null) {
+            gate.attach(channel)
+          }
+          if (wasThrottling) {
+            gate.throttle(this, Option(throttleCause.get()).getOrElse(THROTTLE_CAUSE_QUEUE))
+          }
+        }
       }
     }
   }
@@ -2673,8 +2720,14 @@ private[spark] class StreamingShuffleClientHandler(
    * A handler's intent, not the state of the socket: the socket is shared with every other handler
    * multiplexed onto the same channel and obeys the union of their intents. Use
    * [[isChannelReadEnabled]] for the physical state.
+   *
+   * Derived from the gate's participant record rather than from a flag of this handler's own, so
+   * there is exactly one place an intent is written and one place it is read. The monitor is not
+   * taken here: this is a single read of one concurrent map, and a caller that needs the answer
+   * and the transition it implies to be atomic takes [[gateLock]] and asks the gate directly, which
+   * is what [[disableAutoRead]] and [[enableAutoRead]] do.
    */
-  def isAutoReadEnabled: Boolean = autoReadEnabled.get()
+  def isAutoReadEnabled: Boolean = !readGate.get().isThrottling(this)
 
   /**
    * Whether the physical channel is currently reading from its socket.
@@ -2977,10 +3030,16 @@ private[spark] class StreamingShuffleClientHandler(
       // to every consumer that follows it on this executor.
       val returned = releaseAllQuota()
       partitions.clear()
-      // Withdrawn before the channel reference is dropped. A handler that closed while throttled
-      // would otherwise leave its intent standing in a gate shared with the participants that
-      // outlive it -- a closed receive window no living participant could ever reopen.
-      readGate.get().withdraw(this)
+      // Withdrawn before the channel reference is dropped, and the departure is recorded under the
+      // same monitor as every other transition. A handler that closed while throttled would
+      // otherwise leave its intent standing in a gate shared with the participants that outlive it
+      // -- a closed receive window no living participant could ever reopen -- and a frame still in
+      // flight on the event loop could re-state that throttle a moment after the withdrawal if the
+      // departure were not part of the same transition.
+      gateLock.synchronized {
+        gateDeparted = true
+        readGate.get().withdraw(this)
+      }
       val channel = channelRef.getAndSet(null)
       if (channel != null && releaseChannel) {
         channel.close()
@@ -3153,11 +3212,30 @@ private[spark] class StreamingShuffleClientHandler(
  * participant could ever clear. [[withdraw]] is therefore called from the handler's own close path,
  * and re-evaluates the socket exactly as a resume would.
  *
- * <b>Thread safety and cost.</b> The participant set is a concurrent map and the applied state is
- * an atomic, so every method is safe from a Netty event-loop thread and from the task thread, and
- * nothing here blocks, parks or allocates on the common path. `setAutoRead` is a channel
- * configuration write Netty permits from any thread, and it is issued only when the union actually
- * changes, so a redundant write is skipped however many participants observe the same condition.
+ * <b>Thread safety: one state machine, not three cells that happen to be atomic.</b> Recording a
+ * participant's intent, computing the union, deciding whether the applied state moves and writing
+ * `setAutoRead` are four steps that only mean anything performed together, so they are performed
+ * together, under this gate's own monitor. An earlier revision made each step individually atomic
+ * and left the sequence unserialized, which is not the same property and is not sufficient: with a
+ * throttle and a resume in flight at once, one thread could read `throttling` as non-empty, the
+ * other read it as empty, and whichever reached the applied-state update last decided the socket --
+ * so a channel with no participant throttling could be left wedged shut, unreadable by every
+ * producer multiplexed onto it, or a channel whose participant was out of credit could be left
+ * reading into a bounded queue. Serialising the sequence is what makes the socket state a function
+ * of the participants' intents rather than of a schedule.
+ *
+ * Holding the monitor across the channel write is deliberate and is what closes the last of that
+ * race. It is also safe: `DefaultChannelConfig.setAutoRead` either calls `Channel.read()` or clears
+ * a read-pending flag, and neither re-enters this gate or any participant -- for an NIO channel
+ * `read()` sets an interest op, and for an embedded channel it does nothing -- so this monitor is a
+ * leaf that no callback can acquire out of order. Participants take their own monitor before this
+ * one and never the reverse, and every consequence of a transition that could re-enter a
+ * participant -- the backpressure poll, the counters, the log records -- is issued by the caller
+ * after its monitor has been released.
+ *
+ * The write is still issued only when the union actually changes, so a redundant configuration
+ * write is skipped however many participants observe the same condition, and the common path is one
+ * uncontended monitor acquisition with no allocation, no I/O and no blocking call inside it.
  *
  * <b>Containment.</b> This class is the single place in the subsystem that writes `setAutoRead` for
  * '''flow control''', and it lives in this file so that the containment claim in
@@ -3180,16 +3258,33 @@ private[spark] class StreamingShuffleClientHandler(
 private[streaming] final class StreamingShuffleChannelReadGate {
 
   /**
+   * The one monitor every transition of this gate is performed under.
+   *
+   * Private and owned outright, so that a participant synchronising on the gate object itself could
+   * neither serialise against these transitions by accident nor delay them: what is protected is
+   * this gate's own state machine and nothing else.
+   */
+  private val stateLock = new Object
+
+  /**
    * The participants that currently want reading stopped, mapped to why. Identity-keyed on the
    * participant itself, so a participant can state its intent idempotently and withdraw it exactly
-   * once.
+   * once. Guarded by [[stateLock]]; read without it only through the size accessor, where a
+   * momentarily stale count is a diagnostic rather than a decision.
    */
   private val throttling = new ConcurrentHashMap[AnyRef, String]()
 
-  /** The channel whose window this gate owns, or null until a participant attaches one. */
+  /**
+   * The channel whose window this gate owns, or null until a participant attaches one. Written
+   * under [[stateLock]] and kept in an atomic so accessors need not take the monitor to read it.
+   */
   private val channelRef = new AtomicReference[Channel](null)
 
-  /** The state last written to the channel, so a redundant configuration write is skipped. */
+  /**
+   * The state last written to the channel, so a redundant configuration write is skipped. Written
+   * under [[stateLock]]; the atomic is here for visibility to [[isReadEnabled]], not to order
+   * writes against each other -- the monitor does that.
+   */
   private val applied = new AtomicBoolean(true)
 
   /**
@@ -3204,8 +3299,10 @@ private[streaming] final class StreamingShuffleChannelReadGate {
    */
   def attach(channel: Channel): Unit = {
     if (channel != null) {
-      channelRef.set(channel)
-      applyUnion()
+      stateLock.synchronized {
+        channelRef.set(channel)
+        applyUnionLocked()
+      }
     }
   }
 
@@ -3217,8 +3314,10 @@ private[streaming] final class StreamingShuffleChannelReadGate {
    * @return true when this call was the one that closed the window
    */
   def throttle(participant: AnyRef, cause: String): Boolean = {
-    throttling.put(participant, cause)
-    applyUnion()
+    stateLock.synchronized {
+      throttling.put(participant, cause)
+      applyUnionLocked()
+    }
   }
 
   /**
@@ -3228,8 +3327,10 @@ private[streaming] final class StreamingShuffleChannelReadGate {
    * @return true when this call was the one that reopened the window
    */
   def resume(participant: AnyRef): Boolean = {
-    throttling.remove(participant)
-    applyUnion()
+    stateLock.synchronized {
+      throttling.remove(participant)
+      applyUnionLocked()
+    }
   }
 
   /**
@@ -3252,23 +3353,38 @@ private[streaming] final class StreamingShuffleChannelReadGate {
   def throttlingParticipantCount: Int = throttling.size()
 
   /**
+   * Whether this participant currently wants reading stopped.
+   *
+   * This is the participant's intent, and it is the only record of it: a participant that kept a
+   * flag of its own alongside this map would have two state machines to keep in step, and the pair
+   * diverging is exactly how a participant ends up recorded here with no living code path able to
+   * withdraw it. [[StreamingShuffleClientHandler]] therefore asks this question rather than
+   * answering it for itself.
+   *
+   * @param participant the participant to ask about
+   * @return true when the participant is holding the window shut
+   */
+  def isThrottling(participant: AnyRef): Boolean = throttling.containsKey(participant)
+
+  /**
    * Applies the union of the participants' intents to the channel, writing only on a change.
+   *
+   * Must be called with [[stateLock]] held: the intent that was just recorded, the union computed
+   * from it, the applied state and the channel write are one transition, and interleaving two of
+   * them is the race this gate exists to prevent.
    *
    * @return true when this call changed the applied state
    */
-  private def applyUnion(): Boolean = {
+  private def applyUnionLocked(): Boolean = {
     val wanted = throttling.isEmpty
     val changed = applied.getAndSet(wanted) != wanted
-    if (changed) {
-      val channel = channelRef.get()
-      if (channel != null) {
-        channel.config().setAutoRead(wanted)
-      }
-    } else {
-      // A gate that has just adopted a channel must push the standing state onto it even though the
-      // union did not move, or a channel attached while a participant was throttled would read on.
-      val channel = channelRef.get()
-      if (channel != null && channel.config().isAutoRead != wanted) {
+    val channel = channelRef.get()
+    if (channel != null) {
+      // Written whenever the socket disagrees with the union, not only when the union moved. The
+      // second case is a gate that has just adopted a channel: the union did not change, but a
+      // channel attached while a participant was throttled would read on until something else moved
+      // it. Reading the channel's own state is what makes this idempotent rather than repetitive.
+      if (changed || channel.config().isAutoRead != wanted) {
         channel.config().setAutoRead(wanted)
       }
     }
