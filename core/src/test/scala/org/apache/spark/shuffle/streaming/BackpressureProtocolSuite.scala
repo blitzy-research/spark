@@ -151,6 +151,17 @@ class BackpressureProtocolSuite extends SparkFunSuite
     clock.advance(millisPerSecond / 100L)
   }
 
+  /**
+   * An allowance no other component shares, sized so that no ledger charge is ever refused, which
+   * is what lets a case assert on the exact number of bytes the protocol holds.
+   */
+  private def ledgerAccountingQuota(): MemorySpillManager.ExecutorBufferQuota = {
+    new MemorySpillManager.ExecutorBufferQuota(
+      bufferSizePercent = 50,
+      spillThresholdPercent = DefaultSpillThresholdPercent,
+      executorMemoryProvider = () => 64L * BytesPerMebibyte)
+  }
+
   test("data-plane worker stripes preserve per-owner FIFO and expose idle completion") {
     val protocol = newProtocol(newManualClock())
     val owner = new Object()
@@ -1757,6 +1768,86 @@ class BackpressureProtocolSuite extends SparkFunSuite
       "Only the stream's base charge may remain after its window drains")
     assert(protocol.unregisterStream(key))
     assert(quota.reservedBytes === 0L)
+  }
+
+  test("dropping a shuffle returns every live ledger's metadata to the executor allowance") {
+    val entriesPerStream = 4
+    val quota = ledgerAccountingQuota()
+    val clock = newManualClock()
+    val conf = streamingConfWithOverrides()
+    val protocol = new BackpressureProtocol(
+      conf, null, TokenBucketRateLimiter.executorBudget(conf, clock), clock, quota)
+    assert(quota.reservedBytes === 0L, "the allowance starts with nothing charged to it")
+
+    protocol.registerShuffle(firstShuffleId, partitionCount)
+    protocol.registerShuffle(secondShuffleId, partitionCount)
+    val doomedKeys = Seq(producerKey(partition = 0), producerKey(partition = 1))
+    val survivingKey = producerKey(shuffleId = secondShuffleId, partition = 0)
+    val allKeys = doomedKeys :+ survivingKey
+    allKeys.foreach { key =>
+      assert(protocol.registerStream(key, creditLimitBytes), s"the ledger of $key must open")
+    }
+    assert(protocol.registerStream(doomedKeys.head, creditLimitBytes),
+      "a second owner must join one of the doomed ledgers, so the drop has to override the count")
+    allKeys.foreach { key =>
+      (0 until entriesPerStream).foreach { sequenceNumber =>
+        assert(protocol.tryAdmit(key, blockBytes, sequenceNumber.toLong),
+          s"entry $sequenceNumber of $key must enter the unacknowledged window")
+      }
+    }
+    val perLedgerBytes = BackpressureProtocol.STREAM_LEDGER_BASE_BYTES +
+      entriesPerStream * BackpressureProtocol.STREAM_LEDGER_ENTRY_BYTES
+    assert(protocol.reservedMetadataQuotaBytes === allKeys.size * perLedgerBytes,
+      "each live ledger holds its base charge plus one charge per unacknowledged entry")
+
+    assert(protocol.unregisterShuffle(firstShuffleId) === doomedKeys.size,
+      "dropping a shuffle drops every stream belonging to it, second owners included")
+    assert(protocol.streamCount === 1, "and only those")
+    assert(protocol.reservedMetadataQuotaBytes === perLedgerBytes,
+      "a dropped ledger returns its whole charge, so only the surviving stream's remains")
+
+    doomedKeys.foreach { key =>
+      assert(!protocol.unregisterStream(key),
+        s"the surviving owner of the dropped $key finds no ledger left to release")
+    }
+    assert(protocol.reservedMetadataQuotaBytes === perLedgerBytes,
+      "and that release cannot return a second time what the drop already returned")
+
+    assert(protocol.unregisterShuffle(secondShuffleId) === 1, "the last shuffle drops its stream")
+    assert(protocol.reservedMetadataQuotaBytes === 0L, "leaving this protocol holding no metadata")
+    assert(quota.reservedBytes === 0L,
+      "and the executor's aggregate allowance back exactly where it began, because the allowance " +
+        "is shared process-wide and a charge left on it would be read as another owner's buffers")
+  }
+
+  test("resetting the protocol returns every live ledger's metadata to the executor allowance") {
+    val entriesPerStream = 3
+    val quota = ledgerAccountingQuota()
+    val clock = newManualClock()
+    val conf = streamingConfWithOverrides()
+    val protocol = new BackpressureProtocol(
+      conf, null, TokenBucketRateLimiter.executorBudget(conf, clock), clock, quota)
+
+    protocol.registerShuffle(firstShuffleId, partitionCount)
+    val keys = Seq(producerKey(partition = 0), producerKey(partition = 1))
+    keys.foreach { key =>
+      assert(protocol.registerStream(key, creditLimitBytes), s"the ledger of $key must open")
+      (0 until entriesPerStream).foreach { sequenceNumber =>
+        assert(protocol.tryAdmit(key, blockBytes, sequenceNumber.toLong),
+          s"entry $sequenceNumber of $key must enter the unacknowledged window")
+      }
+    }
+    assert(protocol.reservedMetadataQuotaBytes === keys.size *
+      (BackpressureProtocol.STREAM_LEDGER_BASE_BYTES +
+        entriesPerStream * BackpressureProtocol.STREAM_LEDGER_ENTRY_BYTES),
+      "both ledgers are charged before the reset")
+
+    protocol.reset()
+    assert(protocol.streamCount === 0, "the reset drops every ledger")
+    assert(protocol.reservedMetadataQuotaBytes === 0L,
+      "and a protocol that reports what a freshly constructed one would cannot still hold metadata")
+    assert(quota.reservedBytes === 0L,
+      "so a suite that resets between cases leaves the next one its whole allowance")
   }
 
   test("every registration guard refuses without changing any state") {

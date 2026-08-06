@@ -135,7 +135,9 @@ private[spark] object StreamingShuffleMetricsSource extends Source {
 
   // The three increment helpers below ignore non-positive arguments.
 
-  // clients can use these to avoid classloader issues with the codahale classes
+  // Each counter is reached through a named helper rather than by the subsystem touching the
+  // registry itself, so every call site names the event it is counting, no call site can invent a
+  // metric name, and a decrement is impossible: these three counters are lifetime running totals.
   def incrementSpillCount(n: Long): Unit = if (n > 0L) METRIC_SPILL_COUNT.inc(n)
   def incrementBackpressureEvents(n: Long): Unit = if (n > 0L) METRIC_BACKPRESSURE_EVENTS.inc(n)
   def incrementPartialReadInvalidations(n: Long): Unit =

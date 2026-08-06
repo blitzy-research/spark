@@ -1432,13 +1432,25 @@ Apart from these, the following properties are also available, and may be useful
     including this one, is read once when the component that uses it is constructed -- the manager,
     the buffer allowance, the flow-control protocol, the rate limiter and the fallback policy each
     take their own snapshot -- and is then held immutably, so changing any of them requires an
-    executor restart to take effect. Streaming is also excluded outright while
-    <code>spark.shuffle.service.enabled</code> is true, because streamed and spilled blocks are
-    served by the producing executor's own process rather than by an external shuffle service; every
-    shuffle is then served by the sort-based shuffle manager, exactly as it is when this property is
-    false. See the
+    executor restart to take effect. Streaming additionally requires
+    <code>spark.authenticate</code> to be true, because the streaming data plane carries serialized
+    records from one executor into another executor's deserializer and therefore refuses to activate
+    on an unauthenticated transport; while <code>spark.authenticate</code> is false, which is
+    Spark's default, setting this property to true has no effect on its own. Streaming is also
+    excluded outright while <code>spark.shuffle.service.enabled</code> is true, because streamed and
+    spilled blocks are served by the producing executor's own process rather than by an external
+    shuffle service. Under either exclusion every shuffle is served by the sort-based shuffle
+    manager, exactly as it is when this property is false. While streaming shuffle is active, the
+    streaming manager installs its own shuffle block resolver, so push-based shuffle and External
+    Shuffle Service merge are unavailable for the whole application, including for shuffles this
+    manager delegates to the sort-based one; keep <code>spark.shuffle.manager</code> at
+    <code>sort</code> for an application that depends on them. See the
     <a href="streaming-shuffle.html">Streaming Shuffle</a> guide for how to size the buffers, what
-    each fallback condition means in practice, and the operational limits.
+    each fallback condition means in practice, and the operational limits, its
+    <a href="streaming-shuffle.html#security">Security</a> section for the authentication
+    requirement, and its
+    <a href="streaming-shuffle.html#push-based-shuffle-coexistence">Push-based shuffle
+    coexistence</a> section for the merge interaction.
   </td>
   <td>4.2.0</td>
 </tr>

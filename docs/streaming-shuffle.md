@@ -603,11 +603,16 @@ watching device utilisation will see.
 
 ## Push-based shuffle coexistence
 
-Selecting `spark.shuffle.manager=streaming` installs the streaming block router for the whole
+A JVM in which streaming shuffle is active -- one where all three properties in
+[Turning it on](#turning-it-on) hold -- installs the streaming block router for the whole
 application. Spark's push-merge path runs only with the sort manager's index block resolver.
-Consequently, push-based shuffle and External Shuffle Service merge are unavailable application-wide
-while the streaming manager is selected, including for an individual shuffle that the manager
+Consequently, push-based shuffle and External Shuffle Service merge are unavailable
+application-wide while streaming is active, including for an individual shuffle that the manager
 delegates to its sort-based implementation.
+
+A JVM in which streaming is not active exposes the sort manager's own resolver unchanged, so the
+kill switch and every structural exclusion leave push-based shuffle exactly as it is under
+`spark.shuffle.manager=sort`.
 
 If an application depends on push-based shuffle or External Shuffle Service merge, keep
 `spark.shuffle.manager=sort` for that application. Isolate workloads that need the streaming

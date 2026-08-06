@@ -1242,12 +1242,16 @@ This is the component with the largest amount of instrumented metrics
     Registering the source is not the same as exporting it: every sink is opt-in, and `JmxSink`
     ships commented out in `conf/metrics.properties.template`, so it has to be enabled there before
     these metrics appear in an MBean browser. The metrics are only updated while streaming shuffle
-    is active, which requires `spark.shuffle.manager=streaming` together with
-    `spark.shuffle.streaming.enabled=true` (default is false), so a JVM whose configuration never
-    activates streaming records no streaming events at all and reports 0 for every one of these
-    metrics. Updates also stop once streaming shuffle becomes inactive, whether because the kill
-    switch was turned off or because a job fell back to sort-based shuffle; the source stays
-    registered through all of those.
+    is active, which requires all three of `spark.shuffle.manager=streaming`,
+    `spark.shuffle.streaming.enabled=true` (default is false) and `spark.authenticate=true`
+    (default is false): the streaming data plane carries serialized records from one executor into
+    another executor's deserializer, so it refuses to activate on an unauthenticated transport and
+    the manager serves every shuffle with the sort-based shuffle instead. A JVM missing any one of
+    the three records no streaming events at all and reports 0 for every one of these metrics, which
+    is the first thing to check when all four read 0. See
+    [Streaming Shuffle security](streaming-shuffle.html#security). Updates also stop once streaming
+    shuffle becomes inactive, whether because the kill switch was turned off or because a job fell
+    back to sort-based shuffle; the source stays registered through all of those.
   - **note:** the four metrics do not share one lifetime. `bufferUtilizationPercent` is a live
     reading of buffer occupancy at the moment the sink samples it, and returns to 0 once the
     buffers are released. The other three are counters that accumulate for the lifetime of the
@@ -1285,6 +1289,11 @@ This is the component with the largest amount of instrumented metrics
     hand-off queue reached its high-water mark
   - partialReadInvalidations (counter): number of atomic, per-producer partial read invalidations
     performed after a producer failure, each of which is recovered by ordinary stage recomputation
+  - **note:** see also the [Streaming Shuffle](streaming-shuffle.html) guide, whose
+    [Monitoring](streaming-shuffle.html#monitoring) section explains what each of these four
+    readings means for a running job and what to do about it, and whose
+    [Security](streaming-shuffle.html#security) section covers the authentication precondition
+    above.
 
 - namespace=DAGScheduler
   - job.activeJobs
@@ -1500,12 +1509,16 @@ These metrics are exposed by Spark executors.
     Registering the source is not the same as exporting it: every sink is opt-in, and `JmxSink`
     ships commented out in `conf/metrics.properties.template`, so it has to be enabled there before
     these metrics appear in an MBean browser. The metrics are only updated while streaming shuffle
-    is active, which requires `spark.shuffle.manager=streaming` together with
-    `spark.shuffle.streaming.enabled=true` (default is false), so a JVM whose configuration never
-    activates streaming records no streaming events at all and reports 0 for every one of these
-    metrics. Updates also stop once streaming shuffle becomes inactive, whether because the kill
-    switch was turned off or because a job fell back to sort-based shuffle; the source stays
-    registered through all of those.
+    is active, which requires all three of `spark.shuffle.manager=streaming`,
+    `spark.shuffle.streaming.enabled=true` (default is false) and `spark.authenticate=true`
+    (default is false): the streaming data plane carries serialized records from one executor into
+    another executor's deserializer, so it refuses to activate on an unauthenticated transport and
+    the manager serves every shuffle with the sort-based shuffle instead. A JVM missing any one of
+    the three records no streaming events at all and reports 0 for every one of these metrics, which
+    is the first thing to check when all four read 0. See
+    [Streaming Shuffle security](streaming-shuffle.html#security). Updates also stop once streaming
+    shuffle becomes inactive, whether because the kill switch was turned off or because a job fell
+    back to sort-based shuffle; the source stays registered through all of those.
   - **note:** the four metrics do not share one lifetime. `bufferUtilizationPercent` is a live
     reading of buffer occupancy at the moment the sink samples it, and returns to 0 once the
     buffers are released. The other three are counters that accumulate for the lifetime of the
@@ -1543,6 +1556,11 @@ These metrics are exposed by Spark executors.
     hand-off queue reached its high-water mark
   - partialReadInvalidations (counter): number of atomic, per-producer partial read invalidations
     performed after a producer failure, each of which is recovered by ordinary stage recomputation
+  - **note:** see also the [Streaming Shuffle](streaming-shuffle.html) guide, whose
+    [Monitoring](streaming-shuffle.html#monitoring) section explains what each of these four
+    readings means for a running job and what to do about it, and whose
+    [Security](streaming-shuffle.html#security) section covers the authentication precondition
+    above.
 
 - namespace=plugin.\<Plugin Class Name>
   - Optional namespace(s). Metrics in this namespace are defined by user-supplied code, and

@@ -120,7 +120,15 @@ private[spark] class TokenBucketRateLimiter(
     }
   }
 
-  /** Requests this limiter refused, by its own tokens or by the executor-wide ceiling behind it. */
+  /**
+   * Requests this limiter refused, by its own tokens or by the executor-wide ceiling behind it.
+   *
+   * One refused request is counted here once, and a request the ceiling refused is counted a second
+   * time on the ceiling's own limiter, since that is where it was turned away. The two totals are
+   * therefore per-level readings of the same events and must not be added together: this one is the
+   * authoritative count of what one shuffle was refused, and the ceiling's is the authoritative
+   * count of what the executor was refused across all of its shuffles.
+   */
   def refusalCount: Long = refusals.get()
 
   /** Number of requests refused for asking more than the bucket's whole capacity. */
@@ -459,6 +467,11 @@ private[spark] object TokenBucketRateLimiter extends Logging {
   /**
    * Holds a rate to [[BANDWIDTH_CEILING_PERCENT]] of itself, which is the second of the two steps
    * [[apply]] composes.
+   *
+   * Dividing before multiplying is deliberate: an administered capacity is free to be large enough
+   * that multiplying it by eighty first would overflow a Long, whereas dividing first cannot. The
+   * price is a truncation of at most [[BANDWIDTH_CEILING_PERCENT]] minus one bytes per second,
+   * which is immaterial against the mebibyte-scale rates this method is given.
    *
    * @param bytesPerSecond the rate to hold down
    * @return the paced rate, never less than one byte per second

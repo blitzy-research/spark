@@ -280,7 +280,16 @@ private[spark] class StreamingShuffleReader[K, C](
     }
   }
 
-  /** Applies the dependency's aggregation and ordering to the streamed records. */
+  /**
+   * Applies the dependency's aggregation and ordering to the streamed records.
+   *
+   * The two `dep.mapSideCombine` branches below are unreachable on the streaming path, because a
+   * dependency that asks for map-side combining is declined when the shuffle is registered and is
+   * served by the sort-based shuffle instead. They are retained so that this method stays
+   * structurally identical to `BlockStoreShuffleReader.read`, which is what makes the two readers
+   * comparable line by line and keeps a future change to the shared read shape from having to be
+   * reasoned about twice.
+   */
   private def combineAndSort(records: Iterator[(Any, Any)]): Iterator[Product2[K, C]] = {
     if (dep.keyOrdering.isDefined) {
       val sorter: ExternalSorter[K, _, C] = if (dep.aggregator.isDefined) {

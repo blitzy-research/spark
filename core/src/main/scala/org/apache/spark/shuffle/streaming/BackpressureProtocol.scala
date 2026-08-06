@@ -410,7 +410,8 @@ private[spark] class BackpressureProtocol(
 
   /**
    * Drops a shuffle and every stream belonging to it, releasing all of the credit those streams
-   * held.
+   * held together with every byte of metadata their ledgers had reserved from the executor's
+   * aggregate allowance.
    *
    * @param shuffleId the shuffle to drop
    * @return how many streams were dropped with it
@@ -422,14 +423,13 @@ private[spark] class BackpressureProtocol(
     // Returns this shuffle's share to the shuffles that remain.
     shuffleLimiters.remove(shuffleId)
     egressBudget.release(shuffleId)
+    // The keys are snapshotted first and each one is then dropped through closeAndRemove, so a
+    // ledger is closed by the same indivisible step that unlinks it. Dropping a shuffle is a
+    // shuffle-wide decision that overrides the per-stream owner count, and closing is what returns
+    // the ledger's metadata reservations to the executor's aggregate allowance.
     var dropped = 0
-    val entries = streams.keySet().iterator()
-    while (entries.hasNext) {
-      val key = entries.next()
-      if (key.shuffleId == shuffleId) {
-        // Removing through the key set's own iterator removes from the backing map, so the walk
-        // stays a single pass and cannot observe a key it has already dropped.
-        entries.remove()
+    streams.keySet().asScala.toSeq.foreach { key =>
+      if (key.shuffleId == shuffleId && closeAndRemove(key)) {
         dropped += 1
       }
     }
@@ -438,6 +438,29 @@ private[spark] class BackpressureProtocol(
         log"${MDC(COUNT, dropped)} stream(s) of shuffle ${MDC(SHUFFLE_ID, shuffleId)}")
     }
     dropped
+  }
+
+  /**
+   * Unlinks one stream's ledger and closes it in the same indivisible step, which is the only way
+   * a ledger may leave [[streams]]: `close()` is the sole path that returns the ledger's base and
+   * per-entry metadata reservations to the executor's aggregate allowance, so unlinking without it
+   * would charge those bytes for the lifetime of the process.
+   *
+   * @param key identity of the stream whose ledger is being dropped
+   * @return true if a ledger was found under this key and closed
+   */
+  private def closeAndRemove(key: BackpressureStreamKey): Boolean = {
+    var closed = false
+    streams.compute(key, (_, existing) => {
+      if (existing != null) {
+        // close() is idempotent and the ledger refuses -- and rolls back -- every charge attempted
+        // after it, so a holder that still has this reference can neither leak nor double-release.
+        existing.close()
+        closed = true
+      }
+      null
+    })
+    closed
   }
 
   /**
@@ -1378,6 +1401,12 @@ private[spark] class BackpressureProtocol(
    * Whether this stream's consumer has been at least twice as slow as its producer continuously for
    * longer than sixty seconds, which is the first of the four conditions under which streaming
    * steps aside.
+   *
+   * Asking the question records an observation, and [[pollOnce]] records one for every ledger on
+   * its own timer, so a stream is normally observed twice in the same interval. That composes
+   * safely and deliberately: the recorder latches the instant slowness began and clears the latch
+   * only when the stream stops being slow, so a second observation inside one interval can neither
+   * move the latch forward nor change the verdict this method returns.
    */
   def isConsumerSustainedSlow(key: BackpressureStreamKey): Boolean = {
     val ledger = streams.get(key)
@@ -1749,6 +1778,11 @@ private[spark] class BackpressureProtocol(
    * constructed one would.
    */
   def reset(): Unit = {
+    // Each ledger is closed by the step that unlinks it, because clearing the map on its own would
+    // discard the only references that can return their metadata reservations to the executor's
+    // aggregate allowance -- which is shared process-wide, so the charge would outlive this
+    // protocol and be read as another component's utilisation.
+    streams.keySet().asScala.toSeq.foreach(closeAndRemove)
     streams.clear()
     shufflePartitionCounts.clear()
     shuffleBufferedBytes.clear()

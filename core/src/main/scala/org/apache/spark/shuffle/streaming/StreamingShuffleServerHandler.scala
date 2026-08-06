@@ -3101,6 +3101,12 @@ private[spark] object StreamingShuffleServerHandler {
   /**
    * Flush order: original attempts before retries, lower attempt numbers first, and enqueue order
    * between blocks of equal urgency so that a partition's blocks never leave out of sequence.
+   *
+   * The first key is monotone in the second, since `speculative` is defined as a non-zero attempt
+   * number, so the order this comparator produces is the same with or without it. It is kept
+   * because it states the specified rule -- an original attempt outranks a re-attempt -- in the
+   * vocabulary the requirement uses, rather than leaving a reader to derive that intent from an
+   * integer comparison.
    */
   private val EgressOrdering: Comparator[PendingBlock] = new Comparator[PendingBlock] {
     override def compare(left: PendingBlock, right: PendingBlock): Int = {

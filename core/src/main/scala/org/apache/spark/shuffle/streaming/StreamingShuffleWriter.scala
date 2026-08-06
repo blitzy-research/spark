@@ -2049,11 +2049,14 @@ private[spark] class StreamingShuffleWriter[K, V, C](
     // registered on this executor.
     guardedRelease("return this shuffle's share of the executor's egress allowance") {
       if (backpressure.streamCount(shuffleId) == 0) {
-        val dropped = backpressure.unregisterShuffle(shuffleId)
+        // The guard is what makes this safe for a concurrent attempt of the same shuffle: the share
+        // is returned only when this executor holds no ledger of it, so there is by construction no
+        // ledger for this call to drop and no other attempt's credit to take away.
+        backpressure.unregisterShuffle(shuffleId)
         if (debugEnabled) {
           logDebug(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} returned the executor " +
             log"state of map ${MDC(TASK_ATTEMPT_ID, mapId)} before delegating to the sort-based " +
-            log"writer, dropping ${MDC(COUNT, dropped)} stream ledger(s)")
+            log"writer, no stream ledger of it remaining registered here")
         }
       }
     }
