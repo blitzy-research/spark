@@ -108,25 +108,47 @@ public class StreamingShuffleMessageSuite {
   /**
    * Releases every buffer the test allocated, and asserts that this suite owned each of them alone.
    *
-   * The reference count is checked on both sides of the release. A count other than one before it
+   * The reference count is recorded on both sides of the release. A count other than one before it
    * means something retained the buffer or released it already -- either way the ownership contract
    * this message family is built on has been broken, and a decoder that retained a frame's buffer
    * is exactly the defect that copying the payload out at decode time exists to prevent. A count of
    * zero after it is the release itself, observed rather than assumed.
+   *
+   * <b>Why the ownership check is deferred rather than asserted in the loop.</b> An assertion is a
+   * thrown error, and an error thrown between a buffer and its release leaks that buffer AND every
+   * buffer tracked behind it -- so a suite whose whole purpose is to prove nothing leaks would
+   * report a broken ownership contract by leaking. Every buffer is therefore freed first,
+   * unconditionally and whatever its reference count, with each violation recorded as it is
+   * observed; the single assertion below then fails the test on the accumulated record. Nothing is
+   * lost by waiting: the violations name their buffer by allocation index and report all of
+   * themselves rather than only the first, which is strictly more diagnostic than stopping at one.
    */
   @AfterEach
   public void releaseOwnedBuffers() {
+    List<String> violations = new ArrayList<>();
     try {
-      for (ByteBuf buf : ownedBuffers) {
-        assertEquals(1, buf.refCnt(),
-            "this suite owns every buffer it allocates, so nothing may have retained or released "
-                + "it before teardown");
-        assertTrue(buf.release(), "the last reference must be the one released here");
-        assertEquals(0, buf.refCnt(), "a released buffer holds no reference");
+      for (int index = 0; index < ownedBuffers.size(); index++) {
+        ByteBuf buf = ownedBuffers.get(index);
+        int held = buf.refCnt();
+        if (held != 1) {
+          violations.add("buffer " + index + " held " + held + " reference(s) before release");
+        }
+        if (held > 0) {
+          buf.release(held);
+        }
+        int remaining = buf.refCnt();
+        if (remaining != 0) {
+          violations.add("buffer " + index + " held " + remaining + " reference(s) after release");
+        }
       }
     } finally {
+      // Cleared whatever happened above, so a buffer already freed here can never be presented to
+      // the next test's teardown as one of its own.
       ownedBuffers.clear();
     }
+    assertTrue(violations.isEmpty(),
+        "this suite owns every buffer it allocates alone, so each must hold exactly one reference "
+            + "before teardown releases it and none afterwards: " + violations);
   }
 
   /** An empty buffer whose release this suite owns. */
@@ -1162,14 +1184,16 @@ public class StreamingShuffleMessageSuite {
   @Test
   public void testRetransmissionRequestWindowDomainIsEnforcedOnDecode() {
     // A peer cannot smuggle an inverted or over-wide window past the codec: the same constructor
-    // validates a decoded request and a locally built one.
-    ByteBuf inverted = Unpooled.buffer();
+    // validates a decoded request and a locally built one. Both buffers go through the tracked
+    // helper, because a decode that raises -- which is the whole point of the two cases below --
+    // never reaches a release written at the end of the method.
+    ByteBuf inverted = buffer();
     writeHeader(inverted, SHUFFLE_ID, PARTITION_ID, 9L);
     inverted.writeLong(8L);
     assertThrows(IllegalArgumentException.class,
         () -> RetransmitRequestMessage.decode(inverted));
 
-    ByteBuf overWide = Unpooled.buffer();
+    ByteBuf overWide = buffer();
     writeHeader(overWide, SHUFFLE_ID, PARTITION_ID, 0L);
     overWide.writeLong(RetransmitRequestMessage.MAX_REQUESTED_BLOCKS);
     assertThrows(IllegalArgumentException.class,
@@ -2308,10 +2332,19 @@ public class StreamingShuffleMessageSuite {
    * domain rule has to hold on the route a remote peer actually uses.
    */
   private static HeartbeatMessage decodeHeartbeatWithToken(long consumerToken) {
+    // Released in a finally rather than tracked, because this helper is static and so cannot reach
+    // the instance ownership list -- and a release written after the decode is a release that every
+    // refusing case skips, which is precisely the route this helper exists to exercise. Releasing
+    // is safe because the decoder copies nothing out by reference: it reads the header and two
+    // longs, so the message it returns outlives the bytes it was read from.
     ByteBuf buf = Unpooled.buffer();
-    writeHeader(buf, SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER);
-    buf.writeLong(consumerToken);
-    return HeartbeatMessage.decode(buf);
+    try {
+      writeHeader(buf, SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER);
+      buf.writeLong(consumerToken);
+      return HeartbeatMessage.decode(buf);
+    } finally {
+      buf.release();
+    }
   }
 
   /** Routes a buffer to the concrete decoder matching the given message's type. */

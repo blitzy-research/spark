@@ -1592,7 +1592,21 @@ class StreamingShuffleIntegrationTest
       }
     }, "streaming-shuffle-overlap-consumer")
 
-    try {
+    // The shared settlement owns both halves: it joins them inside the budget and, only if that
+    // expires, releases the two latches this case's producer parks on, interrupts whatever that did
+    // not free, re-joins inside a bounded grace, and completes the task contexts afterwards rather
+    // than before. Completing them first would leave a live thread charging allocations to a
+    // finished accounting entry, and these halves are not daemons, so one left behind can outlive
+    // the suite; a thread that survives every stage fails the case by name with its stack.
+    runBoundedThreadedScenario(
+      threads = Seq(producer, consumer),
+      taskContexts = Seq(writerContext, readerContext),
+      description = "the overlap case",
+      joinTimeoutMillis = OverlapJoinTimeoutMillis,
+      releaseWaits = () => {
+        consumerConsumedOne.countDown()
+        consumerFinishedReading.countDown()
+      }) {
       producer.start()
       // The consumer is started once the producer exists, because a producer that has been given a
       // writer has already been published to the coordinator -- so the consumer's rendezvous
@@ -1606,11 +1620,6 @@ class StreamingShuffleIntegrationTest
         s"the producer must have been given a streaming writer, but failed with " +
           s"${producerFailure.get()}")
       consumer.start()
-      producer.join(OverlapJoinTimeoutMillis)
-      consumer.join(OverlapJoinTimeoutMillis)
-    } finally {
-      writerContext.markTaskCompleted(None)
-      readerContext.markTaskCompleted(None)
     }
 
     assert(producerFailure.get() == null,
@@ -1619,9 +1628,6 @@ class StreamingShuffleIntegrationTest
     assert(consumerFailure.get() == null,
       s"the consumer must have read its partition without failing, but raised " +
         s"${consumerFailure.get()}")
-    assert(!producer.isAlive && !consumer.isAlive,
-      "both halves must have finished inside the join budget, or this case timed out rather than " +
-        "observed anything")
 
     // THE assertion. The producer stopped waiting because the consumer had consumed, not because a
     // timer expired -- so a record produced by a live map task was read by a live reduce task
@@ -1882,7 +1888,15 @@ class StreamingShuffleIntegrationTest
       }
     }, "streaming-shuffle-live-loss-consumer")
 
-    try {
+    // Settled by the shared helper, so a half that outran the budget is released, interrupted and
+    // re-joined before the task contexts it holds reservations against are completed -- see the
+    // overlap case above for why that order is the one that matters.
+    runBoundedThreadedScenario(
+      threads = Seq(producer, consumer),
+      taskContexts = Seq(writerContext, readerContext),
+      description = "the live producer-loss case",
+      joinTimeoutMillis = OverlapJoinTimeoutMillis,
+      releaseWaits = () => consumerConsumedOne.countDown()) {
       producer.start()
       eventually(timeout(OverlapStartupTimeout), interval(OverlapPollInterval)) {
         assert(writerHandle.get() != null || producerFailure.get() != null,
@@ -1892,16 +1906,8 @@ class StreamingShuffleIntegrationTest
         s"the producer must have been given a streaming writer, but failed with " +
           s"${producerFailure.get()}")
       consumer.start()
-      producer.join(OverlapJoinTimeoutMillis)
-      consumer.join(OverlapJoinTimeoutMillis)
-    } finally {
-      writerContext.markTaskCompleted(None)
-      readerContext.markTaskCompleted(None)
     }
 
-    assert(!producer.isAlive && !consumer.isAlive,
-      "both halves must have finished inside the join budget, or this case timed out rather than " +
-        "observed anything")
     assert(producerFailure.get() == null,
       s"the producer half must have failed only where the fault was injected, but raised " +
         s"${producerFailure.get()}")
@@ -2038,7 +2044,14 @@ class StreamingShuffleIntegrationTest
       }
     }, "streaming-shuffle-live-slow-consumer")
 
-    try {
+    // Settled by the shared helper, on the same terms as the two cases above: release, interrupt,
+    // bounded re-join, and only then completion of the contexts these halves draw memory against.
+    runBoundedThreadedScenario(
+      threads = Seq(producer, consumer),
+      taskContexts = Seq(writerContext, readerContext),
+      description = "the live slow-consumer case",
+      joinTimeoutMillis = OverlapJoinTimeoutMillis,
+      releaseWaits = () => consumerConsumedOne.countDown()) {
       producer.start()
       eventually(timeout(OverlapStartupTimeout), interval(OverlapPollInterval)) {
         assert(writerHandle.get() != null || producerFailure.get() != null,
@@ -2048,16 +2061,8 @@ class StreamingShuffleIntegrationTest
         s"the producer must have been given a streaming writer, but failed with " +
           s"${producerFailure.get()}")
       consumer.start()
-      producer.join(OverlapJoinTimeoutMillis)
-      consumer.join(OverlapJoinTimeoutMillis)
-    } finally {
-      writerContext.markTaskCompleted(None)
-      readerContext.markTaskCompleted(None)
     }
 
-    assert(!producer.isAlive && !consumer.isAlive,
-      "both halves must have finished inside the join budget, or this case timed out rather than " +
-        "observed anything")
     assert(producerFailure.get() == null,
       s"a producer whose consumer fell behind must stream to completion rather than fail, but " +
         s"raised ${producerFailure.get()}")
@@ -2178,7 +2183,16 @@ class StreamingShuffleIntegrationTest
       }
     }, "streaming-shuffle-live-partition-consumer")
 
-    try {
+    // Settled by the shared helper, where it earns the most: this case severs the only link the
+    // pair has, so a half left waiting on bytes that will never arrive is exactly what the
+    // release-then-interrupt stages exist for, and the contexts are completed only once both have
+    // actually stopped.
+    runBoundedThreadedScenario(
+      threads = Seq(producer, consumer),
+      taskContexts = Seq(writerContext, readerContext),
+      description = "the live severed-link case",
+      joinTimeoutMillis = OverlapJoinTimeoutMillis,
+      releaseWaits = () => consumerConsumedOne.countDown()) {
       producer.start()
       eventually(timeout(OverlapStartupTimeout), interval(OverlapPollInterval)) {
         assert(writerHandle.get() != null || producerFailure.get() != null,
@@ -2188,16 +2202,8 @@ class StreamingShuffleIntegrationTest
         s"the producer must have been given a streaming writer, but failed with " +
           s"${producerFailure.get()}")
       consumer.start()
-      producer.join(OverlapJoinTimeoutMillis)
-      consumer.join(OverlapJoinTimeoutMillis)
-    } finally {
-      writerContext.markTaskCompleted(None)
-      readerContext.markTaskCompleted(None)
     }
 
-    assert(!producer.isAlive && !consumer.isAlive,
-      "both halves must have finished inside the join budget, or this case timed out rather than " +
-        "observed anything")
     assert(linkSevered.get(),
       "the case must have closed the producer's serving socket, or it partitioned nothing")
     assert(consumerWasAttached.get() && consumed.get() > 0,

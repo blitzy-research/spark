@@ -29,7 +29,7 @@ import scala.collection.mutable
 import scala.concurrent.Awaitable
 import scala.concurrent.duration.Duration
 import scala.jdk.CollectionConverters._
-import scala.util.Random
+import scala.util.{Failure, Random, Try}
 
 import com.codahale.metrics.{Counter, Gauge}
 import org.apache.logging.log4j.LogManager
@@ -1511,6 +1511,21 @@ object StreamingShuffleTestHelper {
 
   val DefaultAwaitTimeoutMillis: Long = 30000L
 
+  /**
+   * Budget granted to each stage of settling a thread that outran its join.
+   *
+   * Set to the consumer-liveness window rather than to something arbitrarily small, because that
+   * window is the longest wait a streaming half legitimately takes: a thread parked inside it has
+   * to be given a full one to notice that its latch was released or that it was interrupted, or the
+   * settlement would report a thread stuck when it was merely mid-wait. Two stages are granted this
+   * budget -- one after the waits are released and one after the interrupt -- so the worst case is
+   * bounded and stated rather than open ended.
+   */
+  val ThreadSettlementGraceMillis: Long = 10000L
+
+  /** Stack frames reported for a thread that survived settlement, enough to name where it sat. */
+  val StuckThreadStackFrames: Int = 12
+
   /** Starting time of a manual clock, chosen non-zero so a bug that reads zero stands out. */
   val ManualClockEpochMillis: Long = 1000000L
 
@@ -2381,6 +2396,170 @@ trait StreamingShuffleTestHelper {
       pool.shutdownNow()
     }
   }
+
+  /**
+   * Runs one threaded scenario to a bounded end, and completes the task contexts it was built on
+   * only once every thread it started has actually stopped.
+   *
+   * ==What this exists to prevent==
+   *
+   * A scenario that attaches a live consumer to a live producer has to run each half on its own
+   * thread, and the only bounded way to wait for a thread is a timed join. A timed join whose
+   * budget expires returns silently, so the shape it invites -- join, then release the fixtures
+   * in a `finally` -- completes the task contexts while the threads holding reservations against
+   * them are still running. Two things go wrong at once. The thread outlives the accounting entry
+   * its allocations are charged to, so a leak is reported against the wrong task or not reported at
+   * all, which is exactly the check the streaming suites depend on. And it is left behind for the
+   * next case to trip over, which for a thread that is not a daemon means it can outlive the suite
+   * and hold the test fork open with nothing to say about why.
+   *
+   * ==The settlement performed instead==
+   *
+   * Every thread is joined inside `joinTimeoutMillis`. If any is still alive after that, two
+   * forcing stages follow, in this order and neither skipped:
+   *
+   *  - `releaseWaits` is invoked, which is where a caller counts down the latches its own halves
+   *    park on. A thread waiting for something this scenario owns is then free to finish on its own
+   *    terms, running its own `finally` blocks, which is strictly better than being interrupted out
+   *    of production code.
+   *  - Whatever the release did not free is interrupted. Every wait in the streaming subsystem is
+   *    bounded and handles interruption, so this is a request the code under test can answer rather
+   *    than a flag nobody reads.
+   *
+   * Each stage is followed by a further bounded join of `settlementGraceMillis`, so the worst case
+   * is one join budget plus two grace windows rather than something open ended.
+   *
+   * The task contexts are completed after all of that, and unconditionally -- including when the
+   * body threw, and including when a thread survived every stage -- because a context left open
+   * leaks its execution-memory reservation permanently and charges it to whichever task later
+   * draws the same accounting identity. A thread that survived settlement then fails the scenario
+   * by name, with its state and the top of its stack, so a hang arrives as a diagnosis rather
+   * than as a twenty minute timeout.
+   *
+   * Failures are reported first-wins: whatever the body raised is what the caller sees, with any
+   * settlement, completion or survival failure attached to it as suppressed, so a cleanup problem
+   * can never mask the fault the scenario was built to observe.
+   *
+   * @param threads the threads the body starts, whose settlement this method owns
+   * @param taskContexts contexts those threads hold reservations against, completed only once they
+   *                     have stopped
+   * @param description the scenario, named in every diagnostic raised here
+   * @param joinTimeoutMillis budget for the ordinary join, before anything is forced
+   * @param settlementGraceMillis budget granted to each forcing stage
+   * @param releaseWaits releases whatever the threads may be parked on; invoked only on the timeout
+   *                     path, so a scenario that finished normally pays nothing for it
+   * @param body starts the threads and performs whatever sequencing the scenario needs between them
+   * @tparam T whatever the body observes
+   * @return the body's result, once settlement and completion have both been performed
+   */
+  def runBoundedThreadedScenario[T](
+      threads: Seq[Thread],
+      taskContexts: Seq[TaskContextImpl],
+      description: String,
+      joinTimeoutMillis: Long = DefaultAwaitTimeoutMillis,
+      settlementGraceMillis: Long = ThreadSettlementGraceMillis,
+      releaseWaits: () => Unit = () => ())(body: => T): T = {
+    require(threads.nonEmpty, s"$description must run at least one thread")
+    require(joinTimeoutMillis > 0L,
+      s"$description needs a positive join budget but was given $joinTimeoutMillis ms")
+    require(settlementGraceMillis > 0L,
+      s"$description needs a positive settlement grace but was given $settlementGraceMillis ms")
+    val outcome = Try(body)
+    val settlement =
+      Try(settleThreads(threads, joinTimeoutMillis, settlementGraceMillis, releaseWaits))
+    val completion = Try(taskContexts.foreach(_.markTaskCompleted(None)))
+    val survival = Try(requireThreadsStopped(settlement.getOrElse(Seq.empty), description))
+    rethrowFirstFailure(Seq(outcome, settlement, completion, survival))
+    outcome.get
+  }
+
+  /**
+   * Joins every thread inside its budget, forces any that outran it, and returns the survivors.
+   *
+   * Returning the survivors rather than asserting on them is deliberate: the caller still has task
+   * contexts to complete before it may fail, and a failure raised here would jump over that.
+   *
+   * @param threads threads to settle
+   * @param joinTimeoutMillis budget for the ordinary join
+   * @param graceMillis budget granted to each forcing stage
+   * @param releaseWaits releases whatever the threads may be parked on
+   * @return the threads still alive after every stage, which is normally empty
+   */
+  private def settleThreads(
+      threads: Seq[Thread],
+      joinTimeoutMillis: Long,
+      graceMillis: Long,
+      releaseWaits: () => Unit): Seq[Thread] = {
+    threads.foreach(thread => joinWithin(thread, joinTimeoutMillis))
+    if (threads.exists(_.isAlive)) {
+      // Stage one: a thread parked on one of this scenario's own latches is let finish by itself.
+      releaseWaits()
+      threads.filter(_.isAlive).foreach(thread => joinWithin(thread, graceMillis))
+      // Stage two: whatever is left is asked to unwind.
+      val stubborn = threads.filter(_.isAlive)
+      stubborn.foreach(_.interrupt())
+      stubborn.foreach(thread => joinWithin(thread, graceMillis))
+    }
+    threads.filter(_.isAlive)
+  }
+
+  /**
+   * Joins one thread inside a bound, re-arming the interrupt status if this thread is interrupted
+   * while waiting.
+   *
+   * Swallowing that interrupt would lose a cancellation the runner is entitled to observe, so it is
+   * re-armed and settlement continues with whatever the remaining stages can do: a thread that
+   * cannot be joined is reported by name rather than waited on indefinitely.
+   *
+   * @param thread thread to join
+   * @param timeoutMillis bound on the wait
+   */
+  private def joinWithin(thread: Thread, timeoutMillis: Long): Unit = {
+    try {
+      thread.join(timeoutMillis)
+    } catch {
+      case _: InterruptedException => Thread.currentThread().interrupt()
+    }
+  }
+
+  /**
+   * Fails when a thread survived settlement, naming it, its state and the top of its stack.
+   *
+   * @param survivors threads still running after every settlement stage
+   * @param description the scenario they belong to
+   */
+  private def requireThreadsStopped(survivors: Seq[Thread], description: String): Unit = {
+    if (survivors.nonEmpty) {
+      val diagnosis = survivors.map { thread =>
+        val frames = thread.getStackTrace.take(StuckThreadStackFrames)
+          .map(frame => s"      at $frame")
+          .mkString("\n")
+        s"  ${thread.getName} (${thread.getState})\n$frames"
+      }.mkString("\n")
+      throw new IllegalStateException(
+        s"$description left ${survivors.size} thread(s) running after its join budget, a " +
+          s"released wait and an interrupt, so its task contexts were completed under live " +
+          s"thread(s):\n" +
+          diagnosis)
+    }
+  }
+
+  /**
+   * Rethrows the first failure among the given attempts, attaching the rest to it as suppressed.
+   *
+   * First rather than last, because the earliest attempt is the scenario's own body: a cleanup
+   * fault that followed the fault under observation must never be the one a reader is shown.
+   *
+   * @param attempts the attempts, in the order their failures are preferred
+   */
+  private def rethrowFirstFailure(attempts: Seq[Try[Any]]): Unit = {
+    val failures = attempts.collect { case Failure(failure) => failure }
+    failures.headOption.foreach { primary =>
+      failures.tail.filterNot(_ eq primary).foreach(primary.addSuppressed)
+      throw primary
+    }
+  }
+
 
   // Injected clocks. Every streaming shuffle component accepts a Clock, defaulted to a system clock
   // in service and handed a ManualClock in test, which turns a five second timeout into one method

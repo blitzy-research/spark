@@ -20,7 +20,7 @@ package org.apache.spark.shuffle.streaming
 import java.lang.management.{BufferPoolMXBean, ManagementFactory}
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.{CountDownLatch, TimeUnit}
-import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicReference}
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong, AtomicReference}
 
 import scala.collection.mutable
 import scala.jdk.CollectionConverters._
@@ -756,9 +756,16 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
     val produced = new AtomicInteger(0)
     val consumed = new AtomicInteger(0)
     val consumedDuringProduction = new AtomicInteger(0)
+    val consumptionDrained = new AtomicBoolean(false)
     val writerHandle = new AtomicReference[StreamingShuffleWriter[Int, Int, Int]](null)
     val producerFailure = new AtomicReference[Throwable](null)
     val consumerFailure = new AtomicReference[Throwable](null)
+    // Each half stamps the instant it stopped working, so the elapsed window below closes when the
+    // two halves finished rather than when the settlement that follows them finished. Reading the
+    // clock after the settlement would fold this fixture's teardown into a latency figure, which is
+    // the one thing a latency benchmark may never do.
+    val producerFinishedAt = new AtomicLong(0L)
+    val consumerFinishedAt = new AtomicLong(0L)
 
     val producer = new Thread(() => {
       try {
@@ -777,8 +784,13 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
         productionFinished.countDown()
         // The end of stream is signalled by `write` itself, so the consumer can finish before this
         // producer stops. Waiting for it is what makes the durable figure below the window the
-        // CONSUMER left rather than one this measurement created by stopping early.
-        consumptionFinished.await(OverlapJoinTimeoutMillis, TimeUnit.MILLISECONDS)
+        // CONSUMER left rather than one this measurement created by stopping early -- so whether
+        // the wait was satisfied is recorded, and a run whose wait expired is refused below instead
+        // of being reported as though the window it measured meant something. The stop still runs
+        // either way, because it is the production withdrawal path and a run that skipped it would
+        // leave this fixture's state for the next run to inherit.
+        consumptionDrained.set(
+          consumptionFinished.await(OverlapJoinTimeoutMillis, TimeUnit.MILLISECONDS))
         writer.stop(success = true)
       } catch {
         case failure: Throwable => producerFailure.set(failure)
@@ -786,6 +798,7 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
         producing.set(false)
         writerReady.countDown()
         productionFinished.countDown()
+        producerFinishedAt.set(System.nanoTime())
         TaskContext.unset()
       }
     }, "streaming-shuffle-benchmark-overlap-producer")
@@ -808,32 +821,55 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
         case failure: Throwable => consumerFailure.set(failure)
       } finally {
         consumptionFinished.countDown()
+        consumerFinishedAt.set(System.nanoTime())
         TaskContext.unset()
       }
     }, "streaming-shuffle-benchmark-overlap-consumer")
 
     val startedAt = System.nanoTime()
-    val run = try {
+    // The shared settlement owns both halves. It joins them inside the budget and, only if that
+    // expires, releases the three latches this run's halves park on, interrupts whatever that did
+    // not free, re-joins inside a bounded grace, and completes the two task contexts afterwards
+    // rather than before. Completing them first would leave a live thread charging allocations to a
+    // finished accounting entry, and neither half is a daemon, so one left behind can outlive the
+    // benchmark run entirely; a half that survives every stage fails the run by name with its
+    // stack, which is the only honest outcome for a measurement that did not finish.
+    runBoundedThreadedScenario(
+      threads = Seq(producer, consumer),
+      taskContexts = Seq(writerContext, readerContext),
+      description = "an overlap run",
+      joinTimeoutMillis = OverlapJoinTimeoutMillis,
+      releaseWaits = () => {
+        writerReady.countDown()
+        productionFinished.countDown()
+        consumptionFinished.countDown()
+      }) {
       producer.start()
+      // The attachment instant is the ONLY thing the two overlap cases differ in, so the wait that
+      // establishes it is a precondition of the measurement rather than a part of it. Its result is
+      // therefore required rather than discarded: a wait that expired means the consumer attached
+      // somewhere other than where this case is defined to attach it, and the run raises here --
+      // before a single figure is calculated -- instead of reporting a row for a case it did not
+      // actually run.
       if (attachDuringProduction) {
-        writerReady.await(OverlapJoinTimeoutMillis, TimeUnit.MILLISECONDS)
+        requireOverlapPrecondition(writerReady, "the producer to have been given a writer")
       } else {
-        productionFinished.await(OverlapJoinTimeoutMillis, TimeUnit.MILLISECONDS)
+        requireOverlapPrecondition(productionFinished, "production to have finished")
       }
       consumer.start()
-      producer.join(OverlapJoinTimeoutMillis)
-      consumer.join(OverlapJoinTimeoutMillis)
-      val elapsedNanos = System.nanoTime() - startedAt
-      requireOverlapRunSucceeded(producer, consumer, producerFailure, consumerFailure)
-      overlapRunOf(elapsedNanos, writerHandle.get(), writerContext, produced, consumed,
-        consumedDuringProduction)
-    } finally {
-      // Unconditional, because these two task contexts hold the run's execution-memory
-      // reservations: a run that left them open would hand its buffers to the next run's budget
-      // and Spark's own leak detection would report the loss against the wrong task.
-      writerContext.markTaskCompleted(None)
-      readerContext.markTaskCompleted(None)
     }
+    // Closed at the later of the two halves' own finishing stamps, so the window is exactly what
+    // this method documents -- from just before the producer started to after both halves finished,
+    // the producer's stop included -- with the settlement and the context completions that follow
+    // them left outside it.
+    val elapsedNanos = math.max(producerFinishedAt.get(), consumerFinishedAt.get()) - startedAt
+    requireOverlapRunSucceeded(producerFailure, consumerFailure, consumptionDrained.get())
+    // Read after the task contexts have been completed, which is the only point at which the
+    // durable figure exists: on the successful path the spill manager publishes onto
+    // `TaskMetrics.diskBytesSpilled` from its task-completion listener, not from the writer's stop,
+    // so a read taken before completion would report every run as having made nothing durable.
+    val run = overlapRunOf(elapsedNanos, writerHandle.get(), writerContext, produced, consumed,
+      consumedDuringProduction)
     // The registration is released last: after both task contexts have completed, so it outlives
     // every reservation taken against it, and only on the success path, so a cleanup failure can
     // never mask the failure that caused it. Releasing it at all is what keeps each run's
@@ -867,16 +903,20 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
    * from a half-finished delivery would not be a slow measurement, it would not be a measurement at
    * all, and presenting one as if it were is the single most misleading thing a benchmark can do.
    *
-   * @param producer the producing thread, checked for having finished inside its budget
-   * @param consumer the consuming thread, checked likewise
+   * Both halves having actually stopped is not checked here, because
+   * [[StreamingShuffleTestHelper.runBoundedThreadedScenario]] already owns that: it raises for any
+   * thread that survived its join budget, a released wait and an interrupt, so a run that reaches
+   * this point has two finished halves by construction.
+   *
    * @param producerFailure whatever the producer raised, if it raised anything
    * @param consumerFailure whatever the consumer raised, if it raised anything
+   * @param consumptionDrained whether the producer's wait for its consumer to finish was satisfied,
+   *                           rather than having expired
    */
   private def requireOverlapRunSucceeded(
-      producer: Thread,
-      consumer: Thread,
       producerFailure: AtomicReference[Throwable],
-      consumerFailure: AtomicReference[Throwable]): Unit = {
+      consumerFailure: AtomicReference[Throwable],
+      consumptionDrained: Boolean): Unit = {
     if (producerFailure.get() != null) {
       throw new IllegalStateException(
         "the overlap producer failed to stream its output", producerFailure.get())
@@ -885,9 +925,33 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
       throw new IllegalStateException(
         "the overlap consumer failed to read its partition", consumerFailure.get())
     }
-    if (producer.isAlive || consumer.isAlive) {
+    if (!consumptionDrained) {
       throw new IllegalStateException(
-        s"an overlap run did not finish inside its ${OverlapJoinTimeoutMillis} ms budget")
+        s"an overlap run's producer waited ${OverlapJoinTimeoutMillis} ms for its consumer to " +
+          s"finish reading and the wait expired, so the durable figure would describe a window " +
+          s"this measurement created by stopping early rather than one its consumer left")
+    }
+  }
+
+  /**
+   * Requires a sequencing latch to have opened inside the run's budget.
+   *
+   * The two overlap cases are defined by WHEN the consumer attaches, so the wait that establishes
+   * the attachment instant decides which case was run. A wait whose result is discarded lets a run
+   * that attached at the wrong instant -- or at no instant at all -- be reported as though it had
+   * attached at the right one, and there is no figure in the report that would reveal it. Raising
+   * here is what keeps a row and the case it is labelled with the same thing.
+   *
+   * @param latch the sequencing latch to wait on
+   * @param awaited what the latch signals, named in the failure so a timeout is attributable
+   */
+  private def requireOverlapPrecondition(latch: CountDownLatch, awaited: String): Unit = {
+    val opened = latch.await(OverlapJoinTimeoutMillis, TimeUnit.MILLISECONDS)
+    if (!opened) {
+      throw new IllegalStateException(
+        s"an overlap run waited ${OverlapJoinTimeoutMillis} ms for $awaited before attaching its " +
+          s"consumer and the wait expired, so the attachment instant this case is defined by " +
+          s"never happened")
     }
   }
 

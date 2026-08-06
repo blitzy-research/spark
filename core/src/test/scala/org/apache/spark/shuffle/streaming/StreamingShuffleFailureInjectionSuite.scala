@@ -1359,7 +1359,19 @@ class StreamingShuffleFailureInjectionSuite
       }
     }, "streaming-shuffle-injected-loss-consumer")
 
-    try {
+    // The shared settlement owns the whole lifecycle of these two threads: it joins them inside the
+    // budget, and on expiry releases the latch either half may be parked on, interrupts whatever
+    // that did not free, re-joins inside a bounded grace, and only THEN completes the task contexts
+    // that hold this pair's execution-memory reservations. Completing them while a producer or a
+    // consumer was still running is what would leave a thread alive against a finished context, and
+    // for threads that are not daemons that thread can outlive the suite; a thread that survives
+    // every stage fails the case by name with the top of its stack rather than silently.
+    runBoundedThreadedScenario(
+      threads = Seq(producer, consumer),
+      taskContexts = Seq(writerContext, readerContext),
+      description = "the injected producer loss under a reading consumer",
+      joinTimeoutMillis = LiveLossJoinMillis,
+      releaseWaits = () => consumerConsumedOne.countDown()) {
       producer.start()
       eventually(timeout(60.seconds), interval(20.milliseconds)) {
         assert(writerHandle.get() != null || producerFailure.get() != null,
@@ -1369,15 +1381,7 @@ class StreamingShuffleFailureInjectionSuite
         s"the producer must have been given a streaming writer, but failed with " +
           s"${producerFailure.get()}")
       consumer.start()
-      producer.join(LiveLossJoinMillis)
-      consumer.join(LiveLossJoinMillis)
-    } finally {
-      writerContext.markTaskCompleted(None)
-      readerContext.markTaskCompleted(None)
     }
-    assert(!producer.isAlive && !consumer.isAlive,
-      "both halves must have finished inside the join budget, or the case timed out rather than " +
-        "observed anything")
     assert(producerFailure.get() == null,
       s"the producer half must have failed only where the fault was injected, but raised " +
         s"${producerFailure.get()}")

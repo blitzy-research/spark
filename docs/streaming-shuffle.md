@@ -86,10 +86,12 @@ different manager might imply. Leaving the manager selected and setting
 stock sort-based shuffle -- the same code path, the same metrics, the same output -- while keeping the
 configuration you will re-enable later intact.
 
-All five streaming properties are read when the manager is constructed. Changing the kill switch,
-like changing any other streaming property, requires restarting the affected executors. A safe
-rollout is therefore to deploy the streaming manager with the gate closed, verify sort behaviour,
-then restart with the gate open.
+Every one of the five streaming properties is read once when the component that uses it is
+constructed -- the manager, the buffer allowance, the flow-control protocol, the rate limiter and
+the fallback policy each take their own snapshot -- and is then held immutably. Changing the kill
+switch, like changing any other streaming property, therefore requires restarting the affected
+executors. A safe rollout is to deploy the streaming manager with the gate closed, verify sort
+behaviour, then restart with the gate open.
 
 The decision path is:
 
@@ -251,9 +253,10 @@ Three consequences matter in practice:
 * The budget is **executor-wide, not per task, and not per direction**. Every concurrently
   streaming task on the executor draws on the same allowance, and producer framing, buffered
   blocks, received frames, transient copies and per-block metadata are all charged against that one
-  figure. The exact per-partition allowance is:
+  figure. The exact per-partition allowance is that same aggregate budget divided by the number of
+  partitions, that is:
 
-      (executorMemory * bufferPercent) / numPartitions
+      ((executorMemory * bufferPercent) / 100) / numPartitions
 
   A wide shuffle therefore gives each partition a smaller allowance. The allowance holds retained
   blocks in flight, not the partition's entire logical output.
@@ -537,8 +540,10 @@ mandatory; TLS and trusted-network isolation remain explicit deployment decision
 # Operational limits
 
 * **Configuration changes require a restart.** Every `spark.shuffle.streaming.*` property is read
-  once when the streaming shuffle manager is constructed and held immutably thereafter. There is no
-  dynamic reconfiguration: to change any of them, restart the executors.
+  once when the component that uses it is constructed -- the manager, the buffer allowance, the
+  flow-control protocol, the rate limiter and the fallback policy each take their own snapshot --
+  and is then held immutably. There is no dynamic reconfiguration: to change any of them, restart
+  the executors.
 * **Blocks are capped at 2 MiB (2,097,152 bytes).** The cap bounds framing and retransmission work.
 * **Telemetry overhead is budgeted below 1% CPU.** Counters update on events rather than per
   record, and the buffer-utilisation gauge is calculated when read.
