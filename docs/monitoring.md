@@ -1256,11 +1256,18 @@ This is the component with the largest amount of instrumented metrics
     a non-zero reading may describe streaming activity that has already ended; read them as
     running totals and difference successive samples to obtain a rate.
   - bufferUtilizationPercent (gauge): executor-wide utilization of the streaming shuffle buffer
-    budget, as a percentage. A value approaching `spark.shuffle.streaming.spillThreshold`
-    (default is 80) predicts spilling. The value is reported as measured and is not clamped, so it
-    may briefly read above 100 while an allocation is over the budget set by
-    `spark.shuffle.streaming.bufferSizePercent`; that is deliberate, because masking an over-budget
-    executor would hide the condition this gauge exists to expose.
+    budget, as a percentage. The numerator is every byte of streaming shuffle buffer held on the
+    executor, in both directions and across all four categories the budget charges -- producer
+    framing and buffered blocks, consumer received frames, transient framing copies, and per-stream
+    metadata -- and the denominator is the whole budget set by
+    `spark.shuffle.streaming.bufferSizePercent`. There is one budget per executor rather than one
+    per direction, so a single reading covers everything the subsystem holds. A value approaching
+    `spark.shuffle.streaming.spillThreshold` (default is 80) predicts spilling, and it is the same
+    aggregate reading the spill trigger is evaluated against. Reservation is admission-controlled --
+    a request that would carry the total past the budget is refused rather than granted -- so the
+    reading stays within 0 to 100. It is nonetheless reported as measured and never clamped, so that
+    a reading above 100, which admission should make impossible, stays visible as the accounting
+    defect it would be rather than being masked at exactly 100.
   - spillCount (counter): number of spill events performed to keep buffer utilization within
     `spark.shuffle.streaming.spillThreshold`, counted once per spill event rather than once per
     evicted partition. Two kinds of disk write are counted, because both mean the buffer allowance
@@ -1507,11 +1514,18 @@ These metrics are exposed by Spark executors.
     a non-zero reading may describe streaming activity that has already ended; read them as
     running totals and difference successive samples to obtain a rate.
   - bufferUtilizationPercent (gauge): executor-wide utilization of the streaming shuffle buffer
-    budget, as a percentage. A value approaching `spark.shuffle.streaming.spillThreshold`
-    (default is 80) predicts spilling. The value is reported as measured and is not clamped, so it
-    may briefly read above 100 while an allocation is over the budget set by
-    `spark.shuffle.streaming.bufferSizePercent`; that is deliberate, because masking an over-budget
-    executor would hide the condition this gauge exists to expose.
+    budget, as a percentage. The numerator is every byte of streaming shuffle buffer held on the
+    executor, in both directions and across all four categories the budget charges -- producer
+    framing and buffered blocks, consumer received frames, transient framing copies, and per-stream
+    metadata -- and the denominator is the whole budget set by
+    `spark.shuffle.streaming.bufferSizePercent`. There is one budget per executor rather than one
+    per direction, so a single reading covers everything the subsystem holds. A value approaching
+    `spark.shuffle.streaming.spillThreshold` (default is 80) predicts spilling, and it is the same
+    aggregate reading the spill trigger is evaluated against. Reservation is admission-controlled --
+    a request that would carry the total past the budget is refused rather than granted -- so the
+    reading stays within 0 to 100. It is nonetheless reported as measured and never clamped, so that
+    a reading above 100, which admission should make impossible, stays visible as the accounting
+    defect it would be rather than being masked at exactly 100.
   - spillCount (counter): number of spill events performed to keep buffer utilization within
     `spark.shuffle.streaming.spillThreshold`, counted once per spill event rather than once per
     evicted partition. Two kinds of disk write are counted, because both mean the buffer allowance

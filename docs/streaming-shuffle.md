@@ -155,6 +155,22 @@ reduce attempt reading while a superseded or speculative map attempt is still pr
 consumer resuming after a channel loss, and for retransmission from the unacknowledged window. In
 those cases blocks go straight from the producer's buffers to the consumer with no disk involved.
 
+There is exactly one egress path, and it is that live one: a consumer attached while a producer runs
+and a consumer attached after that producer's task has gone are served by the same code, over the
+same transport, with the same credit, checksums and acknowledgements. What differs is only how much
+the producer still held when its task ended, and that is decided by how much its consumers had
+taken. Both halves of the claim are established by the suites rather than asserted here:
+
+* `StreamingShuffleIntegrationTest` attaches a consumer during production and asserts that records
+  reach it before the producer has finished, and that a producer whose consumer kept pace writes
+  only a fraction of what it streamed;
+* the same suite runs an ordinary scheduled job on two executor JVMs and **measures** the stage
+  boundary, reporting how long after the map stage completed the reduce stage was submitted and how
+  many bytes each half moved -- so the limit above is a measurement, not a caveat; and
+* `StreamingShufflePerformanceBenchmark` prices the overlap, by delivering one volume twice through
+  the production components and varying only when the consumer attaches. See
+  [How the targets are measured](#how-the-targets-are-measured).
+
 ## How the targets are measured
 
 The performance figures for this feature are **acceptance targets measured by a benchmark**, not
@@ -162,6 +178,17 @@ thresholds enforced by a build gate. `StreamingShufflePerformanceBenchmark` prod
 sort-versus-streaming report (latency, memory, spill and bandwidth) for a 100 MB, 10-partition
 `groupByKey`, plus a CPU-bound case that isolates coordination overhead. Judge streaming on that
 report against your own workload; nothing in the standard test run asserts a percentage.
+
+The report carries a third scenario, and it is the one to read if the section above left you
+wondering what the pipelining is worth. **Producer/consumer overlap** delivers one volume twice --
+once to a consumer attached while the producer is producing, once to a consumer attached only after
+it has stopped -- through the same manager, writer, reader, rendezvous and transport, on one
+context, varying nothing but the attachment instant. Beside the two elapsed times it prints how many
+records each arm read while the producer was still producing, which is what says how much overlap
+the measurement actually contained, and what each arm had to make durable at the producer's stop.
+Read that reduction as the value of the overlap on the path the shuffle abstraction owns; it is not
+a scheduled job's latency and may not be added to the figure from the comparison above, because a
+scheduled job attaches its consumer only after its map stage has finished.
 
 Two figures in that report deserve a caveat, because they are easy to over-read:
 
@@ -367,7 +394,7 @@ The static metrics source exposes exactly four metrics under the `shuffle.stream
 
 | Metric | Type | Reading it |
 |---|---|---|
-| `shuffle.streaming.bufferUtilizationPercent` | gauge | Live executor-wide buffer occupancy. Approaching `spark.shuffle.streaming.spillThreshold` predicts spilling. Returns to 0 once buffers are released, and is deliberately not clamped at 100. |
+| `shuffle.streaming.bufferUtilizationPercent` | gauge | Live executor-wide buffer occupancy: every byte of streaming buffer the executor holds, in both directions and in all four charged categories (producer framing and buffered blocks, consumer received frames, transient framing copies, per-stream metadata), over the one budget `spark.shuffle.streaming.bufferSizePercent` sets. Approaching `spark.shuffle.streaming.spillThreshold` predicts spilling, and it is the same aggregate reading the spill trigger uses. Admission refuses any reservation past the budget, so the reading stays within 0-100; it is deliberately still not clamped, so a reading above 100 would remain visible as the accounting defect it would be. Returns to 0 once buffers are released. |
 | `shuffle.streaming.spillCount` | counter | Spill events, counted once per event. Pressure signal: the end-of-stream flush that makes retained output durable is not counted, though its bytes still reach `diskBytesSpilled`. |
 | `shuffle.streaming.backpressureEvents` | counter | Transitions into a throttled state, counted once per episode. Steady zero on an unpressured workload. |
 | `shuffle.streaming.partialReadInvalidations` | counter | Producer failures a consumer recovered from by discarding partial reads and recomputing. Non-zero means the failure path is being exercised. |

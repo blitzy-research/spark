@@ -346,10 +346,13 @@ private[spark] object StreamingShuffleStandDownCause {
  *    manager. A partial grant is Spark's own idiom for memory pressure -- `acquireMemory` answers
  *    with the amount it could actually grant -- and a partial grant that eviction could not reverse
  *    trips [[StreamingShuffleFallbackReason.MemoryPressure]].
- *  - [[recordLinkUtilization]] carries egress against the administered link capacity, and
- *    saturation sustained across consecutive measurement intervals trips
- *    [[StreamingShuffleFallbackReason.NetworkSaturation]]. Intervals rather than observations,
- *    because the callers poll ten times per published rate.
+ *  - [[recordLinkUtilization]] carries egress against the administered link capacity, and the
+ *    '''first''' evaluable reading '''strictly above''' the tolerated share trips
+ *    [[StreamingShuffleFallbackReason.NetworkSaturation]]. One reading, not a run: the
+ *    specification attaches no sustaining requirement to this condition, so none is imposed here,
+ *    there is no counter to accumulate, and a trip is therefore always attributable to the very
+ *    reading that caused it. A reading taken against a capacity that is zero, negative or not a
+ *    finite number is not evidence of anything and never trips.
  *  - [[checkProtocolVersion]] performs an explicit compatibility check on the version byte in the
  *    wire header, and an incompatible peer trips
  *    [[StreamingShuffleFallbackReason.ProtocolVersionMismatch]]. Only a peer's wire revision does:
@@ -821,8 +824,10 @@ private[spark] class StreamingShuffleFallbackPolicy(
    * protection against a spurious trip: a reading is either evaluable, in which case it is evidence
    * and is acted on immediately, or it is not, in which case it is not evidence at all.
    *
-   * The sample is attributed to the instant the injected clock reports. Use the three-argument form
-   * when the caller already holds the instant its measurement belongs to.
+   * The sample is passed on with the instant the injected clock reports. Use the three-argument
+   * form when the caller already holds the instant its measurement belongs to -- noting, as that
+   * overload documents, that an instantaneous rule consults no instant, so the choice of form
+   * cannot change whether a reading trips.
    *
    * @param usedBytesPerSecond observed egress, in bytes per second
    * @param capacityBytesPerSecond the link capacity the observation is measured against, in bytes
@@ -835,26 +840,34 @@ private[spark] class StreamingShuffleFallbackPolicy(
   /**
    * Records observed egress against an explicit link capacity, at an explicit instant.
    *
-   * <b>Why the instant is part of the observation.</b> A rate is a property of a measurement
-   * interval, and the interval this condition is evaluated over is
-   * [[BackpressureProtocol.SATURATION_SAMPLE_WINDOW_MS]] -- one second, which is the cadence at
-   * which the protocol's rate windows republish. The callers, by contrast, poll on the protocol's
-   * hundred-millisecond cadence, so the same published rate is handed to this method roughly ten
-   * times before a new one exists. Counting observations therefore reached the sustained threshold
-   * inside a single interval and stood streaming down in two or three hundred milliseconds on one
-   * legal burst -- the very burst the sustained rule exists to tolerate. Distinct intervals are
-   * counted instead, identified by quantising the observation instant onto the sample window, which
-   * is exactly the rule `BackpressureProtocol` applies to its own view of the same condition.
+   * The decision is the two-argument form's decision, unchanged: the '''first''' evaluable reading
+   * '''strictly above''' the tolerated share trips, with no run to accumulate and no interval to
+   * identify. This overload therefore differs from that one in exactly one respect -- who supplies
+   * the instant -- and in none that can change the outcome.
    *
-   * The instant is a parameter rather than only a clock read so that a caller which already knows
-   * which measurement interval its figure belongs to can say so, exactly as
-   * [[recordProducerThroughput]] does -- and so that the bound is deterministic under test rather
-   * than dependent on how fast a loop runs.
+   * <b>Why an instant is in the signature at all, given the rule does not use one.</b> The policy's
+   * recorders take an instant as a family, because the conditions that '''are''' sustained -- the
+   * consumer-slowness window fed by [[recordProducerThroughput]] and [[recordConsumerThroughput]]
+   * -- must attribute a figure to the moment it was measured rather than to the moment it was
+   * reported, and a caller holding both should never have to reach for a clock for one of them and
+   * not the others. Uniformity is the whole of the reason, and this method keeps the parameter
+   * rather than diverging from its siblings.
+   *
+   * <b>What that means for a caller.</b> Nothing is retained under this instant and nothing is
+   * quantised onto a window, so a stale instant can neither delay a trip nor bring one forward, and
+   * a burst that a sustained rule would have tolerated is '''not''' tolerated here. That is
+   * deliberate: the specification states this condition as saturation above
+   * [[StreamingShuffleFallbackPolicy.SATURATION_TRIP_PERCENT]] of link capacity with no sustaining
+   * requirement attached, and inventing one would tolerate exactly the saturation an operator
+   * administered a capacity in order to avoid. The sustained rule `BackpressureProtocol` applies to
+   * its own view of link usage is that component's, and is not this policy's trip condition.
    *
    * @param usedBytesPerSecond observed egress, in bytes per second
    * @param capacityBytesPerSecond the link capacity the observation is measured against, in bytes
    *                               per second
-   * @param sampleTimeMillis the instant the measurement belongs to, in milliseconds
+   * @param sampleTimeMillis the instant the measurement belongs to, in milliseconds; accepted for
+   *                         uniformity with the sustained recorders and deliberately not consulted
+   *                         by this instantaneous rule
    */
   def recordLinkUtilization(
       usedBytesPerSecond: Double,

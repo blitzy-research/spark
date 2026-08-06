@@ -19,7 +19,7 @@ package org.apache.spark.shuffle.streaming
 
 import java.io.File
 import java.nio.ByteBuffer
-import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong}
 
 import scala.collection.mutable
 import scala.util.control.NonFatal
@@ -437,7 +437,9 @@ class StreamingShuffleWriterSuite
    * fallback verdict is latched exactly as the coordinator latches it, so a second declaration
    * returns the state the first one established.
    */
-  private class RecordingCoordinatorGateway(refuseStandDown: Boolean = false)
+  private class RecordingCoordinatorGateway(
+      refuseStandDown: Boolean = false,
+      completionAnswer: Option[Boolean] = Some(true))
     extends StreamingShuffleCoordinatorGateway {
 
     private val declared = new mutable.ArrayBuffer[StreamingShuffleStandDownCause]()
@@ -504,9 +506,13 @@ class StreamingShuffleWriterSuite
 
     override def completeProducer(
         shuffleId: Int,
-        generation: StreamingShuffleProducerGeneration): Boolean = synchronized {
+        generation: StreamingShuffleProducerGeneration): Option[Boolean] = synchronized {
       completed += generation
-      true
+      // The three answers the interface documents, selected by the switch a case sets.
+      // `Some(false)` is the driver refusing a generation it has disowned -- the answer a
+      // shuffle-wide stand-down or a superseding attempt produces -- and `None` is a driver that
+      // could not be asked, which is emphatically not a refusal.
+      completionAnswer
     }
 
     override def heartbeatProducer(
@@ -903,6 +909,29 @@ class StreamingShuffleWriterSuite
       awaitDataPlane("consumer subscription")
     }
 
+    /**
+     * Acknowledges consumption through one position, which is what releases the producer's retained
+     * blocks up to and including it.
+     *
+     * Sent as a real ack frame through the production receive path, because the release this drives
+     * is the whole point: an acknowledged block is one the producer no longer holds, and a case
+     * that reached into the store to free it would not exercise the protocol that frees it.
+     *
+     * @param shuffleId the shuffle the producer serves
+     * @param mapId the map output the producer serves
+     * @param partitionId the reduce partition being acknowledged
+     * @param position the highest data-block sequence number consumed
+     */
+    def acknowledge(
+        shuffleId: Int,
+        mapId: Long,
+        partitionId: Int,
+        position: Long): Unit = {
+      handler.receive(client,
+        new AckMessage(shuffleId, mapId, partitionId, position).toByteBuffer())
+      awaitDataPlane("consumer acknowledgement")
+    }
+
     /** Requests replay through one position and waits for the worker-owned transition. */
     def retransmit(
         shuffleId: Int,
@@ -943,6 +972,61 @@ class StreamingShuffleWriterSuite
       if (channel.isOpen) {
         channel.close().syncUninterruptibly()
       }
+    }
+  }
+
+  /**
+   * A record stream that acknowledges the producer's first delivered block through a live consumer
+   * and only then applies a runtime trip condition.
+   *
+   * The order is the whole point of the cases that use this, and it cannot be arranged from outside
+   * the iterator: a block has to have been framed and delivered before there is anything to
+   * acknowledge, and the trip has to arrive after the acknowledgement has released it, while
+   * records still remain so the stand-down is observed mid-production. Both are therefore driven
+   * from inside the stream the writer is consuming.
+   *
+   * The consumer's channel is drained only until the first block arrives, because draining settles
+   * the producer's data plane and doing it per record for a whole stream would dominate the case's
+   * runtime for no additional evidence.
+   *
+   * @param harness the producer under test
+   * @param consumer a consumer already subscribed to partition zero
+   * @param recordCount records to offer
+   * @param seed seed of the deterministic record stream
+   * @param trip applies the condition under test to the fixture's policy, and asserts that it fired
+   * @return the record stream, not yet consumed
+   */
+  private def acknowledgeThenTrip(
+      harness: WriterHarness,
+      consumer: ConsumerAttachment,
+      recordCount: Int,
+      seed: Long)(
+      trip: StreamingShuffleFallbackPolicy => Unit): Iterator[Product2[Int, Int]] = {
+    val acknowledged = new AtomicLong(MemorySpillManager.UNSET_SEQUENCE)
+    val tripped = new AtomicBoolean(false)
+    deterministicRecords(recordCount, seed = seed, keySpace = 40).iterator.map { record =>
+      if (acknowledged.get() == MemorySpillManager.UNSET_SEQUENCE) {
+        if (harness.writer.blocksStreamed > 0L) {
+          val delivered = consumer.drainOutbound().collect {
+            case block: DataBlockMessage => block.sequenceNumber()
+          }
+          if (delivered.nonEmpty) {
+            // A real ack frame on a real channel, so the release is the production release.
+            consumer.acknowledge(harness.shuffleId, defaultMapId, 0, delivered.max)
+            acknowledged.set(delivered.max)
+            // Either a prefix went, so the window no longer starts at zero, or everything went and
+            // nothing is retained at all. Both mean the same thing here: a byte range beginning at
+            // sequence zero no longer exists, so no rewrite can reproduce this task's input.
+            assert(harness.spillManager.lowestRetainedSequence(0) != 0L,
+              "the acknowledgement must have released the retained prefix of partition 0, or " +
+                "this case is the in-place rewrite case rather than the one it cannot serve")
+          }
+        }
+      } else if (!tripped.get()) {
+        tripped.set(true)
+        trip(harness.fallbackPolicy)
+      }
+      record
     }
   }
 
@@ -2619,6 +2703,106 @@ class StreamingShuffleWriterSuite
     }
   }
 
+  test("a refused completion publishes no ordinary status and reports the withdrawn one instead") {
+    // The publication barrier, from the producer's side. A shuffle-wide stand-down withdraws a
+    // shuffle's map output on the DRIVER, while a map task in its final drain keeps running -- so
+    // the two overlap, and a writer that published an ordinary map status afterwards would
+    // re-register the very output the withdrawal removed. The map stage would then report itself
+    // available again, the recomputation the stand-down exists to force would not happen, and the
+    // delegated reduce stage would retry against output no owner will serve.
+    //
+    // The driver's refusal of the completion report is the only authoritative statement of that
+    // fact, so this case answers `Some(false)` from the gateway -- exactly what the coordinator
+    // answers once a generation has been retired -- and asserts what the writer does about it.
+    val refusing = new RecordingCoordinatorGateway(completionAnswer = Some(false))
+    val harness = newHarness(registration = RegistrationFixture(gateway = refusing))
+    withHarness(harness) { fixture =>
+      fixture.writer.write(deterministicRecords(96, seed = 211L, keySpace = 24).iterator)
+      // The shuffle-wide verdict this executor now holds, which is what makes the refusal a
+      // DEGRADATION rather than a zombie attempt: a stand-down completes the attempt so that no
+      // task attempt is consumed for a condition the platform absorbs. Cached exactly as a
+      // declaration's answer is cached, and deliberately without arming a LOCAL trip, so that the
+      // only thing under test is what the writer does with the driver's refusal.
+      assert(fixture.fallbackPolicy.observeShuffleFallback(fixture.shuffleId,
+          StreamingShuffleFallbackState(
+            StreamingShuffleFallbackReason.NetworkSaturation.toString, declaredEpoch)),
+        "the shuffle-wide verdict must be cached, because that is what the writer consults")
+
+      val status = fixture.writer.stop(success = true)
+      assert(status.isDefined,
+        "the shared write path dereferences the status unconditionally, so even a withdrawn " +
+          "output must report one")
+      val reported = status.get
+      // The void status: every declared partition reports at least one byte, so no reducer may skip
+      // this output, and every ask for it fails because it was withdrawn before this status
+      // existed.
+      (0 until defaultPartitions).foreach { partitionId =>
+        assert(reported.getSizeForBlock(partitionId) > 0L,
+          s"partition $partitionId of a withdrawn output must be unskippable, or a reducer would " +
+            "silently produce a result short of data")
+      }
+      assert(fixture.gateway.completions.nonEmpty,
+        "the writer must have asked the driver to accept its completion before publishing anything")
+      assert(fixture.routes.withdrawals.nonEmpty,
+        s"a refused generation must be withdrawn from every owner on this executor, yet the " +
+          s"routing table saw ${fixture.routes.withdrawals}")
+      assert(!fixture.serverHandler.servesRetainedOutput,
+        "and it must serve nothing further, because the output it held is being recomputed")
+      assertNoPublishedFailure(fixture.errorNotifier,
+        "a producer that finished into a shuffle-wide fallback")
+    }
+  }
+
+  test("a refused completion with no shuffle-wide verdict fails rather than publishing") {
+    // The other refusal, and the one that must NOT complete. A generation the driver has disowned
+    // without any shuffle-wide stand-down is a zombie: it was superseded by a newer attempt, or
+    // invalidated by a consumer that has already raised the fetch failure which recomputes the
+    // stage. Completing it would publish a status for output the winning attempt owns, so the
+    // honest answer is to fail -- the scheduler has the recovery, and this attempt's records will
+    // be produced again by the attempt that owns the map index.
+    val refusing = new RecordingCoordinatorGateway(completionAnswer = Some(false))
+    val harness = newHarness(registration = RegistrationFixture(gateway = refusing))
+    withHarness(harness) { fixture =>
+      fixture.writer.write(deterministicRecords(96, seed = 212L, keySpace = 24).iterator)
+      assert(!fixture.fallbackPolicy.hasTripped,
+        "no trip may be latched here, or this would be the degradation case rather than the " +
+          "zombie one")
+
+      val failure = intercept[SparkException] {
+        fixture.writer.stop(success = true)
+      }
+      assert(failure.getMessage.contains("no longer holds that producer generation"),
+        s"the failure must name the reason precisely so it cannot be mistaken for a generic one, " +
+          s"but was: ${failure.getMessage}")
+      assert(fixture.writer.producedMapStatus.isEmpty,
+        "and no map status may exist for a generation the driver disowned")
+      assert(fixture.routes.withdrawals.nonEmpty,
+        "the failed generation must be withdrawn from every owner on this executor")
+    }
+  }
+
+  test("a completion the driver could not be asked about still publishes its status") {
+    // The third answer, and the one a refusal must never be confused with. An unreachable driver
+    // knows nothing about this generation, and withholding a map output on the strength of nothing
+    // would fail a task whose output is perfectly readable -- the same direction every other
+    // unreachable answer in this subsystem resolves in, and the direction `heartbeatProducer`
+    // documents for itself.
+    val unreachable = new RecordingCoordinatorGateway(completionAnswer = None)
+    val harness = newHarness(registration = RegistrationFixture(gateway = unreachable))
+    withHarness(harness) { fixture =>
+      fixture.writer.write(deterministicRecords(96, seed = 213L, keySpace = 24).iterator)
+      val status = fixture.writer.stop(success = true)
+      assert(status.isDefined && status.get.mapId === defaultMapId,
+        "an unreachable driver must not cost a producer its map status")
+      assert(fixture.writer.getPartitionLengths().exists(_ > 0L),
+        "and the status must describe output that was really streamed")
+      assert(fixture.routes.withdrawals.isEmpty,
+        s"nothing may be withdrawn on the strength of an answer that was never received, yet the " +
+          s"routing table saw ${fixture.routes.withdrawals}")
+      assertNoPublishedFailure(fixture.errorNotifier, "a producer whose driver was unreachable")
+    }
+  }
+
   test("a second stop is a no-op that returns None") {
     withHarness(newHarness()) { harness =>
       harness.writer.write(deterministicRecords(64, seed = 6L, keySpace = 16).iterator)
@@ -4132,6 +4316,120 @@ class StreamingShuffleWriterSuite
       assert(fixture.metrics.recordsWritten === 0L,
         s"a degraded attempt must publish none of the records it streamed, but published " +
           s"${fixture.metrics.recordsWritten}")
+    }
+  }
+
+  test("a runtime stand down after a live consumer acknowledged a block invalidates instead") {
+    // The case the in-place rewrite above CANNOT serve, and the reason it is proved impossible
+    // before the sort-based writer is ever built.
+    //
+    // The rewrite reads this attempt's own streamed blocks back out of the retained store. An
+    // acknowledgement is precisely the instruction to stop retaining them: a consumer that has
+    // taken a block owns it, so the producer releases it and its memory. Once a live consumer has
+    // acknowledged anything, a byte range beginning at sequence zero no longer exists and no
+    // rewrite can produce this map task's input in full. Discovering that half way through the
+    // delegate's own write would leave a partially written map output behind a failing attempt; the
+    // window bounds are therefore checked first, between the withdrawal and the delegate.
+    //
+    // The recovery asserted here is the specified one and invents nothing: the generation is
+    // withdrawn from every owner of it -- which atomically invalidates what the consumer had
+    // partially consumed, because every later fetch of it is now a fetch failure -- the
+    // shuffle-wide verdict is latched so the recomputation is served by the sort-based path from
+    // its first record, and the attempt fails naming the exact block it could not replay.
+    val delegate = new RecordingSortShuffleWriter(DegradationPartitions)
+    val harness = newHarness(
+      numPartitions = DegradationPartitions,
+      executorMemoryBytes = DegradationExecutorMemoryBytes,
+      sortWriterFactory = Some(() => delegate))
+    withHarness(harness) { fixture =>
+      val consumer = attachConsumer(fixture)
+      try {
+        consumer.subscribe(fixture.shuffleId, defaultMapId, partitionId = 0)
+        val refusal = intercept[SparkException] {
+          fixture.writer.write(
+            acknowledgeThenTrip(fixture, consumer, DegradationRecords, seed = 233L) { policy =>
+              policy.recordLinkUtilization(
+                usedBytesPerSecond = 990.0d, capacityBytesPerSecond = 1000.0d)
+              assert(policy.trippedReason.contains(
+                  StreamingShuffleFallbackReason.NetworkSaturation),
+                s"link saturation must trip NetworkSaturation, but the policy reported " +
+                  s"${policy.trippedReason}")
+            })
+        }
+
+        assert(refusal.getMessage.contains("is no longer retained"),
+          s"the refusal must name the block it cannot replay rather than read as a generic " +
+            s"failure, but was: ${refusal.getMessage}")
+        assert(delegate.writeCallCount === 0,
+          s"and nothing may have been written through the sort-based delegate, because a rewrite " +
+            s"that cannot be completed must not be started, yet it was written to " +
+            s"${delegate.writeCallCount} time(s)")
+        assert(fixture.gateway.declaredFallbacks.contains(
+            StreamingShuffleFallbackReason.NetworkSaturation),
+          s"the verdict must still be latched shuffle-wide so the recomputation is served by the " +
+            s"sort-based path, but the gateway saw ${fixture.gateway.declaredFallbacks.mkString}")
+        assert(fixture.gateway.invalidations.contains(
+            StreamingShuffleInvalidationReason.IncompleteStream),
+          s"and the generation must be withdrawn so the consumer's partial consumption is " +
+            s"invalidated, but the gateway saw ${fixture.gateway.invalidations.mkString}")
+        assert(!fixture.serverHandler.servesRetainedOutput,
+          "the withdrawn generation must serve nothing further")
+        assert(fixture.metrics.bytesWritten === 0L && fixture.metrics.recordsWritten === 0L,
+          "and an attempt whose output is recomputed must publish none of what it streamed")
+      } finally {
+        consumer.close()
+      }
+    }
+  }
+
+  test("the same invalidation happens when a live consumer's slowness is what stands it down") {
+    // The second runtime condition, driven the way the policy documents it: a consumer sustained at
+    // least twice as slow as its producer, continuously for longer than the window. Both runtime
+    // conditions have to reach the same terminus once a consumer has acknowledged, because it is
+    // the ACKNOWLEDGEMENT and not the condition that makes the rewrite impossible -- and a consumer
+    // that fell behind is by definition one that was reading, the likelier of the two.
+    //
+    // The throughput samples carry their own instants rather than moving the fixture's clock, so
+    // the sixty-second window is crossed without crossing the ten-second consumer-liveness window
+    // and turning this into a test of the consumer-failure flow.
+    val delegate = new RecordingSortShuffleWriter(DegradationPartitions)
+    val harness = newHarness(
+      numPartitions = DegradationPartitions,
+      executorMemoryBytes = DegradationExecutorMemoryBytes,
+      sortWriterFactory = Some(() => delegate))
+    withHarness(harness) { fixture =>
+      val consumer = attachConsumer(fixture)
+      try {
+        consumer.subscribe(fixture.shuffleId, defaultMapId, partitionId = 0)
+        val armedAt = fixture.clock.getTimeMillis()
+        val refusal = intercept[SparkException] {
+          fixture.writer.write(
+            acknowledgeThenTrip(fixture, consumer, DegradationRecords, seed = 234L) { policy =>
+              policy.recordProducerThroughput(fixture.shuffleId, 1000.0d, armedAt)
+              policy.recordConsumerThroughput(fixture.shuffleId, 400.0d, armedAt)
+              policy.recordConsumerThroughput(fixture.shuffleId, 400.0d,
+                armedAt + StreamingShuffleFallbackPolicy.SUSTAINED_SLOWNESS_WINDOW_MS + 1L)
+              assert(policy.trippedReason.contains(
+                  StreamingShuffleFallbackReason.ConsumerTooSlow),
+                s"a deficit held past the window must trip ConsumerTooSlow, but the policy " +
+                  s"reported ${policy.trippedReason}")
+            })
+        }
+
+        assert(refusal.getMessage.contains("is no longer retained"),
+          s"the refusal must name the block it cannot replay, but was: ${refusal.getMessage}")
+        assert(delegate.writeCallCount === 0,
+          "and no partial map output may have been written through the sort-based delegate")
+        assert(fixture.gateway.declaredFallbacks.contains(
+            StreamingShuffleFallbackReason.ConsumerTooSlow),
+          s"the consumer-slowness verdict must be latched shuffle-wide, but the gateway saw " +
+            s"${fixture.gateway.declaredFallbacks.mkString}")
+        assert(fixture.gateway.invalidations.contains(
+            StreamingShuffleInvalidationReason.IncompleteStream),
+          "and the generation must be withdrawn before the attempt fails")
+      } finally {
+        consumer.close()
+      }
     }
   }
 

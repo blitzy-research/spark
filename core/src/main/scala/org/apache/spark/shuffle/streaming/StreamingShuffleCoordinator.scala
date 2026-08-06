@@ -1357,6 +1357,11 @@ private[spark] class StreamingShuffleCoordinator(
   // gate only.
   private val deniedOperations = new AtomicLong(0L)
 
+  // Stand-downs whose publication barrier had to remove a map status published after the
+  // withdrawal. Counted rather than only logged, because it is the one observable trace of a race
+  // between a producer's stop sequence and a shuffle-wide withdrawal.
+  private val withdrawalBarriers = new AtomicLong(0L)
+
   // Timer that drives stale-producer reaping. Started in onStart and cancelled in onStop, in the
   // manner of the driver's heartbeat receiver. The executor is created lazily by the JDK, so an
   // endpoint that is constructed but never started spawns no thread.
@@ -2123,9 +2128,19 @@ private[spark] class StreamingShuffleCoordinator(
    * new attempts from its delegate. No scheduler, executor or sort-based class is involved in
    * arranging that.
    *
-   * An unknown shuffle is answered with the streaming-in-force value and changes nothing: there is
-   * no state to stand down, and creating some would let any peer mint a registry entry for any
-   * integer it named.
+   * '''Nothing happens before the caller is authorized.''' The token is compared against the state
+   * this would act on before any of the three steps above, and before the map-output withdrawal
+   * they depend on, so a caller that cannot present it changes nothing at all -- not the registry,
+   * and not the tracker. An unknown shuffle is answered the same way and for the same reason:
+   * there is no state to stand down, creating some would let any peer mint a registry entry for any
+   * integer it named, and a shuffle id this coordinator never registered may well belong to a
+   * sort-based shuffle whose output is not this subsystem's to invalidate.
+   *
+   * '''The withdrawal is taken twice.''' Once before the latch, because a participant may not be
+   * told to delegate while the map stage still reports itself available, and once immediately after
+   * it, because a producer whose completion was already applied can publish a map status inside
+   * that interval. See [[sealWithdrawalAfterLatch]], which also states the one residual window
+   * and the existing mechanism that recovers it.
    *
    * @param shuffleId shuffle that must stand streaming down; must be non-negative
    * @param capabilityToken token issued when the shuffle was registered on the driver
@@ -2165,6 +2180,33 @@ private[spark] class StreamingShuffleCoordinator(
       s"$reasonName is not a streaming shuffle stand-down record this build will store for " +
         s"shuffle $shuffleId")
     val recordedDetail = StreamingShuffleCoordinator.sanitizeDetail(detail)
+    // AUTHORIZATION IS THE FIRST STEP, and it is first because the step after it mutates state
+    // outside this registry. Withdrawing a shuffle's map output forces a stage recomputation across
+    // the whole application, so a peer that reached the withdrawal before its token was compared
+    // could drive that recomputation for any integer it named -- including a shuffle id belonging
+    // to a sort-based shuffle this coordinator knows nothing about, whose outputs are not streaming
+    // output and are not this subsystem's to invalidate. The
+    // registry is therefore resolved and the token compared BEFORE anything leaves this class, and
+    // the two refusals below touch nothing whatsoever.
+    //
+    // Both refusals answer with the streaming-in-force value, which is the same answer an in-force
+    // shuffle gives, so the shape of the reply still discloses nothing about whether a shuffle id
+    // exists -- exactly as [[fallbackStateFor]] and [[lookupProducers]] answer.
+    val resolved = Option(shuffleStates.get(shuffleId))
+    if (resolved.isEmpty) {
+      // An unknown shuffle has no state to stand down, and creating some would let any peer mint a
+      // registry entry for any integer it named. Its map output, if it has one, belongs to another
+      // implementation and is not withdrawn here.
+      if (debugEnabled) {
+        logDebug(log"Ignoring a streaming shuffle fallback declaration naming an unknown shuffle " +
+          log"${MDC(SHUFFLE_ID, shuffleId)}: ${MDC(NEW_VALUE, reasonName)}")
+      }
+      return StreamingShuffleFallbackState()
+    }
+    if (resolved.exists(state => unauthorizedFor(state, capabilityToken))) {
+      denyOperation("a shuffle fallback declaration", shuffleId, unauthorizedReason)
+      return StreamingShuffleFallbackState()
+    }
     // The withdrawal is a PRECONDITION of the transition rather than a step after it, and that
     // ordering is the whole of what makes a latched verdict actionable. A participant told that a
     // shuffle has stood down delegates its work to the sort-based path, which is only correct if
@@ -2175,11 +2217,14 @@ private[spark] class StreamingShuffleCoordinator(
     // learns the declaration did not take effect and fails locally rather than delegating, and the
     // next declaration of the same condition retries the withdrawal.
     //
-    // Ordering the withdrawal first is safe against a concurrent declaration and against a producer
-    // registering in the interval. A second declaration finds the verdict already latched and
-    // withdraws nothing; a producer that registers between the withdrawal and the latch is dropped
-    // by the latch itself, in the same registry update that records the reason.
-    val alreadyStoodDown = Option(shuffleStates.get(shuffleId)).exists(_.hasFallenBack)
+    // Ordering the withdrawal ahead of the latch is safe against a concurrent declaration and
+    // against a producer registering in the interval. A second declaration finds the verdict
+    // already latched and withdraws nothing; a producer that registers between the withdrawal and
+    // the latch is dropped by the latch itself, in the same registry update that records the
+    // reason. What the interval does admit is a map status PUBLISHED in it by a producer whose
+    // completion was applied before the latch, and that is what the barrier after the latch exists
+    // to remove.
+    val alreadyStoodDown = resolved.exists(_.hasFallenBack)
     val withdrawn = alreadyStoodDown || invalidateStreamedMapOutput(shuffleId)
     var unauthorized = false
     var declared = false
@@ -2199,8 +2244,12 @@ private[spark] class StreamingShuffleCoordinator(
     shuffleStates.computeIfPresent(shuffleId,
       (_: Int, existing: StreamingShuffleState) => {
         if (unauthorizedFor(existing, capabilityToken)) {
-          // Standing a shuffle down forces a stage recomputation across the whole application, so
-          // it is precisely the operation a stranger must never drive. Nothing is disclosed either.
+          // The comparison is made a second time, and inside the transition rather than beside it,
+          // because the state authorized above is not necessarily the state being mutated here: a
+          // shuffle can be unregistered and re-registered in the interval, and a re-registration
+          // mints a new token. Repeating it under the map's per-key lock is what makes "authorized
+          // against the state that is actually changed" true rather than merely likely, at the cost
+          // of one constant-time comparison. Nothing is disclosed either.
           unauthorized = true
           existing
         } else if (existing.hasFallenBack) {
@@ -2231,6 +2280,8 @@ private[spark] class StreamingShuffleCoordinator(
       denyOperation("a shuffle fallback declaration", shuffleId, unauthorizedReason)
       StreamingShuffleFallbackState()
     } else if (declared) {
+      // The publication barrier, and the reason the withdrawal is performed twice.
+      sealWithdrawalAfterLatch(shuffleId, epoch)
       // One record per shuffle for the life of the application, because the state latches. This is
       // a decision an operator must be told about without having to enable anything, since it is
       // the difference between the fast path and the guaranteed one.
@@ -2249,6 +2300,95 @@ private[spark] class StreamingShuffleCoordinator(
           log"${MDC(NEW_VALUE, reasonName)}")
       }
       state
+    }
+  }
+
+  /**
+   * Closes the interval between the withdrawal that precedes a stand-down and the latch itself, by
+   * withdrawing once more now that no generation of the shuffle can stream or complete.
+   *
+   * '''The race this removes.''' A stand-down withdraws the streamed map output before it latches,
+   * because a participant may not be told to delegate while the map stage still reports itself
+   * available. A producer whose completion the coordinator had already applied can publish its map
+   * status inside that interval, and the status would then be registered '''after''' the withdrawal
+   * -- so the map stage would report itself available again, the recomputation the stand-down
+   * exists to force would not happen, and the reduce stage would retry against output no owner
+   * will serve. Withdrawing a second time here removes exactly that status, and this is the
+   * earliest point at
+   * which the removal is durable: the latch has already dropped every producer and retired every
+   * generation, so [[completeProducer]] refuses every later report and no further status can be
+   * published by a streaming producer of this shuffle.
+   *
+   * '''Why exactly twice, and never on a timer.''' The recomputation this stand-down forces is
+   * served by the sort-based path, and those attempts publish map statuses of their own that are
+   * entirely legitimate. A withdrawal repeated on a cadence would remove them too, and the map
+   * stage would be resubmitted for as long as the cadence ran -- turning a degradation into a
+   * livelock. The second withdrawal is therefore taken once, immediately, while the only statuses
+   * that can exist are streamed ones.
+   *
+   * '''The residual window, stated rather than implied.''' A status still in flight when this runs
+   * -- one whose completion was applied before the latch and whose task result has not yet reached
+   * the driver -- is not caught here. It is recovered by the mechanism the whole design leans on
+   * and invents nothing beyond: the delegated reduce attempt asks for that output, no sort-based
+   * file exists for a streamed map output, the resulting fetch failure names the address it asked,
+   * and the unmodified scheduler unregisters that one output and recomputes the stage. The cost is
+   * one additional stage attempt, in a window measured in the time a task result takes to arrive;
+   * the correctness is unaffected, which is why closing it further is not worth a livelock hazard.
+   *
+   * Package-scoped rather than private so that the one situation it exists for can be constructed
+   * deterministically by a suite -- a map status registered after a withdrawal -- instead of being
+   * chased through a thread race that would either flake or never fire.
+   *
+   * @param shuffleId the shuffle that has just latched a stand-down
+   * @param epoch the epoch the latch advanced to, for the record only
+   */
+  private[streaming] def sealWithdrawalAfterLatch(shuffleId: Int, epoch: Long): Unit = {
+    val available = registeredMapOutputCount(shuffleId)
+    if (available > 0) {
+      withdrawalBarriers.incrementAndGet()
+      val outcome = if (invalidateStreamedMapOutput(shuffleId)) {
+        "is confirmed"
+      } else {
+        "could NOT be confirmed, so a delegated reduce attempt may need one further fetch failure"
+      }
+      // Reported at warning level because it is evidence of the race rather than routine: an
+      // operator reading it learns that a map status was published while the shuffle was standing
+      // down, which is exactly the condition an unexplained extra stage attempt would come from.
+      logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} had " +
+        log"${MDC(COUNT, available)} map output(s) registered when it latched its stand-down at " +
+        log"epoch ${MDC(EPOCH, epoch)}, published while the withdrawal was in progress; the " +
+        log"withdrawal was therefore taken again and ${MDC(STATUS, outcome)}")
+    } else if (debugEnabled) {
+      logDebug(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} held no registered map output " +
+        log"when it latched its stand-down at epoch ${MDC(EPOCH, epoch)}, so nothing was " +
+        log"published inside the withdrawal interval")
+    }
+  }
+
+  /**
+   * How many map outputs of a shuffle the driver's tracker currently reports as available.
+   *
+   * Answered as zero anywhere the tracker is not the master instance, and zero when nothing is
+   * registered, so a caller may treat any positive answer as "output that a reduce stage would be
+   * told to read". Reads only the tracker's own public accessor and never mutates it; a tracker
+   * that raises is reported as zero, because a count that could not be taken must not become a
+   * withdrawal nobody asked for.
+   *
+   * @param shuffleId the shuffle to count
+   * @return the number of registered map outputs, or zero when it cannot be established
+   */
+  private def registeredMapOutputCount(shuffleId: Int): Int = {
+    try {
+      Option(SparkEnv.get).map(_.mapOutputTracker) match {
+        case Some(master: MapOutputTrackerMaster) if master.containsShuffle(shuffleId) =>
+          master.getNumAvailableOutputs(shuffleId)
+        case _ => 0
+      }
+    } catch {
+      case NonFatal(e) =>
+        logWarning(log"The registered map output of streaming shuffle " +
+          log"${MDC(SHUFFLE_ID, shuffleId)} could not be counted", e)
+        0
     }
   }
 
@@ -3069,6 +3209,16 @@ private[spark] class StreamingShuffleCoordinator(
    * exceeded a registry cap. Monotonic for the lifetime of the endpoint.
    */
   def deniedOperationCount: Long = deniedOperations.get()
+
+  /**
+   * Number of stand-downs whose publication barrier found a map status registered after the
+   * withdrawal and removed it. Monotonic for the lifetime of the endpoint.
+   *
+   * A non-zero reading is the count of times a producer published output while its shuffle was
+   * standing down -- the race [[sealWithdrawalAfterLatch]] closes -- and is therefore worth having
+   * beside the denial count rather than only in a log record.
+   */
+  def withdrawalBarrierCount: Long = withdrawalBarriers.get()
 
   /**
    * Whether a request originated inside this JVM rather than from a peer.
@@ -4106,16 +4256,28 @@ private[spark] trait StreamingShuffleCoordinatorGateway {
   def invalidateStreamedMapOutput(shuffleId: Int, detail: String): Boolean
 
   /**
-   * Reports that one producer has streamed its whole map output to completion.
+   * Reports that one producer has streamed its whole map output to completion, and learns whether
+   * the driver accepted the report.
+   *
+   * The answer distinguishes three outcomes rather than two, because a producer about to publish a
+   * map status must act differently in each. `Some(true)` is an applied report: the driver still
+   * holds this generation, so its output may be published. `Some(false)` is a '''refusal''': the
+   * generation has been retired, superseded or invalidated, or the shuffle is no longer registered,
+   * and output the driver has disowned must not be published as though a consumer could read it.
+   * `None` means nothing is known -- the driver could not be reached, or answered something this
+   * build does not recognise -- and must never be read as a refusal, for the same reason
+   * [[heartbeatProducer]] documents: standing down on the strength of nothing would abandon a
+   * shuffle that is healthy everywhere else.
    *
    * @param shuffleId shuffle the producer streamed
    * @param generation generation identity of the reporting producer, whose map index is what the
    *                   completion set is keyed by
-   * @return `true` when the coordinator applied the report
+   * @return `Some(true)` when the coordinator applied the report, `Some(false)` when it refused it,
+   *         and `None` when the driver could not be asked
    */
   def completeProducer(
       shuffleId: Int,
-      generation: StreamingShuffleProducerGeneration): Boolean
+      generation: StreamingShuffleProducerGeneration): Option[Boolean]
 
   /**
    * Refreshes one producer generation's liveness, and learns whether the driver still holds it.
@@ -4279,12 +4441,15 @@ private[spark] class RpcStreamingShuffleCoordinatorGateway(
 
   override def completeProducer(
       shuffleId: Int,
-      generation: StreamingShuffleProducerGeneration): Boolean = {
+      generation: StreamingShuffleProducerGeneration): Option[Boolean] = {
     val operation = "a streaming shuffle producer completion report"
     askAny(operation, shuffleId,
       CompleteStreamingShuffleProducer(shuffleId, capabilityToken, generation)) match {
-      case Some(applied: java.lang.Boolean) => applied.booleanValue()
-      case answer => unexpected(operation, shuffleId, answer, false)
+      case Some(applied: java.lang.Boolean) => Some(applied.booleanValue())
+      // An unreachable driver and an unrecognised answer both mean nothing is known, and neither
+      // may be reported as a refusal: a refusal makes the caller withhold its map output, which is
+      // right for a generation the driver has disowned and wrong for one that could not be asked.
+      case answer => unexpected(operation, shuffleId, answer, None)
     }
   }
 

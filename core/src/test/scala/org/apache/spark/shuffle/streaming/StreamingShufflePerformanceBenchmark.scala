@@ -19,18 +19,20 @@ package org.apache.spark.shuffle.streaming
 
 import java.lang.management.{BufferPoolMXBean, ManagementFactory}
 import java.nio.charset.StandardCharsets
-import java.util.concurrent.TimeUnit
+import java.util.concurrent.{CountDownLatch, TimeUnit}
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicReference}
 
 import scala.collection.mutable
 import scala.jdk.CollectionConverters._
 import scala.util.control.NonFatal
 
-import org.apache.spark.{SparkConf, SparkContext, SparkEnv, TestUtils}
+import org.apache.spark.{SparkConf, SparkContext, SparkEnv, TaskContext, TaskContextImpl,
+  TestUtils}
 import org.apache.spark.benchmark.{Benchmark, BenchmarkBase}
 import org.apache.spark.executor.TaskMetrics
-import org.apache.spark.internal.config.{SHUFFLE_MANAGER, SHUFFLE_STREAMING_BUFFER_SIZE_PERCENT,
-  SHUFFLE_STREAMING_ENABLED, SHUFFLE_STREAMING_MAX_BANDWIDTH_MBPS,
-  SHUFFLE_STREAMING_SPILL_THRESHOLD}
+import org.apache.spark.internal.config.{SHUFFLE_COMPRESS, SHUFFLE_MANAGER,
+  SHUFFLE_STREAMING_BUFFER_SIZE_PERCENT, SHUFFLE_STREAMING_ENABLED,
+  SHUFFLE_STREAMING_MAX_BANDWIDTH_MBPS, SHUFFLE_STREAMING_SPILL_THRESHOLD}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.scheduler.{SparkListener, SparkListenerTaskEnd}
 
@@ -164,6 +166,85 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
    * of the machine's own noise without turning an on-demand run into an overnight one.
    */
   private val MeasuredIterations: Int = 3
+
+  // ---------------------------------------------------------------------------------------------
+  // The overlap scenario. The two cases above compare whole scheduled jobs, and a whole job under
+  // the unmodified DAG scheduler submits its reduce stage only once its map stage reports available
+  // output -- so neither of them can measure the defining behaviour of this feature, which is a
+  // consumer being served WHILE a producer produces. Task submission is an absolute preservation
+  // zone (AAP 0.2.1, 0.2.2 and 0.8.2 Tier 1), so this scenario stops waiting for the scheduler to
+  // provide the attachment and makes it directly, through the production manager, writer, reader,
+  // coordinator rendezvous and transport, and measures the one difference that matters: the same
+  // volume delivered to a consumer attached DURING production, against the same volume delivered to
+  // a consumer attached AFTER it. Everything else about the two cases is identical, so the gap
+  // between them is the overlap and nothing else.
+  // ---------------------------------------------------------------------------------------------
+
+  /** Name of the overlap scenario, printed by the harness above its comparison table. */
+  private val OverlapScenarioName: String = "Producer/consumer overlap on the streaming path"
+
+  /**
+   * The master the overlap cases run on.
+   *
+   * A local master, and for a reason that is the opposite of the cluster cases': the attachment is
+   * made by this JVM, so both halves must be served by one manager instance, which is exactly what
+   * local mode gives -- an executor skips shuffle manager initialisation when the driver's instance
+   * already exists. Both overlap cases share this master, so the comparison between them is still a
+   * comparison of shuffles rather than of masters.
+   */
+  private val OverlapMaster: String = "local[4]"
+
+  /**
+   * Declared partitions of the overlap shuffle.
+   *
+   * Two, with every key a multiple of two, so every record lands in partition zero and the single
+   * consumer of `[0, 1)` reads the whole of the map output. A consumer that read only part of it
+   * would be comparing two fractions rather than two deliveries of the same volume. This is the
+   * shape the integration suite's overlap case established, and it is repeated rather than
+   * re-derived so the measurement and the assertion cannot drift apart.
+   */
+  private val OverlapPartitions: Int = 2
+
+  /**
+   * Records each overlap run streams.
+   *
+   * Chosen for block count rather than for byte count: a run that fits in one or two blocks offers
+   * a consumer nothing to consume until production is nearly over, so it could not show an overlap
+   * however well the subsystem pipelined. Eight million integer pairs frame tens of blocks with
+   * compression off, which is what gives a consumer attached at the first block nearly the whole of
+   * the producer's lifetime to work in -- and what makes each run long enough that the elapsed
+   * comparison is not dominated by one JVM's own warm-up noise.
+   */
+  private val OverlapRecords: Int = 8000000
+
+  /** How long an overlap run's two threads are given before the measurement is abandoned. */
+  private val OverlapJoinTimeoutMillis: Long = 180000L
+
+  /** Map id both overlap cases produce under; each run registers a shuffle of its own. */
+  private val OverlapMapId: Long = 0L
+
+  /**
+   * First task attempt id an overlap run uses, and the stride between runs.
+   *
+   * Distinct per run, and deliberately: a `MemoryManager` accounts execution memory per task
+   * attempt id, so two runs sharing an id would share an accounting entry and the second run's
+   * release could be charged the first run's outstanding bytes. The base is well clear of the small
+   * ids real tasks are handed.
+   */
+  private val OverlapAttemptBase: Long = 9200L
+
+  private val OverlapAttemptStride: Long = 2L
+
+  private val OverlapAppName: String = "streaming-shuffle-benchmark-overlap"
+
+  private val OverlapComparisonName: String =
+    s"$OverlapRecords records streamed to one consumer"
+
+  /** Label of the case in which the consumer is attached before the first record is produced. */
+  private val OverlapLiveCaseName: String = "consumer attached during production"
+
+  /** Label of the case in which the consumer is attached only after the producer has stopped. */
+  private val OverlapRetainedCaseName: String = "consumer attached after production"
 
   /** Label of the sort-based case, which is the report's reference point. */
   private val BaselineCaseName: String = "sort-based shuffle (baseline)"
@@ -301,7 +382,23 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
   private val LatencyAttributionNote: Seq[String] = Seq(
     "  Note: the DAG scheduler is unmodified and starts reduce tasks after the map stage finishes.",
     "  This comparison measures framing, checksumming, retained-output publication and transport",
-    "  against sort, index publication and ordinary block fetch. It claims no map/reduce overlap.")
+    "  against sort, index publication and ordinary block fetch. It claims no map/reduce overlap.",
+    "  The overlap the subsystem does deliver is measured on its own, in the section below.")
+
+  /**
+   * What the overlap comparison establishes, and what it must not be read as establishing.
+   *
+   * The two arms differ only in when the consumer attaches, so their difference is the value of the
+   * overlap on the path this subsystem owns. It is not a scheduled job's figure and cannot be added
+   * to one: a scheduled job attaches its consumer only after the map stage finishes, which is the
+   * scheduler's own contract and an absolute preservation zone for this feature.
+   */
+  private val OverlapAttributionNote: Seq[String] = Seq(
+    "  Note: both arms stream the same volume through the same manager, writer, reader, rendezvous",
+    "  and transport, on one context, and differ only in when the consumer attaches. The reduction",
+    "  is the value of the overlap on the path the shuffle abstraction owns. It is NOT a scheduled",
+    "  job's latency and may not be added to the figure above: a scheduled job attaches its",
+    "  consumer only once the map stage has finished, which nothing inside this boundary may move.")
 
   /** The standing reminder that this file measures and does not gate. */
   private val TargetsNote: Seq[String] = Seq(
@@ -319,6 +416,14 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
 
   /** The case the active context was built for, so that a switch of case is detected. */
   private var activeCase: Option[CaseObservation] = None
+
+  /**
+   * Attempt id the next overlap run takes, advanced by the stride once it has been handed out.
+   *
+   * A plain field rather than an atomic, because the harness runs one case at a time on one thread
+   * and this is read and advanced only there, before either of a run's own threads is started.
+   */
+  private var nextOverlapAttemptId: Long = OverlapAttemptBase
 
   // ---------------------------------------------------------------------------------------------
   // The comparison.
@@ -375,8 +480,34 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
         benchmark.run()
       }
       stopActiveContext()
+      // ONE observation for both overlap cases, and therefore one context for both: the two cases
+      // differ only in when the consumer attaches, so a context of their own each would have made
+      // them differ in a second respect as well.
+      val overlapContext = new CaseObservation(
+        OverlapScenarioName,
+        withLocalMaster(overlapConf(), OverlapAppName, OverlapMaster),
+        OverlapMaster)
+      val overlap = new OverlapObservation
+      // The context is brought up before either arm runs, so neither charges cluster start-up to
+      // the overlap. Without this the arm that ran first would carry it alone, and the mean of two
+      // arms measured on different terms is not a comparison of anything.
+      require(contextFor(overlapContext) != null, "the overlap context must be live")
+      runBenchmark(OverlapScenarioName) {
+        val benchmark = new Benchmark(OverlapComparisonName, OverlapRecords.toLong,
+          MeasuredIterations, output = output)
+        benchmark.addCase(OverlapLiveCaseName) { _ =>
+          overlap.observeLive(measureOverlapPath(overlapContext, attachDuringProduction = true))
+        }
+        benchmark.addCase(OverlapRetainedCaseName) { _ =>
+          overlap.observeRetained(
+            measureOverlapPath(overlapContext, attachDuringProduction = false))
+        }
+        benchmark.run()
+      }
+      stopActiveContext()
       val telemetryCpu = measureTelemetryCpuOverhead()
-      emitReport(master, baseline, streaming, cpuBaseline, cpuStreaming, telemetryCpu)
+      emitReport(master, baseline, streaming, cpuBaseline, cpuStreaming, telemetryCpu,
+        overlapContext, overlap)
     } finally {
       // Unconditional, so neither a failure in a case nor a failure while reporting can leave a
       // live context behind. The harness's own main reaches afterAll only when nothing threw.
@@ -553,6 +684,246 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
       round += 1
     }
     mixed
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // The overlap measurement.
+  // ---------------------------------------------------------------------------------------------
+
+  /**
+   * The configuration both overlap cases run under.
+   *
+   * Shuffle compression is off, and that is a property of the MEASUREMENT rather than of the
+   * subsystem: a codec buffers a whole frame before it yields a byte, so with compression on a
+   * consumer can need the tail of a partition before it can produce its first record, and the
+   * producer's pipelining would be hidden behind the codec's buffering. The integration suite's
+   * overlap case turns it off for the same reason, and asserts the wrapping contract under
+   * compression separately.
+   *
+   * @return the configuration, master and application name not yet applied
+   */
+  private def overlapConf(): SparkConf = {
+    streamingConf().set(SHUFFLE_COMPRESS, false)
+  }
+
+  /**
+   * Streams one overlap run and returns what it cost and what it moved.
+   *
+   * Both cases stream the same volume through the same manager, writer, reader, coordinator
+   * rendezvous and transport, on the same context, and differ in exactly one respect: whether the
+   * consumer is attached while the producer is still producing or only once it has stopped. The
+   * elapsed window runs from just before the producer starts to after both halves have finished,
+   * the producer's stop included, because the stop is where a producer makes durable whatever its
+   * consumers did not take -- which is a cost the attachment instant decides and not one this
+   * measurement may exclude.
+   *
+   * ==Why the producer never waits for the consumer here==
+   *
+   * The integration suite's overlap case makes its producer WAIT for the consumer to have consumed,
+   * because a test must prove the overlap happened. A benchmark must not: a wait would put the
+   * consumer's latency inside the producer's elapsed time and would measure the fixture rather than
+   * the subsystem. This run therefore lets both halves proceed at their own pace and REPORTS how
+   * many records were read while the producer was still producing, so a reader of the report can
+   * see how much overlap the measurement actually contained.
+   *
+   * @param observation the case whose context both overlap cases share
+   * @param attachDuringProduction whether the consumer is started at the first block or only once
+   *                               production has finished
+   * @return what the run moved, spilled and cost
+   */
+  private def measureOverlapPath(
+      observation: CaseObservation,
+      attachDuringProduction: Boolean): OverlapRun = {
+    val context = contextFor(observation)
+    val manager = SparkEnv.get.shuffleManager.asInstanceOf[StreamingShuffleManager]
+    // A shuffle of its own per run, so no run inherits another's registration state. The
+    // registrations are left for the context's teardown to release, exactly as the integration
+    // suite leaves them: they hold no memory once each run's task contexts have completed.
+    val dependency = shuffleDependencyFor(context, context.getConf,
+      numPartitions = OverlapPartitions, numRecords = 1)
+    val handle = dependency.shuffleHandle.asInstanceOf[StreamingShuffleHandle[Int, Int, Int]]
+    val attemptId = nextOverlapAttemptId
+    nextOverlapAttemptId += OverlapAttemptStride
+    val writerContext = newTaskContext(context.env, partitionId = 0,
+      taskAttemptId = attemptId, numPartitions = OverlapPartitions)
+    val readerContext = newTaskContext(context.env, partitionId = 0,
+      taskAttemptId = attemptId + 1L, numPartitions = OverlapPartitions)
+
+    val writerReady = new CountDownLatch(1)
+    val productionFinished = new CountDownLatch(1)
+    val consumptionFinished = new CountDownLatch(1)
+    val producing = new AtomicBoolean(true)
+    val produced = new AtomicInteger(0)
+    val consumed = new AtomicInteger(0)
+    val consumedDuringProduction = new AtomicInteger(0)
+    val writerHandle = new AtomicReference[StreamingShuffleWriter[Int, Int, Int]](null)
+    val producerFailure = new AtomicReference[Throwable](null)
+    val consumerFailure = new AtomicReference[Throwable](null)
+
+    val producer = new Thread(() => {
+      try {
+        TaskContext.setTaskContext(writerContext)
+        val writer = manager
+          .getWriter[Int, Int](handle, OverlapMapId, writerContext,
+            writerContext.taskMetrics.shuffleWriteMetrics)
+          .asInstanceOf[StreamingShuffleWriter[Int, Int, Int]]
+        writerHandle.set(writer)
+        // Announced only once the writer exists, because a writer is what publishes this producer
+        // to the coordinator: a consumer started earlier would spend its rendezvous budget on an
+        // address that is not there yet.
+        writerReady.countDown()
+        writer.write(overlapRecords(produced))
+        producing.set(false)
+        productionFinished.countDown()
+        // The end of stream is signalled by `write` itself, so the consumer can finish before this
+        // producer stops. Waiting for it is what makes the durable figure below the window the
+        // CONSUMER left rather than one this measurement created by stopping early.
+        consumptionFinished.await(OverlapJoinTimeoutMillis, TimeUnit.MILLISECONDS)
+        writer.stop(success = true)
+      } catch {
+        case failure: Throwable => producerFailure.set(failure)
+      } finally {
+        producing.set(false)
+        writerReady.countDown()
+        productionFinished.countDown()
+        TaskContext.unset()
+      }
+    }, "streaming-shuffle-benchmark-overlap-producer")
+
+    val consumer = new Thread(() => {
+      try {
+        TaskContext.setTaskContext(readerContext)
+        val records = manager
+          .getReader[Int, Int](handle, 0, Int.MaxValue, 0, 1, readerContext,
+            readerContext.taskMetrics.createTempShuffleReadMetrics())
+          .read()
+        while (records.hasNext) {
+          records.next()
+          consumed.incrementAndGet()
+          if (producing.get()) {
+            consumedDuringProduction.incrementAndGet()
+          }
+        }
+      } catch {
+        case failure: Throwable => consumerFailure.set(failure)
+      } finally {
+        consumptionFinished.countDown()
+        TaskContext.unset()
+      }
+    }, "streaming-shuffle-benchmark-overlap-consumer")
+
+    val startedAt = System.nanoTime()
+    val run = try {
+      producer.start()
+      if (attachDuringProduction) {
+        writerReady.await(OverlapJoinTimeoutMillis, TimeUnit.MILLISECONDS)
+      } else {
+        productionFinished.await(OverlapJoinTimeoutMillis, TimeUnit.MILLISECONDS)
+      }
+      consumer.start()
+      producer.join(OverlapJoinTimeoutMillis)
+      consumer.join(OverlapJoinTimeoutMillis)
+      val elapsedNanos = System.nanoTime() - startedAt
+      requireOverlapRunSucceeded(producer, consumer, producerFailure, consumerFailure)
+      overlapRunOf(elapsedNanos, writerHandle.get(), writerContext, produced, consumed,
+        consumedDuringProduction)
+    } finally {
+      // Unconditional, because these two task contexts hold the run's execution-memory
+      // reservations: a run that left them open would hand its buffers to the next run's budget
+      // and Spark's own leak detection would report the loss against the wrong task.
+      writerContext.markTaskCompleted(None)
+      readerContext.markTaskCompleted(None)
+    }
+    // The registration is released last: after both task contexts have completed, so it outlives
+    // every reservation taken against it, and only on the success path, so a cleanup failure can
+    // never mask the failure that caused it. Releasing it at all is what keeps each run's
+    // arbitration and rendezvous state out of the next run's measurement.
+    manager.unregisterShuffle(handle.shuffleId)
+    run
+  }
+
+  /**
+   * The records an overlap run produces, all of which land in reduce partition zero.
+   *
+   * @param produced counter advanced as each record is handed over, so the run can report how far
+   *                 production had got at any instant
+   * @return the record iterator, which is exhausted exactly once
+   */
+  private def overlapRecords(produced: AtomicInteger): Iterator[Product2[Int, Int]] = {
+    new Iterator[Product2[Int, Int]] {
+      override def hasNext: Boolean = produced.get() < OverlapRecords
+
+      override def next(): Product2[Int, Int] = {
+        val index = produced.getAndIncrement()
+        (index * OverlapPartitions, index)
+      }
+    }
+  }
+
+  /**
+   * Fails the run rather than reporting a measurement that did not happen.
+   *
+   * This is not a threshold and does not contradict this object's reporting-only stance: a figure
+   * from a half-finished delivery would not be a slow measurement, it would not be a measurement at
+   * all, and presenting one as if it were is the single most misleading thing a benchmark can do.
+   *
+   * @param producer the producing thread, checked for having finished inside its budget
+   * @param consumer the consuming thread, checked likewise
+   * @param producerFailure whatever the producer raised, if it raised anything
+   * @param consumerFailure whatever the consumer raised, if it raised anything
+   */
+  private def requireOverlapRunSucceeded(
+      producer: Thread,
+      consumer: Thread,
+      producerFailure: AtomicReference[Throwable],
+      consumerFailure: AtomicReference[Throwable]): Unit = {
+    if (producerFailure.get() != null) {
+      throw new IllegalStateException(
+        "the overlap producer failed to stream its output", producerFailure.get())
+    }
+    if (consumerFailure.get() != null) {
+      throw new IllegalStateException(
+        "the overlap consumer failed to read its partition", consumerFailure.get())
+    }
+    if (producer.isAlive || consumer.isAlive) {
+      throw new IllegalStateException(
+        s"an overlap run did not finish inside its ${OverlapJoinTimeoutMillis} ms budget")
+    }
+  }
+
+  /**
+   * Reads everything one finished overlap run has to say about itself.
+   *
+   * The streamed and durable byte figures come from the writer's own task metrics, which are the
+   * accumulators Spark already reports, so they are the same figures an operator would see rather
+   * than a private accounting of this benchmark's own.
+   *
+   * @param elapsedNanos wall time from just before the producer started to both halves finished
+   * @param writer the writer the producer used, which may be absent if it never got one
+   * @param writerContext the producer's task context, whose metrics carry the byte figures
+   * @param produced records the producer handed over
+   * @param consumed records the consumer read
+   * @param consumedDuringProduction records read before production finished
+   * @return the run
+   */
+  private def overlapRunOf(
+      elapsedNanos: Long,
+      writer: StreamingShuffleWriter[Int, Int, Int],
+      writerContext: TaskContextImpl,
+      produced: AtomicInteger,
+      consumed: AtomicInteger,
+      consumedDuringProduction: AtomicInteger): OverlapRun = {
+    val metrics = writerContext.taskMetrics
+    new OverlapRun(
+      elapsedNanos,
+      produced.get().toLong,
+      consumed.get().toLong,
+      consumedDuringProduction.get().toLong,
+      if (writer == null) 0L else writer.blocksStreamed,
+      metrics.shuffleWriteMetrics.bytesWritten,
+      metrics.diskBytesSpilled,
+      if (writer == null) 0L else writer.spillsObserved,
+      if (writer == null) None else writer.standDownDescription)
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -807,6 +1178,8 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
    * @param cpuBaseline sort-based CPU-bound case
    * @param cpuStreaming streaming CPU-bound case
    * @param telemetryCpu source-on/source-off CPU accounting
+   * @param overlapContext the case whose context both overlap arms shared
+   * @param overlap both arms of the producer/consumer overlap comparison
    */
   private def emitReport(
       master: String,
@@ -814,11 +1187,14 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
       streaming: CaseObservation,
       cpuBaseline: CaseObservation,
       cpuStreaming: CaseObservation,
-      telemetryCpu: TelemetryCpuObservation): Unit = {
+      telemetryCpu: TelemetryCpuObservation,
+      overlapContext: CaseObservation,
+      overlap: OverlapObservation): Unit = {
     emit(
       workloadSection(master, baseline, streaming) ++
         activationSection(baseline, streaming) ++
         latencySection(baseline, streaming) ++
+        overlapSection(overlapContext, overlap) ++
         cpuBoundSection(cpuBaseline, cpuStreaming) ++
         memorySection(baseline, streaming) ++
         spillSection(baseline, streaming) ++
@@ -927,6 +1303,101 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
       row("acceptance target, NOT MEASURED HERE",
         s"$MinLatencyReductionPercent to $MaxLatencyReductionPercent percent reduction")) ++
       LatencyAttributionNote
+  }
+
+  /**
+   * The overlap itself: the same volume delivered to a consumer attached during production, against
+   * the same volume delivered to a consumer attached after it.
+   *
+   * ==Why this section exists at all==
+   *
+   * The latency section above compares two whole scheduled jobs, and under the unmodified DAG
+   * scheduler a whole job submits its reduce stage only once its map stage reports available
+   * output.
+   * That stage boundary is not a defect of the measurement, it is the scheduler's contract, and it
+   * is an absolute preservation zone for this feature: AAP 0.2.1 and 0.2.2 forbid modifying the DAG
+   * scheduler, the task lifecycle or task scheduling algorithms, and AAP 0.8.2 Tier 1 restates the
+   * prohibition file by file. So the latency section carries a note saying it claims no overlap,
+   * and it is right to.
+   *
+   * What IS entirely inside the shuffle abstraction -- which AAP 0.2.1 fixes as the whole
+   * modification scope -- is whether a consumer that IS attached during production is served while
+   * production continues, and what that is worth. This section measures exactly that, on the
+   * production manager, writer, reader, coordinator rendezvous and transport, with the attachment
+   * instant as the single difference between its two arms.
+   *
+   * ==How to read it, and how not to==
+   *
+   * The reduction below is the value of the overlap on the path the subsystem controls. It is NOT a
+   * claim about a scheduled job's end-to-end latency, and it may not be added to the latency
+   * section's figure: a scheduled job does not attach its consumer during production, so it does
+   * not collect this. The records-read-during-production row is what says how much overlap each arm
+   * actually contained, and the durable-bytes rows are what the overlap bought in avoided writes.
+   *
+   * @param contextCase the case whose context both arms shared, read for the manager in service
+   * @param overlap both arms as they were accumulated
+   * @return the section's lines
+   */
+  private def overlapSection(
+      contextCase: CaseObservation,
+      overlap: OverlapObservation): Seq[String] = {
+    val liveRuns = overlap.liveRuns
+    val retainedRuns = overlap.retainedRuns
+    val bestReduction =
+      reductionTenths(overlap.bestNanos(retainedRuns), overlap.bestNanos(liveRuns))
+    val meanReduction =
+      reductionTenths(overlap.meanNanos(retainedRuns), overlap.meanNanos(liveRuns))
+    Seq(
+      "",
+      "Producer/consumer overlap, one volume delivered two ways on the streaming path",
+      row("workload", OverlapComparisonName),
+      row("master, shared by both arms", OverlapMaster),
+      row("shuffle manager in service", contextCase.managerInService),
+      // Printed because the value of an overlap is bounded by the parallelism available to it: on a
+      // machine with no spare processor the two halves cannot proceed at once however well the
+      // subsystem pipelines, and a reader comparing two arms deserves to know which case they are
+      // reading. This is the JVM's own view of what it was allowed, not the host's core count.
+      row("processors available to this JVM",
+        Runtime.getRuntime.availableProcessors.toString),
+      row("shuffle compression", "off, so pipelining is not hidden behind a codec's buffering"),
+      row(OverlapLiveCaseName, overlapElapsedDescription(overlap, liveRuns)),
+      row(OverlapRetainedCaseName, overlapElapsedDescription(overlap, retainedRuns)),
+      row("reduction on best time", s"${renderTenths(bestReduction)} percent"),
+      row("reduction on mean time", s"${renderTenths(meanReduction)} percent"),
+      row(s"every run, $OverlapLiveCaseName", overlap.samples(liveRuns)),
+      row(s"every run, $OverlapRetainedCaseName", overlap.samples(retainedRuns)),
+      row("records read while the producer was producing",
+        s"${overlap.peak(liveRuns, _.recordsConsumedDuringProduction)} attached during, " +
+          s"${overlap.peak(retainedRuns, _.recordsConsumedDuringProduction)} attached after, " +
+          s"of $OverlapRecords"),
+      row("blocks streamed per run",
+        s"${overlap.peak(liveRuns, _.blocksStreamed)} attached during, " +
+          s"${overlap.peak(retainedRuns, _.blocksStreamed)} attached after"),
+      row("bytes streamed per run",
+        s"${overlap.peak(liveRuns, _.streamedBytes)} attached during, " +
+          s"${overlap.peak(retainedRuns, _.streamedBytes)} attached after"),
+      row("bytes made durable at the producer's stop",
+        s"${overlap.trough(liveRuns, _.durableBytes)} attached during, " +
+          s"${overlap.trough(retainedRuns, _.durableBytes)} attached after"),
+      row("spill events observed per run",
+        s"${overlap.peak(liveRuns, _.spillsObserved)} attached during, " +
+          s"${overlap.peak(retainedRuns, _.spillsObserved)} attached after"),
+      row("every record delivered on both arms", overlap.deliveredEverything.toString),
+      row("stand-downs observed",
+        if (overlap.standDowns.isEmpty) "none" else overlap.standDowns.mkString("; "))) ++
+      OverlapAttributionNote
+  }
+
+  /** Best, mean and run count of one overlap arm, in the shape the latency section uses. */
+  private def overlapElapsedDescription(
+      overlap: OverlapObservation,
+      runs: Seq[OverlapRun]): String = {
+    if (runs.isEmpty) {
+      "no run recorded"
+    } else {
+      s"best ${millisOf(overlap.bestNanos(runs))} ms, mean ${millisOf(overlap.meanNanos(runs))} " +
+        s"ms over ${runs.size} run(s)"
+    }
   }
 
   /**
@@ -1615,6 +2086,100 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
       val sourceOffNanos: Option[Long],
       val sourceOnNanos: Option[Long],
       val checksum: Long)
+
+  /**
+   * One overlap run: what it delivered, what it cost, and what it had to make durable.
+   *
+   * @param elapsedNanos wall time from just before the producer started to both halves finished
+   * @param recordsProduced records the producer handed to the writer
+   * @param recordsConsumed records the consumer read, which must equal the above
+   * @param recordsConsumedDuringProduction records read before production finished, which is how
+   *                                        much overlap this run actually contained
+   * @param blocksStreamed blocks the writer handed to egress
+   * @param streamedBytes bytes the writer reported on the task's shuffle write accumulator
+   * @param durableBytes bytes that reached disk, reported on the task's spill accumulator
+   * @param spillsObserved spill events the writer's spill manager counted
+   * @param standDownDescription why streaming stood down mid-write, if it did
+   */
+  private class OverlapRun(
+      val elapsedNanos: Long,
+      val recordsProduced: Long,
+      val recordsConsumed: Long,
+      val recordsConsumedDuringProduction: Long,
+      val blocksStreamed: Long,
+      val streamedBytes: Long,
+      val durableBytes: Long,
+      val spillsObserved: Long,
+      val standDownDescription: Option[String])
+
+  /**
+   * Both arms of the overlap comparison, accumulated as the harness runs them.
+   *
+   * The two arms are kept apart rather than merged into one `CaseObservation` each, because they
+   * share a context and a configuration and differ only in the instant the consumer attaches: two
+   * case observations would have implied two environments and invited the reader to compare them as
+   * if they were independent.
+   */
+  private class OverlapObservation {
+
+    private val live = new mutable.ArrayBuffer[OverlapRun]()
+
+    private val retained = new mutable.ArrayBuffer[OverlapRun]()
+
+    /** Records a run in which the consumer was attached while the producer was still producing. */
+    def observeLive(run: OverlapRun): Unit = {
+      live += run
+    }
+
+    /** Records a run in which the consumer was attached only once production had finished. */
+    def observeRetained(run: OverlapRun): Unit = {
+      retained += run
+    }
+
+    def liveRuns: Seq[OverlapRun] = live.toSeq
+
+    def retainedRuns: Seq[OverlapRun] = retained.toSeq
+
+    /** Fastest run of an arm, or zero before that arm has run. */
+    def bestNanos(runs: Seq[OverlapRun]): Long = {
+      if (runs.isEmpty) 0L else runs.map(_.elapsedNanos).min
+    }
+
+    /** Mean run of an arm, or zero before that arm has run. */
+    def meanNanos(runs: Seq[OverlapRun]): Long = {
+      if (runs.isEmpty) 0L else runs.map(_.elapsedNanos).sum / runs.size.toLong
+    }
+
+    /** Every run of an arm in the order the runs happened, in milliseconds. */
+    def samples(runs: Seq[OverlapRun]): String = {
+      if (runs.isEmpty) {
+        "no run recorded"
+      } else {
+        s"${runs.map(run => millisOf(run.elapsedNanos).toString).mkString(", ")} ms"
+      }
+    }
+
+    /** Field-wise maximum of one figure across an arm's runs, never a single run's reading. */
+    def peak(runs: Seq[OverlapRun], figure: OverlapRun => Long): Long = {
+      if (runs.isEmpty) 0L else runs.map(figure).max
+    }
+
+    /** Field-wise minimum of a figure across an arm's runs. */
+    def trough(runs: Seq[OverlapRun], figure: OverlapRun => Long): Long = {
+      if (runs.isEmpty) 0L else runs.map(figure).min
+    }
+
+    /** Whether every run of both arms delivered every record it produced. */
+    def deliveredEverything: Boolean = {
+      val runs = live ++ retained
+      runs.nonEmpty && runs.forall { run =>
+        run.recordsProduced == OverlapRecords.toLong && run.recordsConsumed == run.recordsProduced
+      }
+    }
+
+    /** Descriptions of every stand-down either arm observed, which should be none. */
+    def standDowns: Seq[String] = (live ++ retained).flatMap(_.standDownDescription).toSeq
+  }
 
   /**
    * Everything one case of the comparison is, and everything it turned out to cost.

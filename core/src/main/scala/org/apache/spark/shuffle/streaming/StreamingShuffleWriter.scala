@@ -973,13 +973,29 @@ private[spark] class StreamingShuffleWriter[K, V, C](
    *     executor-scoped resolver; that transfer, not the moment this task happens to finish, is
    *     what bounds the lifetime of retained output. A map output every consumer already
    *     acknowledged has nothing retained, so this step writes nothing at all.
+   *
+   *     '''How large that window is depends entirely on what consumers took, and is not decided
+   *     here.''' Every acknowledgement releases what it covers the moment it arrives, so a producer
+   *     whose consumer kept pace reaches this step holding a fraction of its output -- which
+   *     `StreamingShuffleIntegrationTest` asserts against a live consumer -- while a producer no
+   *     consumer ever subscribed to reaches it holding all of it, because a shuffle's reduce tasks
+   *     are submitted only after its map stage completes and that ordering belongs to the scheduler
+   *     (AAP 0.2.1, 0.2.2 and 0.8.2 Tier 1 forbid touching it). The same suite measures that
+   *     ordering on an ordinary scheduled job rather than assuming it. What is decided here is only
+   *     that whatever remains is made durable before a status promises a consumer can read it:
+   *     bringing that write forward on a cadence of its own would spill below the configured
+   *     threshold, which is the one thing AAP 0.9.4 fixes about spill behaviour.
    *  3. The reachability requirement immediately after, because it is the one condition under which
    *     publishing a status would be a promise this producer cannot keep.
    *  4. Stream completion before the status, so that a consumer which reads the completion set and
    *     then asks the ledger how many blocks to expect gets an answer rather than an unterminated
    *     stream.
-   *  5. The completion report after the drain and before the status is handed back, so the
-   *     coordinator's completion set never claims output this writer has not finished framing.
+   *  5. The completion report after the drain and '''immediately before''' the status is built, so
+   *     that the coordinator's completion set never claims output this writer has not finished
+   *     framing, and -- the load-bearing half -- so that the driver's answer is the last thing this
+   *     sequence learns before it publishes. A refusal means the driver has disowned this
+   *     generation, and an ordinary status published after that would re-register output a
+   *     shuffle-wide withdrawal has just removed. See [[requirePublishableGeneration]].
    *
    * @return the placeholder map status, always non-empty
    */
@@ -1003,11 +1019,90 @@ private[spark] class StreamingShuffleWriter[K, V, C](
     completeProducerStreams()
     unregisterProducerStreams()
     publishWriteMetrics()
+    val refusal = requirePublishableGeneration()
+    if (refusal.isDefined) {
+      return refusal
+    }
     mapStatus = MapStatus(blockManager.shuffleServerId, partitionLengths, mapId)
-    reportMapOutputComplete()
     serverHandler.markProducerTaskComplete()
     logStreamingSummary()
     Option(mapStatus)
+  }
+
+  /**
+   * Asks the driver to accept this generation's completion and settles whether its output may be
+   * published, answering with the status to report instead when it may not.
+   *
+   * '''The race this closes.''' A shuffle-wide stand-down withdraws the streamed map output of a
+   * shuffle and retires every generation of it, and it does both on the driver. A map task in its
+   * final drain cannot be stopped by that -- the drain runs inside a successful stop, where raising
+   * would abandon output that is about to be made durable -- so the two can genuinely overlap. If
+   * this writer then published an ordinary map status, the withdrawal would be undone by the very
+   * attempt it was meant to invalidate: the map stage would report itself available again, the
+   * recomputation would not happen, and the delegated reduce stage would retry against output no
+   * owner will serve. The completion report is the barrier, because the coordinator applies it only
+   * while the generation is still registered and not retired, so its refusal is the driver's own
+   * statement that this output has been disowned -- taken here, after everything else in the stop
+   * sequence, so that nothing can intervene between the answer and the publication it authorises.
+   *
+   * '''The two refusals, and why they end differently.''' A refusal accompanied by a shuffle-wide
+   * fallback is a degradation, so it ends as every other trip does: the attempt completes with the
+   * void status, its output withdrawn, and no task attempt is consumed. A refusal without one is a
+   * zombie generation -- superseded by a newer attempt, or invalidated by a consumer that has
+   * already raised the fetch failure which recomputes the stage -- and the honest answer there is
+   * to fail, exactly as [[standDownIfRetired]] fails it when its own pass finds the same thing.
+   *
+   * '''An unreachable driver is not a refusal.''' Nothing is known in that case, and withholding a
+   * map output on the strength of nothing would fail a task whose output is perfectly readable. It
+   * is recorded and the status is published, which is the same direction every other unreachable
+   * answer in this subsystem is resolved in.
+   *
+   * @return `None` when this generation may publish its ordinary status, or the status to report
+   *         instead when it may not
+   * @throws org.apache.spark.SparkException when the generation was refused without a shuffle-wide
+   *         fallback, so that the unmodified scheduler recomputes this map output
+   */
+  private def requirePublishableGeneration(): Option[MapStatus] = {
+    reportMapOutputComplete() match {
+      case Some(true) => None
+      case None =>
+        logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} map " +
+          log"${MDC(TASK_ATTEMPT_ID, mapId)} could not confirm its completion with the driver, " +
+          log"so its map status is published on the strength of a local success; nothing is " +
+          log"known about the driver's view of this generation, and a lost report is recovered " +
+          log"by the consumer's own poll and timeout")
+        None
+      case Some(false) if fallbackPolicy.shuffleHasFallenBack(shuffleId) =>
+        // Read across the whole closed set, for the reason every other stand-down here reads it
+        // that way: the shuffle-wide verdict may be a structural decline, and re-labelling it as
+        // one of the four specified conditions would put a measurement nobody took into the record.
+        val reason: StreamingShuffleStandDownCause =
+          fallbackPolicy.knownShuffleFallback(shuffleId).flatMap(_.cause)
+            .orElse(fallbackPolicy.trippedReason)
+            .getOrElse(StreamingShuffleStandDownCause.ProducerUnavailable)
+        val signal = new StreamingShuffleWriter.StandDownSignal(reason,
+          s"the driver refused the completion of map index ${context.partitionId()} attempt " +
+            s"${context.taskAttemptId()} because a shuffle-wide fallback had retired its " +
+            "producer generation, so this attempt reports a withdrawn output rather than one a " +
+            "delegated reduce task would be told to read")
+        logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} map " +
+          log"${MDC(TASK_ATTEMPT_ID, mapId)} finished streaming into a shuffle-wide fallback: " +
+          log"its completion was refused, so it reports the void status and its output is " +
+          log"recomputed on the sort-based path")
+        completeStandDown(signal)
+        mapStatus = voidMapStatus()
+        Option(mapStatus)
+      case Some(false) =>
+        val failure = new SparkException(s"Streaming shuffle $shuffleId refused the completion " +
+          s"of map index ${context.partitionId()} attempt ${context.taskAttemptId()}: the driver " +
+          "no longer holds that producer generation, so it has been superseded by a newer " +
+          "attempt or invalidated by a consumer. No map status is published for it and the task " +
+          "is failed so that the unmodified scheduler recomputes the output.")
+        logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} failing map " +
+          log"${MDC(TASK_ATTEMPT_ID, mapId)} at publication because the driver refused its " +
+          log"completion report", failure)
+        throw failure
+    }
   }
 
   /**
@@ -2012,12 +2107,13 @@ private[spark] class StreamingShuffleWriter[K, V, C](
    * Reached from the maintenance pass alone, and never from the final drain. That drain runs inside
    * a successful stop, where raising would abandon output that is about to be made durable and
    * readable, so the drain refreshes the registration and ignores the answer. A generation retired
-   * during the drain is therefore not stood down, and it does not need to be: its completion report
-   * is refused by the driver, so no consumer is told its output is available; no consumer can be
-   * handed its address either, because the driver's registry no longer holds it; and its local
-   * owners are retired by the shuffle's own unregistration. Correctness is unaffected, because the
-   * consumer whose invalidation retired the generation has already raised the fetch failure that
-   * recomputes the stage.
+   * during the drain is not stood down here -- it is settled at the end of the stop sequence
+   * instead, by [[requirePublishableGeneration]], which asks the driver to accept this generation's
+   * completion immediately before the map status is built and refuses to publish an ordinary status
+   * when the driver refuses the report. That is the same fact this method acts on, learned through
+   * the same registry, at the one instant where acting on it can still keep a withdrawn output from
+   * being re-registered; putting it there rather than in the drain is what lets the drain finish
+   * making its output durable without publishing it.
    */
   private def standDownIfRetired(nowMillis: Long): Unit = {
     if (!finished) {
@@ -2139,8 +2235,9 @@ private[spark] class StreamingShuffleWriter[K, V, C](
    * monitoring the backpressure protocol exists to provide.
    *
    * <b>Only the second trigger is arbitrated.</b> The first is this subsystem's own contract -- the
-   * spill threshold is evaluated against the producer buffer budget and eviction at that point is
-   * unconditional -- so no arbitration may stand in front of it. The second exists to make one
+   * spill threshold is evaluated against the executor's one aggregate streaming buffer reservation,
+   * every category of it, and eviction at that point is unconditional -- so no arbitration may
+   * stand in front of it. The second exists to make one
    * shuffle yield on account of another's demand, and that is exactly the question arbitration
    * answers: `shouldYield` places the concurrent shuffles in order of how much of the executor's
    * buffered egress each is responsible for and exempts the least demanding one, so a small shuffle
@@ -2558,12 +2655,26 @@ private[spark] class StreamingShuffleWriter[K, V, C](
    * streamed half are deliberately never published, so the delegate's own accounting is the only
    * accounting this attempt contributes and nothing is counted twice.
    *
-   * '''The one case this cannot repair.''' A block a consumer has both received and acknowledged
-   * has been released, which is what the acknowledgement is for, and no producer can reproduce it.
-   * That cannot arise for a stage the unmodified scheduler submits -- no reduce task of this
-   * shuffle exists while its map stage is still running -- and if it ever did, the honest answer is
-   * the historical one: fail the attempt so the map output is recomputed. The refusal names the
-   * exact block, so it can never be mistaken for a generic failure.
+   * '''The one case this cannot repair, and why it is settled before the delegate exists.''' A
+   * block a consumer has both received and acknowledged has been released -- that is what the
+   * acknowledgement is for -- and no producer can reproduce it. Whenever a consumer really is
+   * attached during production, which is the case this whole subsystem is built for, that is not a
+   * hypothetical: one advancing acknowledgement is enough to make the reconstruction short. So the
+   * reconstruction is proved possible '''before''' anything is handed to the sort-based writer, by
+   * [[firstUnreconstructableBlock]], rather than being discovered part way through it. The
+   * difference matters twice over: a delegate that has already written half a map output when the
+   * gap is found leaves the attempt failing with a partially written output behind it, and the
+   * failure would arrive from inside another writer's `write` where it reads as that writer's fault
+   * rather than as the exact block this one cannot replay.
+   *
+   * When the proof fails, the recovery is the one the platform already has and this method's own
+   * first step has already begun: the generation is withdrawn from every owner of it, which
+   * atomically invalidates whatever a consumer had partially consumed and makes every later fetch
+   * of it a fetch failure, and the attempt then fails so that the unmodified scheduler recomputes
+   * the map output -- served, because the shuffle has stood streaming down, by the sort-based path
+   * from the first record. The per-block check inside [[degradedRecords]] remains as a backstop for
+   * anything the two window bounds cannot see, and both name the exact block, so neither can be
+   * mistaken for a generic failure.
    *
    * @param degradation the stand-down that was observed, for the log and the delegate's diagnosis
    * @param remaining the records this attempt had not yet consumed, handed on intact
@@ -2584,6 +2695,23 @@ private[spark] class StreamingShuffleWriter[K, V, C](
     val reason = s"${degradation.description} (${degradation.name})"
     withdrawGeneration(s"streaming stood down mid-production because $reason, and this map " +
       "output is being rewritten by the sort-based shuffle")
+    // The withdrawal above is what makes the refusal below safe: it has already retired this
+    // generation everywhere, so a consumer that had acknowledged part of this output can no longer
+    // read any of it and will recompute rather than mix a surviving prefix with a new attempt's
+    // output. Proving the reconstruction complete here, between that withdrawal and the delegate,
+    // is therefore the last point at which failing costs nothing that was not already invalid.
+    firstUnreconstructableBlock().foreach { case (partitionId, sequenceNumber) =>
+      val refusal = new SparkException(
+        StreamingShuffleWriter.unreconstructableBlockMessage(
+          shuffleId, mapId, partitionId, sequenceNumber))
+      logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} map " +
+        log"${MDC(TASK_ATTEMPT_ID, mapId)} cannot rewrite its output through the sort-based " +
+        log"shuffle after ${MDC(REASON, reason)}: block ${MDC(COUNT, sequenceNumber)} " +
+        log"of partition ${MDC(PARTITION_ID, partitionId)} was acknowledged and released. The " +
+        log"attempt fails with its output already withdrawn, so the map stage is recomputed on " +
+        log"the sort-based path from its first record", refusal)
+      throw refusal
+    }
     val reconstructed = activePartitions.toSeq.sorted.iterator.flatMap { partitionId =>
       degradedRecords(partitionStates(partitionId), tails(partitionId))
     }
@@ -2601,6 +2729,49 @@ private[spark] class StreamingShuffleWriter[K, V, C](
       log"${MDC(TASK_ATTEMPT_ID, mapId)} rewrote ${MDC(RECORDS, recordsAppended)} already " +
       log"streamed record(s) and the remainder of its input through the sort-based shuffle after " +
       log"${MDC(REASON, reason)}; the attempt completes rather than being retried")
+  }
+
+  /**
+   * The first block of this attempt's streamed output that can no longer be read back, if any.
+   *
+   * '''Why two window bounds rather than a probe per block.''' A partition's retained window is
+   * always a contiguous run -- admission is dense and retirement always retires a prefix, which
+   * [[MemorySpillManager.lowestRetainedSequence]] documents -- so the run
+   * `[lowestRetainedSequence, lastAcceptedSequence]` is the whole replayable range, and comparing
+   * it against the range this writer framed settles reconstructability for a partition in two
+   * constant-time reads. Probing every sequence number would ask the store for a payload it may
+   * have to read from disk, which is precisely the work this check exists to avoid starting.
+   *
+   * Two gaps are therefore visible here. A released prefix, which is what an advancing consumer
+   * acknowledgement produces, shows as a retained window that no longer starts at zero; the first
+   * block that cannot be read back is then sequence zero itself. A window that stops short of the
+   * last block framed shows as a highest retained sequence below it, and the first missing block is
+   * the one after the highest. Anything neither bound can see -- a block that was framed but never
+   * admitted at all -- is left to the per-block check in [[degradedRecords]].
+   *
+   * @return the partition and the sequence number of the first block that cannot be read back, or
+   *         `None` when every framed block of every active partition is still retained
+   */
+  private def firstUnreconstructableBlock(): Option[(Int, Long)] = {
+    var index = 0
+    var missing = Option.empty[(Int, Long)]
+    while (index < activePartitions.length && missing.isEmpty) {
+      val partitionId = activePartitions(index)
+      val framed = partitionStates(partitionId).nextSequenceNumber
+      if (framed > 0L) {
+        val lowest = spillManager.lowestRetainedSequence(partitionId)
+        val highest = spillManager.lastAcceptedSequence(partitionId)
+        if (lowest != 0L) {
+          // Either a prefix was acknowledged and released, or nothing is retained at all. In both
+          // cases the first block a reconstruction would ask for is the first one ever framed.
+          missing = Some((partitionId, 0L))
+        } else if (highest < framed - 1L) {
+          missing = Some((partitionId, highest + 1L))
+        }
+      }
+      index += 1
+    }
+    missing
   }
 
   /**
@@ -2647,10 +2818,11 @@ private[spark] class StreamingShuffleWriter[K, V, C](
     val partitionId = state.partitionId
     val admitted = (0L until state.nextSequenceNumber).iterator.map { sequenceNumber =>
       new ByteArrayInputStream(spillManager.retainedPayload(partitionId, sequenceNumber).getOrElse {
-        throw new SparkException(s"Streaming shuffle $shuffleId cannot finish map $mapId through " +
-          s"the sort-based shuffle because block $sequenceNumber of partition $partitionId is no " +
-          "longer retained: a consumer had already acknowledged it, which released it. This " +
-          "attempt is failed so that the map output is recomputed.")
+        // The backstop for a gap the window bounds cannot see; [[firstUnreconstructableBlock]] has
+        // already refused every gap they can, before the delegate existed. Same message either way,
+        // so an operator reads one explanation and a test asserts one string.
+        throw new SparkException(StreamingShuffleWriter.unreconstructableBlockMessage(
+          shuffleId, mapId, partitionId, sequenceNumber))
       }): InputStream
     }
     val segments = if (tail == null) admitted else admitted ++ Iterator.single(
@@ -2717,18 +2889,28 @@ private[spark] class StreamingShuffleWriter[K, V, C](
    * and doing it only on success is what keeps it honest, because a failed task's output is exactly
    * what a consumer must not be told is complete.
    *
-   * The report is best effort by design. If it does not reach the driver the consumer polls, times
-   * out and recovers by recomputing this stage, which is strictly safer than the alternative of a
-   * consumer concluding on its own that output it never received was complete.
+   * '''The answer is a precondition of publishing, not a courtesy.''' The driver applies the report
+   * only while this generation is still the registered one and has not been retired, so a refusal
+   * is the one authoritative statement that this attempt's output has been disowned -- by a
+   * shuffle-wide stand-down, by a newer attempt, or by a consumer that invalidated it. Publishing
+   * an ordinary map status after a refusal would re-register output the driver has just withdrawn,
+   * which is why [[completeSuccessfully]] asks for this answer immediately before it builds that
+   * status and acts on it. An unreachable driver is a different answer again and is not a refusal:
+   * nothing is known, and the consumer's own poll and timeout recover a report that was lost.
+   *
+   * @return `Some(true)` when the driver applied the report, `Some(false)` when it refused it, and
+   *         `None` when the driver could not be asked
    */
-  private def reportMapOutputComplete(): Unit = {
+  private def reportMapOutputComplete(): Option[Boolean] = {
     val generation = StreamingShuffleProducerGeneration(
       context.partitionId(), mapId, context.taskAttemptId())
-    if (coordinatorGateway.completeProducer(shuffleId, generation) && debugEnabled) {
+    val applied = coordinatorGateway.completeProducer(shuffleId, generation)
+    if (applied.contains(true) && debugEnabled) {
       logDebug(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} recorded map " +
         log"${MDC(MAP_ID, mapId)} index ${MDC(INDEX, context.partitionId())} as streamed to " +
         log"completion")
     }
+    applied
   }
 
   // End of stream
@@ -3940,6 +4122,33 @@ private[spark] object StreamingShuffleWriter {
       val reason: StreamingShuffleStandDownCause,
       val detail: String)
     extends Exception(detail, null, false, false)
+
+  /**
+   * The one explanation of a reconstruction that cannot be completed, shared by the check that runs
+   * before the sort-based delegate exists and by the per-block backstop inside the reconstruction
+   * itself.
+   *
+   * One builder rather than two literals so that an operator reads a single explanation whichever
+   * check refused, and so that the two can never drift into describing the same condition
+   * differently. It names the exact block, because "a block was released" and "the shuffle failed"
+   * demand completely different investigations.
+   *
+   * @param shuffleId the shuffle whose map output cannot be rewritten
+   * @param mapId the map output that cannot be rewritten
+   * @param partitionId the reduce partition holding the block that cannot be read back
+   * @param sequenceNumber the sequence number of that block
+   * @return the refusal message
+   */
+  private[streaming] def unreconstructableBlockMessage(
+      shuffleId: Int,
+      mapId: Long,
+      partitionId: Int,
+      sequenceNumber: Long): String = {
+    s"Streaming shuffle $shuffleId cannot finish map $mapId through the sort-based shuffle " +
+      s"because block $sequenceNumber of partition $partitionId is no longer retained: a " +
+      "consumer had already acknowledged it, which released it. This attempt is failed, with its " +
+      "streamed output already withdrawn from every owner of it, so the map output is recomputed."
+  }
 
   /**
    * Executor-scoped aggregation of the "block written straight to local disk" report.

@@ -111,22 +111,41 @@ private[spark] trait StreamingShuffleBufferUtilizationContributor {
  * condition it exists to expose.
  *
  * What production actually registers is exactly one contributor: the
- * [[MemorySpillManager.ExecutorBufferQuota]] that every spill manager on the executor shares, whose
- * numerator is the bytes every producer on the executor is holding and whose denominator is the
- * whole executor buffer allowance. Registering the shared allowance rather than each spill manager
- * is what makes the reading executor-wide without counting one budget many times, and it withdraws
- * when the last spill manager on the executor closes.
+ * [[MemorySpillManager.ExecutorBufferQuota]] that every spill manager on the executor shares.
+ * Registering the shared allowance rather than each spill manager is what makes the reading
+ * executor-wide without counting one budget many times, and it withdraws when the last spill
+ * manager on the executor closes.
  *
- * The read side registers nothing, deliberately. The bytes a consumer holds are measured against
- * the receive quota, which is a different budget from the producer buffer allowance this gauge
- * reports and the one the spill threshold is evaluated against; mixing the two would put unrelated
- * bytes in the numerator and unrelated capacity in the denominator, so a producer genuinely at its
- * spill point would read as roughly half of it the moment one idle reader started.
+ * ==What the numerator is==
  *
- * The gauge nevertheless sums numerators and sums denominators across every registered contributor
- * and divides once, rather than reading a single cell, so the reading is independent of the order
- * owners happen to run in and an owner that finishes withdraws its contribution rather than
- * overwriting everybody else's.
+ * The numerator is every byte of streaming shuffle buffer held anywhere on this executor, in
+ * '''both directions''', and the denominator is the whole of that one allowance. There is one
+ * aggregate quota, not one per direction, because `spark.shuffle.streaming.bufferSizePercent` is a
+ * promise about an executor rather than about a role: two independent allowances of the same
+ * percentage would sum to twice the configured percentage on any executor doing both at once, which
+ * is every executor in a multi-stage job. So the quota charges four ownership categories against
+ * one ceiling -- producer framing and buffered blocks, consumer received frames, transient framing
+ * copies, and per-stream metadata -- and this gauge reports their total.
+ *
+ * The read side therefore registers '''nothing of its own''', and that is the reason: a consumer's
+ * received bytes are already in this numerator, charged as the consumer category of the same
+ * quota. A second contributor for the read side would count those bytes twice and add the same
+ * allowance to the denominator a second time, so an executor genuinely at its spill point would
+ * read as roughly half of it the moment one reader registered.
+ *
+ * ==What the range is==
+ *
+ * Reservation is admission-controlled: the quota refuses any request that would carry the total
+ * past the allowance, so no byte counted here was ever granted beyond the ceiling and a reading
+ * above 100 cannot arise from admitted reservations. The arithmetic nevertheless applies no clamp
+ * -- see [[bufferUtilizationPercent]] -- because a clamp would mask an accounting defect rather
+ * than prevent one, and a gauge that reads 100 while an executor is over budget would be reporting
+ * calm in exactly the condition it exists to expose.
+ *
+ * The gauge sums numerators and sums denominators across every registered contributor and divides
+ * once, rather than reading a single cell, so the reading is independent of the order owners happen
+ * to run in and an owner that finishes withdraws its contribution rather than overwriting
+ * everybody else's.
  *
  * Registration. This source is published through the static source list, which `MetricsSystem`
  * registers when it starts -- on the driver and on every executor alike -- provided static sources
@@ -270,8 +289,13 @@ private[spark] object StreamingShuffleMetricsSource extends Source {
    * zero total budget answers zero, so the gauge is total: there is no input for which it throws
    * and no sentinel value it can return in place of a percentage.
    *
-   * The value is not clamped at 100. A momentarily over-budget allocation stays visible to
-   * operators instead of being masked, which is the whole point of watching this gauge.
+   * The value is not clamped at 100, and in service it does not need to be: the quota behind the
+   * only contributor production registers admits no reservation that would carry its total past the
+   * allowance, so every byte in the numerator was granted inside the ceiling and an admitted state
+   * reads between zero and a hundred. The clamp is omitted so that a contributor which somehow
+   * reported bytes it was never granted -- an accounting defect, not an admitted state -- stays
+   * visible to operators instead of being masked at exactly 100, which is the whole point of
+   * watching this gauge.
    */
   def bufferUtilizationPercent: Long = {
     var bufferedBytes = 0L
@@ -328,8 +352,9 @@ private[spark] object StreamingShuffleMetricsSource extends Source {
    * Expresses `bufferedBytes` as a percentage of `budgetBytes`, without overflowing for any pair
    * of non-negative inputs. The straightforward product is used whenever it is provably safe, and
    * the divisor is scaled down instead for the extreme totals where it is not. The result is
-   * reported verbatim and is deliberately not clamped at 100, so that a momentarily over-budget
-   * executor stays visible to operators instead of being masked.
+   * reported verbatim and is deliberately not clamped at 100, for the reason given on
+   * [[bufferUtilizationPercent]]: admission already keeps an admitted reading inside the range, so
+   * a clamp could only ever hide an accounting defect.
    */
   private def percentOf(bufferedBytes: Long, budgetBytes: Long): Long = {
     if (bufferedBytes <= 0L || budgetBytes <= 0L) {

@@ -50,11 +50,13 @@ import org.apache.spark.util.{Clock, SystemClock}
  *
  * <b>Why `autoRead` lives here, and only here.</b> Toggling `autoRead` is a new idiom in this code
  * base: it appears nowhere in the shared transport module and nowhere else in Spark core. This file
- * is its sole owner -- the producer-side handler never touches it, and participates in flow control
- * only through the protocol -- and confining the idiom to one file is what satisfies the directive
- * to prefer the least modification to the network transport layer. Within this file the single
- * point that writes the flag is [[StreamingShuffleChannelReadGate]], because the flag belongs to
- * the '''socket''' and a socket now carries several handlers: the window is closed while ANY
+ * owns it as a flow-control mechanism -- the producer-side handler never touches it, and
+ * participates in flow control only through the protocol -- and confining the idiom to one file is
+ * what satisfies the directive to prefer the least modification to the network transport layer. The
+ * one call outside this file is a fault-injection hook that only ever disables reading and never
+ * paces anything; [[StreamingShuffleChannelReadGate]] names it, for the reason given there. Within
+ * this file the single point that writes the flag is that gate, because the flag belongs to the
+ * '''socket''' and a socket now carries several handlers: the window is closed while ANY
  * participant is throttled and reopened only when none is. A flag per handler let one participant
  * reopen a window another still needed shut, which is the one way this layer can fail silently.
  * No shared transport class is modified by this feature: `TransportContext`, its pipeline
@@ -3157,9 +3159,23 @@ private[spark] class StreamingShuffleClientHandler(
  * configuration write Netty permits from any thread, and it is issued only when the union actually
  * changes, so a redundant write is skipped however many participants observe the same condition.
  *
- * <b>Containment.</b> This class is the single place in the subsystem that calls `setAutoRead`, and
- * it lives in this file so that the containment claim in [[StreamingShuffleClientHandler]]'s
- * documentation stays checkable by inspection.
+ * <b>Containment.</b> This class is the single place in the subsystem that writes `setAutoRead` for
+ * '''flow control''', and it lives in this file so that the containment claim in
+ * [[StreamingShuffleClientHandler]]'s documentation stays checkable by inspection.
+ *
+ * There is exactly one other `setAutoRead` call anywhere in the subsystem, and it is not flow
+ * control: `StreamingShuffleReader`'s package-private `pauseInboundTraffic`, which end-to-end
+ * failure injection uses to make a live socket stop delivering bytes so that the reader's
+ * application-level connection timeout is the path under test rather than the channel-closed path.
+ * It is named here rather than glossed over because a containment claim that quietly excluded a
+ * caller would be worth nothing. Two properties keep it harmless to this gate: it only ever
+ * disables reading, so it cannot reopen a window a participant still needs shut, and it remembers
+ * nothing -- the paused channels are closed by failed-task cleanup and a retry opens fresh ones in
+ * the normal state -- so it can neither be cleared by a resume nor outlive the fault it injects.
+ * What it does bypass is this gate's own bookkeeping, so the state this gate believes it applied
+ * may afterwards disagree with the socket until the channel is closed; that is acceptable in
+ * exactly the run where the channel is about to be discarded, and it is why the hook is confined to
+ * the injection path and is not offered as a way to exert backpressure.
  */
 private[streaming] final class StreamingShuffleChannelReadGate {
 

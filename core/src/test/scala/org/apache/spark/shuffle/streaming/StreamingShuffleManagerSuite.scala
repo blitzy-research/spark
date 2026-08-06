@@ -32,9 +32,9 @@ import org.mockito.stubbing.Answer
 import org.scalatest.concurrent.Eventually._
 import org.scalatest.time.SpanSugar._
 
-import org.apache.spark.{Aggregator, HashPartitioner, LocalSparkContext, Partitioner,
-  SecurityManager, ShuffleDependency, SparkConf, SparkContext, SparkEnv, SparkException,
-  SparkFunSuite, SparkIllegalArgumentException, TaskContext}
+import org.apache.spark.{Aggregator, HashPartitioner, LocalSparkContext, MapOutputTrackerMaster,
+  Partitioner, SecurityManager, ShuffleDependency, SparkConf, SparkContext, SparkEnv,
+  SparkException, SparkFunSuite, SparkIllegalArgumentException, TaskContext}
 import org.apache.spark.internal.config.{AUTH_SECRET, NETWORK_AUTH_ENABLED, SHUFFLE_MANAGER,
   SHUFFLE_SERVICE_ENABLED, SHUFFLE_STREAMING_BUFFER_SIZE_PERCENT, SHUFFLE_STREAMING_DEBUG,
   SHUFFLE_STREAMING_ENABLED, SHUFFLE_STREAMING_MAX_BANDWIDTH_MBPS,
@@ -47,6 +47,7 @@ import org.apache.spark.network.crypto.{AuthClientBootstrap, AuthServerBootstrap
 import org.apache.spark.network.shuffle.protocol.streaming.{HeartbeatMessage,
   StreamingShuffleMessage}
 import org.apache.spark.rpc.RpcEnv
+import org.apache.spark.scheduler.MapStatus
 import org.apache.spark.serializer.{JavaSerializer, Serializer}
 import org.apache.spark.shuffle.{BaseShuffleHandle, IndexShuffleBlockResolver, MigratableResolver,
   ShuffleHandle, ShuffleManager, ShuffleReader, ShuffleReadMetricsReporter}
@@ -1423,6 +1424,112 @@ class StreamingShuffleManagerSuite extends SparkFunSuite
     assert(!authorised.fallenBack,
       s"the live shuffle must still be streaming after the refused declaration, but the " +
         s"coordinator reports ${authorised}")
+  }
+
+  test("an unauthorised fallback declaration withdraws no map output from the tracker") {
+    // The companion of the case above, and the one that would have caught the ordering defect it
+    // could not: that case asserts the coordinator's own state is untouched by a refused
+    // declaration, which is true whichever order authorization and withdrawal happen in. What a
+    // stand-down actually DOES first is withdraw the shuffle's map output from the driver's
+    // tracker, which is state outside this class -- so it has to be populated for the refusal to
+    // be a refusal of anything. An unauthorised caller that reached the withdrawal would force a
+    // stage recomputation across the whole application for any shuffle id it named.
+    sc = new SparkContext(
+      withLocalMaster(streamingConf(), "streaming-shuffle-manager-withdrawal", "local[2]"))
+    val tracker = SparkEnv.get.mapOutputTracker.asInstanceOf[MapOutputTrackerMaster]
+    val coordinator = new StreamingShuffleCoordinator(sc.env.rpcEnv, sc.conf, newManualClock())
+    val streamingShuffleId = 41
+    // A second shuffle this coordinator never registered, standing in for the case that matters
+    // most: a shuffle id belonging to the sort-based path, whose outputs are not streaming outputs
+    // and are not this subsystem's to invalidate at anyone's request.
+    val sortOwnedShuffleId = 42
+    val grant = coordinator.registerShuffle(streamingShuffleId, numPartitions = 2, numMaps = 1,
+      ProtocolVersion).getOrElse(
+      fail("the coordinator must accept a well-formed registration of the current protocol"))
+    val token = grant.capabilityToken
+    val location = BlockManagerId("exec-withdrawal", "withdrawal-host", 7077)
+
+    // The tracker's own publication path. Its boolean answer reports a CHECKSUM MISMATCH rather
+    // than success, so registration is confirmed by the available-output count. Registering the
+    // shuffle itself is separate because the tracker refuses a shuffle id twice, while a map output
+    // may legitimately be published again -- which is exactly the late publication asserted below.
+    def publishMapOutput(shuffleId: Int, attemptId: Long): Unit = {
+      val mismatched = tracker.registerMapOutput(shuffleId, mapIndex = 0,
+        MapStatus(location, Array(11L, 13L), attemptId))
+      assert(!mismatched,
+        s"publishing map output for shuffle $shuffleId cannot be read as a checksum change")
+    }
+
+    try {
+      tracker.registerShuffle(streamingShuffleId, numMaps = 1, numReduces = 2)
+      tracker.registerShuffle(sortOwnedShuffleId, numMaps = 1, numReduces = 2)
+      publishMapOutput(streamingShuffleId, attemptId = 100L)
+      publishMapOutput(sortOwnedShuffleId, attemptId = 200L)
+      assert(tracker.getNumAvailableOutputs(streamingShuffleId) === 1 &&
+          tracker.getNumAvailableOutputs(sortOwnedShuffleId) === 1,
+        "both shuffles must start with their map output registered, or nothing below is a test " +
+          "of a withdrawal")
+
+      val sameLengthWrongToken = "x" * token.length
+      Seq(sameLengthWrongToken, "", "too-short").foreach { presented =>
+        assert(!coordinator.declareFallback(streamingShuffleId, presented,
+            StreamingShuffleFallbackReason.NetworkSaturation, "an unauthorised declaration")
+          .fallenBack,
+          s"a declaration presenting '$presented' must be refused")
+        assert(tracker.getNumAvailableOutputs(streamingShuffleId) === 1,
+          s"a declaration presenting '$presented' must withdraw NOTHING: the map output of " +
+            s"shuffle $streamingShuffleId was withdrawn before the token was compared, which " +
+            s"forces a stage recomputation at an unauthorised caller's request")
+        // The same refusal for an id this coordinator holds no state for, presenting the token of
+        // the one it does -- which is the shape an attempt to invalidate another implementation's
+        // shuffle would take.
+        assert(!coordinator.declareFallback(sortOwnedShuffleId, token,
+            StreamingShuffleFallbackReason.NetworkSaturation, "an unknown-shuffle declaration")
+          .fallenBack,
+          "a declaration naming a shuffle this coordinator never registered must be refused")
+        assert(tracker.getNumAvailableOutputs(sortOwnedShuffleId) === 1,
+          s"and it must withdraw nothing: the map output of unregistered shuffle " +
+            s"$sortOwnedShuffleId is not this subsystem's to invalidate")
+      }
+      assert(coordinator.epochFor(streamingShuffleId).contains(grant.coordinatorEpoch),
+        "no refused declaration may advance the epoch")
+
+      // The authorised declaration is the control: the very same operation, presenting the very
+      // same token the registration minted, withdraws exactly the shuffle it names.
+      assert(coordinator.declareFallback(streamingShuffleId, token,
+          StreamingShuffleFallbackReason.NetworkSaturation, "an authorised declaration").fallenBack,
+        "the token holder must be able to stand its own shuffle down")
+      assert(tracker.getNumAvailableOutputs(streamingShuffleId) === 0,
+        "an authorised stand-down must withdraw the streamed map output, or the delegated reduce " +
+          "stage would read output no owner will serve")
+      assert(tracker.getNumAvailableOutputs(sortOwnedShuffleId) === 1,
+        "and it must withdraw nothing else")
+
+      // The publication barrier. A producer whose completion was applied before the latch can
+      // publish its map status inside the interval between the withdrawal and the latch, and the
+      // status would then outlive the withdrawal that was meant to invalidate it. Registering one
+      // now is exactly that situation, held still: the barrier removes it and counts that it did.
+      val barriersBefore = coordinator.withdrawalBarrierCount
+      publishMapOutput(streamingShuffleId, attemptId = 101L)
+      assert(tracker.getNumAvailableOutputs(streamingShuffleId) === 1,
+        "the late publication must be registered, or the barrier has nothing to remove")
+      coordinator.sealWithdrawalAfterLatch(streamingShuffleId,
+        coordinator.epochFor(streamingShuffleId).getOrElse(
+          fail("a stood-down shuffle must still report an epoch")))
+      assert(tracker.getNumAvailableOutputs(streamingShuffleId) === 0,
+        "the barrier must withdraw a map status published inside the withdrawal interval, or the " +
+          "map stage reports itself available again and the stand-down forces no recomputation")
+      assert(coordinator.withdrawalBarrierCount === barriersBefore + 1,
+        s"and the barrier must record that it fired, but the count stayed at $barriersBefore")
+
+      // Idempotent, and silent when there is nothing to do: a barrier that counted or withdrew on
+      // an empty tracker would fire during every ordinary stand-down.
+      coordinator.sealWithdrawalAfterLatch(streamingShuffleId, grant.coordinatorEpoch)
+      assert(coordinator.withdrawalBarrierCount === barriersBefore + 1,
+        "a barrier that finds no registered output must neither withdraw nor count")
+    } finally {
+      Seq(streamingShuffleId, sortOwnedShuffleId).foreach(tracker.unregisterShuffle)
+    }
   }
 
   test("a channel that keeps sending frames the listener cannot handle is closed exactly once") {

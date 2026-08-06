@@ -40,9 +40,9 @@ import org.apache.spark.internal.config.{SHUFFLE_COMPRESS, SHUFFLE_MANAGER,
   SHUFFLE_STREAMING_SPILL_THRESHOLD, STAGE_MAX_CONSECUTIVE_ATTEMPTS, TASK_MAX_FAILURES}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.scheduler.{JobSucceeded, SparkListener, SparkListenerJobEnd,
-  SparkListenerStageSubmitted, SparkListenerTaskEnd}
+  SparkListenerStageCompleted, SparkListenerStageSubmitted, SparkListenerTaskEnd}
 import org.apache.spark.shuffle.FetchFailedException
-import org.apache.spark.util.{CollectionAccumulator, LongAccumulator, ManualClock}
+import org.apache.spark.util.{CollectionAccumulator, LongAccumulator, ManualClock, RpcUtils}
 
 /**
  * End-to-end integration tests for the streaming shuffle, run across REAL separate executor JVMs.
@@ -238,6 +238,24 @@ class StreamingShuffleIntegrationTest
    * The full target dataset, large enough for each producer to cross the minimum spill threshold.
    */
   private val SlowConsumerDatasetBytes: Long = TargetDatasetBytes
+
+  /**
+   * The width of the production scheduled vertical: four reduce partitions.
+   *
+   * Narrower than the feature's named ten, because this case measures the stage ordering and the
+   * data path rather than a latency figure, and every partition it adds is executor time spent
+   * re-establishing something the ten-partition case above already establishes.
+   */
+  private val VerticalPartitions: Int = 4
+
+  /**
+   * The dataset the production scheduled vertical shuffles: eight mebibytes.
+   *
+   * Large enough that every partition carries several blocks -- so the write and read reporters
+   * move for real and the transfer is a pipelined one rather than a single frame -- and small
+   * enough that the case costs seconds rather than the minute the hundred-mebibyte case costs.
+   */
+  private val VerticalDatasetBytes: Long = 8L * BytesPerMebibyte
 
   /** Raw transport-failure workload: two partitions, each larger than one receive-credit window. */
   private val FailurePartitionCount: Int = 2
@@ -971,6 +989,30 @@ class StreamingShuffleIntegrationTest
   }
 
   /**
+   * Whether the driver has latched a stand-down for the shuffle behind a lazily consumed RDD.
+   *
+   * Asked of the application's own coordinator over its own endpoint, presenting the capability
+   * token the registration minted, so the answer is the cluster-wide verdict rather than a local
+   * opinion. A shuffle with no streaming handle has nothing to have stood down and is reported as
+   * still streaming, which is what makes this safe to call before the handle has been established.
+   *
+   * @param shuffled the shuffle to ask about
+   * @return true when the shuffle has stood streaming down
+   */
+  private def streamingShuffleStoodDown(shuffled: RDD[_]): Boolean = {
+    shuffled.dependencies.headOption.collect {
+      case dependency: ShuffleDependency[_, _, _]
+        if dependency.shuffleHandle.isInstanceOf[StreamingShuffleHandle[_, _, _]] =>
+        dependency.shuffleHandle.asInstanceOf[StreamingShuffleHandle[_, _, _]]
+    }.exists { handle =>
+      val coordinator = RpcUtils.makeDriverRef(
+        StreamingShuffleCoordinator.ENDPOINT_NAME, sc.getConf, sc.env.rpcEnv)
+      coordinator.askSync[StreamingShuffleFallbackState](
+        GetStreamingShuffleFallbackState(handle.shuffleId, handle.capabilityToken)).fallenBack
+    }
+  }
+
+  /**
    * Whether the shuffle behind a lazily consumed RDD was registered on the streaming path.
    *
    * Read from the handle the driver produced, so it says which manager registered the shuffle
@@ -1624,6 +1666,114 @@ class StreamingShuffleIntegrationTest
       log"and ${MDC(COUNT, recordsAtWait.get())} record(s) -- and " +
       log"${MDC(MEMORY_SIZE, spilledBytes)} of ${MDC(BYTE_SIZE, streamedBytes)} streamed byte(s) " +
       log"needed to be made durable at the stop")
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Scenario 1c: the production scheduled vertical, and the barrier it runs into, both OBSERVED.
+  //
+  // The case above establishes that a consumer attached during production is served live, through
+  // production components, and it constructs that attachment itself. This one takes the opposite
+  // vantage point and gives up all construction: an ordinary Spark job, submitted through the
+  // unmodified scheduler onto two real executor JVMs, with nothing driven by hand. What it settles
+  // is everything about the production vertical that IS inside the subsystem's boundary --
+  //
+  //  * the job's output is exactly the sort-based baseline's, so a scheduled streaming shuffle is
+  //    correct end to end rather than only in component fixtures;
+  //  * the streaming path really carried both halves: the driver registered a streaming handle, the
+  //    shuffle never stood down, and Spark's own write and read reporters were populated by the
+  //    streaming writer and reader, which is what makes a streaming shuffle visible on every
+  //    existing observability surface; and
+  //  * neither half was retried, so nothing above was reached through a recomputation.
+  //
+  // -- and then MEASURES the one thing that is not inside the boundary, instead of asserting it in
+  // prose: the reduce stage's first submission does not precede the map stage's completion. That
+  // ordering belongs to the DAG scheduler and to task scheduling, which AAP 0.2.1 and 0.2.2 place
+  // under zero modifications and AAP 0.8.2 Tier 1 restates file by file for `scheduler/**`. It is
+  // the reason an ordinary single-attempt map stage has no consumer subscribed while it produces,
+  // and therefore the reason the retained window at task end is the whole map output in a scheduled
+  // vertical while it is a fraction of it whenever a consumer keeps pace. Closing that gap would
+  // take either a scheduler change or an intermediate staging tier -- a component AAP 0.8.2 Tier 3
+  // excludes along with anything else not enumerated in AAP 0.1.2, and one that would contradict
+  // FR-2's "pipeline buffered data directly to consumer executors" besides. So it is recorded here
+  // as a measurement an operator can reproduce, beside the accounting it produces.
+  // ---------------------------------------------------------------------------------------------
+
+  test("a scheduled job is carried by the streaming path and its stage barrier is measured") {
+    val baseline = sortBaselineKeyedDigest(VerticalPartitions, VerticalDatasetBytes)
+    assert(baseline.nonEmpty, "the sort-based baseline must have produced records to compare with")
+
+    sc = new SparkContext(resilientStreamingConf("streaming-shuffle-integration-vertical"))
+    TestUtils.waitUntilExecutorsUp(sc, ExecutorCount, ExecutorStartupTimeoutMillis)
+    assertStreamingManagerInService()
+    val recorder = new StreamingShuffleJobRecorder
+    sc.addSparkListener(recorder)
+
+    val shuffled = lazilyConsumedDataset(sc, VerticalPartitions, VerticalDatasetBytes)
+    assert(isStreamingKeyedShuffle(shuffled),
+      "the driver must have registered this shuffle on the streaming path, or the run below says " +
+        "nothing about streaming")
+    val observed = keyedDigestOf(shuffled)
+
+    // 1. Correctness, through the scheduler, against the implementation this one coexists with.
+    assertNoDataLoss(observed, baseline,
+      s"a scheduled $VerticalPartitions partition streaming shuffle")
+
+    // 2. The streaming path carried both halves, and neither was reached through a retry.
+    assert(recorder.succeededJobCount === 1L && recorder.failedJobCount === 0L,
+      s"the vertical must have run as exactly one successful job, but the recorder saw " +
+        s"${recorder.succeededJobCount} succeeded and ${recorder.failedJobCount} failed")
+    assert(recorder.fetchFailures.isEmpty,
+      s"no fetch failure may have occurred, or the output was reached by recomputation rather " +
+        s"than by streaming: ${recorder.fetchFailures}")
+    assert(recorder.maxStageSubmissions === 1,
+      s"no stage may have been submitted twice, but the busiest was submitted " +
+        s"${recorder.maxStageSubmissions} time(s)")
+    assert(!streamingShuffleStoodDown(shuffled),
+      "the shuffle must still be streaming, or the vertical fell back and measured sort")
+
+    // Spark's own reporters, which the streaming writer and reader are required to populate. One
+    // producing stage and one consuming stage, identified by which reporter each one moved rather
+    // than by assuming a stage id.
+    val producing = recorder.producingStageIds
+    val consuming = recorder.consumingStageIds
+    assert(producing.size === 1 && consuming.size === 1,
+      s"the vertical must be exactly one producing stage and one consuming stage, but the write " +
+        s"reporter moved in stages $producing and the read reporter in stages $consuming")
+    val mapStageId = producing.head
+    val reduceStageId = consuming.head
+    assert(mapStageId != reduceStageId,
+      s"the producing and consuming halves must be different stages, but both were $mapStageId")
+    assert(recorder.bytesWrittenByStage(mapStageId) > 0L,
+      "the streaming writer must have reported its bytes onto the task's shuffle write metrics, " +
+        "or every existing Spark observability surface is blank for this shuffle")
+    assert(recorder.bytesReadByStage(reduceStageId) > 0L,
+      "and the streaming reader must have reported its bytes onto the task's shuffle read metrics")
+
+    // 3. The barrier itself, measured. The scheduler submits a stage only once every parent stage
+    // reports available output, so the consuming stage cannot have been submitted before the
+    // producing stage completed -- which is exactly why no consumer is subscribed while an ordinary
+    // map task produces.
+    val mapCompletedAt = recorder.completionTimeOf(mapStageId).getOrElse(
+      fail(s"the scheduler must have recorded a completion time for map stage $mapStageId"))
+    val reduceSubmittedAt = recorder.submissionTimeOf(reduceStageId).getOrElse(
+      fail(s"the scheduler must have recorded a submission time for reduce stage $reduceStageId"))
+    assert(reduceSubmittedAt >= mapCompletedAt,
+      s"the reduce stage was submitted at $reduceSubmittedAt and the map stage completed at " +
+        s"$mapCompletedAt: a consuming stage submitted before its producing stage finished would " +
+        "mean the scheduler had changed, which this feature is forbidden to arrange and this " +
+        "assertion exists to notice")
+
+    // 4. The accounting that ordering produces, recorded rather than asserted as a target: with no
+    // consumer subscribed during production, the retained window at each map task's end is its
+    // whole output, which the attached-consumer case above shows as a small fraction instead.
+    logInfo(log"Scheduled streaming vertical: map stage ${MDC(COUNT, mapStageId)} wrote " +
+      log"${MDC(BYTE_SIZE, recorder.bytesWrittenByStage(mapStageId))} byte(s) and reduce stage " +
+      log"${MDC(NUM_PARTITIONS, reduceStageId)} read " +
+      log"${MDC(NUM_BYTES, recorder.bytesReadByStage(reduceStageId))} byte(s); " +
+      log"${MDC(MEMORY_SIZE, recorder.diskBytesSpilled)} byte(s) were made durable at task end " +
+      log"because the reduce stage was submitted ${MDC(TIME_UNITS, reduceSubmittedAt -
+        mapCompletedAt)} ms after the map stage completed, which is the stage barrier this " +
+      log"feature may not move")
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -3294,9 +3444,36 @@ private class StreamingShuffleJobRecorder extends SparkListener {
 
   private var crashLocalBytes: Long = 0L
 
+  // When each stage was submitted and when it completed, taken from the scheduler's own stage
+  // information rather than from a clock this listener reads. Together with the per-stage byte
+  // accounting below they are what let a case OBSERVE the stage barrier -- which of two stages
+  // streamed and which read, and whether the reader was submitted before the producer had finished
+  // -- instead of asserting it in prose.
+  private val submittedAtMs = mutable.Map.empty[Int, Long]
+
+  private val completedAtMs = mutable.Map.empty[Int, Long]
+
+  private val writtenByStage = mutable.Map.empty[Int, Long]
+
+  private val readByStage = mutable.Map.empty[Int, Long]
+
   override def onStageSubmitted(stageSubmitted: SparkListenerStageSubmitted): Unit = synchronized {
     val stageId = stageSubmitted.stageInfo.stageId
     submissions(stageId) = submissions.getOrElse(stageId, 0) + 1
+    // The FIRST submission of a stage, because a resubmitted stage's later submission says nothing
+    // about when its consumers were allowed to start.
+    stageSubmitted.stageInfo.submissionTime.foreach { at =>
+      if (!submittedAtMs.contains(stageId)) {
+        submittedAtMs(stageId) = at
+      }
+    }
+  }
+
+  override def onStageCompleted(stageCompleted: SparkListenerStageCompleted): Unit = synchronized {
+    val stageId = stageCompleted.stageInfo.stageId
+    // The LAST completion, so a stage that was recomputed is described by the attempt whose output
+    // its consumers actually read.
+    stageCompleted.stageInfo.completionTime.foreach(at => completedAtMs(stageId) = at)
   }
 
   /**
@@ -3320,6 +3497,14 @@ private class StreamingShuffleJobRecorder extends SparkListener {
       memorySpilledTotal += metrics.memoryBytesSpilled
       diskSpilledTotal += metrics.diskBytesSpilled
       peakMemoryHighWater = math.max(peakMemoryHighWater, metrics.peakExecutionMemory)
+      // Spark's own shuffle reporters, per stage. A streaming shuffle populates exactly these, so a
+      // stage that wrote bytes is a producing stage and one that read them is a consuming stage --
+      // which is how a case identifies the two halves without assuming a stage id.
+      val stageId = taskEnd.stageId
+      writtenByStage(stageId) =
+        writtenByStage.getOrElse(stageId, 0L) + metrics.shuffleWriteMetrics.bytesWritten
+      readByStage(stageId) = readByStage.getOrElse(stageId, 0L) +
+        metrics.shuffleReadMetrics.remoteBytesRead + metrics.shuffleReadMetrics.localBytesRead
     }
     taskEnd.reason match {
       case fetchFailed: FetchFailed =>
@@ -3357,6 +3542,28 @@ private class StreamingShuffleJobRecorder extends SparkListener {
   def diskBytesSpilled: Long = synchronized(diskSpilledTotal)
 
   def peakExecutionMemory: Long = synchronized(peakMemoryHighWater)
+
+  /** Stage ids that wrote shuffle bytes, which on the streaming path are the producing stages. */
+  def producingStageIds: Seq[Int] = synchronized {
+    writtenByStage.filter(_._2 > 0L).keys.toSeq.sorted
+  }
+
+  /** Stage ids that read shuffle bytes, which are the consuming stages. */
+  def consumingStageIds: Seq[Int] = synchronized {
+    readByStage.filter(_._2 > 0L).keys.toSeq.sorted
+  }
+
+  /** Shuffle bytes one stage's tasks reported writing through Spark's own write reporter. */
+  def bytesWrittenByStage(stageId: Int): Long = synchronized(writtenByStage.getOrElse(stageId, 0L))
+
+  /** Shuffle bytes one stage's tasks reported reading through Spark's own read reporter. */
+  def bytesReadByStage(stageId: Int): Long = synchronized(readByStage.getOrElse(stageId, 0L))
+
+  /** When a stage was first submitted, as the scheduler recorded it. */
+  def submissionTimeOf(stageId: Int): Option[Long] = synchronized(submittedAtMs.get(stageId))
+
+  /** When a stage last completed, as the scheduler recorded it. */
+  def completionTimeOf(stageId: Int): Option[Long] = synchronized(completedAtMs.get(stageId))
 
   def remoteBlocksBeforeInjectedProducerCrash: Long = synchronized(crashRemoteBlocks)
 

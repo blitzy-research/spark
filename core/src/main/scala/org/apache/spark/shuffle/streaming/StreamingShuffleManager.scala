@@ -89,18 +89,40 @@ import org.apache.spark.util.{Clock, SystemClock}
  * The streaming path removes the map side's materialisation of shuffle output and the reduce side's
  * index-and-fetch round trip and whole-partition buffering. A block is framed, checksummed and
  * pushed the moment it is cut, and a subscribed consumer turns it into records without any of it
- * reaching disk.
+ * reaching disk. There is exactly one egress path, and it is the live one: a consumer attached
+ * while a producer is running and a consumer attached after that producer's task has gone are
+ * served by the same code, over the same transport, with the same credit, checksums and
+ * acknowledgements, and only the arrival time differs. Every acknowledgement releases producer
+ * memory whenever it arrives, so how much a map task has left to make durable at its end is
+ * decided by how much its consumers took, not by a design choice made here.
  *
- * What activation does <i>not</i> do is change when consumers exist. Task submission belongs to the
- * DAG scheduler and to the task scheduler, both of which this feature may not modify at all, and
- * the unmodified scheduler submits a stage only once every parent stage reports its output
- * available. For a map stage whose tasks each run once, its reduce tasks are therefore submitted
- * after the last map task has finished, no consumer is subscribed while any of them produces, and
- * what those reduce tasks read is retained output served by [[StreamingShuffleBlockResolver]]
- * rather than a live stream. Producer/consumer overlap is exercised only where a consumer really is
- * attached -- a reconnecting consumer asking for a replay of the window it has not acknowledged,
- * and any subscriber a scheduler that submitted consumers earlier would provide. Both halves of the
- * subsystem are built for that case and take it whenever it arises; neither pretends to create it.
+ * What activation does <i>not</i> do is change <i>when</i> consumers exist. Task submission belongs
+ * to the DAG scheduler and to the task scheduler, both of which this feature may not modify at all
+ * -- AAP 0.2.1 and 0.2.2 place them under zero modifications and AAP 0.8.2 Tier 1 restates it file
+ * by file for the whole scheduler package -- and the unmodified scheduler submits a stage only once
+ * every parent stage reports its output available. For a map stage whose tasks each run once, its
+ * reduce tasks are therefore submitted after the last map task has finished, no consumer is
+ * subscribed while any of them produces, and what those reduce tasks read is retained output
+ * served by [[StreamingShuffleBlockResolver]] over the streaming transport rather than a live
+ * producer's buffers. That ordering is not asserted here as prose: the integration suite runs an
+ * ordinary scheduled job on two executor JVMs and measures it, reporting the interval between the
+ * map stage's completion and the reduce stage's submission alongside the bytes each half moved.
+ *
+ * Producer/consumer overlap is therefore exercised wherever a consumer really is attached: a
+ * reconnecting consumer asking for a replay of the window it has not acknowledged, a reduce attempt
+ * reading while a superseded or speculative map attempt is still producing, and any subscriber a
+ * scheduler that submitted consumers earlier would provide. Both halves of the subsystem are built
+ * for that case and take it whenever it arises; neither pretends to create it, and
+ * `StreamingShufflePerformanceBenchmark` measures that path directly rather than inferring it from
+ * a whole-job figure.
+ *
+ * Closing the remaining gap would take one of two things this plan forbids. Changing when a reduce
+ * task is submitted is a scheduler change. Interposing a staging tier that consumes on a reduce
+ * task's behalf before one exists is a new component, which AAP 0.8.2 Tier 3 excludes along with
+ * anything else not enumerated in AAP 0.1.2, and it would contradict FR-2's requirement to
+ * "pipeline buffered data directly to consumer executors" besides -- while introducing a failure
+ * domain in which committed map output lives on an executor that did not produce it, needing a
+ * recovery mechanism this design is explicitly not permitted to invent.
  *
  * ==What is consulted before streaming is used==
  *

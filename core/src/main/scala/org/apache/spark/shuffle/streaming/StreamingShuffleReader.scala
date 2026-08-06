@@ -426,12 +426,18 @@ private[spark] class StreamingShuffleReader[K, C](
     // Makes this shuffle visible to the executor-wide ledger, which is what lets the protocol
     // arbitrate between concurrent shuffles and what the token bucket's refill rate is divided by.
     backpressure.registerShuffle(shuffleId, handle.numPartitions)
-    // The consumer and producer draw from one executor-wide quota, but only the producer's retained
-    // bytes define the spill-threshold gauge: consumer payloads cannot be evicted by the producer's
-    // spill manager, so including them in that numerator would make the gauge claim a producer
-    // spill threshold had been crossed when no producer buffer was at that threshold. Aggregate
-    // usage remains observable through the protocol's quota accessors; this gauge keeps its
-    // narrower, actionable meaning.
+    // Consumer and producer draw on ONE executor-wide quota, and a consumer's received frames are
+    // charged to it exactly as a producer's buffered blocks are -- as the consumer category of the
+    // same aggregate reservation, alongside transient framing copies and per-stream metadata. That
+    // is deliberate: the configured buffer percentage is a promise about an executor rather than
+    // about a role, so both directions raise the same numerator, the same
+    // `shuffle.streaming.bufferUtilizationPercent` gauge and the same spill trigger, which
+    // `MemorySpillManager.maybeSpill` evaluates against that aggregate reservation. What keeps it
+    // sound is that the bytes any one spill manager sheds are capped by what that instance itself
+    // holds: consumer bytes lift the trigger without ever asking a producer's spill manager to
+    // evict something it cannot, and an instance holding nothing does no work however loaded its
+    // neighbours are. This reader therefore registers no utilisation contributor of its own -- the
+    // shared quota already reports its bytes, and a second contribution would count them twice.
 
     // Deduplicated before anything is claimed or opened, so that the credit split, the streams
     // and the reduce input all describe the same set of producers.
@@ -1436,13 +1442,16 @@ private[spark] class StreamingShuffleReader[K, C](
    * treats the utilisation sample as unevaluable, which is exactly right: absence of a cap means
    * unlimited, never zero.
    *
-   * Buffer utilisation is deliberately not among the things reported. That reading is per shuffle
-   * and last-writer-wins, its numerator is the producer buffer budget the spill threshold is
-   * evaluated against, and this side holds a different budget entirely -- so a reader reporting its
-   * own stash would not add to the picture, it would replace the producer's half of it, and a
-   * producer genuinely at its eighty percent spill point would read as whatever the reader happened
-   * to be holding. The invariant is stated once where this reader registers the shuffle, and this
-   * is the method that would otherwise break it.
+   * Buffer utilisation is deliberately not among the things reported, and the reason is that it is
+   * already reported. A consumer's received frames are charged to the one executor-wide quota, so
+   * this side's stash is in the `shuffle.streaming.bufferUtilizationPercent` numerator -- and in
+   * the spill trigger -- before this method is ever reached. That gauge is neither per shuffle nor
+   * last-writer-wins: it sums the buffered bytes and the budgets of every registered contributor
+   * and divides once, so a reader adding its own stash as a second contribution would count those
+   * bytes twice and add the same allowance to the denominator twice. What this method reports is
+   * precisely what only a consumer can measure and the quota cannot: the two throughputs, and
+   * observed link usage. The invariant is stated once where this reader registers the shuffle, and
+   * this is the method that would otherwise break it.
    */
   private def sampleFlowControl(): Unit = {
     if (backpressure.isPollDue) {
@@ -3403,6 +3412,16 @@ private[spark] class NettyStreamingShuffleProducerConnector(
    * contract for the reader and therefore exercises its application-level connection timeout
    * rather than the immediate channel-closed path. The pause is intentionally not remembered:
    * failed-task cleanup closes these channels and a retry opens fresh channels in the normal state.
+   *
+   * <b>This is the one `setAutoRead` call in the subsystem that is not flow control, and it is
+   * declared as such where the flow-control claim is made.</b> Backpressure belongs to
+   * `StreamingShuffleChannelReadGate`, which is the single writer of the flag for that purpose
+   * because the flag belongs to the socket and a socket carries several handlers; that class's
+   * documentation names this hook explicitly, so neither statement can drift into claiming to be
+   * the only caller. Two properties make the exception safe: this hook only ever disables reading,
+   * so it can never reopen a window a participant still needs shut, and it writes nothing back to
+   * the gate, which is tolerable only because every channel it touches is about to be closed. It is
+   * therefore not a way to exert backpressure and must not be used as one.
    *
    * @return the number of active channels that were paused
    */
