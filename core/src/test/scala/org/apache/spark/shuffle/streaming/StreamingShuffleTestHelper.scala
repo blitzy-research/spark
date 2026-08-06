@@ -17,10 +17,11 @@
 
 package org.apache.spark.shuffle.streaming
 
-import java.io.{File, InputStream}
+import java.io.{File, InputStream, RandomAccessFile}
 import java.nio.ByteBuffer
 import java.util.Properties
-import java.util.concurrent.{Callable, CountDownLatch, CyclicBarrier, Semaphore, TimeUnit}
+import java.util.concurrent.{Callable, ConcurrentHashMap, CountDownLatch, CyclicBarrier, Semaphore,
+  TimeUnit}
 import java.util.concurrent.{Future => JFuture}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong, AtomicReference}
 
@@ -31,20 +32,30 @@ import scala.jdk.CollectionConverters._
 import scala.util.Random
 
 import com.codahale.metrics.{Counter, Gauge}
+import org.apache.logging.log4j.LogManager
+import org.apache.logging.log4j.core.{LogEvent, Logger => Log4jLogger}
+import org.apache.logging.log4j.core.appender.AbstractAppender
+import org.apache.logging.log4j.core.config.Property
 import org.scalatest.Tag
 
-import org.apache.spark.{HashPartitioner, Partitioner, ShuffleDependency, SparkConf, SparkContext, SparkEnv, TaskContext, TaskContextImpl}
-import org.apache.spark.internal.config.{SHUFFLE_MANAGER, SHUFFLE_STREAMING_BUFFER_SIZE_PERCENT, SHUFFLE_STREAMING_DEBUG, SHUFFLE_STREAMING_ENABLED, SHUFFLE_STREAMING_MAX_BANDWIDTH_MBPS, SHUFFLE_STREAMING_SPILL_THRESHOLD, UNSAFE_EXCEPTION_ON_MEMORY_LEAK}
+import org.apache.spark.{HashPartitioner, Partitioner, ShuffleDependency, SparkConf, SparkContext,
+  SparkEnv, TaskContext, TaskContextImpl}
+import org.apache.spark.internal.config.{AUTH_SECRET, NETWORK_AUTH_ENABLED, SHUFFLE_MANAGER,
+  SHUFFLE_STREAMING_BUFFER_SIZE_PERCENT, SHUFFLE_STREAMING_DEBUG, SHUFFLE_STREAMING_ENABLED,
+  SHUFFLE_STREAMING_MAX_BANDWIDTH_MBPS, SHUFFLE_STREAMING_SPILL_THRESHOLD,
+  UNSAFE_EXCEPTION_ON_MEMORY_LEAK}
 import org.apache.spark.internal.config.UI.UI_ENABLED
 import org.apache.spark.memory.TaskMemoryManager
 import org.apache.spark.metrics.MetricsSystem
 import org.apache.spark.metrics.source.Source
 import org.apache.spark.network.buffer.{ManagedBuffer, NioManagedBuffer}
-import org.apache.spark.network.shuffle.protocol.streaming.{AckMessage, DataBlockMessage, HeartbeatMessage, RetransmitRequestMessage, StreamingShuffleChecksum, StreamingShuffleMessage, StreamingShuffleMessageType, StreamTerminationMessage}
+import org.apache.spark.network.shuffle.protocol.streaming.{AckMessage, DataBlockMessage,
+  HeartbeatMessage, RetransmitRequestMessage, StreamingShuffleChecksum, StreamingShuffleMessage,
+  StreamingShuffleMessageType, StreamTerminationMessage}
 import org.apache.spark.rdd.{RDD, ShuffledRDD}
 import org.apache.spark.serializer.KryoSerializer
 import org.apache.spark.shuffle.{ShuffleReadMetricsReporter, ShuffleWriteMetricsReporter}
-import org.apache.spark.util.{Clock, ManualClock, SystemClock, ThreadUtils, Utils}
+import org.apache.spark.util.{Clock, LongAccumulator, ManualClock, SystemClock, ThreadUtils, Utils}
 
 /**
  * ScalaTest tag carried by the five-minute streaming shuffle stress workload.
@@ -868,6 +879,268 @@ private[spark] class MidWriteTripHolder(val reason: StreamingShuffleFallbackReas
 }
 
 /**
+ * Applies one of the ten enumerated failure scenarios to the '''live''' streaming shuffle a running
+ * job is using, on the executor, through production APIs only.
+ *
+ * ==Why this exists==
+ *
+ * A fault driven against a standalone component proves that the component behaves correctly in
+ * isolation. It does not prove that a job survives the fault, and a comparison against the
+ * sort-based baseline made on a '''different, healthy''' run proves nothing at all about the fault:
+ * the run that was compared never saw it. This holder closes that gap. Every action below is
+ * applied from inside a transformation of the very job whose output is compared, so the shuffle
+ * that is faulted and the shuffle that is asserted are one shuffle.
+ *
+ * ==Where each action reaches, and why it is a real fault==
+ *
+ *  - '''Producer crash''' and '''concurrent producer failures''' throw from inside a map function.
+ *    The map stage is fused, so a streaming writer PULLS records through that function: by the time
+ *    the fault fires, blocks have been framed, checksummed and streamed and the iterator is nowhere
+ *    near exhausted. That is a producer lost mid-write.
+ *  - '''Network partition''' and '''connection timeout during transfer''' call
+ *    `StreamingShuffleListener.deregisterShuffle`, the production withdrawal path: routing entries,
+ *    retained output, sessions and the spill files behind them all go. Every consumer that resolved
+ *    one of those producers is left with an address that answers nothing, which is what a
+ *    partitioned link and a peer that stops answering mid-transfer both look like from the only
+ *    side able to observe either. Applied from the consuming side, and deliberately: withdrawing a
+ *    generation from under the writer that is still filling it fails that writer outright with
+ *    incomplete output, which is a producer crash rather than a partition and is already covered as
+ *    one. Applied as the reduce side is about to read, the producers have finished and the fault is
+ *    exactly what it claims to be -- output that was published and is now unreachable.
+ *  - '''Memory exhaustion on allocation''' commits what is left of the executor's shared streaming
+ *    buffer allowance, so the writer's next block admission is refused after every recovery
+ *    round -- the specified "memory pressure prevents buffer allocation" condition, live. The
+ *    bytes are returned by a task-completion listener, so the fault cannot outlive the task that
+ *    injected it.
+ *  - '''Executor GC pause''' allocates and touches real ballast and asks for a collection. The
+ *    pause is the JVM's own rather than a sleep standing in for one.
+ *  - '''Disk failure during spill''' unlinks the temporary shuffle segments this executor has
+ *    written, which is what a device losing them looks like to every later read of them.
+ *  - '''Checksum mismatch on receive''' flips a byte inside those same segments, so the block a
+ *    consumer receives from spill fails its CRC32C verification -- a corruption introduced into
+ *    real data that a real verification then catches.
+ *  - '''Consumer crash''' and '''consumer reconnect after downtime''' throw from inside the loop
+ *    pulling the reader's own iterator, so the consumer dies with an unacknowledged window
+ *    outstanding and its retry is a genuine reconnection.
+ *
+ * ==Determinism==
+ *
+ * Nothing here sleeps and nothing waits on a wall clock. The two throwing actions are conditioned
+ * on the task attempt number, so attempt zero always fails and its retry always succeeds. Every
+ * other
+ * action takes a claim held in a set on this class's companion, whose scope is the executor JVM --
+ * which is exactly the scope of the transport, the buffer allowance and the local directories being
+ * damaged. A per-instance flag could not serve: a holder is deserialized afresh for every task, so
+ * it would fire once per task, and recovery could never succeed.
+ *
+ * @param scenario which of the ten faults to apply
+ * @param faultPartitions partition indexes eligible to apply it, or empty for every partition
+ * @param recordsBeforeFault records to let through before applying it
+ */
+private[spark] class LiveFaultHolder(
+    val scenario: StreamingShuffleFaultScenario,
+    val faultPartitions: Set[Int] = Set.empty,
+    val recordsBeforeFault: Int = 0)
+  extends Serializable {
+
+  /**
+   * The shuffle being faulted. Set by the driver after the shuffled RDD exists and before the job
+   * is submitted -- task closures are serialized at submission, not at definition -- and negative
+   * until then, which every action treats as nothing to do.
+   */
+  @volatile var shuffleId: Int = -1
+
+  /**
+   * Applies this holder's fault from the map side, while a streaming writer is pulling records.
+   *
+   * @param partitionIndex map partition the caller is producing
+   * @param recordIndex how many records this partition has already offered
+   * @return how many units of damage were done, for the caller's accumulator
+   */
+  def applyOnMapSide(partitionIndex: Int, recordIndex: Int): Int = {
+    if (!eligible(partitionIndex, recordIndex)) {
+      0
+    } else {
+      scenario match {
+        case StreamingShuffleFaultScenario.ProducerCrashDuringWrite |
+             StreamingShuffleFaultScenario.ConcurrentProducerFailures =>
+          crashThisAttempt(s"producer of map partition $partitionIndex")
+        case StreamingShuffleFaultScenario.MemoryExhaustionOnAllocation =>
+          once(commitBufferAllowance())
+        case StreamingShuffleFaultScenario.ExecutorGarbageCollectionPause =>
+          once(forceCollectionPause())
+        case _ => 0
+      }
+    }
+  }
+
+  /**
+   * Applies this holder's fault from the reduce side, while the reader's own iterator is being
+   * pulled.
+   *
+   * @param partitionIndex reduce partition the caller is consuming
+   * @param recordIndex how many records this partition has already taken off the reader
+   * @return how many units of damage were done, for the caller's accumulator
+   */
+  def applyOnReduceSide(partitionIndex: Int, recordIndex: Int): Int = {
+    if (!eligible(partitionIndex, recordIndex)) {
+      0
+    } else {
+      scenario match {
+        case StreamingShuffleFaultScenario.ConsumerCrashDuringRead |
+             StreamingShuffleFaultScenario.ConsumerReconnectAfterDowntime =>
+          crashThisAttempt(s"consumer of reduce partition $partitionIndex")
+        case StreamingShuffleFaultScenario.NetworkPartition |
+             StreamingShuffleFaultScenario.ConnectionTimeoutDuringTransfer =>
+          once(severTransport())
+        case StreamingShuffleFaultScenario.DiskFailureDuringSpill =>
+          once(destroySpilledSegments())
+        case StreamingShuffleFaultScenario.ChecksumMismatchOnReceive =>
+          once(corruptSpilledSegments())
+        case _ => 0
+      }
+    }
+  }
+
+  /** Whether this call is the one the fault is aimed at. */
+  private def eligible(partitionIndex: Int, recordIndex: Int): Boolean = {
+    shuffleId >= 0 && recordIndex == recordsBeforeFault &&
+      (faultPartitions.isEmpty || faultPartitions.contains(partitionIndex))
+  }
+
+  /** Runs `body` if this executor has not applied this fault to this shuffle already. */
+  private def once(body: => Int): Int = {
+    if (LiveFaultHolder.claim(scenario, shuffleId)) body else 0
+  }
+
+  /** The first attempt dies; its retry does not, so recovery is able to succeed. */
+  private def crashThisAttempt(role: String): Int = {
+    val attempt = Option(TaskContext.get()).map(_.attemptNumber()).getOrElse(0)
+    if (attempt == 0) {
+      throw new IllegalStateException(
+        s"Injected streaming shuffle ${scenario.faultName}: the $role of shuffle $shuffleId died " +
+          s"after $recordsBeforeFault record(s)")
+    }
+    0
+  }
+
+  /** Withdraws every producer generation of this shuffle that this executor is serving. */
+  private def severTransport(): Int = {
+    SparkEnv.get.shuffleManager match {
+      case manager: StreamingShuffleManager =>
+        manager.boundStreamingListener.map(_.deregisterShuffle(shuffleId)).getOrElse(0)
+      case _ => 0
+    }
+  }
+
+  /**
+   * Commits what is left of the executor's shared streaming buffer allowance, and returns it when
+   * the task ends.
+   *
+   * Halved on refusal for the same reason the writer halves its own framing request: the allowance
+   * is shared and moves, so the reservation converges instead of failing on an arithmetic change.
+   */
+  private def commitBufferAllowance(): Int = {
+    val quota = MemorySpillManager.executorQuota(SparkEnv.get.conf)
+    var request = quota.totalBytes - quota.reservedBytes
+    var taken = 0L
+    while (request > 0L && taken == 0L) {
+      if (quota.tryReserve(request)) {
+        taken = request
+      } else {
+        request /= 2L
+      }
+    }
+    if (taken > 0L) {
+      val held = taken
+      Option(TaskContext.get()).foreach { context =>
+        context.addTaskCompletionListener[Unit](_ => quota.release(held))
+      }
+      1
+    } else {
+      0
+    }
+  }
+
+  /** Allocates and touches real ballast, then asks for a collection, so the pause is the JVM's. */
+  private def forceCollectionPause(): Int = {
+    val ballast = Array.fill(LiveFaultHolder.GC_BALLAST_CHUNKS)(
+      new Array[Byte](LiveFaultHolder.GC_BALLAST_CHUNK_BYTES))
+    var touchedBytes = 0L
+    var index = 0
+    while (index < ballast.length) {
+      ballast(index)(0) = index.toByte
+      touchedBytes += ballast(index).length.toLong
+      index += 1
+    }
+    System.gc()
+    if (touchedBytes > 0L) 1 else 0
+  }
+
+  /** The temporary shuffle segments this executor has written, through the production accessor. */
+  private def spilledSegments(): Seq[File] = {
+    SparkEnv.get.blockManager.diskBlockManager.getAllFiles()
+      .filter(file => file.getName.startsWith(LiveFaultHolder.TEMP_SHUFFLE_PREFIX))
+      .toSeq
+  }
+
+  /** Unlinks them, which is what a device losing them looks like to every later read. */
+  private def destroySpilledSegments(): Int = spilledSegments().count(file => file.delete())
+
+  /** Flips one byte in the middle of each, so a CRC32C verification on receive must fail. */
+  private def corruptSpilledSegments(): Int = {
+    spilledSegments().count { file =>
+      val length = file.length()
+      if (length <= 0L) {
+        false
+      } else {
+        val handle = new RandomAccessFile(file, "rw")
+        try {
+          val offset = length / 2L
+          handle.seek(offset)
+          val original = handle.readByte()
+          handle.seek(offset)
+          handle.writeByte(original ^ 0xFF)
+          true
+        } finally {
+          handle.close()
+        }
+      }
+    }
+  }
+}
+
+/**
+ * The JVM-scoped record of which faults this executor has already applied, and the ballast shape
+ * the collection pause uses.
+ *
+ * An `object`, deliberately: the claim's lifetime has to be the executor's, because a holder is
+ * deserialized afresh for every task and a per-instance flag would apply the fault once per task
+ * instead of once per executor -- which is a fault that never stops and a recovery that never
+ * succeeds.
+ */
+private[spark] object LiveFaultHolder {
+
+  /** Prefix `createTempShuffleBlock` gives every segment a streaming spill writes. */
+  val TEMP_SHUFFLE_PREFIX: String = "temp_shuffle"
+
+  /** Ballast chunks the collection pause allocates and touches. */
+  val GC_BALLAST_CHUNKS: Int = 16
+
+  /** Bytes per ballast chunk, so the pause is over a real sixty-four mebibytes. */
+  val GC_BALLAST_CHUNK_BYTES: Int = 4 * 1024 * 1024
+
+  private val applied = ConcurrentHashMap.newKeySet[(String, Int)]()
+
+  /** Takes this JVM's one claim on a fault, or reports that it has already been applied. */
+  private def claim(scenario: StreamingShuffleFaultScenario, shuffleId: Int): Boolean =
+    applied.add((scenario.faultName, shuffleId))
+
+  /** Returns the claims, so one case's damage cannot silence the next case's. */
+  def reset(): Unit = applied.clear()
+}
+
+/**
  * Constants and pure helpers shared by every streaming shuffle suite and by the benchmark.
  *
  * Two opposite policies govern this object, and which one applies depends on whether the value is a
@@ -899,6 +1172,10 @@ private[spark] class MidWriteTripHolder(val reason: StreamingShuffleFallbackReas
  * stress-workload shape.
  */
 object StreamingShuffleTestHelper {
+
+  private val TestApplicationId = "streaming-shuffle-test-application"
+
+  private val TestAuthenticationSecret = "streaming-shuffle-test-authentication-secret"
 
   val DefaultBufferSizePercent: Int = 20
 
@@ -997,24 +1274,42 @@ object StreamingShuffleTestHelper {
   val MaxEncodedFrameBytes: Int = 2 * 1024 * 1024 + 38
 
   /**
-   * Encoded length of every control message: acknowledgement, heartbeat, retransmission request and
+   * Encoded length of a control message that carries no field of its own: an acknowledgement or a
    * stream termination. Each is the shared header followed by the producer identifier and nothing
    * else, because each folds its one semantic value into the header's sequence number.
    *
-   * All four are the same size, which is precisely why a decoder must never discriminate on length.
-   * The framing type byte is the discriminator; [[messageTypeOf]] reads the concrete class instead,
-   * which is the same decision expressed in Scala.
+   * Sizes are fixed per type rather than shared by all of them, which is precisely why a decoder
+   * must never discriminate on length. The framing type byte is the discriminator;
+   * [[messageTypeOf]] reads the concrete class instead, which is the same decision expressed in
+   * Scala.
    */
   val FixedMessageEncodedLength: Int = 25
 
-  /** Encoded length of a heartbeat, which is a control message like any other. */
-  val HeartbeatBaseEncodedLength: Int = FixedMessageEncodedLength
+  /**
+   * Encoded length of a retransmission request: a control message plus the eight bytes of its
+   * window's inclusive upper bound, which is the field that lets one frame name a whole repair.
+   */
+  val RetransmitRequestEncodedLength: Int = FixedMessageEncodedLength + 8
+
+  /**
+   * Encoded length of a heartbeat: a control message plus the eight bytes of the consumer session
+   * token that lets a producer recognise a reconnection as the consumer it already knows. Fixed
+   * whether the heartbeat declares a token or declares none, so a producer's framing budget never
+   * depends on what its peers choose to say.
+   */
+  val HeartbeatBaseEncodedLength: Int = FixedMessageEncodedLength + 8
 
   /** Sentinel a consumer sends before it has consumed anything. */
   val NothingConsumedPosition: Long = -1L
 
-  /** Blocks a single retransmission request names, which is exactly one position. */
-  val RequestedBlocksPerRequest: Long = 1L
+  /**
+   * Token a heartbeat carries when it declares no consumer session identity, which is what a
+   * producer's own heartbeat carries and what a peer of an earlier protocol revision sends.
+   */
+  val NoConsumerToken: Long = 0L
+
+  /** Most blocks a single retransmission request may name. */
+  val MaxRequestedBlocksPerRequest: Long = RetransmitRequestMessage.MAX_REQUESTED_BLOCKS
 
   /** Largest span a consumer will ask a producer to replay, in blocks. */
   val MaxReplayWindowBlocks: Long = StreamingShuffleClientHandler.MAX_REPLAY_WINDOW_BLOCKS
@@ -1055,20 +1350,25 @@ object StreamingShuffleTestHelper {
     check("control message encoded length", FixedMessageEncodedLength,
       StreamingShuffleMessage.CONTROL_MESSAGE_ENCODED_LENGTH)
     check("nothing consumed sentinel", NothingConsumedPosition, AckMessage.NOTHING_CONSUMED)
-    check("requested blocks per request", RequestedBlocksPerRequest,
-      RetransmitRequestMessage.REQUESTED_BLOCKS)
+    check("max requested blocks per request", MaxRequestedBlocksPerRequest,
+      RetransmitRequestMessage.MAX_REQUESTED_BLOCKS)
     check("checksum algorithm", ChecksumAlgorithm, StreamingShuffleChecksum.ALGORITHM)
     // Totals, taken from real messages so that a body change is caught as well as a header change.
     val payload = Array[Byte](1, 2, 3, 4)
     val payloadChecksum = StreamingShuffleChecksum.computeBlock(1, 2L, 3, 4L, payload)
     check("acknowledgement encoded length", FixedMessageEncodedLength,
       new AckMessage(1, 2L, 3, 5L).encodedLength())
-    check("retransmission request encoded length", FixedMessageEncodedLength,
+    check("retransmission request encoded length", RetransmitRequestEncodedLength,
       new RetransmitRequestMessage(1, 2L, 3, 4L).encodedLength())
+    check("ranged retransmission request encoded length", RetransmitRequestEncodedLength,
+      new RetransmitRequestMessage(1, 2L, 3, 4L, 9L).encodedLength())
     check("stream termination encoded length", FixedMessageEncodedLength,
       new StreamTerminationMessage(1, 2L, 3, 4L).encodedLength())
     check("heartbeat encoded length", HeartbeatBaseEncodedLength,
       new HeartbeatMessage(1, 2L, 3, 4L).encodedLength())
+    check("identified heartbeat encoded length", HeartbeatBaseEncodedLength,
+      new HeartbeatMessage(1, 2L, 3, 4L, 7L).encodedLength())
+    check("no consumer token sentinel", NoConsumerToken, HeartbeatMessage.NO_CONSUMER_TOKEN)
     check("data block encoded length",
       HeaderEncodedLength + ProducerIdEncodedLength + 8 + 4 + payload.length,
       new DataBlockMessage(1, 2L, 3, 4L, payloadChecksum, payload).encodedLength())
@@ -1103,6 +1403,14 @@ object StreamingShuffleTestHelper {
   val JustBeforeConsumerLivenessMillis: Long = ConsumerLivenessTimeoutMillis - 1L
 
   val JustBeforeSustainedSlownessMillis: Long = SustainedSlownessWindowMillis - 1L
+
+  /**
+   * The interval over which link usage is measured before a rate is derived from it.
+   *
+   * Taken from the protocol rather than restated, so that a suite advancing "one measurement
+   * interval" advances exactly the interval the rate windows republish on.
+   */
+  val SaturationSampleWindowMillis: Long = BackpressureProtocol.SATURATION_SAMPLE_WINDOW_MS
 
   val RetryBaseBackoffMillis: Long = BackpressureProtocol.RETRY_BASE_BACKOFF_MS
 
@@ -1365,6 +1673,18 @@ object StreamingShuffleTestHelper {
     }
   }
 
+  /** Compact value-preserving digest of one raw shuffled record. */
+  def rawRecordDigest(record: (Int, String)): (Int, Int, Int) = {
+    val (key, value) = record
+    var index = 0
+    var hash = 0
+    while (index < value.length) {
+      hash = 31 * hash + value.charAt(index).toInt
+      index += 1
+    }
+    (key, value.length, hash)
+  }
+
   // ---------------------------------------------------------------------------------------------
   // Error conditions this feature is authorized to add to the central catalogue.
   //
@@ -1376,6 +1696,26 @@ object StreamingShuffleTestHelper {
 
   /** Prefix carried by every error condition this feature is authorized to add. */
   val StreamingShuffleConditionPrefix: String = "STREAMING_SHUFFLE_"
+
+  /**
+   * A long accumulator whose updates survive the failure of the task that made them.
+   *
+   * `SparkContext.longAccumulator` registers with `countFailedValues = false`, so the driver
+   * DISCARDS every update from a task that failed. That default is right for a user counting rows
+   * and wrong for a suite counting injected faults: a fault injected part way through a task is
+   * very often what fails it, so the one observation that proves the injection took effect is
+   * exactly the one thrown away. Registering with the flag set is what makes an in-job fault
+   * observable from the driver at all.
+   *
+   * @param sc the context to register with
+   * @param name accumulator name, which is what makes it legible in the UI and in a heap dump
+   * @return the accumulator, registered
+   */
+  def failureCountingAccumulator(sc: SparkContext, name: String): LongAccumulator = {
+    val accumulator = new LongAccumulator
+    accumulator.register(sc, Some(name), countFailedValues = true)
+    accumulator
+  }
 
   /**
    * SQLSTATE every streaming shuffle condition carries.
@@ -1432,13 +1772,9 @@ object StreamingShuffleTestHelper {
         policy.recordAllocationGrant(MaxBlockSizeBytes.toLong, 0L)
       case StreamingShuffleFallbackReason.NetworkSaturation =>
         // Ninety-nine percent of the administered link, which is strictly above the trip share, on
-        // as many consecutive samples as a sustained saturation needs. One sample is deliberately
-        // not enough: a pacing bucket must be able to admit one maximum-sized block, so its burst
-        // allowance legitimately exceeds the administered capacity for a single sampling interval,
-        // and tripping on that stood streaming down on links that were never saturated.
-        (1L to StreamingShuffleFallbackPolicy.SATURATION_SUSTAINED_SAMPLES).foreach { _ =>
-          policy.recordLinkUtilization(99.0d, 100.0d)
-        }
+        // one reading. One reading is all the condition requires: the specification names
+        // utilisation above ninety percent and attaches no sustaining requirement to it.
+        policy.recordLinkUtilization(99.0d, 100.0d)
       case StreamingShuffleFallbackReason.ProtocolVersionMismatch =>
         // A version one beyond the one this build speaks, detected by the explicit compatibility
         // check rather than inferred from a parse failure.
@@ -1515,9 +1851,9 @@ trait StreamingShuffleTestHelper {
    *
    * `spark.testing` itself is deliberately '''not''' set. It would grant the same bind tolerance,
    * but `UnifiedMemoryManager` also reads it to decide whether to reserve its 300MB system
-   * allowance, so putting it in a `SparkConf` silently changes the executor memory a buffer budget
-   * is a percentage of -- and the budget arithmetic is precisely what several of these suites
-   * assert. The narrow key is used instead, which buys the tolerance and changes nothing else.
+   * allowance, so putting it in a `SparkConf` silently changes how much execution memory a task may
+   * acquire -- and the streaming buffer is a `MemoryConsumer`, so every spill case here depends on
+   * that figure. The narrow key is used instead, which buys the tolerance and changes nothing else.
    *
    * Exposed rather than private because a suite that has to build its own configuration -- one
    * exercising a component directly, with no shuffle manager selected -- still runs in this
@@ -1550,8 +1886,19 @@ trait StreamingShuffleTestHelper {
       .set(SHUFFLE_STREAMING_ENABLED, false)
   }
 
+  /**
+   * A fully active streaming configuration, including its mandatory transport authentication.
+   *
+   * The fixed application id and secret are test-only credentials. Stating them here keeps every
+   * component fixture on the same secure-default posture as a real manager and lets a connector
+   * built without a live `SparkEnv` construct the same `SecurityManager` deterministically.
+   */
   def streamingConf(loadDefaults: Boolean = false): SparkConf = {
-    gatedOffStreamingConf(loadDefaults).set(SHUFFLE_STREAMING_ENABLED, true)
+    gatedOffStreamingConf(loadDefaults)
+      .set(SHUFFLE_STREAMING_ENABLED, true)
+      .set(NETWORK_AUTH_ENABLED, true)
+      .set(AUTH_SECRET, TestAuthenticationSecret)
+      .set("spark.app.id", TestApplicationId)
   }
 
   /**
@@ -1591,6 +1938,10 @@ trait StreamingShuffleTestHelper {
    * @param debug whether verbose streaming diagnostics are emitted
    * @param enabled whether the behaviour gate is open; false yields the kill-switch configuration
    * @param loadDefaults whether to pick up ambient `spark.*` system properties
+   * Authentication is always enabled, including when `enabled` is false. That keeps this builder's
+   * one varying dimension confined to the streaming behaviour gate; a test of missing
+   * authentication sets `NETWORK_AUTH_ENABLED` false explicitly.
+   *
    * @return the configured instance
    */
   def streamingConfWithOverrides(
@@ -1603,6 +1954,9 @@ trait StreamingShuffleTestHelper {
     val conf = testEnvelopeConf(loadDefaults)
       .set(SHUFFLE_MANAGER, StreamingShuffleManager.SHORT_NAME)
       .set(SHUFFLE_STREAMING_ENABLED, enabled)
+      .set(NETWORK_AUTH_ENABLED, true)
+      .set(AUTH_SECRET, TestAuthenticationSecret)
+      .set("spark.app.id", TestApplicationId)
       .set(SHUFFLE_STREAMING_BUFFER_SIZE_PERCENT, bufferSizePercent)
       .set(SHUFFLE_STREAMING_SPILL_THRESHOLD, spillThreshold)
       .set(SHUFFLE_STREAMING_DEBUG, debug)
@@ -1679,11 +2033,87 @@ trait StreamingShuffleTestHelper {
       .dependencies.head.asInstanceOf[ShuffleDependency[Int, Int, Int]]
   }
 
+  /**
+   * The five pairs every job-level case in this suite family shuffles.
+   *
+   * One definition, so a faulted run and the baseline it is compared against can never differ in
+   * their input -- which is the only way an output comparison means anything.
+   */
+  val WorkloadPairs: Seq[(Int, String)] =
+    Seq((1, "one"), (2, "two"), (3, "three"), (4, "four"), (5, "five"))
+
   def groupByKeyWorkload(
       sc: SparkContext,
       numPartitions: Int = DefaultPartitionCount): RDD[(Int, Iterable[String])] = {
-    val pairs = Seq((1, "one"), (2, "two"), (3, "three"), (4, "four"), (5, "five"))
-    sc.parallelize(pairs, numPartitions).groupByKey(numPartitions)
+    sc.parallelize(WorkloadPairs, numPartitions).groupByKey(numPartitions)
+  }
+
+  /**
+   * The grouping workload with a producer crash injected into the job's OWN map side, collected.
+   *
+   * <b>Why the fault has to be inside the compared job.</b> A fault applied to one job and output
+   * compared from another proves only that a healthy job is healthy. Here the crash is fused into
+   * the map stage of the very job whose output is compared, so a streaming writer is pulling
+   * records through the throwing function when it fires: blocks have been framed and streamed,
+   * and the iterator is not exhausted.
+   *
+   * <b>Why it is deterministic.</b> The crash is conditioned on the attempt number, so the first
+   * attempt of every non-empty map partition always dies and every retry always succeeds. No clock
+   * is waited on and no rate is hoped for.
+   *
+   * @param sc live context to build on
+   * @param numPartitions partitions the shuffle produces
+   * @param failureMessage text the injected failure carries, so a run names its own fault
+   * @return the faulted job's output as a set, comparable to the sort-based baseline
+   */
+  def crashingGroupedOutputAsSet(
+      sc: SparkContext,
+      numPartitions: Int,
+      failureMessage: String): Set[(Int, Seq[String])] = {
+    sc.parallelize(WorkloadPairs, numPartitions)
+      .mapPartitionsWithIndex { (partitionIndex, records) =>
+        records.map { record =>
+          if (TaskContext.get().attemptNumber() == 0) {
+            throw new IllegalStateException(s"$failureMessage in map partition $partitionIndex")
+          }
+          record
+        }
+      }
+      .groupByKey(numPartitions)
+      .mapValues(values => values.toSeq.sorted)
+      .collect()
+      .toSet
+  }
+
+  /**
+   * The grouping workload with a CONSUMER crash injected into the job's own reduce side, collected.
+   *
+   * The crash fires only after a group has been pulled from the shuffle reader, which is what makes
+   * it a crash during a read rather than before one: on the streaming path that pull is a block
+   * received, checksum-verified and acknowledged, so the attempt that dies is one that had already
+   * consumed part of a producer's output. Conditioning on the attempt number makes the first
+   * attempt of every non-empty reduce partition die and every retry succeed.
+   *
+   * @param sc live context to build on
+   * @param numPartitions partitions the shuffle produces
+   * @param failureMessage text the injected failure carries
+   * @return the faulted job's output as a set, comparable to the sort-based baseline
+   */
+  def consumerCrashingGroupedOutputAsSet(
+      sc: SparkContext,
+      numPartitions: Int,
+      failureMessage: String): Set[(Int, Seq[String])] = {
+    groupByKeyWorkload(sc, numPartitions)
+      .mapPartitionsWithIndex { (partitionIndex, groups) =>
+        val buffered = groups.buffered
+        if (buffered.hasNext && TaskContext.get().attemptNumber() == 0) {
+          throw new IllegalStateException(s"$failureMessage in reduce partition $partitionIndex")
+        }
+        buffered
+      }
+      .mapValues(values => values.toSeq.sorted)
+      .collect()
+      .toSet
   }
 
   /**
@@ -1749,6 +2179,45 @@ trait StreamingShuffleTestHelper {
         val key = partitionIndex * recordsPerPartition + recordIndex
         (key, deterministicValue(partitionIndex, recordIndex))
       }
+    }
+  }
+
+  /**
+   * The deterministic large dataset after a raw hash shuffle, with no grouping materialization.
+   *
+   * A consumer of this RDD advances the real shuffle reader one record at a time. That makes it the
+   * integration seam for pacing, connection loss and corruption: a fault injected from a downstream
+   * iterator acts while the reader and its transport routes are live rather than after a grouped
+   * sequence has already been materialized.
+   */
+  def rawShuffleWorkload(
+      sc: SparkContext,
+      numPartitions: Int = DefaultPartitionCount,
+      totalBytes: Long = TargetDatasetBytes): RDD[(Int, String)] = {
+    largeDataset(sc, numPartitions, totalBytes)
+      .partitionBy(new HashPartitioner(numPartitions))
+  }
+
+  /** Output digest of a raw shuffled workload, compared as a set. */
+  def rawOutputDigest(shuffled: RDD[(Int, String)]): Set[(Int, Int, Int)] =
+    shuffled.map(rawRecordDigest).collect().toSet
+
+  /**
+   * Runs the raw workload through stock sort shuffle and returns its digest.
+   *
+   * The context is owned by this method and stopped before it returns.
+   */
+  def sortBaselineRawOutput(
+      numPartitions: Int,
+      totalBytes: Long,
+      master: String = "local[2]"): Set[(Int, Int, Int)] = {
+    val conf = withLocalMaster(
+      sortBaselineConf(), "streaming-shuffle-raw-sort-baseline", master)
+    val baselineContext = new SparkContext(conf)
+    try {
+      rawOutputDigest(rawShuffleWorkload(baselineContext, numPartitions, totalBytes))
+    } finally {
+      baselineContext.stop()
     }
   }
 
@@ -2212,46 +2681,56 @@ trait StreamingShuffleTestHelper {
     new AckMessage(shuffleId, mapId, partitionId, consumerPosition)
 
   /**
-   * A liveness signal reporting the position the consumer has reached.
+   * A liveness signal reporting the next position its sender expects to handle.
    *
-   * A heartbeat is a control message of exactly the size of every other, so it carries neither an
-   * arrival timestamp nor a consumer identity on the wire. The receiver stamps arrival from its own
-   * clock -- a peer-supplied instant would be a peer-controlled input to a local timeout -- and
-   * identifies the sender from the connection it arrived on.
+   * A heartbeat carries no arrival timestamp -- the receiver stamps arrival from its own clock,
+   * because a peer-supplied instant would be a peer-controlled input to a local timeout -- but it
+   * does carry the consumer session token, because a producer that could not recognise a
+   * reconnecting consumer would hold the lost connection's retained output open beside the new one
+   * and would resume the new one from nothing. The token defaults to the value that declares none,
+   * which is what a producer's own heartbeat sends.
    *
    * @param shuffleId shuffle the stream belongs to
    * @param mapId producing map task
    * @param partitionId partition the stream belongs to
    * @param consumerPosition highest sequence the consumer has consumed, or the nothing-consumed
    *                         sentinel before it has consumed anything
+   * @param consumerToken stable identity of the logical consumer, or [[NoConsumerToken]]
    * @return the heartbeat
    */
   def heartbeat(
       shuffleId: Int,
       mapId: Long,
       partitionId: Int,
-      consumerPosition: Long): HeartbeatMessage =
-    new HeartbeatMessage(shuffleId, mapId, partitionId, consumerPosition)
+      consumerPosition: Long,
+      consumerToken: Long = NoConsumerToken): HeartbeatMessage =
+    new HeartbeatMessage(shuffleId, mapId, partitionId, consumerPosition, consumerToken)
 
   /**
-   * A request to replay one block.
+   * A request to replay an inclusive run of blocks, which for a single block is a window whose two
+   * ends coincide.
    *
-   * A request names exactly one position, so a consumer that has lost a run of blocks emits one
-   * request per position. That keeps every control message the same fixed size, and it keeps the
-   * producer's obligation per message unambiguous: replay this block or refuse it.
+   * One request names the whole run, and that is the contract a suite has to exercise rather than
+   * work around: the producer decides serviceability over the whole range, charges one replay
+   * attempt for it and arms one backoff, so a run asked for together is repaired together. Frames
+   * per position would leave every sibling deferred behind the first one's pause.
    *
    * @param shuffleId shuffle the stream belongs to
    * @param mapId producing map task
    * @param partitionId partition the stream belongs to
-   * @param sequenceNumber position of the block to replay
+   * @param sequenceNumber inclusive first position to replay
+   * @param lastSequenceNumber inclusive last position to replay; defaults to a single-block
+   *                           window
    * @return the request
    */
   def retransmitRequest(
       shuffleId: Int,
       mapId: Long,
       partitionId: Int,
-      sequenceNumber: Long): RetransmitRequestMessage =
-    new RetransmitRequestMessage(shuffleId, mapId, partitionId, sequenceNumber)
+      sequenceNumber: Long,
+      lastSequenceNumber: Long = -1L): RetransmitRequestMessage =
+    new RetransmitRequestMessage(shuffleId, mapId, partitionId, sequenceNumber,
+      if (lastSequenceNumber < sequenceNumber) sequenceNumber else lastSequenceNumber)
 
   /**
    * An orderly end-of-stream signal, placed at the only position the protocol permits.
@@ -2558,4 +3037,125 @@ trait StreamingShuffleTestHelper {
       s"$description published a ${published.getClass.getName} but " +
         s"${tag.runtimeClass.getName} was expected: ${published.getMessage}")
   }
+
+  /**
+   * Runs `body` with every log record this subsystem emits captured, and returns them alongside its
+   * result.
+   *
+   * '''Why a capture rather than a counter.''' The log-volume budget this feature is held to is a
+   * property of what reaches an appender at the level a deployment runs at, so a case about which
+   * component owns a default-level record cannot be settled by reading a counter: a counter says
+   * the condition occurred, not that it was reported, and the two are exactly what the aggregation
+   * separates. Attaching an appender is the only way to assert "one record, from this owner".
+   *
+   * No level is touched, deliberately. The budget is defined for the streaming debug key off and
+   * the framework at its configured level, and a helper that raised a level would let a case pass
+   * on a configuration no deployment runs.
+   *
+   * The appender selects the subsystem's records by logger name for itself rather than trusting its
+   * attachment point: adding an appender to a package logger with no configuration of its own
+   * resolves to an ancestor's configuration, so an appender that assumed its attachment had
+   * narrowed the stream would capture every record in the JVM.
+   *
+   * @param body the work whose logging is captured
+   * @return the result of `body`, and every streaming shuffle record emitted while it ran
+   */
+  def capturingStreamingLogs[T](body: => T): (T, Seq[CapturedLogRecord]) = {
+    val appender =
+      new StreamingShuffleLogCaptureAppender(StreamingShuffleLogCapture.LOGGER_NAME_PREFIX)
+    val root = LogManager.getRootLogger.asInstanceOf[Log4jLogger]
+    appender.start()
+    root.addAppender(appender)
+    try {
+      val result = body
+      (result, appender.captured)
+    } finally {
+      root.removeAppender(appender)
+      appender.stop()
+    }
+  }
+
+  /**
+   * Asserts that exactly one component owns the default-level record of one condition.
+   *
+   * @param records everything captured while the condition was driven
+   * @param owner simple class name of the component entitled to the record
+   * @param silent simple class names of the components that must say nothing at default level
+   * @param what the condition, quoted back in the failure message
+   */
+  def assertSingleDefaultLevelOwner(
+      records: Seq[CapturedLogRecord],
+      owner: String,
+      silent: Seq[String],
+      what: String): Unit = {
+    val atDefaultLevel = records.filter(_.isDefaultLevel)
+    val fromOwner = atDefaultLevel.filter(_.loggerName.endsWith(owner))
+    assert(fromOwner.size == 1,
+      s"$what must be reported once at default level by $owner, but it was reported " +
+        s"${fromOwner.size} time(s): ${fromOwner.map(_.message).mkString(" | ")}")
+    silent.foreach { component =>
+      val fromComponent = atDefaultLevel.filter(_.loggerName.endsWith(component))
+      assert(fromComponent.isEmpty,
+        s"$component must not report $what at default level -- $owner owns that record -- but it " +
+          s"emitted ${fromComponent.size}: ${fromComponent.map(_.message).mkString(" | ")}")
+    }
+  }
+}
+
+/** The logger-name prefix every component of this subsystem logs beneath. */
+private[streaming] object StreamingShuffleLogCapture {
+  val LOGGER_NAME_PREFIX: String = "org.apache.spark.shuffle.streaming."
+}
+
+/**
+ * One log record a case captured, reduced to the three properties an ownership assertion needs.
+ *
+ * @param loggerName the component that emitted it, which is the class's own fully qualified name
+ * @param level the level it was emitted at, as log4j2 reported it
+ * @param message the rendered message, MDC values included, because Spark's structured logging
+ *                embeds them in the message rather than in the context map
+ */
+private[streaming] case class CapturedLogRecord(
+    loggerName: String,
+    level: String,
+    message: String) {
+
+  /**
+   * Whether this record reaches an operator who has set no debug key.
+   *
+   * WARN and above, plus INFO: the subsystem emits its aggregated summaries at INFO and its
+   * conditions at WARN, and both are inside a stock deployment's level. DEBUG and TRACE are not,
+   * which is precisely what makes demoting a record to debug a reduction in volume.
+   */
+  def isDefaultLevel: Boolean =
+    level == "INFO" || level == "WARN" || level == "ERROR" || level == "FATAL"
+}
+
+/**
+ * Captures this subsystem's log records for the duration of one case.
+ *
+ * Every field is read from the [[org.apache.logging.log4j.core.LogEvent]] as it arrives, and the
+ * buffer is synchronised, because log4j2 delivers on whichever thread logged -- for this subsystem,
+ * a task thread, a Netty event-loop thread and an executor-scoped ticker alike.
+ *
+ * @param loggerNamePrefix only records logged beneath this name are captured
+ */
+private[streaming] class StreamingShuffleLogCaptureAppender(loggerNamePrefix: String)
+  extends AbstractAppender("streamingShuffleLogCapture", null, null, true, Property.EMPTY_ARRAY) {
+
+  private val records = mutable.ArrayBuffer.empty[CapturedLogRecord]
+
+  override def append(event: LogEvent): Unit = {
+    val loggerName = Option(event.getLoggerName).getOrElse("")
+    if (loggerName.startsWith(loggerNamePrefix)) {
+      val message = Option(event.getMessage).map(_.getFormattedMessage).getOrElse("")
+      val level = Option(event.getLevel).map(_.name()).getOrElse("")
+      synchronized {
+        records += CapturedLogRecord(loggerName, level, message)
+      }
+    }
+  }
+
+  /** Everything captured so far, in arrival order. */
+  def captured: Seq[CapturedLogRecord] = synchronized(records.toSeq)
 }

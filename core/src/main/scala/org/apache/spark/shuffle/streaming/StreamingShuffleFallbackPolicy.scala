@@ -29,6 +29,39 @@ import org.apache.spark.network.shuffle.protocol.streaming.StreamingShuffleMessa
 import org.apache.spark.util.{Clock, SystemClock}
 
 /**
+ * Why a streaming shuffle stopped streaming, whatever the kind of reason.
+ *
+ * Two kinds exist and the distinction is the whole point of this type.
+ *
+ *  - A [[StreamingShuffleFallbackReason]] is one of the four '''specified''' graceful-degradation
+ *    conditions. Each one asserts a measurement or an explicit check, and each is a condition an
+ *    operator can act on by tuning something.
+ *  - A [[StreamingShuffleStandDownCause.StructuralDecline]] is a request the streaming protocol
+ *    '''cannot serve at all'''. Nothing was measured and nothing is tunable; the shuffle simply has
+ *    to be read from materialised files instead.
+ *
+ * Both stand a shuffle down and both end in the same place -- delegation to the unmodified
+ * sort-based shuffle -- so they share this supertype, which is what the coordinator's declaration
+ * path accepts. They are nonetheless kept apart in the type system, because reporting a structural
+ * decline as one of the four would send an operator to tune a throughput ratio, a buffer budget or
+ * a link capacity that nothing on that path ever observed. That mis-attribution is precisely what
+ * this split exists to make impossible.
+ */
+private[spark] sealed trait StreamingShuffleStandDownCause {
+
+  /**
+   * A one-clause, operator-facing rendering of this cause, phrased so that it composes into the
+   * single warning that is emitted when a shuffle stands down. There is no leading capital and no
+   * terminating punctuation, precisely so it can be embedded mid-sentence.
+   *
+   * `toString` is deliberately left as the synthesised case-object name, because that is the stable
+   * identifier a test asserts on and the name that crosses the wire, while this is the prose an
+   * operator reads.
+   */
+  def description: String
+}
+
+/**
  * Why the streaming shuffle stepped aside in favour of sort-based shuffle.
  *
  * The four members of this type are exactly the four conditions the streaming shuffle is specified
@@ -37,19 +70,12 @@ import org.apache.spark.util.{Clock, SystemClock}
  * reason is behavioural: every one of them routes to the identical terminus, which is delegation to
  * the unmodified sort-based shuffle. A reason is therefore diagnostic information, never a
  * behavioural switch.
+ *
+ * A condition that is not one of these four is '''not''' a fallback reason and must never be
+ * reported as one. Where streaming has to stand down for a request the protocol cannot serve, the
+ * structural causes under [[StreamingShuffleStandDownCause]] carry that decision instead.
  */
-private[spark] sealed trait StreamingShuffleFallbackReason {
-
-  /**
-   * A one-clause, operator-facing rendering of this condition, phrased so that it composes into the
-   * single warning the policy emits when it trips. There is no leading capital and no terminating
-   * punctuation, precisely so it can be embedded mid-sentence.
-   *
-   * `toString` is deliberately left as the synthesised case-object name, because that is the stable
-   * identifier a test asserts on, while this is the prose an operator reads.
-   */
-  def description: String
-}
+private[spark] sealed trait StreamingShuffleFallbackReason extends StreamingShuffleStandDownCause
 
 /**
  * The four fallback conditions, and nothing else.
@@ -62,29 +88,25 @@ private[spark] sealed trait StreamingShuffleFallbackReason {
 private[spark] object StreamingShuffleFallbackReason {
 
   /**
-   * The two ends of a pipelined shuffle could not be kept in step.
+   * The consumer of a shuffle has been unable to keep up with its producer.
    *
-   * The condition has a '''measured''' form and an '''observed''' form, and they are one condition
-   * rather than two because the thing that has failed is the same in both: the producer and the
-   * consumer of one shuffle can no longer sustain a pipeline between them.
+   * This is a '''measurement and nothing else''': the consumer's throughput has stayed below the
+   * producer's by at least [[StreamingShuffleFallbackPolicy.CONSUMER_SLOWNESS_RATIO]], continuously
+   * for longer than [[StreamingShuffleFallbackPolicy.SUSTAINED_SLOWNESS_WINDOW_MS]]. Sustained
+   * rather than instantaneous, because a momentary stall is ordinary flow control that backpressure
+   * and spill already absorb and must not cost the job its fast path.
    *
-   *  - Measured: the consumer has been unable to keep up with the producer by the tolerated factor,
-   *    continuously for longer than the tolerated window. Sustained rather than instantaneous,
-   *    because a momentary stall is ordinary flow control that backpressure and spill already
-   *    absorb and must not cost the job its fast path.
-   *  - Observed: a consumer could not resolve a producer at all, or producers of the shuffle kept
-   *    being lost to the connection timeout across successive recomputations. The window of the
-   *    measured form is sixty seconds and the connection timeout is five, so a stream that keeps
-   *    dying is never available to be measured -- which is precisely why the observed form exists.
-   *
-   * The rendering below therefore names the failure rather than one of its two symptoms, and the
-   * free-text detail recorded alongside the verdict states which observation was actually made.
+   * Deliberately '''not''' this condition: a producer lost to the connection timeout, and a
+   * consumer that could not resolve a producer at all. Neither takes the throughput measurement
+   * above, so reporting either one here would tell an operator to go and tune consumer throughput
+   * for something that was never the matter. A lost producer follows the specified
+   * producer-failure flow instead -- partial-read invalidation and upstream recomputation -- and an
+   * unresolvable producer is [[StreamingShuffleStandDownCause.ProducerUnavailable]].
    */
   case object ConsumerTooSlow extends StreamingShuffleFallbackReason {
     override val description: String =
-      "a streaming shuffle producer and consumer could not be kept in step: either the consumer " +
-        "stayed at least 2x slower than the producer for more than 60 seconds, or its producers " +
-        "kept being lost to the connection timeout"
+      "a streaming shuffle consumer stayed at least 2x slower than its producer for more than 60 " +
+        "seconds"
   }
 
   /**
@@ -142,7 +164,142 @@ private[spark] object StreamingShuffleFallbackReason {
   def fromName(name: String): Option[StreamingShuffleFallbackReason] = {
     if (name == null) None else all.find(_.toString == name)
   }
+
+  /**
+   * The name a stand-down record carries when streaming was never available for a shuffle at all,
+   * rather than when one of the four conditions was observed.
+   *
+   * '''This is not a fifth condition, and it is deliberately not a member of this trait.''' The
+   * four conditions are measurements: a throughput ratio held for a minute, a buffer reservation
+   * that was refused, a share of an administered link, a protocol version compared against this
+   * build's. Each describes a shuffle that was streaming and then could not continue, and each
+   * sends an operator to look at a specific resource. There is a second, structurally different
+   * situation: a shuffle that could not stream in the first place, because no producer of it can be
+   * resolved or because a producer's address could not be published at all. Nothing was measured
+   * there, and recording one of the four for it would tell an operator to tune something that was
+   * never the matter -- the exact defect the four descriptions are kept narrow to prevent.
+   *
+   * It still has to be '''recorded''', because a stand-down is how the manager learns to serve the
+   * shuffle's next attempts from its sort-based delegate: a shuffle-wide latch is what makes the
+   * recomputation land on a path that can complete, and without one every retry would reach the
+   * same unavailable streaming path again. So this is the name such a record carries, resolvable by
+   * [[isDeclarable]] at the RPC boundary and rendered by
+   * [[StreamingShuffleFallbackState.condition]], while [[all]] and [[fromName]] stay closed at
+   * four.
+   */
+  val UNAVAILABLE_NAME: String = "StreamingUnavailable"
+
+  /** Prose rendered for [[UNAVAILABLE_NAME]] when a declaration carried no detail of its own. */
+  val UNAVAILABLE_DESCRIPTION: String =
+    "streaming shuffle was not available for this shuffle, so it stood down without any of the " +
+      "four fallback conditions having been measured"
+
+  /**
+   * Whether a name may be recorded as a stand-down: any cause in the closed
+   * [[StreamingShuffleStandDownCause]] set -- the four conditions or a structural decline -- or
+   * [[UNAVAILABLE_NAME]].
+   *
+   * The whitelist is what lets the coordinator refuse a name this build does not know while still
+   * accepting the one record that names no condition. Both halves matter: standing a whole shuffle
+   * down is too consequential to do on the strength of a name this build cannot reason about, and a
+   * peer that could choose the name could choose the text of a driver log record.
+   *
+   * @param name candidate record name, which may be `null`
+   * @return true when this build is willing to latch a stand-down under that name
+   */
+  def isDeclarable(name: String): Boolean =
+    StreamingShuffleStandDownCause.fromName(name).isDefined || UNAVAILABLE_NAME == name
 }
+
+/**
+ * The causes a shuffle can stand streaming down for: the four specified fallback conditions, plus
+ * the structural declines that are not fallback conditions at all.
+ *
+ * ==Why structural declines exist as their own kind==
+ *
+ * The four fallback conditions are a closed set and this object does not widen it. Each of them
+ * asserts something that was '''observed about the running system''' -- a throughput ratio held for
+ * a minute, a buffer reservation that was refused, a share of an administered link, a peer speaking
+ * an incompatible revision -- and each therefore points an operator at something they can tune.
+ *
+ * A structural decline observes nothing. It is the answer to a request the streaming protocol has
+ * no way to serve, and no amount of memory, bandwidth or patience would change that. Borrowing a
+ * fallback condition to carry such a decision was actively harmful: it put a throughput or a
+ * compatibility claim into a driver log record for a shuffle in which neither was ever measured,
+ * and it made the specified set of four look like a set of five or six. Structural declines are
+ * therefore their own kind, resolvable and reportable, but never readable as one of the four.
+ *
+ * The set of structural declines is closed too, for the same reason the fallback set is: the sealed
+ * supertype makes adding one a compile-time visible act.
+ */
+private[spark] object StreamingShuffleStandDownCause {
+
+  /** A structural decline: something the streaming shuffle protocol cannot serve. */
+  private[spark] sealed trait StructuralDecline extends StreamingShuffleStandDownCause
+
+  /**
+   * A consumer asked for a read shape the streaming protocol cannot serve.
+   *
+   * The concrete case is a narrowed map range. A live producer registration names a map id and a
+   * task attempt id but no map index, so "map indexes 3 to 7" cannot be resolved to a set of
+   * producers that are still running, and the read has to come from materialised files. Declining
+   * is forced rather than chosen, and nothing about the executor's memory, its link or its peers is
+   * implicated.
+   */
+  case object UnsupportedReadShape extends StructuralDecline {
+    override val description: String =
+      "a streaming shuffle read shape the streaming protocol cannot serve was requested"
+  }
+
+  /**
+   * The rendezvous between the two ends of a shuffle could not be established.
+   *
+   * Either a consumer could not resolve a live producer for every map output it is entitled to
+   * read, or a producer could not publish the address a consumer resolves it by. In both cases
+   * there is no pipeline to pace, so there is no throughput to measure and nothing to conclude
+   * about the consumer -- which is exactly why this is not
+   * [[StreamingShuffleFallbackReason.ConsumerTooSlow]].
+   *
+   * This is distinct from the specified producer-failure flow. A producer lost to the connection
+   * timeout is recovered by invalidating the partial reads taken from it and letting the unmodified
+   * scheduler recompute the upstream stage; that flow stands nothing down and this cause is not
+   * declared for it. This cause is for a rendezvous that cannot be established at all, where
+   * recomputation on the streaming path has nothing to converge to.
+   */
+  case object ProducerUnavailable extends StructuralDecline {
+    override val description: String =
+      "a streaming shuffle producer and consumer could not establish a rendezvous"
+  }
+
+  /** The structural declines, which are deliberately not fallback conditions. */
+  val structuralDeclines: Seq[StructuralDecline] = Seq(UnsupportedReadShape, ProducerUnavailable)
+
+  /**
+   * Every cause a shuffle may stand streaming down for: the four specified fallback conditions
+   * first, in the order the specification enumerates them, then the structural declines.
+   */
+  val all: Seq[StreamingShuffleStandDownCause] =
+    StreamingShuffleFallbackReason.all ++ structuralDeclines
+
+  /**
+   * Resolves a cause from its stable name, answering `None` for anything outside the closed set.
+   *
+   * A stand-down is agreed over RPC, so the cause has to cross a process boundary, and it crosses
+   * as this name rather than as the object. Two properties follow, and both matter. The name is
+   * stable -- it is the synthesised case-object name, which is also what tests assert on -- so it
+   * survives serialization without depending on how a `case object` happens to be reconstructed.
+   * And resolution is a lookup in a set this build owns, so a peer can neither introduce a cause
+   * this build does not know nor choose the text of a driver log record: an unrecognised name
+   * resolves to `None` and is refused at the boundary rather than recorded.
+   *
+   * @param name candidate cause name, which may be `null`
+   * @return the matching cause, or `None` when this build does not know the name
+   */
+  def fromName(name: String): Option[StreamingShuffleStandDownCause] = {
+    if (name == null) None else all.find(_.toString == name)
+  }
+}
+
 
 /**
  * Decides when the streaming shuffle must stop streaming and let sort-based shuffle take over.
@@ -182,17 +339,26 @@ private[spark] object StreamingShuffleFallbackReason {
  * Each is fed by the component that already measures it, so nothing is re-derived here:
  *
  *  - [[recordProducerThroughput]] and [[recordConsumerThroughput]] carry rate samples from the
- *    backpressure protocol, which already tracks acknowledgement progress and pending volume.
- *    Sustained slowness trips [[StreamingShuffleFallbackReason.ConsumerTooSlow]].
+ *    backpressure protocol, which already tracks acknowledgement progress and pending volume. A
+ *    consumer measured at least 2x slower than its producer, continuously for longer than the
+ *    window, trips [[StreamingShuffleFallbackReason.ConsumerTooSlow]] -- and nothing else does.
  *  - [[recordAllocationGrant]] carries the outcome of a buffer reservation from the memory spill
  *    manager. A partial grant is Spark's own idiom for memory pressure -- `acquireMemory` answers
  *    with the amount it could actually grant -- and a partial grant that eviction could not reverse
  *    trips [[StreamingShuffleFallbackReason.MemoryPressure]].
  *  - [[recordLinkUtilization]] carries egress against the administered link capacity, and
- *    saturation trips [[StreamingShuffleFallbackReason.NetworkSaturation]].
+ *    saturation sustained across consecutive measurement intervals trips
+ *    [[StreamingShuffleFallbackReason.NetworkSaturation]]. Intervals rather than observations,
+ *    because the callers poll ten times per published rate.
  *  - [[checkProtocolVersion]] performs an explicit compatibility check on the version byte in the
  *    wire header, and an incompatible peer trips
- *    [[StreamingShuffleFallbackReason.ProtocolVersionMismatch]].
+ *    [[StreamingShuffleFallbackReason.ProtocolVersionMismatch]]. Only a peer's wire revision does:
+ *    the member is reserved for an actual disagreement about the protocol and is never used to
+ *    decline a request this build simply cannot serve.
+ *
+ * The correspondence is one to one in both directions. Each of the four members is trippable by
+ * exactly the one measurement above, and no other situation is reported under any of their names --
+ * a stand-down that measured none of the four carries a [[StreamingShuffleStandDownCause]] instead.
  *
  * One invariant runs through all four, and it is what makes the policy safe to consult from
  * anywhere: '''an un-evaluable sample never trips.''' A rate that is not a finite non-negative
@@ -635,79 +801,85 @@ private[spark] class StreamingShuffleFallbackPolicy(
   // Trip 3: network utilisation above 90% of the administered link capacity.
 
   /**
-   * Records observed egress against an explicit link capacity, and trips when utilisation is
-   * '''strictly above''' the tolerated share.
+   * Records observed egress against an explicit link capacity, and trips on the '''first'''
+   * evaluable reading whose utilisation is '''strictly above''' the tolerated share.
    *
-   * Exactly at the threshold is not saturation. The specification tolerates utilisation up to
-   * [[StreamingShuffleFallbackPolicy.SATURATION_TRIP_PERCENT]] and trips past it, so the comparison
-   * is `>` and never `>=`.
+   * The specification states the condition as network saturation exceeding
+   * [[StreamingShuffleFallbackPolicy.SATURATION_TRIP_PERCENT]] of the link capacity, with no
+   * sustaining requirement attached to it, so there is none here: one reading above the tolerated
+   * share is the trip. There is deliberately no run to accumulate and no counter to inspect, which
+   * also means a caller cannot be surprised by a trip that arrives two samples after the reading
+   * that caused it.
+   *
+   * Exactly at the threshold is not saturation. The specification tolerates utilisation up to the
+   * threshold and trips past it, so the comparison is `>` and never `>=`.
    *
    * Division is guarded rather than attempted: a capacity that is zero, negative or not a finite
    * number is not a capacity, and a link of unknown capacity cannot be described as saturated. Such
    * a sample is counted as un-evaluable and never trips, which is also why this method can never
-   * divide by zero and can never produce a NaN comparison.
+   * divide by zero and can never produce a NaN comparison. That guard is the whole of the
+   * protection against a spurious trip: a reading is either evaluable, in which case it is evidence
+   * and is acted on immediately, or it is not, in which case it is not evidence at all.
+   *
+   * The sample is attributed to the instant the injected clock reports. Use the three-argument form
+   * when the caller already holds the instant its measurement belongs to.
    *
    * @param usedBytesPerSecond observed egress, in bytes per second
    * @param capacityBytesPerSecond the link capacity the observation is measured against, in bytes
    *                               per second
    */
   def recordLinkUtilization(usedBytesPerSecond: Double, capacityBytesPerSecond: Double): Unit = {
+    recordLinkUtilization(usedBytesPerSecond, capacityBytesPerSecond, clock.getTimeMillis())
+  }
+
+  /**
+   * Records observed egress against an explicit link capacity, at an explicit instant.
+   *
+   * <b>Why the instant is part of the observation.</b> A rate is a property of a measurement
+   * interval, and the interval this condition is evaluated over is
+   * [[BackpressureProtocol.SATURATION_SAMPLE_WINDOW_MS]] -- one second, which is the cadence at
+   * which the protocol's rate windows republish. The callers, by contrast, poll on the protocol's
+   * hundred-millisecond cadence, so the same published rate is handed to this method roughly ten
+   * times before a new one exists. Counting observations therefore reached the sustained threshold
+   * inside a single interval and stood streaming down in two or three hundred milliseconds on one
+   * legal burst -- the very burst the sustained rule exists to tolerate. Distinct intervals are
+   * counted instead, identified by quantising the observation instant onto the sample window, which
+   * is exactly the rule `BackpressureProtocol` applies to its own view of the same condition.
+   *
+   * The instant is a parameter rather than only a clock read so that a caller which already knows
+   * which measurement interval its figure belongs to can say so, exactly as
+   * [[recordProducerThroughput]] does -- and so that the bound is deterministic under test rather
+   * than dependent on how fast a loop runs.
+   *
+   * @param usedBytesPerSecond observed egress, in bytes per second
+   * @param capacityBytesPerSecond the link capacity the observation is measured against, in bytes
+   *                               per second
+   * @param sampleTimeMillis the instant the measurement belongs to, in milliseconds
+   */
+  def recordLinkUtilization(
+      usedBytesPerSecond: Double,
+      capacityBytesPerSecond: Double,
+      sampleTimeMillis: Long): Unit = {
     if (!isMeasurable(usedBytesPerSecond) || !isMeasurable(capacityBytesPerSecond) ||
         capacityBytesPerSecond <= 0.0d) {
       unevaluableSamples.incrementAndGet()
     } else {
       val utilization = usedBytesPerSecond / capacityBytesPerSecond
-      if (utilization <= SATURATION_TRIP_RATIO) {
-        // Under the tolerated share, so any run of over-capacity samples ends here.
-        consecutiveSaturatedSamples.set(0L)
-      } else {
-        val consecutive = consecutiveSaturatedSamples.incrementAndGet()
-        if (consecutive >= SATURATION_SUSTAINED_SAMPLES) {
-          trip(NetworkSaturation,
-            log"streaming shuffle egress reached " +
-              log"${MDC(PERCENT, math.round(utilization * PERCENT_SCALE))}% of the administered " +
-              log"link capacity, ${MDC(NUM_BYTES, usedBytesPerSecond)} bytes/s against " +
-              log"${MDC(MAX_SIZE, capacityBytesPerSecond)} bytes/s, above the " +
-              log"${MDC(THRESHOLD, SATURATION_TRIP_PERCENT)}% this policy tolerates, on " +
-              log"${MDC(COUNT, consecutive)} consecutive sample(s).")
-        } else if (debugEnabled) {
-          logDebug(log"Streaming shuffle egress read " +
+      if (utilization > SATURATION_TRIP_RATIO) {
+        trip(NetworkSaturation,
+          log"streaming shuffle egress reached " +
             log"${MDC(PERCENT, math.round(utilization * PERCENT_SCALE))}% of the administered " +
-            log"link capacity on ${MDC(COUNT, consecutive)} consecutive sample(s), short of the " +
-            log"${MDC(MAX_SIZE, SATURATION_SUSTAINED_SAMPLES)} a sustained saturation needs")
-        }
+            log"link capacity, ${MDC(NUM_BYTES, usedBytesPerSecond)} bytes/s against " +
+            log"${MDC(MAX_SIZE, capacityBytesPerSecond)} bytes/s, above the " +
+            log"${MDC(THRESHOLD, SATURATION_TRIP_PERCENT)}% this policy tolerates.")
+      } else if (debugEnabled) {
+        logDebug(log"Streaming shuffle egress read " +
+          log"${MDC(PERCENT, math.round(utilization * PERCENT_SCALE))}% of the administered link " +
+          log"capacity, inside the ${MDC(THRESHOLD, SATURATION_TRIP_PERCENT)}% this policy " +
+          log"tolerates")
       }
     }
   }
-
-  /**
-   * Consecutive over-capacity samples observed, which is what distinguishes a burst from
-   * saturation.
-   *
-   * <b>Why one sample cannot be enough.</b> The pacing bucket must be able to admit one
-   * maximum-sized block -- a bucket whose capacity were smaller would refuse every block forever,
-   * which is a deadlock rather than a rate limit -- so its burst allowance is at least one frame
-   * however small its paced share is. A bucket that starts full therefore legitimately delivers
-   * that burst inside a single sampling interval, and with several concurrent shuffles the sum of
-   * those bursts exceeds the administered capacity for exactly that interval before any of them can
-   * refill. Tripping on one sample turned that legal burst into a stand-down: egress read at nearly
-   * twice the administered capacity with not one stream throttled, every live producer of the
-   * shuffle was invalidated, and the recomputation wrote more than a quarter of the shuffle's
-   * records a second time. The ceiling was being enforced by abandoning streaming rather than by
-   * pacing it.
-   *
-   * A run, by contrast, is the property the fallback condition is about. A burst clears on the next
-   * sample because the bucket has to refill at its paced rate before it can burst again; a link
-   * that really is saturated stays over capacity sample after sample, and still stands streaming
-   * down within a few seconds -- far inside the sixty-second window the sustained-slowness
-   * condition beside it uses for the same kind of reason.
-   */
-  private val consecutiveSaturatedSamples = new AtomicLong(0L)
-
-  /**
-   * Consecutive over-capacity samples observed with no intervening sample under capacity.
-   */
-  def consecutiveSaturatedSampleCount: Long = consecutiveSaturatedSamples.get()
 
   /**
    * Records observed egress against the capacity the operator administered through
@@ -1183,32 +1355,21 @@ private[spark] object StreamingShuffleFallbackPolicy {
   val SATURATION_TRIP_PERCENT: Long = 90L
 
   /**
+   * [[SATURATION_TRIP_PERCENT]] as a fraction, which is the form the comparison actually uses.
+   *
+   * Derived rather than written out, so the percentage an operator reads in a log record and the
+   * ratio the policy compares against can never drift apart. The comparison is strictly greater, so
+   * utilisation of exactly ninety percent is tolerated utilisation rather than saturation.
+   */
+  val SATURATION_TRIP_RATIO: Double = SATURATION_TRIP_PERCENT.toDouble / 100.0d
+
+  /**
    * Whether the notice about an unevaluable saturation condition has already been emitted.
    *
    * Process wide rather than per instance, so a JVM that constructs more than one policy states the
    * fact once rather than once per construction.
    */
   private[streaming] val saturationNoticeEmitted = new AtomicBoolean(false)
-
-  /** [[SATURATION_TRIP_PERCENT]] as a fraction, which is the form the comparison actually uses. */
-  val SATURATION_TRIP_RATIO: Double = SATURATION_TRIP_PERCENT.toDouble / 100.0d
-
-  /**
-   * Consecutive over-capacity samples a link must produce before its saturation is treated as
-   * sustained and streaming stands down.
-   *
-   * Three. Sized against what it must exclude rather than picked round: the pacing buckets' burst
-   * allowance can exceed the administered capacity for exactly one sampling interval apiece and
-   * then not again until it has refilled at the paced rate, so two consecutive over-capacity
-   * samples already rule a burst out and three leave margin for a second wave of limiters created
-   * part-way through a shuffle. Against what it must catch it costs almost nothing: the samples
-   * arrive on the protocol's own one-second measurement cadence, so a genuinely saturated link
-   * still stands streaming down within a few seconds, an order of magnitude sooner than the
-   * sixty-second sustained-slowness condition beside it. Deliberately kept in step with
-   * `BackpressureProtocol.LINK_SATURATION_SUSTAINED_INTERVALS`, which applies the same rule to the
-   * protocol's own view of the same condition.
-   */
-  val SATURATION_SUSTAINED_SAMPLES: Long = 3L
 
   /**
    * Bytes in one MiB, used to convert the administered bandwidth from MB/s into bytes per second.

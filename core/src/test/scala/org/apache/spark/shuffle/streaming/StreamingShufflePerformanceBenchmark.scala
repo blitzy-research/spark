@@ -17,16 +17,20 @@
 
 package org.apache.spark.shuffle.streaming
 
+import java.lang.management.{BufferPoolMXBean, ManagementFactory}
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.TimeUnit
 
 import scala.collection.mutable
+import scala.jdk.CollectionConverters._
 import scala.util.control.NonFatal
 
 import org.apache.spark.{SparkConf, SparkContext, SparkEnv, TestUtils}
 import org.apache.spark.benchmark.{Benchmark, BenchmarkBase}
 import org.apache.spark.executor.TaskMetrics
-import org.apache.spark.internal.config.{SHUFFLE_MANAGER, SHUFFLE_STREAMING_BUFFER_SIZE_PERCENT, SHUFFLE_STREAMING_ENABLED, SHUFFLE_STREAMING_MAX_BANDWIDTH_MBPS, SHUFFLE_STREAMING_SPILL_THRESHOLD}
+import org.apache.spark.internal.config.{SHUFFLE_MANAGER, SHUFFLE_STREAMING_BUFFER_SIZE_PERCENT,
+  SHUFFLE_STREAMING_ENABLED, SHUFFLE_STREAMING_MAX_BANDWIDTH_MBPS,
+  SHUFFLE_STREAMING_SPILL_THRESHOLD}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.scheduler.{SparkListener, SparkListenerTaskEnd}
 
@@ -61,22 +65,21 @@ import org.apache.spark.scheduler.{SparkListener, SparkListenerTaskEnd}
  * times taken on different masters would be comparing the masters rather than the shuffles. A
  * local master would be worse than merely unfaithful: in local mode the executor skips shuffle
  * manager initialisation, because the driver's instance already exists, so one manager would serve
- * both the producer and the consumer role and no block would cross a JVM boundary -- which is
- * exactly the transfer the streaming path exists to overlap with map-side work. Two real executor
- * JVMs give the driver-registers / executor-resolves rendezvous and genuine cross-executor
- * streaming.
+ * both the producer and the consumer role and no block would cross a JVM boundary. Two real
+ * executor JVMs give the driver-registers / executor-resolves rendezvous and genuine
+ * cross-executor transfer of retained output. The DAG scheduler remains unmodified and still starts
+ * the reduce stage after the map stage finishes.
  *
  * ==What is measured, and where each figure comes from==
  *
  * Latency is wall-clock time taken around the job alone, so cluster start-up is charged to neither
- * case, and the harness times the same runs independently. Memory and spill come from Spark's
- * EXISTING task accumulators -- `TaskMetrics.peakExecutionMemory`, `memoryBytesSpilled` and
- * `diskBytesSpilled` -- read through a `SparkListener`, which is the same read path an operator's
- * own tooling uses; counters of this feature's own would have left the streaming path invisible to
- * every Spark observability surface there already is. Bandwidth is derived from the shuffle bytes
- * those same accumulators report over the elapsed time. The four `shuffle.streaming` metrics
- * supplement the picture, and the registry backing them is reset as the case switches so that each
- * case reports its own reading.
+ * case, and the harness times the same runs independently. Memory is sampled inside executor tasks:
+ * full JVM heap, native buffer pools, and every category of the aggregate streaming quota are read
+ * together. Spark's existing `TaskMetrics.peakExecutionMemory` is printed beside that full
+ * footprint instead of being mistaken for it. Spill and bandwidth come from the existing task
+ * accumulators read through a `SparkListener`, the same read path an operator's own tooling uses.
+ * The four `shuffle.streaming` metrics are also sampled on the executors, and the registry backing
+ * them is reset as the case switches so that each case reports its own reading.
  *
  * {{{
  *   To run this benchmark:
@@ -118,9 +121,20 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
   /** Name of the scenario, printed by the harness above its comparison table. */
   private val ScenarioName: String = "Streaming shuffle versus sort-based shuffle"
 
+  /** CPU-bound comparison that isolates shuffle coordination beneath deterministic compute. */
+  private val CpuScenarioName: String = "CPU-bound shuffle coordination"
+
   /** Name of the comparison table, derived so it can never disagree with the workload above. */
   private val ComparisonName: String =
     s"groupByKey, ${DatasetBytes / BytesPerMebibyte} MB over $PartitionCount partitions"
+
+  /** Work items and deterministic mixing rounds applied on both sides of the CPU-bound shuffle. */
+  private val CpuWorkItems: Int = PartitionCount * 8192
+
+  private val CpuMixRounds: Int = 64
+
+  private val CpuComparisonName: String =
+    s"deterministic CPU mix, $CpuWorkItems records over $PartitionCount partitions"
 
   // ---------------------------------------------------------------------------------------------
   // The environment. Both cases share one master, for the reason set out in this object's
@@ -163,6 +177,10 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
   /** Application name of the streaming context. */
   private val StreamingAppName: String = "streaming-shuffle-benchmark-streaming"
 
+  private val CpuBaselineAppName: String = "streaming-shuffle-benchmark-cpu-sort"
+
+  private val CpuStreamingAppName: String = "streaming-shuffle-benchmark-cpu-streaming"
+
   // ---------------------------------------------------------------------------------------------
   // The acceptance targets, and the report's own presentation constants. The latency window comes
   // from the shared fixtures; the other two targets exist nowhere else in the tree, so they are
@@ -171,6 +189,11 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
 
   /** Ceiling of the reported memory overhead, as a whole percentage of the baseline. */
   private val MaxMemoryOverheadPercent: Int = 10
+
+  /** Improvement window the CPU-bound acceptance target names. */
+  private val MinCpuBoundImprovementPercent: Int = 5
+
+  private val MaxCpuBoundImprovementPercent: Int = 10
 
   /**
    * The workload shapes memory overhead is reported at, narrowest first.
@@ -226,40 +249,59 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
   private val TenthsPerWhole: Long = 1000L
 
   /** The reading a case carries before it has run, so no accessor ever answers with a null. */
-  private val EmptyTelemetry: StreamingTelemetry = new StreamingTelemetry(0L, 0L, 0L, 0L)
+  private val EmptyTelemetry: StreamingTelemetry =
+    new StreamingTelemetry(0L, 0L, 0L, 0L, 0)
 
-  /** Why a driver-side reading of the four streaming metrics can be zero and still be correct. */
-  private val TelemetryScopeNote: Seq[String] = Seq(
-    "  Note: the four metrics are read from THIS JVM's registry. Under a cluster master the",
-    "  streaming writer and reader run inside the executor JVMs, whose own registries export the",
-    "  same four metrics per executor over whatever sink an operator has configured, so a driver",
-    "  side reading of zero is expected and is not evidence that nothing streamed.")
+  private val EmptyMemoryFootprint: MemoryFootprint =
+    new MemoryFootprint(0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L)
+
+  /** Sampling interval for executor memory while grouped output is consumed. */
+  private val MemorySampleInterval: Int = 256
+
+  /** Representative CPU accounting shape for telemetry source-on/source-off comparison. */
+  private val TelemetryCpuWorkItems: Int = 500000
+
+  private val TelemetryCpuSampleInterval: Int = 4096
+
+  private val TelemetryCpuSamples: Int = 5
 
   /**
-   * Why a latency reduction is not to be expected at an ordinary stage boundary, stated in the
-   * report rather than left for a reader to infer from a figure that missed its target.
+   * Metric operations the source-on loop performs at each sampled event.
    *
-   * The acceptance target asks for a thirty to fifty percent reduction, and the mechanism that
-   * would deliver it is overlap: reduce-side work proceeding while map-side work is still
-   * producing. Which tasks run when is the DAG scheduler's decision, and the scheduler is an
-   * absolute preservation zone for this feature -- it is not modified, and it submits a reduce task
-   * only once the map stage it depends on has finished. Producer and consumer overlap is therefore
-   * a CAPABILITY this subsystem provides, exercised whenever a consumer is live while a producer
-   * still has output to give, and not an outcome an ordinary `groupByKey` at one stage boundary
-   * produces. What this comparison measures at such a boundary is the cost of the streaming path's
-   * framing, checksumming and durability flush against the sort-based path's writer -- worth
-   * measuring, and not the same quantity the target names.
+   * One gauge read plus three counter increments. Named rather than inlined because the per-event
+   * cost is the total divided by OPERATIONS, not by passes: dividing by passes would report the
+   * cost of four operations under the label of one and understate it fourfold.
+   */
+  private val TelemetryOpsPerSampledEvent: Int = 4
+
+  private val MaxTelemetryCpuOverheadPercent: Int = 1
+
+  /** One representative producer contribution for source-on gauge reads. */
+  private val TelemetryCpuContributor: StreamingShuffleBufferUtilizationContributor =
+    new StreamingShuffleBufferUtilizationContributor {
+      override def contributedBufferedBytes: Long = BytesPerMebibyte
+      override def contributedBudgetBytes: Long = 4L * BytesPerMebibyte
+    }
+
+  /** Scope and availability of the executor-side streaming telemetry in this report. */
+  private val TelemetryScopeNote: Seq[String] = Seq(
+    "  Note: the four metrics are sampled inside the workload tasks and merged once per executor.",
+    "  A zero spillCount is therefore an executor-side zero. If no executor sample is available,",
+    "  pressure-spill attribution is printed as unavailable rather than as a misleading zero.")
+
+  /**
+   * What the ordinary stage-boundary comparison can attribute without claiming scheduler changes.
    *
-   * Saying so here is the honest alternative to two dishonest ones: presenting a figure that misses
-   * the target as though it met it, and quietly changing the target.
+   * The DAG scheduler remains an absolute preservation zone and submits a reduce stage only after
+   * its map stage finishes. This benchmark therefore measures the implementation that exists:
+   * framing, checksumming, retained-output publication and transport against sort, index
+   * publication and ordinary block fetch. It reports the thirty to fifty percent project target
+   * beside that measurement, but never explains a result using overlap the workload cannot have.
    */
   private val LatencyAttributionNote: Seq[String] = Seq(
-    "  Note: the thirty to fifty percent target is reached by OVERLAP -- reduce-side work",
-    "  proceeding while the map side still produces. Task scheduling is the DAG scheduler's, and",
-    "  the scheduler is unmodified by this feature: it submits a reduce task only once the map",
-    "  stage has finished, so a single groupByKey stage boundary offers no overlap to convert.",
-    "  What is measured above is the streaming path's framing, checksumming and durability flush",
-    "  against the sort-based writer, which is a different quantity from the one the target names.")
+    "  Note: the DAG scheduler is unmodified and starts reduce tasks after the map stage finishes.",
+    "  This comparison measures framing, checksumming, retained-output publication and transport",
+    "  against sort, index publication and ordinary block fetch. It claims no map/reduce overlap.")
 
   /** The standing reminder that this file measures and does not gate. */
   private val TargetsNote: Seq[String] = Seq(
@@ -278,9 +320,6 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
   /** The case the active context was built for, so that a switch of case is detected. */
   private var activeCase: Option[CaseObservation] = None
 
-  /** Listener-bus drains that timed out, reported so an incomplete reading is never silent. */
-  private var listenerDrainTimeouts: Int = 0
-
   // ---------------------------------------------------------------------------------------------
   // The comparison.
   // ---------------------------------------------------------------------------------------------
@@ -290,8 +329,9 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
    *
    * The two cases are handed to the harness as ordinary cases, so the table it prints carries its
    * own best, mean, standard deviation, rate and relative columns for both. The report emitted
-   * afterwards adds the three dimensions the harness knows nothing about -- memory, spill and
-   * bandwidth -- and restates latency beside the acceptance window.
+   * afterwards adds the dimensions the harness knows nothing about -- full memory, spill,
+   * bandwidth, executor telemetry and telemetry CPU cost -- and restates latency beside the
+   * acceptance windows.
    *
    * @param mainArgs program arguments; an optional first element overrides the master both cases
    *                 run on, which is what lets the comparison still be taken in an environment
@@ -307,6 +347,10 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
     // sort-based manager it holds internally, and this benchmark would be comparing sort with sort.
     val streaming = new CaseObservation(
       StreamingCaseName, withLocalMaster(streamingConf(), StreamingAppName, master), master)
+    val cpuBaseline = new CaseObservation(
+      BaselineCaseName, withLocalMaster(sortBaselineConf(), CpuBaselineAppName, master), master)
+    val cpuStreaming = new CaseObservation(
+      StreamingCaseName, withLocalMaster(streamingConf(), CpuStreamingAppName, master), master)
     try {
       runBenchmark(ScenarioName) {
         val benchmark =
@@ -318,8 +362,21 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
           runCase(streaming)
         }
         benchmark.run()
-        emitReport(master, baseline, streaming)
       }
+      runBenchmark(CpuScenarioName) {
+        val benchmark =
+          new Benchmark(CpuComparisonName, CpuWorkItems.toLong, MeasuredIterations, output = output)
+        benchmark.addCase(BaselineCaseName) { _ =>
+          runCpuCase(cpuBaseline)
+        }
+        benchmark.addCase(StreamingCaseName) { _ =>
+          runCpuCase(cpuStreaming)
+        }
+        benchmark.run()
+      }
+      stopActiveContext()
+      val telemetryCpu = measureTelemetryCpuOverhead()
+      emitReport(master, baseline, streaming, cpuBaseline, cpuStreaming, telemetryCpu)
     } finally {
       // Unconditional, so neither a failure in a case nor a failure while reporting can leave a
       // live context behind. The harness's own main reaches afterAll only when nothing threw.
@@ -363,29 +420,80 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
    */
   private def runCase(observation: CaseObservation): Unit = {
     val context = contextFor(observation)
+    observation.recorder.beginWindow()
     val startedAt = System.nanoTime()
-    val groupsProduced = groupedReferenceWorkload(context).count()
+    val workload = observeGroupedWorkload(groupedReferenceWorkload(context))
     val elapsedNanos = System.nanoTime() - startedAt
     // Task-end events arrive on the listener bus's own thread, so the bus is drained before the
     // accumulated figures are read; otherwise the tasks of the run just finished might not be in
     // them yet.
     drainListenerBus(context)
-    observation.observeRun(elapsedNanos, groupsProduced, telemetrySnapshot())
-    observation.observeShapePeak(
-      shapeName(PartitionCount), observation.recorder.takePeakSinceMark())
+    val metrics = observation.recorder.finishWindow()
+    observation.observeRun(elapsedNanos, workload, metrics)
+    observation.observeShapeFootprint(shapeName(PartitionCount), workload.memory)
     if (observation.runCount == 1) {
       // Once per case, on the harness's warm-up iteration, and in this case's own context: closing
-      // the recorder's peak window after each shape is what lets one context report a peak per
-      // shape, so measuring the extra widths costs no additional cluster start-up and no additional
-      // measured iteration. They are deliberately not timed -- the latency comparison is the
+      // the recorder window after each shape prevents its task metrics from contaminating the
+      // reference comparison. They are deliberately not timed -- the latency comparison is the
       // reference workload's alone, and adding shapes to it would compare different workloads.
       Seq(NarrowPartitionCount, WidePartitionCount).foreach { partitions =>
-        largeDataset(context, partitions, ShapeProbeBytes).groupByKey(partitions).count()
+        observation.recorder.beginWindow()
+        val shape = observeGroupedWorkload(
+          largeDataset(context, partitions, ShapeProbeBytes).groupByKey(partitions))
         drainListenerBus(context)
-        observation.observeShapePeak(
-          shapeName(partitions), observation.recorder.takePeakSinceMark())
+        observation.recorder.finishWindow()
+        observation.observeShapeFootprint(shapeName(partitions), shape.memory)
       }
     }
+  }
+
+  /** Runs the representative CPU-bound shuffle once and records its isolated task-metric window. */
+  private def runCpuCase(observation: CaseObservation): Unit = {
+    val context = contextFor(observation)
+    observation.recorder.beginWindow()
+    val startedAt = System.nanoTime()
+    val workload = observeGroupedWorkload(cpuBoundWorkload(context))
+    val elapsedNanos = System.nanoTime() - startedAt
+    drainListenerBus(context)
+    observation.observeRun(elapsedNanos, workload, observation.recorder.finishWindow())
+  }
+
+  /**
+   * Consumes grouped output on the executors and returns compact executor-side observations.
+   *
+   * Sampling inside the result tasks makes both telemetry and full memory readings belong to the
+   * executor JVMs that ran the streaming writer and reader rather than to the driver.
+   */
+  private def observeGroupedWorkload(grouped: RDD[_]): WorkloadObservation = {
+    val observations = grouped.mapPartitions { records =>
+      val sampler = new ExecutorMemorySampler
+      var groups = 0L
+      sampler.sample()
+      while (records.hasNext) {
+        records.next()
+        groups += 1L
+        if (groups % MemorySampleInterval.toLong == 0L) {
+          sampler.sample()
+        }
+      }
+      sampler.sample()
+      Iterator.single(new ExecutorWorkloadObservation(
+        SparkEnv.get.executorId, groups, telemetrySnapshot(), sampler.observed))
+    }.collect().toSeq
+    aggregateExecutorObservations(observations)
+  }
+
+  /** Reduces per-partition observations to one case reading without double-counting an executor. */
+  private def aggregateExecutorObservations(
+      observations: Seq[ExecutorWorkloadObservation]): WorkloadObservation = {
+    val byExecutor = observations.groupBy(_.executorId)
+    val telemetry = byExecutor.values.foldLeft(EmptyTelemetry) { (total, samples) =>
+      total.plus(samples.map(_.telemetry).reduce(_.max(_)))
+    }
+    val memory = byExecutor.values.foldLeft(EmptyMemoryFootprint) { (total, samples) =>
+      total.plus(samples.map(_.memory).reduce(_.max(_)))
+    }
+    new WorkloadObservation(observations.map(_.groupsProduced).sum, telemetry, memory)
   }
 
   /**
@@ -416,6 +524,35 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
    */
   private def groupedReferenceWorkload(context: SparkContext): RDD[(Int, Iterable[String])] = {
     largeDataset(context, PartitionCount, DatasetBytes).groupByKey(PartitionCount)
+  }
+
+  /** CPU-heavy shuffle with identical deterministic compute on the sort and streaming paths. */
+  private def cpuBoundWorkload(context: SparkContext): RDD[(Int, Long)] = {
+    context.parallelize(0 until CpuWorkItems, PartitionCount)
+      .map { value =>
+        (value % PartitionCount, cpuMix(value.toLong, CpuMixRounds))
+      }
+      .groupByKey(PartitionCount)
+      .mapValues { values =>
+        values.iterator.foldLeft(0L) { (combined, value) =>
+          combined ^ cpuMix(value, CpuMixRounds)
+        }
+      }
+  }
+
+  /** Deterministic integer mixing used to make the CPU-bound case substantial and reproducible. */
+  private def cpuMix(seed: Long, rounds: Int): Long = {
+    var mixed = seed ^ 0x9e3779b97f4a7c15L
+    var round = 0
+    while (round < rounds) {
+      mixed ^= mixed >>> 30
+      mixed *= 0xbf58476d1ce4e5b9L
+      mixed ^= mixed >>> 27
+      mixed *= 0x94d049bb133111ebL
+      mixed ^= mixed >>> 31
+      round += 1
+    }
+    mixed
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -484,19 +621,14 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
   /**
    * Waits for the listener bus to deliver everything a run queued.
    *
-   * A timeout is counted and reported rather than thrown. It would mean one iteration's figures are
-   * incomplete, which is worth knowing and is printed, but it is not a reason to abandon a
-   * measurement that has already been taken -- and a benchmark that died because a bus was slow
-   * would be failing for something other than the shuffle it set out to measure.
+   * A timeout is allowed to fail the run. Reporting figures from a listener window that did not
+   * finish draining would present incomplete task metrics as a measurement, which is less useful
+   * than stopping with the actual cause.
    *
    * @param context the context whose bus is drained
    */
   private def drainListenerBus(context: SparkContext): Unit = {
-    try {
-      context.listenerBus.waitUntilEmpty(ListenerDrainTimeoutMillis)
-    } catch {
-      case NonFatal(_) => listenerDrainTimeouts += 1
-    }
+    context.listenerBus.waitUntilEmpty(ListenerDrainTimeoutMillis)
   }
 
   /**
@@ -521,11 +653,10 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
   /**
    * The four `shuffle.streaming` metrics as they stand, read through the metrics registry.
    *
-   * Taken after every iteration rather than once at the end, because the registry is reset when the
-   * case switches: a reading taken only at the end would report streaming's figures for both cases.
-   * The three counters are cumulative across the case. The utilisation gauge is computed when it is
-   * read, so a sample taken once the job has finished is expected to be zero and says nothing about
-   * what the gauge showed while records were in flight.
+   * Taken inside each result task rather than once on the driver, because every executor owns its
+   * own registry and the case switch resets only the current JVM. The three counters are cumulative
+   * across the case. The utilisation gauge is computed when read, so each result partition samples
+   * it while that executor is still serving or consuming the workload.
    *
    * @return the snapshot
    */
@@ -534,7 +665,131 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
       observedBufferUtilizationPercent(),
       observedSpillCount(),
       observedBackpressureEvents(),
-      observedPartialReadInvalidations())
+      observedPartialReadInvalidations(),
+      1)
+  }
+
+  /** Measures source-on/source-off CPU cost without putting a threshold in the run. */
+  private def measureTelemetryCpuOverhead(): TelemetryCpuObservation = {
+    measuredTelemetryCpuSample(sourceEnabled = false)
+    measuredTelemetryCpuSample(sourceEnabled = true)
+    resetStreamingShuffleMetrics()
+    val disabledSamples = new mutable.ArrayBuffer[Long]()
+    val enabledSamples = new mutable.ArrayBuffer[Long]()
+    var checksum = 0L
+    var sample = 0
+    var available = true
+    while (sample < TelemetryCpuSamples && available) {
+      val ordered = if (sample % 2 == 0) {
+        Seq(false, true)
+      } else {
+        Seq(true, false)
+      }
+      ordered.foreach { enabled =>
+        measuredTelemetryCpuSample(enabled) match {
+          case Some((elapsed, observed)) =>
+            if (enabled) enabledSamples += elapsed else disabledSamples += elapsed
+            checksum ^= observed
+          case None =>
+            available = false
+        }
+      }
+      resetStreamingShuffleMetrics()
+      sample += 1
+    }
+    if (available && disabledSamples.nonEmpty && enabledSamples.nonEmpty) {
+      new TelemetryCpuObservation(
+        Some(medianLong(disabledSamples.toSeq)),
+        Some(medianLong(enabledSamples.toSeq)),
+        checksum)
+    } else {
+      new TelemetryCpuObservation(None, None, checksum)
+    }
+  }
+
+  /** One CPU sample with representative gauge ownership installed outside the measured window. */
+  private def measuredTelemetryCpuSample(sourceEnabled: Boolean): Option[(Long, Long)] = {
+    if (sourceEnabled) {
+      StreamingShuffleMetricsSource.registerBufferUtilizationContributor(TelemetryCpuContributor)
+    }
+    try {
+      measuredThreadCpuNanos(telemetryCpuLoop(sourceEnabled))
+    } finally {
+      if (sourceEnabled) {
+        StreamingShuffleMetricsSource.unregisterBufferUtilizationContributor(
+          TelemetryCpuContributor)
+      }
+    }
+  }
+
+  /** Representative CPU work with sparse metric updates matching the source's event-level use. */
+  private def telemetryCpuLoop(sourceEnabled: Boolean): Long = {
+    var item = 0
+    var checksum = 0L
+    var localEvents = 0L
+    while (item < TelemetryCpuWorkItems) {
+      checksum ^= cpuMix(item.toLong, CpuMixRounds)
+      if (item % TelemetryCpuSampleInterval == 0) {
+        localEvents += 1L
+        if (sourceEnabled) {
+          checksum ^= StreamingShuffleMetricsSource.bufferUtilizationPercent
+          StreamingShuffleMetricsSource.incrementSpillCount(1L)
+          StreamingShuffleMetricsSource.incrementBackpressureEvents(1L)
+          StreamingShuffleMetricsSource.incrementPartialReadInvalidations(1L)
+        }
+      }
+      item += 1
+    }
+    checksum ^ localEvents
+  }
+
+  /** Current-thread CPU time around one body, or unavailable when the JVM cannot expose it. */
+  private def measuredThreadCpuNanos(body: => Long): Option[(Long, Long)] = {
+    try {
+      val bean = ManagementFactory.getThreadMXBean
+      if (!bean.isCurrentThreadCpuTimeSupported) {
+        None
+      } else {
+        if (!bean.isThreadCpuTimeEnabled) {
+          bean.setThreadCpuTimeEnabled(true)
+        }
+        val startedAt = bean.getCurrentThreadCpuTime
+        val result = body
+        val elapsed = bean.getCurrentThreadCpuTime - startedAt
+        if (startedAt < 0L || elapsed <= 0L) None else Some(elapsed -> result)
+      }
+    } catch {
+      case NonFatal(_) => None
+    }
+  }
+
+  /**
+   * Metric operations the source-on loop priced: the per-operation denominator.
+   *
+   * @return gauge reads plus counter increments performed across the whole loop
+   */
+  private def telemetryOperationCount: Long = {
+    val sampledEvents =
+      (TelemetryCpuWorkItems + TelemetryCpuSampleInterval - 1) / TelemetryCpuSampleInterval
+    sampledEvents.toLong * TelemetryOpsPerSampledEvent.toLong
+  }
+
+  /**
+   * Cost of one metric operation, in nanoseconds, from the source-on/source-off difference.
+   *
+   * @param differenceNanos source-on CPU time less source-off CPU time
+   * @return nanoseconds per metric operation, floored at zero because a negative difference means
+   *         the two arms were indistinguishable rather than that telemetry saved time
+   */
+  private def telemetryNanosPerOperation(differenceNanos: Long): Long = {
+    val operations = telemetryOperationCount
+    if (operations <= 0L || differenceNanos <= 0L) 0L else differenceNanos / operations
+  }
+
+  /** Lower-median reading, used so one noisy CPU sample cannot dominate the report. */
+  private def medianLong(values: Seq[Long]): Long = {
+    val ordered = values.sorted
+    ordered((ordered.size - 1) / 2)
   }
 
 
@@ -549,20 +804,28 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
    * @param master the master both cases ran on
    * @param baseline the sort-based case
    * @param streaming the streaming case
+   * @param cpuBaseline sort-based CPU-bound case
+   * @param cpuStreaming streaming CPU-bound case
+   * @param telemetryCpu source-on/source-off CPU accounting
    */
   private def emitReport(
       master: String,
       baseline: CaseObservation,
-      streaming: CaseObservation): Unit = {
+      streaming: CaseObservation,
+      cpuBaseline: CaseObservation,
+      cpuStreaming: CaseObservation,
+      telemetryCpu: TelemetryCpuObservation): Unit = {
     emit(
       workloadSection(master, baseline, streaming) ++
         activationSection(baseline, streaming) ++
         latencySection(baseline, streaming) ++
+        cpuBoundSection(cpuBaseline, cpuStreaming) ++
         memorySection(baseline, streaming) ++
         spillSection(baseline, streaming) ++
         writeAmplificationSection(baseline, streaming) ++
         bandwidthSection(baseline, streaming) ++
         telemetrySection(baseline, streaming) ++
+        telemetryCpuSection(telemetryCpu) ++
         Seq(ReportRule))
   }
 
@@ -661,9 +924,41 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
       row("reduction on worst time", s"${renderTenths(worstReduction)} percent"),
       row("every run, sort-based", runSamples(baseline)),
       row("every run, streaming", runSamples(streaming)),
-      row("acceptance target",
+      row("acceptance target, NOT MEASURED HERE",
         s"$MinLatencyReductionPercent to $MaxLatencyReductionPercent percent reduction")) ++
       LatencyAttributionNote
+  }
+
+  /**
+   * CPU-bound comparison, with identical deterministic compute wrapped around both shuffle paths.
+   *
+   * The same work items and mixing rounds are used in both cases, so the elapsed-time difference
+   * isolates the scheduler and shuffle-coordination work left once deterministic application CPU is
+   * held constant. Like every other section, this reports the target and does not enforce it.
+   *
+   * @param baseline the sort-based CPU-bound case
+   * @param streaming the streaming CPU-bound case
+   * @return the section's lines
+   */
+  private def cpuBoundSection(
+      baseline: CaseObservation,
+      streaming: CaseObservation): Seq[String] = {
+    val bestImprovement = reductionTenths(baseline.bestNanos, streaming.bestNanos)
+    val meanImprovement = reductionTenths(baseline.meanNanos, streaming.meanNanos)
+    Seq(
+      "",
+      "CPU-bound workload, deterministic compute plus shuffle coordination",
+      row("workload", CpuComparisonName),
+      row(baseline.caseName, elapsedDescription(baseline)),
+      row(streaming.caseName, elapsedDescription(streaming)),
+      row("improvement on best time", s"${renderTenths(bestImprovement)} percent"),
+      row("improvement on mean time", s"${renderTenths(meanImprovement)} percent"),
+      row("every run, sort-based", runSamples(baseline)),
+      row("every run, streaming", runSamples(streaming)),
+      row("acceptance target",
+        s"$MinCpuBoundImprovementPercent to $MaxCpuBoundImprovementPercent percent improvement"),
+      row("read this way", "both paths execute the same integer mixing before and after"),
+      row("", "the shuffle, so the difference is coordination beneath fixed CPU work"))
   }
 
   /**
@@ -682,10 +977,13 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
   }
 
   /**
-   * Memory, taken from the peak execution memory Spark's own accumulator already reports.
+   * Full executor memory, sampled in the tasks that consume each workload.
    *
-   * A high-water mark across tasks rather than a sum: peak execution memory is already a per-task
-   * peak, so adding peaks that never coexisted would report a total no executor ever held.
+   * Heap and native buffer-pool use are sampled together, then merged as a high-water mark per
+   * executor and summed across represented executors. The streaming quota and its four ownership
+   * categories are reported beside that footprint but are not added to it: those bytes already
+   * live in heap or native memory. Spark's task execution-memory peak remains useful, so it is
+   * printed as a separate, deliberately narrower reading.
    *
    * @param baseline the sort-based case
    * @param streaming the streaming case
@@ -694,37 +992,80 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
   private def memorySection(
       baseline: CaseObservation,
       streaming: CaseObservation): Seq[String] = {
-    val baselinePeak = baseline.recorder.peakExecutionMemory
-    val streamingPeak = streaming.recorder.peakExecutionMemory
-    val overhead = percentTenths(streamingPeak - baselinePeak, baselinePeak)
+    val baselineMemory = baseline.memoryFootprint
+    val streamingMemory = streaming.memoryFootprint
     val referenceShape = shapeName(PartitionCount)
-    val shapes = streaming.measuredShapes.filter(shape => baseline.shapePeak(shape) > 0L ||
-      streaming.shapePeak(shape) > 0L)
-    val perShape = shapes.flatMap { shape =>
-      val shapeBaseline = baseline.shapePeak(shape)
-      val shapeStreaming = streaming.shapePeak(shape)
-      val shapeOverhead = percentTenths(shapeStreaming - shapeBaseline, shapeBaseline)
+    val shapes = streaming.measuredShapes.filter { shape =>
+      baseline.shapeFootprint(shape).totalBytes > 0L ||
+        streaming.shapeFootprint(shape).totalBytes > 0L
+    }
+    val components = Seq(
+      "heap used" -> (baselineMemory.heapBytes, streamingMemory.heapBytes),
+      "native buffer pools" -> (baselineMemory.nativeBytes, streamingMemory.nativeBytes),
+      "aggregate streaming quota" ->
+        (baselineMemory.aggregateQuotaBytes, streamingMemory.aggregateQuotaBytes),
+      "quota: producer" -> (baselineMemory.producerBytes, streamingMemory.producerBytes),
+      "quota: consumer" -> (baselineMemory.consumerBytes, streamingMemory.consumerBytes),
+      "quota: transient" -> (baselineMemory.transientBytes, streamingMemory.transientBytes),
+      "quota: metadata" -> (baselineMemory.metadataBytes, streamingMemory.metadataBytes))
+    val componentRows = components.flatMap { case (label, (baselineBytes, streamingBytes)) =>
       Seq(
-        row(s"  $shape", s"$shapeBaseline against $shapeStreaming bytes"),
-        row(s"    overhead", s"${renderTenths(shapeOverhead)} percent, " +
-          s"${shapeStreaming - shapeBaseline} bytes absolute"))
+        row(s"  $label", s"$baselineBytes / $streamingBytes bytes"),
+        row("    overhead", memoryOverheadDescription(baselineBytes, streamingBytes)))
+    }
+    val perShape = shapes.flatMap { shape =>
+      val shapeBaseline = baseline.shapeFootprint(shape)
+      val shapeStreaming = streaming.shapeFootprint(shape)
+      Seq(
+        row(s"  $shape",
+          s"${shapeBaseline.totalBytes} / ${shapeStreaming.totalBytes} bytes"),
+        row("    overhead",
+          memoryOverheadDescription(shapeBaseline.totalBytes, shapeStreaming.totalBytes)),
+        row("    streaming quota", quotaDescription(shapeStreaming)))
     }
     Seq(
       "",
-      "Memory, peak execution memory high water mark across tasks",
-      row(baseline.caseName, s"$baselinePeak bytes"),
-      row(streaming.caseName, s"$streamingPeak bytes"),
-      row("overhead", s"${renderTenths(overhead)} percent"),
-      row("acceptance target", s"under $MaxMemoryOverheadPercent percent overhead"),
-      "  by workload shape, sort-based against streaming:") ++
+      "Memory, executor-side heap plus native buffer-pool high-water marks",
+      row(baseline.caseName, footprintDescription(baselineMemory)),
+      row(streaming.caseName, footprintDescription(streamingMemory)),
+      row("full-footprint overhead",
+        memoryOverheadDescription(baselineMemory.totalBytes, streamingMemory.totalBytes)),
+      row("TaskMetrics peakExecutionMemory",
+        s"${baseline.peakExecutionMemory} / ${streaming.peakExecutionMemory} bytes"),
+      row("acceptance target", s"under $MaxMemoryOverheadPercent percent full-footprint overhead"),
+      "  component high-water marks, baseline / streaming:") ++
+      componentRows ++
+      Seq("  by workload shape, baseline / streaming:") ++
       perShape ++
       Seq(
         row("  verdict shape", referenceShape),
-        row("  read this way", "the buffer allowance is divided by the partition count, so " +
-          "width is what"),
-        row("", "overhead depends on; and a percentage taken against a sort-based"),
-        row("", "peak of a few bytes is large however small the absolute"),
-        row("", "difference, which is why both figures are printed for each shape"))
+        row("  read this way", "heap plus native is the full footprint; quota rows are an"),
+        row("", "ownership breakdown already included in that footprint, not extra bytes"),
+        row("", "to add again. Shape probes use isolated task-metric windows."))
+  }
+
+  /** One full executor footprint rendered without hiding its heap and native constituents. */
+  private def footprintDescription(footprint: MemoryFootprint): String = {
+    s"${footprint.totalBytes} bytes = ${footprint.heapBytes} heap + " +
+      s"${footprint.nativeBytes} native"
+  }
+
+  /** Aggregate quota and its independently sampled ownership-category high-water marks. */
+  private def quotaDescription(footprint: MemoryFootprint): String = {
+    s"${footprint.aggregateQuotaBytes} aggregate; producer ${footprint.producerBytes}, " +
+      s"consumer ${footprint.consumerBytes}, transient ${footprint.transientBytes}, " +
+      s"metadata ${footprint.metadataBytes} bytes"
+  }
+
+  /** Relative and absolute memory change, with an explicit zero-baseline interpretation. */
+  private def memoryOverheadDescription(baselineBytes: Long, streamingBytes: Long): String = {
+    val difference = streamingBytes - baselineBytes
+    if (baselineBytes <= 0L) {
+      s"baseline zero; $difference bytes absolute"
+    } else {
+      val overhead = percentTenths(difference, baselineBytes)
+      s"${renderTenths(overhead)} percent, $difference bytes absolute"
+    }
   }
 
   /**
@@ -776,10 +1117,10 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
         s"${renderTenths(spillRateTenths(baseline))} percent / " +
           s"${renderTenths(spillRateTenths(streaming))} percent"),
       row("threshold-driven spill events (spillCount)",
-        s"${baseline.telemetry.spillCount} / ${streaming.telemetry.spillCount}"),
+        s"${spillCountDescription(baseline)} / ${spillCountDescription(streaming)}"),
       row("spill rate under pressure, the target's figure",
-        s"${renderTenths(pressureSpillRateTenths(baseline))} percent / " +
-          s"${renderTenths(pressureSpillRateTenths(streaming))} percent"),
+        s"${pressureSpillRateDescription(baseline)} / " +
+          pressureSpillRateDescription(streaming)),
       row("acceptance target", s"under $MaxSpillRatePercent percent under pressure")) ++
       spillAttribution(streaming)
   }
@@ -796,7 +1137,13 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
    * @return the note's lines
    */
   private def spillAttribution(streaming: CaseObservation): Seq[String] = {
-    if (streaming.telemetry.spillCount == 0L && streaming.recorder.diskBytesSpilled > 0L) {
+    if (!streaming.telemetry.available) {
+      Seq(
+        row("attribution",
+          "unavailable: no executor telemetry sample was returned by the workload."),
+        row("", "TaskMetrics disk volume remains valid, but a driver-local zero is not"),
+        row("", "substituted for the missing executor spill-event attribution."))
+    } else if (streaming.telemetry.spillCount == 0L && streaming.diskBytesSpilled > 0L) {
       Seq(
         row("attribution",
           "no threshold-driven spill event occurred, so every disk byte above is the"),
@@ -814,6 +1161,19 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
     } else {
       Seq(row("attribution", "no disk bytes were written on either path."))
     }
+  }
+
+  /** Executor-side spill-event count, never a driver-local zero when no sample was returned. */
+  private def spillCountDescription(observation: CaseObservation): String = {
+    if (observation.telemetry.available) observation.telemetry.spillCount.toString
+    else "unavailable"
+  }
+
+  /** Pressure-spill rate qualified by whether executor-side event attribution was available. */
+  private def pressureSpillRateDescription(observation: CaseObservation): String = {
+    pressureSpillRateTenths(observation)
+      .map(tenths => s"${renderTenths(tenths)} percent")
+      .getOrElse("unavailable")
   }
 
   /**
@@ -856,22 +1216,30 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
    * @return the description, records and percentage together
    */
   private def amplificationDescription(observation: CaseObservation): String = {
-    val written = observation.recorder.shuffleRecordsWritten
-    val read = observation.recorder.shuffleRecordsRead
+    val written = observation.shuffleRecordsWritten
+    val read = observation.shuffleRecordsRead
     val amplification = percentTenths(written - read, read)
     s"$written written, $read read, ${renderTenths(amplification)} percent amplification"
   }
 
   /**
-   * Bandwidth, derived from the shuffle bytes the accumulators report over the best elapsed time.
+   * Bandwidth, derived from the REMOTE shuffle bytes the accumulators report over the best run.
+   *
+   * <b>Why remote bytes and not total.</b> `ShuffleReadMetrics.totalBytesRead` is the sum of local
+   * and remote bytes, and a local read never touches a link -- it is a file the same executor
+   * wrote, or a buffer the same executor holds. Labelling that sum "bandwidth" overstates the
+   * link's load by however much of the shuffle stayed on one host, which on a two-executor cluster
+   * is a large fraction and on a `local` master is all of it, where a "bandwidth" figure would be
+   * reported for a run that put nothing on any wire at all. `remoteBytesRead` is the part that
+   * crossed a link, so it is the only part a bandwidth figure may be computed from. Both are
+   * printed, so the local share is visible rather than folded away.
    *
    * Byte totals are divided by the number of runs recorded before the rate is taken, because the
    * accumulators are cumulative over every run of a case while the elapsed time is one run's.
    *
-   * The byte figures are what the accumulators report, which is bytes ON THE WIRE and therefore
-   * bytes after shuffle compression. They are consequently far smaller than the dataset, whose
-   * values are highly compressible, and that is the right basis for a bandwidth figure: what a link
-   * carries is the compressed stream, not the dataset it was built from.
+   * The byte figures are what the accumulators report, which is bytes after shuffle compression,
+   * and that is the right basis for a bandwidth figure: what a link carries is the compressed
+   * stream, not the dataset it was built from.
    *
    * @param baseline the sort-based case
    * @param streaming the streaming case
@@ -882,24 +1250,27 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
       streaming: CaseObservation): Seq[String] = {
     Seq(
       "",
-      "Bandwidth, shuffle bytes on the wire per second of the best run",
+      "Bandwidth, REMOTE shuffle bytes per second of the best run",
       row(baseline.caseName, bandwidthDescription(baseline)),
       row(streaming.caseName, bandwidthDescription(streaming)),
       row("shuffle bytes written per run",
-        s"${perRun(baseline.recorder.shuffleBytesWritten, baseline.runCount)} / " +
-          s"${perRun(streaming.recorder.shuffleBytesWritten, streaming.runCount)}"),
-      row("shuffle bytes read per run",
-        s"${perRun(baseline.recorder.shuffleBytesRead, baseline.runCount)} / " +
-          s"${perRun(streaming.recorder.shuffleBytesRead, streaming.runCount)}"),
+        s"${perRun(baseline.shuffleBytesWritten, baseline.runCount)} / " +
+          s"${perRun(streaming.shuffleBytesWritten, streaming.runCount)}"),
+      row("remote bytes read per run, the wire figure",
+        s"${perRun(baseline.shuffleRemoteBytesRead, baseline.runCount)} / " +
+          s"${perRun(streaming.shuffleRemoteBytesRead, streaming.runCount)}"),
+      row("local plus remote read per run, NOT the wire",
+        s"${perRun(baseline.shuffleTotalBytesRead, baseline.runCount)} / " +
+          s"${perRun(streaming.shuffleTotalBytesRead, streaming.runCount)}"),
       row("shuffle records written per run",
-        s"${perRun(baseline.recorder.shuffleRecordsWritten, baseline.runCount)} / " +
-          s"${perRun(streaming.recorder.shuffleRecordsWritten, streaming.runCount)}"),
+        s"${perRun(baseline.shuffleRecordsWritten, baseline.runCount)} / " +
+          s"${perRun(streaming.shuffleRecordsWritten, streaming.runCount)}"),
       row("shuffle records read per run",
-        s"${perRun(baseline.recorder.shuffleRecordsRead, baseline.runCount)} / " +
-          s"${perRun(streaming.recorder.shuffleRecordsRead, streaming.runCount)}"),
+        s"${perRun(baseline.shuffleRecordsRead, baseline.runCount)} / " +
+          s"${perRun(streaming.shuffleRecordsRead, streaming.runCount)}"),
       row("fetch wait time per run, ms",
-        s"${perRun(baseline.recorder.fetchWaitTime, baseline.runCount)} / " +
-          s"${perRun(streaming.recorder.fetchWaitTime, streaming.runCount)}"))
+        s"${perRun(baseline.fetchWaitTime, baseline.runCount)} / " +
+          s"${perRun(streaming.fetchWaitTime, streaming.runCount)}"))
   }
 
   /**
@@ -917,20 +1288,66 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
     Seq(
       "",
       "Streaming telemetry, the four shuffle.streaming metrics, baseline / streaming",
-      row("bufferUtilizationPercent (live gauge, post job)",
-        s"${baselineTelemetry.bufferUtilizationPercent} / " +
-          s"${streamingTelemetry.bufferUtilizationPercent}"),
+      row("bufferUtilizationPercent (task-side sampled gauge)",
+        s"${telemetryValue(baselineTelemetry, baselineTelemetry.bufferUtilizationPercent)} / " +
+          telemetryValue(streamingTelemetry, streamingTelemetry.bufferUtilizationPercent)),
       row("spillCount",
-        s"${baselineTelemetry.spillCount} / ${streamingTelemetry.spillCount}"),
+        s"${telemetryValue(baselineTelemetry, baselineTelemetry.spillCount)} / " +
+          telemetryValue(streamingTelemetry, streamingTelemetry.spillCount)),
       row("backpressureEvents",
-        s"${baselineTelemetry.backpressureEvents} / ${streamingTelemetry.backpressureEvents}"),
+        s"${telemetryValue(baselineTelemetry, baselineTelemetry.backpressureEvents)} / " +
+          telemetryValue(streamingTelemetry, streamingTelemetry.backpressureEvents)),
       row("partialReadInvalidations",
-        s"${baselineTelemetry.partialReadInvalidations} / " +
-          s"${streamingTelemetry.partialReadInvalidations}"),
+        s"${telemetryValue(baselineTelemetry, baselineTelemetry.partialReadInvalidations)} / " +
+          telemetryValue(streamingTelemetry, streamingTelemetry.partialReadInvalidations)),
+      row("executor registries represented",
+        s"${baselineTelemetry.executorCount} / ${streamingTelemetry.executorCount}"),
       row("tasks observed",
-        s"${baseline.recorder.taskEndCount} / ${streaming.recorder.taskEndCount}"),
-      row("listener bus drain timeouts", listenerDrainTimeouts.toString),
+        s"${baseline.taskEndCount} / ${streaming.taskEndCount}"),
       "") ++ TelemetryScopeNote ++ Seq("") ++ TargetsNote
+  }
+
+  /** Metric value qualified by whether an executor-side sample was returned. */
+  private def telemetryValue(telemetry: StreamingTelemetry, value: Long): String = {
+    if (telemetry.available) value.toString else "unavailable"
+  }
+
+  /**
+   * Source-on/source-off current-thread CPU accounting for the streaming telemetry implementation.
+   *
+   * Paired samples are alternated and reduced with the lower median, so launch order and one noisy
+   * reading cannot decide the result. JVMs that cannot expose current-thread CPU time are reported
+   * as unavailable rather than silently substituting wall time.
+   *
+   * @param observation the paired CPU readings
+   * @return the section's lines
+   */
+  private def telemetryCpuSection(observation: TelemetryCpuObservation): Seq[String] = {
+    (observation.sourceOffNanos, observation.sourceOnNanos) match {
+      case (Some(sourceOff), Some(sourceOn)) =>
+        val overhead = percentTenths(sourceOn - sourceOff, sourceOff)
+        Seq(
+          "",
+          "Telemetry CPU cost, paired current-thread CPU samples",
+          row("source off, lower median", s"$sourceOff ns"),
+          row("source on, lower median", s"$sourceOn ns"),
+          row("source-on overhead", s"${renderTenths(overhead)} percent"),
+          row("acceptance target", s"under $MaxTelemetryCpuOverheadPercent percent CPU overhead"),
+          row("cost per metric operation",
+            s"${telemetryNanosPerOperation(sourceOn - sourceOff)} ns"),
+          row("metric operations priced", telemetryOperationCount.toString),
+          row("anti-optimization checksum", observation.checksum.toString),
+          row("read this way", "the source-on loop reads the live gauge and advances the"),
+          row("", "three event counters at a sparse representative event interval"))
+      case _ =>
+        Seq(
+          "",
+          "Telemetry CPU cost, paired current-thread CPU samples",
+          row("measurement", "unavailable"),
+          row("reason", "this JVM did not expose enabled current-thread CPU time"),
+          row("acceptance target", s"under $MaxTelemetryCpuOverheadPercent percent CPU overhead"),
+          row("anti-optimization checksum", observation.checksum.toString))
+    }
   }
 
   /**
@@ -991,8 +1408,8 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
    * @return the rendered description
    */
   private def spillDescription(observation: CaseObservation): String = {
-    s"${observation.recorder.memoryBytesSpilled} bytes in memory, " +
-      s"${observation.recorder.diskBytesSpilled} bytes to disk"
+    s"${observation.memoryBytesSpilled} bytes in memory, " +
+      s"${observation.diskBytesSpilled} bytes to disk"
   }
 
   /**
@@ -1002,7 +1419,7 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
    * @return the rendered description
    */
   private def bandwidthDescription(observation: CaseObservation): String = {
-    val bytesPerRun = perRun(observation.recorder.shuffleBytesRead, observation.runCount)
+    val bytesPerRun = perRun(observation.shuffleRemoteBytesRead, observation.runCount)
     s"${renderTenths(mebibytesPerSecondTenths(bytesPerRun, observation.bestNanos))} MB/s"
   }
 
@@ -1013,7 +1430,7 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
    * @return tenths of a percent
    */
   private def spillRateTenths(observation: CaseObservation): Long = {
-    percentTenths(observation.recorder.diskBytesSpilled, observation.recorder.shuffleBytesWritten)
+    percentTenths(observation.diskBytesSpilled, observation.shuffleBytesWritten)
   }
 
   /**
@@ -1029,10 +1446,16 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
    * benchmark cannot make.
    *
    * @param observation the case
-   * @return the rate in tenths of a percent
+   * @return the rate in tenths of a percent, or none without executor-side attribution
    */
-  private def pressureSpillRateTenths(observation: CaseObservation): Long = {
-    if (observation.telemetry.spillCount == 0L) 0L else spillRateTenths(observation)
+  private def pressureSpillRateTenths(observation: CaseObservation): Option[Long] = {
+    if (!observation.telemetry.available) {
+      None
+    } else if (observation.telemetry.spillCount == 0L) {
+      Some(0L)
+    } else {
+      Some(spillRateTenths(observation))
+    }
   }
 
   /**
@@ -1119,6 +1542,80 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
   // What a case is, and what it observed.
   // ---------------------------------------------------------------------------------------------
 
+  /** Compact result of one grouped workload after its executor-side observations are merged. */
+  private class WorkloadObservation(
+      val groupsProduced: Long,
+      val telemetry: StreamingTelemetry,
+      val memory: MemoryFootprint) extends Serializable
+
+  /** Observation emitted by one result partition before readings are merged per executor. */
+  private class ExecutorWorkloadObservation(
+      val executorId: String,
+      val groupsProduced: Long,
+      val telemetry: StreamingTelemetry,
+      val memory: MemoryFootprint) extends Serializable
+
+  /** Full executor footprint plus the aggregate streaming-quota breakdown sampled during a run. */
+  private class MemoryFootprint(
+      val heapBytes: Long,
+      val nativeBytes: Long,
+      val totalBytes: Long,
+      val aggregateQuotaBytes: Long,
+      val producerBytes: Long,
+      val consumerBytes: Long,
+      val transientBytes: Long,
+      val metadataBytes: Long) extends Serializable {
+
+    def max(other: MemoryFootprint): MemoryFootprint = {
+      new MemoryFootprint(
+        math.max(heapBytes, other.heapBytes),
+        math.max(nativeBytes, other.nativeBytes),
+        math.max(totalBytes, other.totalBytes),
+        math.max(aggregateQuotaBytes, other.aggregateQuotaBytes),
+        math.max(producerBytes, other.producerBytes),
+        math.max(consumerBytes, other.consumerBytes),
+        math.max(transientBytes, other.transientBytes),
+        math.max(metadataBytes, other.metadataBytes))
+    }
+
+    def plus(other: MemoryFootprint): MemoryFootprint = {
+      new MemoryFootprint(
+        heapBytes + other.heapBytes,
+        nativeBytes + other.nativeBytes,
+        totalBytes + other.totalBytes,
+        aggregateQuotaBytes + other.aggregateQuotaBytes,
+        producerBytes + other.producerBytes,
+        consumerBytes + other.consumerBytes,
+        transientBytes + other.transientBytes,
+        metadataBytes + other.metadataBytes)
+    }
+  }
+
+  /**
+   * Isolated task-metric window for one reference run or one shape probe.
+   *
+   * Remote bytes and local-plus-remote bytes are carried SEPARATELY and deliberately. A bandwidth
+   * figure may only be computed from the part that crossed a link, and `totalBytesRead` is the sum
+   * of local and remote; see [[bandwidthSection]].
+   */
+  private class TaskMetricWindow(
+      val taskEndCount: Long,
+      val memoryBytesSpilled: Long,
+      val diskBytesSpilled: Long,
+      val peakExecutionMemory: Long,
+      val shuffleBytesWritten: Long,
+      val shuffleRecordsWritten: Long,
+      val shuffleRemoteBytesRead: Long,
+      val shuffleTotalBytesRead: Long,
+      val shuffleRecordsRead: Long,
+      val fetchWaitTime: Long)
+
+  /** Current-thread CPU readings for the representative telemetry source-off/source-on loops. */
+  private class TelemetryCpuObservation(
+      val sourceOffNanos: Option[Long],
+      val sourceOnNanos: Option[Long],
+      val checksum: Long)
+
   /**
    * Everything one case of the comparison is, and everything it turned out to cost.
    *
@@ -1143,6 +1640,28 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
 
     private var lastTelemetry: StreamingTelemetry = EmptyTelemetry
 
+    private var fullMemory: MemoryFootprint = EmptyMemoryFootprint
+
+    private var taskEnds: Long = 0L
+
+    private var memorySpilled: Long = 0L
+
+    private var diskSpilled: Long = 0L
+
+    private var taskPeakExecutionMemory: Long = 0L
+
+    private var bytesWritten: Long = 0L
+
+    private var recordsWritten: Long = 0L
+
+    private var remoteBytesRead: Long = 0L
+
+    private var totalBytesRead: Long = 0L
+
+    private var recordsRead: Long = 0L
+
+    private var fetchWait: Long = 0L
+
     /**
      * Every run's elapsed time, in the order the runs happened.
      *
@@ -1153,15 +1672,8 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
      */
     private val elapsedSamples = new mutable.ArrayBuffer[Long]()
 
-    /**
-     * The peak execution memory of each workload shape this case ran, keyed by the shape's label
-     * and kept in the order the shapes were measured.
-     *
-     * A single shape cannot support a claim about memory overhead. The streaming path divides its
-     * buffer allowance by the partition count, so a shuffle's width is the very thing the overhead
-     * depends on, and reporting one width would let a favourable one stand for all of them.
-     */
-    private val shapePeaks = new mutable.LinkedHashMap[String, Long]()
+    /** Full executor footprint of each workload shape, in measurement order. */
+    private val shapeFootprints = new mutable.LinkedHashMap[String, MemoryFootprint]()
 
     /**
      * Records one completed run of the workload.
@@ -1172,37 +1684,51 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
      * is printed beside it so a reader can see how much the two differ.
      *
      * @param elapsedNanos wall time the job took, cluster start-up excluded
-     * @param producedGroups groups the job produced, kept as evidence that it did the work
-     * @param telemetry the four streaming metrics as they stood when the run finished
+     * @param workload executor-side group count, telemetry and full memory observations
+     * @param metrics isolated task metrics from this reference run only
      */
     def observeRun(
         elapsedNanos: Long,
-        producedGroups: Long,
-        telemetry: StreamingTelemetry): Unit = {
+        workload: WorkloadObservation,
+        metrics: TaskMetricWindow): Unit = {
       runs += 1
       totalElapsedNanos += elapsedNanos
       bestElapsedNanos = math.min(bestElapsedNanos, elapsedNanos)
-      groups = math.max(groups, producedGroups)
-      lastTelemetry = telemetry
+      groups = math.max(groups, workload.groupsProduced)
+      lastTelemetry = workload.telemetry
+      fullMemory = fullMemory.max(workload.memory)
+      taskEnds += metrics.taskEndCount
+      memorySpilled += metrics.memoryBytesSpilled
+      diskSpilled += metrics.diskBytesSpilled
+      taskPeakExecutionMemory =
+        math.max(taskPeakExecutionMemory, metrics.peakExecutionMemory)
+      bytesWritten += metrics.shuffleBytesWritten
+      recordsWritten += metrics.shuffleRecordsWritten
+      remoteBytesRead += metrics.shuffleRemoteBytesRead
+      totalBytesRead += metrics.shuffleTotalBytesRead
+      recordsRead += metrics.shuffleRecordsRead
+      fetchWait += metrics.fetchWaitTime
       elapsedSamples += elapsedNanos
     }
 
     /**
-     * Records the peak execution memory one workload shape reached, keeping the highest reading
-     * when a shape is measured more than once.
+     * Records the full executor footprint one workload shape reached, taking field-wise maxima when
+     * a shape is measured more than once.
      *
      * @param shapeName the shape's label, which the report prints
-     * @param peakBytes the peak the shape's tasks reported
+     * @param footprint the executor-side heap, native and quota reading
      */
-    def observeShapePeak(shapeName: String, peakBytes: Long): Unit = {
-      shapePeaks(shapeName) = math.max(shapePeaks.getOrElse(shapeName, 0L), peakBytes)
+    def observeShapeFootprint(shapeName: String, footprint: MemoryFootprint): Unit = {
+      shapeFootprints(shapeName) =
+        shapeFootprints.get(shapeName).map(_.max(footprint)).getOrElse(footprint)
     }
 
-    /** Peak execution memory recorded for one shape, or zero if that shape was never measured. */
-    def shapePeak(shapeName: String): Long = shapePeaks.getOrElse(shapeName, 0L)
+    /** Full executor footprint recorded for one shape. */
+    def shapeFootprint(shapeName: String): MemoryFootprint =
+      shapeFootprints.getOrElse(shapeName, EmptyMemoryFootprint)
 
     /** Shapes measured for this case, in the order they were measured. */
-    def measuredShapes: Seq[String] = shapePeaks.keys.toSeq
+    def measuredShapes: Seq[String] = shapeFootprints.keys.toSeq
 
     /**
      * Records the shuffle manager the live environment held when this case's context came up.
@@ -1236,6 +1762,31 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
 
     /** The streaming metrics as they stood at the end of this case's most recent run. */
     def telemetry: StreamingTelemetry = lastTelemetry
+
+    /** Full executor heap plus native footprint observed across the case. */
+    def memoryFootprint: MemoryFootprint = fullMemory
+
+    def taskEndCount: Long = taskEnds
+
+    def memoryBytesSpilled: Long = memorySpilled
+
+    def diskBytesSpilled: Long = diskSpilled
+
+    def peakExecutionMemory: Long = taskPeakExecutionMemory
+
+    def shuffleBytesWritten: Long = bytesWritten
+
+    def shuffleRecordsWritten: Long = recordsWritten
+
+    /** Bytes that crossed a link, which is the only basis a bandwidth figure may be taken from. */
+    def shuffleRemoteBytesRead: Long = remoteBytesRead
+
+    /** Local plus remote bytes: what the accumulator reports, and NOT a wire figure. */
+    def shuffleTotalBytesRead: Long = totalBytesRead
+
+    def shuffleRecordsRead: Long = recordsRead
+
+    def fetchWaitTime: Long = fetchWait
   }
 
   /**
@@ -1245,12 +1796,67 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
    * @param spillCount spill events counted since the case's registry was reset
    * @param backpressureEvents transitions into a throttled state counted since that reset
    * @param partialReadInvalidations per-producer invalidations counted since that reset
+   * @param executorCount executor registries represented by this merged reading
    */
   private class StreamingTelemetry(
       val bufferUtilizationPercent: Long,
       val spillCount: Long,
       val backpressureEvents: Long,
-      val partialReadInvalidations: Long)
+      val partialReadInvalidations: Long,
+      val executorCount: Int) extends Serializable {
+
+    def available: Boolean = executorCount > 0
+
+    def max(other: StreamingTelemetry): StreamingTelemetry = {
+      new StreamingTelemetry(
+        math.max(bufferUtilizationPercent, other.bufferUtilizationPercent),
+        math.max(spillCount, other.spillCount),
+        math.max(backpressureEvents, other.backpressureEvents),
+        math.max(partialReadInvalidations, other.partialReadInvalidations),
+        math.max(executorCount, other.executorCount))
+    }
+
+    def plus(other: StreamingTelemetry): StreamingTelemetry = {
+      new StreamingTelemetry(
+        math.max(bufferUtilizationPercent, other.bufferUtilizationPercent),
+        spillCount + other.spillCount,
+        backpressureEvents + other.backpressureEvents,
+        partialReadInvalidations + other.partialReadInvalidations,
+        executorCount + other.executorCount)
+    }
+  }
+
+  /** Samples executor heap, native buffer pools and every category of the aggregate quota. */
+  private class ExecutorMemorySampler {
+
+    private val bufferPools =
+      ManagementFactory.getPlatformMXBeans(classOf[BufferPoolMXBean]).asScala.toSeq
+
+    private var peak: MemoryFootprint = EmptyMemoryFootprint
+
+    def sample(): Unit = {
+      val env = SparkEnv.get
+      val quota = if (env != null && env.shuffleManager.isInstanceOf[StreamingShuffleManager]) {
+        Some(MemorySpillManager.executorQuota(env.conf))
+      } else {
+        None
+      }
+      val heapBytes = ManagementFactory.getMemoryMXBean.getHeapMemoryUsage.getUsed
+      val nativeBytes = bufferPools.map(pool => math.max(0L, pool.getMemoryUsed)).sum
+      val footprint = new MemoryFootprint(
+        heapBytes,
+        nativeBytes,
+        heapBytes + nativeBytes,
+        quota.map(_.reservedBytes).getOrElse(0L),
+        quota.map(_.reservedBytes(MemorySpillManager.ProducerMemory)).getOrElse(0L),
+        quota.map(_.reservedBytes(MemorySpillManager.ConsumerMemory)).getOrElse(0L),
+        quota.map(_.reservedBytes(MemorySpillManager.TransientMemory)).getOrElse(0L),
+        quota.map(_.reservedBytes(MemorySpillManager.MetadataMemory)).getOrElse(0L))
+      peak = peak.max(footprint)
+    }
+
+    def observed: MemoryFootprint = peak
+  }
 
   /**
    * Accumulates the task metrics Spark already reports, for every task a case runs.
@@ -1266,93 +1872,77 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
    */
   private class ShuffleTaskMetricsRecorder extends SparkListener {
 
+    private var windowActive: Boolean = false
+
     private var tasksEnded: Long = 0L
 
-    private var memorySpilledTotal: Long = 0L
+    private var memorySpilled: Long = 0L
 
-    private var diskSpilledTotal: Long = 0L
+    private var diskSpilled: Long = 0L
 
-    private var peakMemoryHighWater: Long = 0L
+    private var peakExecutionMemory: Long = 0L
 
-    private var peakSinceMark: Long = 0L
+    private var shuffleBytesWritten: Long = 0L
 
-    private var shuffleBytesWrittenTotal: Long = 0L
+    private var shuffleRecordsWritten: Long = 0L
 
-    private var shuffleRecordsWrittenTotal: Long = 0L
+    private var shuffleRemoteBytesRead: Long = 0L
 
-    private var shuffleBytesReadTotal: Long = 0L
+    private var shuffleTotalBytesRead: Long = 0L
 
-    private var shuffleRecordsReadTotal: Long = 0L
+    private var shuffleRecordsRead: Long = 0L
 
-    private var fetchWaitTimeTotal: Long = 0L
+    private var fetchWaitTime: Long = 0L
+
+    /** Opens a clean task-metric window for one reference run or one shape probe. */
+    def beginWindow(): Unit = synchronized {
+      windowActive = true
+      tasksEnded = 0L
+      memorySpilled = 0L
+      diskSpilled = 0L
+      peakExecutionMemory = 0L
+      shuffleBytesWritten = 0L
+      shuffleRecordsWritten = 0L
+      shuffleRemoteBytesRead = 0L
+      shuffleTotalBytesRead = 0L
+      shuffleRecordsRead = 0L
+      fetchWaitTime = 0L
+    }
 
     override def onTaskEnd(taskEnd: SparkListenerTaskEnd): Unit = synchronized {
-      tasksEnded += 1L
-      // The metrics are documented as null for a task that failed, so a failure adds to the task
-      // count and to nothing else instead of bringing the listener bus thread down.
-      val metrics: TaskMetrics = taskEnd.taskMetrics
-      if (metrics != null) {
-        memorySpilledTotal += metrics.memoryBytesSpilled
-        diskSpilledTotal += metrics.diskBytesSpilled
-        // A high-water mark rather than a sum: peak execution memory is already a per-task peak, so
-        // adding peaks that never coexisted would report a total no executor ever held.
-        peakMemoryHighWater = math.max(peakMemoryHighWater, metrics.peakExecutionMemory)
-        // The same mark over a window a caller can close, which is what lets one context report a
-        // peak per workload shape. Two shapes measured in one context are otherwise
-        // indistinguishable: a high-water mark cannot be differenced, so without a closable window
-        // the wider shape's peak would simply absorb the narrower one's and the report could only
-        // ever describe whichever shape happened to be the more demanding.
-        peakSinceMark = math.max(peakSinceMark, metrics.peakExecutionMemory)
-        shuffleBytesWrittenTotal += metrics.shuffleWriteMetrics.bytesWritten
-        shuffleRecordsWrittenTotal += metrics.shuffleWriteMetrics.recordsWritten
-        shuffleBytesReadTotal += metrics.shuffleReadMetrics.totalBytesRead
-        shuffleRecordsReadTotal += metrics.shuffleReadMetrics.recordsRead
-        fetchWaitTimeTotal += metrics.shuffleReadMetrics.fetchWaitTime
+      if (windowActive) {
+        tasksEnded += 1L
+        // The metrics are documented as null for a task that failed, so a failure adds to the task
+        // count and to nothing else instead of bringing the listener bus thread down.
+        val metrics: TaskMetrics = taskEnd.taskMetrics
+        if (metrics != null) {
+          memorySpilled += metrics.memoryBytesSpilled
+          diskSpilled += metrics.diskBytesSpilled
+          peakExecutionMemory = math.max(peakExecutionMemory, metrics.peakExecutionMemory)
+          shuffleBytesWritten += metrics.shuffleWriteMetrics.bytesWritten
+          shuffleRecordsWritten += metrics.shuffleWriteMetrics.recordsWritten
+          shuffleRemoteBytesRead += metrics.shuffleReadMetrics.remoteBytesRead
+          shuffleTotalBytesRead += metrics.shuffleReadMetrics.totalBytesRead
+          shuffleRecordsRead += metrics.shuffleReadMetrics.recordsRead
+          fetchWaitTime += metrics.shuffleReadMetrics.fetchWaitTime
+        }
       }
     }
 
-    /** Task-end events seen, whether or not they carried metrics. */
-    def taskEndCount: Long = synchronized(tasksEnded)
-
-    /** In-memory bytes spilled, summed over every task of every run. */
-    def memoryBytesSpilled: Long = synchronized(memorySpilledTotal)
-
-    /** On-disk bytes spilled, summed over every task of every run. */
-    def diskBytesSpilled: Long = synchronized(diskSpilledTotal)
-
-    /** The highest per-task peak execution memory any task reported. */
-    def peakExecutionMemory: Long = synchronized(peakMemoryHighWater)
-
-    /**
-     * The highest per-task peak execution memory reported since this window was last closed, and
-     * closes it.
-     *
-     * The case-wide mark above is left untouched, so this adds a reading rather than replacing one:
-     * a caller that runs several workload shapes in one context closes the window after each shape
-     * and gets that shape's peak, while [[peakExecutionMemory]] goes on describing the whole case.
-     *
-     * @return the peak observed in the closed window
-     */
-    def takePeakSinceMark(): Long = synchronized {
-      val observed = peakSinceMark
-      peakSinceMark = 0L
-      observed
+    /** Closes and returns the current isolated window. */
+    def finishWindow(): TaskMetricWindow = synchronized {
+      windowActive = false
+      new TaskMetricWindow(
+        tasksEnded,
+        memorySpilled,
+        diskSpilled,
+        peakExecutionMemory,
+        shuffleBytesWritten,
+        shuffleRecordsWritten,
+        shuffleRemoteBytesRead,
+        shuffleTotalBytesRead,
+        shuffleRecordsRead,
+        fetchWaitTime)
     }
-
-    /** Shuffle bytes written, summed over every task of every run. */
-    def shuffleBytesWritten: Long = synchronized(shuffleBytesWrittenTotal)
-
-    /** Shuffle records written, summed over every task of every run. */
-    def shuffleRecordsWritten: Long = synchronized(shuffleRecordsWrittenTotal)
-
-    /** Shuffle bytes read, local and remote together, summed over every task of every run. */
-    def shuffleBytesRead: Long = synchronized(shuffleBytesReadTotal)
-
-    /** Shuffle records read, summed over every task of every run. */
-    def shuffleRecordsRead: Long = synchronized(shuffleRecordsReadTotal)
-
-    /** Milliseconds tasks spent blocked on remote shuffle input, summed over every run. */
-    def fetchWaitTime: Long = synchronized(fetchWaitTimeTotal)
   }
 }
-

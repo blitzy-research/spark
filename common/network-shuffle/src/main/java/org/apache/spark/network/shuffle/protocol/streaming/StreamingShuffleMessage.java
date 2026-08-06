@@ -24,6 +24,8 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 
 import org.apache.spark.annotation.Private;
+import org.apache.spark.network.buffer.ManagedBuffer;
+import org.apache.spark.network.buffer.NettyManagedBuffer;
 import org.apache.spark.network.protocol.Encodable;
 
 /**
@@ -73,10 +75,13 @@ import org.apache.spark.network.protocol.Encodable;
  * sixth header field, so that the header stays exactly what the specification says it is while
  * routing remains a non-allocating peek.
  *
- * The four control messages -- acknowledgement, heartbeat, retransmission request and stream
- * termination -- are consequently fixed at {@value #CONTROL_MESSAGE_ENCODED_LENGTH} bytes each: the
- * header plus that producer id, with the single stream position each of them expresses carried by
- * the header's own {@code sequenceNumber} field. A framed message always occupies {@code
+ * The plain control messages -- acknowledgement and stream termination -- are consequently fixed at
+ * {@value #CONTROL_MESSAGE_ENCODED_LENGTH} bytes each: the header plus that producer id, with the
+ * single stream position each of them expresses carried by the header's own {@code sequenceNumber}
+ * field. The remaining two control messages add exactly one fixed-width field of their own -- a
+ * heartbeat its consumer session token, a retransmission request its window's inclusive upper bound
+ * -- so each of the five types has a width this build fixes and none has a width a peer chooses. A
+ * framed message always occupies {@code
  * encodedLength() + 1} bytes in total. The field order above is normative. It is written by {@link
  * #encodeHeader(ByteBuf)} and read by {@link #readHeader(ByteBuf)}, both defined here rather than
  * in the subclasses, precisely so that no subclass can let the two orders drift apart.
@@ -143,10 +148,11 @@ import org.apache.spark.network.protocol.Encodable;
  *       size the protocol can legitimately produce, so a peer cannot induce work or allocation
  *       proportional to a length it invented. It is checked before dispatch.</li>
  *   <li><b>Semantic domains, at one choke point.</b> {@link #readHeader(ByteBuf)} validates the
- *       protocol version and rejects a negative shuffle id, map id, partition id or sequence
- *       number. Every concrete decoder reads the header through that method before it reads a
- *       field of its own, so the domain check cannot be bypassed by reaching a concrete decoder
- *       directly.</li>
+ *       protocol version and rejects a negative shuffle id, partition id or sequence number, and
+ *       {@link #readProducerId(ByteBuf)} rejects a negative map id on the same terms as the first
+ *       field of the body. Every concrete decoder reads the header through that method before it
+ *       reads a field of its own, so the domain check cannot be bypassed by reaching a concrete
+ *       decoder directly.</li>
  *   <li><b>Exact frame consumption.</b> A decoder consumes its body exactly, and
  *       {@link Decoder#fromByteBuffer(ByteBuffer)} then requires the frame to be fully spent.
  *       Trailing bytes are a framing error and are rejected rather than ignored, which denies a
@@ -190,10 +196,11 @@ public abstract class StreamingShuffleMessage implements Encodable {
    * The total is 17 bytes, which is exactly the header the feature specification fixes -- the
    * protocol revision, the shuffle and partition identity and the stream position, and no further
    * field. Every subclass builds its own {@code encodedLength()} on top of this constant and of
-   * {@link #PRODUCER_ID_ENCODED_LENGTH}, so the four control messages encode to {@link
-   * #CONTROL_MESSAGE_ENCODED_LENGTH} while a data block adds its checksum and its length-prefixed
-   * payload on top of that. The value is written as the sum of its parts rather than as a literal
-   * so that it cannot drift from the layout it describes.
+   * {@link #PRODUCER_ID_ENCODED_LENGTH}, so an acknowledgement and a stream termination encode to
+   * {@link #CONTROL_MESSAGE_ENCODED_LENGTH}, a heartbeat and a retransmission request add one
+   * fixed-width field each, and a data block adds its checksum and its length-prefixed payload on
+   * top of that. The value is written as the sum of its parts rather than as a literal so that it
+   * cannot drift from the layout it describes.
    */
   public static final int HEADER_ENCODED_LENGTH = 1 + 4 + 4 + 8;
 
@@ -208,14 +215,16 @@ public abstract class StreamingShuffleMessage implements Encodable {
   public static final int PRODUCER_ID_ENCODED_LENGTH = 8;
 
   /**
-   * Encoded length of every control message: acknowledgement, heartbeat, retransmission request and
+   * Encoded length of a control message that carries no field of its own: an acknowledgement or a
    * stream termination.
    *
-   * All four are fixed at this size -- the shared header plus the producer id -- because the single
+   * Both are fixed at this size -- the shared header plus the producer id -- because the single
    * stream position each of them expresses is carried by the header's own {@code sequenceNumber}
-   * field rather than by a field of its own. Naming the size once means the four classes cannot
-   * come to disagree about it, and a test can state the specified size without restating the
-   * arithmetic.
+   * field rather than by a field of its own. The other two control messages add one fixed-width
+   * field each on top of this constant: a heartbeat its consumer session token, a retransmission
+   * request the inclusive upper bound of the window it names. Naming the shared size once means the
+   * classes that share it cannot come to disagree about it, and a test can state the specified size
+   * without restating the arithmetic.
    */
   public static final int CONTROL_MESSAGE_ENCODED_LENGTH =
       HEADER_ENCODED_LENGTH + PRODUCER_ID_ENCODED_LENGTH;
@@ -464,6 +473,35 @@ public abstract class StreamingShuffleMessage implements Encodable {
 
   /** Serializes the 'type' byte followed by the message itself. */
   public ByteBuffer toByteBuffer() {
+    return encodeContiguousFrame().nioBuffer();
+  }
+
+  /**
+   * Serializes this message into a transport-owned managed buffer.
+   *
+   * This is the production send-path entry point. Concrete payload messages may override
+   * {@link #encodeManagedFrame()} to return a gathering buffer whose payload is retained
+   * rather than copied into one contiguous allocation. The legacy {@link #toByteBuffer()}
+   * API remains contiguous for callers that require a single NIO buffer.
+   *
+   * @return a managed buffer containing the complete framed message
+   */
+  @Private
+  public ManagedBuffer toManagedBuffer() {
+    return new NettyManagedBuffer(encodeManagedFrame());
+  }
+
+  /**
+   * Encodes the frame representation used by {@link #toManagedBuffer()}.
+   *
+   * Control messages use the contiguous default. Data blocks override it to gather their fixed
+   * header and immutable payload without copying the payload.
+   */
+  protected ByteBuf encodeManagedFrame() {
+    return encodeContiguousFrame();
+  }
+
+  private ByteBuf encodeContiguousFrame() {
     // Allow room for encoded message, plus the type byte. The framed size is derived from
     // FRAME_TYPE_PREFIX_LENGTH rather than by adding one here, so that this allocation and the
     // budgets the producer's memory accounting and rate limiter apply cannot disagree.
@@ -474,7 +512,7 @@ public abstract class StreamingShuffleMessage implements Encodable {
     buf.writeByte(type().id());
     encode(buf);
     assert buf.writableBytes() == 0 : "Writable bytes remain: " + buf.writableBytes();
-    return buf.nioBuffer();
+    return buf;
   }
 
   /**
@@ -540,10 +578,12 @@ public abstract class StreamingShuffleMessage implements Encodable {
    * #encodeHeader(ByteBuf)}.
    *
    * The length is checked rather than asserted, because these bytes arrive from a remote peer and a
-   * truncated frame must be reported the same way in production as it is under test. The five
-   * fields are then handed to {@link Header}, whose constructor rejects a negative shuffle id, map
+   * truncated frame must be reported the same way in production as it is under test. The four
+   * header fields are then handed to {@link Header}, whose constructor rejects a negative shuffle
    * id, partition id or sequence number, so a malformed or hostile frame is refused here rather
-   * than being carried into the subsystem as an impossible routing identity or stream position.
+   * than being carried into the subsystem as an impossible routing identity or stream position. The
+   * map id is not one of them: it opens the BODY at a fixed offset, so it is validated by
+   * {@link #readProducerId(ByteBuf)} immediately after this method returns.
    *
    * This method is the protocol's validation choke point, and that is a deliberate placement. Every
    * concrete decoder must read the header before it reads a field of its own, so validating here
@@ -856,11 +896,88 @@ public abstract class StreamingShuffleMessage implements Encodable {
     /**
      * Rejects a header whose identities or stream position are outside the protocol's domains.
      *
-     * @throws IllegalArgumentException if the shuffle id, the map id, the partition id or the
-     *         sequence number is negative
+     * The map id is deliberately absent from this record and therefore from this check: it is the
+     * first field of every concrete body rather than a header field, and
+     * {@link StreamingShuffleMessage#readProducerId(ByteBuf)} applies the same domain rule to it.
+     *
+     * @throws IllegalArgumentException if the shuffle id, the partition id or the sequence number
+     *         is negative
      */
     public Header {
       checkHeaderDomains(shuffleId, partitionId, sequenceNumber);
+    }
+  }
+
+  /**
+   * Executor-owned reservation gate used before a decoder allocates a data-block payload.
+   *
+   * The wire module deliberately knows nothing about Spark core's quota implementation. The caller
+   * supplies this narrow bridge, and the data-block decoder invokes it after validating the header
+   * and length prefix but before allocating the array named by that prefix.
+   */
+  @Private
+  public interface PayloadReservation {
+
+    /**
+     * Attempts to reserve one payload allocation.
+     *
+     * @return true when the decoder may allocate, false when it must reject without allocation
+     */
+    boolean tryReserve(
+        int shuffleId,
+        long mapId,
+        int partitionId,
+        long sequenceNumber,
+        int payloadBytes);
+
+    /** Returns a reservation whose payload was rejected, discarded, or fully consumed. */
+    void release(int payloadBytes);
+  }
+
+  /** Raised when the caller's executor-wide quota refuses a payload before allocation. */
+  @Private
+  public static class PayloadReservationRejectedException extends RuntimeException {
+
+    private final int shuffleId;
+    private final long mapId;
+    private final int partitionId;
+    private final long sequenceNumber;
+    private final int payloadBytes;
+
+    public PayloadReservationRejectedException(
+        int shuffleId,
+        long mapId,
+        int partitionId,
+        long sequenceNumber,
+        int payloadBytes) {
+      super("Streaming shuffle payload reservation was refused for shuffle " + shuffleId +
+        " map " + mapId + " partition " + partitionId + " sequence " + sequenceNumber +
+        " before allocating " + payloadBytes + " byte(s)");
+      this.shuffleId = shuffleId;
+      this.mapId = mapId;
+      this.partitionId = partitionId;
+      this.sequenceNumber = sequenceNumber;
+      this.payloadBytes = payloadBytes;
+    }
+
+    public int shuffleId() {
+      return shuffleId;
+    }
+
+    public long mapId() {
+      return mapId;
+    }
+
+    public int partitionId() {
+      return partitionId;
+    }
+
+    public long sequenceNumber() {
+      return sequenceNumber;
+    }
+
+    public int payloadBytes() {
+      return payloadBytes;
     }
   }
 
@@ -886,6 +1003,17 @@ public abstract class StreamingShuffleMessage implements Encodable {
      *                                 its type, or followed by bytes the decoder did not consume
      */
     public static StreamingShuffleMessage fromByteBuffer(ByteBuffer msg) {
+      return fromByteBuffer(msg, null);
+    }
+
+    /**
+     * Deserializes one frame while reserving a data payload before its array is allocated.
+     *
+     * Control messages allocate no variable payload and therefore do not consult the reservation.
+     */
+    public static StreamingShuffleMessage fromByteBuffer(
+        ByteBuffer msg,
+        PayloadReservation payloadReservation) {
       Objects.requireNonNull(msg, "msg");
       // Wrapping shares the bytes and leaves the caller's ByteBuffer position untouched, so a
       // caller that peeked the version beforehand can pass the very same buffer here.
@@ -923,7 +1051,7 @@ public abstract class StreamingShuffleMessage implements Encodable {
       // to the discriminator without this dispatch failing to compile until it is handled.
       StreamingShuffleMessageType resolved = StreamingShuffleMessageType.fromId(type);
       StreamingShuffleMessage decoded = switch (resolved) {
-        case DATA_BLOCK -> DataBlockMessage.decode(buf);
+        case DATA_BLOCK -> DataBlockMessage.decode(buf, payloadReservation);
         case ACK -> AckMessage.decode(buf);
         case HEARTBEAT -> HeartbeatMessage.decode(buf);
         case RETRANSMIT_REQUEST -> RetransmitRequestMessage.decode(buf);

@@ -24,16 +24,20 @@ import java.util.concurrent.atomic.AtomicInteger
 import scala.collection.mutable
 import scala.util.control.NonFatal
 
-import _root_.io.netty.channel.DefaultChannelId
+import _root_.io.netty.channel.{Channel, DefaultChannelId}
 import _root_.io.netty.channel.embedded.EmbeddedChannel
 import org.scalatest.PrivateMethodTester
 import org.scalatest.matchers.must.Matchers
 
-import org.apache.spark.{SharedSparkContext, SparkConf, SparkException, SparkFunSuite, TaskContextImpl}
-import org.apache.spark.internal.config.{SHUFFLE_STREAMING_BUFFER_SIZE_PERCENT, SHUFFLE_STREAMING_MAX_BANDWIDTH_MBPS, SHUFFLE_STREAMING_SPILL_THRESHOLD}
+import org.apache.spark.{SharedSparkContext, SparkConf, SparkException, SparkFunSuite,
+  TaskContextImpl}
+import org.apache.spark.internal.config.{SHUFFLE_STREAMING_BUFFER_SIZE_PERCENT,
+  SHUFFLE_STREAMING_MAX_BANDWIDTH_MBPS, SHUFFLE_STREAMING_SPILL_THRESHOLD}
 import org.apache.spark.network.client.{TransportClient, TransportResponseHandler}
 import org.apache.spark.network.protocol.OneWayMessage
-import org.apache.spark.network.shuffle.protocol.streaming.{AckMessage, DataBlockMessage, HeartbeatMessage, RetransmitRequestMessage, StreamingShuffleChecksum, StreamingShuffleMessage, StreamingShuffleMessageType, StreamTerminationMessage}
+import org.apache.spark.network.shuffle.protocol.streaming.{AckMessage, DataBlockMessage,
+  HeartbeatMessage, RetransmitRequestMessage, StreamingShuffleChecksum, StreamingShuffleMessage,
+  StreamingShuffleMessageType, StreamTerminationMessage}
 import org.apache.spark.scheduler.MapStatus
 import org.apache.spark.shuffle.{FetchFailedException, ShuffleWriter}
 import org.apache.spark.storage.BlockManagerId
@@ -84,6 +88,35 @@ class StreamingShuffleWriterSuite
   private val defaultPartitions = 4
 
   /**
+   * Returns the process-scoped state to zero on BOTH edges of every case.
+   *
+   * Two things in this feature outlive a test: the metrics source is a JVM singleton whose counters
+   * accumulate, and the executor-scoped log-aggregation windows and buffer allowance are derived
+   * once per executor. A case asserting "exactly one of these was counted" would otherwise be
+   * asserting on whatever the rest of the JVM had already counted.
+   *
+   * Both edges, not just the entry one, because a case's teardown is still running code --
+   * harnesses close, listeners release generations, maintenance threads wind down -- and a counter
+   * that advances after the body returned would become the starting point of whichever case runs
+   * next. This suite shares one context across its cases, so that carry-over is the normal case
+   * rather than an unusual one.
+   */
+  override def beforeEach(): Unit = {
+    super.beforeEach()
+    resetStreamingShuffleMetrics()
+    MemorySpillManager.resetSharedStateForTesting()
+  }
+
+  override def afterEach(): Unit = {
+    try {
+      super.afterEach()
+    } finally {
+      resetStreamingShuffleMetrics()
+      MemorySpillManager.resetSharedStateForTesting()
+    }
+  }
+
+  /**
    * Executor memory the default fixture derives its buffer budget from.
    *
    * Stated here rather than sampled from the JVM so that every expected figure in this suite is
@@ -99,7 +132,9 @@ class StreamingShuffleWriterSuite
 
   private val capabilityToken = "streaming-shuffle-writer-suite-token"
 
-  private val consumerId = "streaming-shuffle-writer-suite-consumer"
+  private val consumerId = s"attempt-4096-partitions-0-${defaultPartitions - 1}"
+
+  private val authenticatedApplicationId = "application-streaming-shuffle-writer-suite"
 
   private val declaredEpoch = 1L
 
@@ -166,15 +201,27 @@ class StreamingShuffleWriterSuite
    */
   private class ProducerConsumerChannel(
       val handler: StreamingShuffleServerHandler,
-      val consumerId: String) {
+      val consumerId: String,
+      val transportPrincipal: String = authenticatedApplicationId) {
 
     val channel: EmbeddedChannel = new EmbeddedChannel(DefaultChannelId.newInstance())
 
     val client: TransportClient =
       new TransportClient(channel, new TransportResponseHandler(channel))
+    client.setClientId(transportPrincipal)
+
+    private def awaitDataPlane(operation: String): Unit = {
+      if (!handler.awaitDataPlaneIdle(10000L)) {
+        throw new IllegalStateException(
+          s"The producer data plane did not settle after $operation")
+      }
+    }
 
     /** Announces this consumer on the channel, which is what the transport's callback does. */
-    def activate(): Unit = handler.channelActive(client)
+    def activate(): Unit = {
+      handler.channelActive(client)
+      awaitDataPlane("channel activation")
+    }
 
     /**
      * Delivers one frame to the producer exactly as the transport would.
@@ -186,6 +233,7 @@ class StreamingShuffleWriterSuite
       val bytes = new Array[Byte](framed.remaining())
       framed.duplicate().get(bytes)
       handler.receive(client, ByteBuffer.wrap(bytes))
+      awaitDataPlane("frame delivery")
     }
 
     /**
@@ -198,6 +246,7 @@ class StreamingShuffleWriterSuite
      */
     def deliverRaw(bytes: Array[Byte]): Unit = {
       handler.receive(client, ByteBuffer.wrap(bytes.clone()))
+      awaitDataPlane("raw frame delivery")
     }
 
     /**
@@ -207,14 +256,33 @@ class StreamingShuffleWriterSuite
      * through one rather than by reaching into the handler is what makes these cases exercise the
      * production path.
      *
+     * The frame declares [[consumerToken]], which is what makes this fixture's identity a wire fact
+     * rather than a fixture fact: a second instance carrying the same [[consumerId]] is recognised
+     * by the producer as the same logical consumer returning, which is what a reconnection is.
+     *
      * @param shuffleId the shuffle being read
      * @param mapId the map output being read
      * @param partitionId the reduce partition to subscribe to
      * @param nextPosition the next block position this consumer expects
      */
     def subscribe(shuffleId: Int, mapId: Long, partitionId: Int, nextPosition: Long = 0L): Unit = {
-      deliver(new HeartbeatMessage(shuffleId, mapId, partitionId, nextPosition))
+      deliver(new HeartbeatMessage(shuffleId, mapId, partitionId, nextPosition, consumerToken))
     }
+
+    /** The stable session token every heartbeat from this consumer declares. */
+    def consumerToken: Long = BackpressureStreamKey.consumerTokenOf(consumerId)
+
+    /**
+     * The identity the producer keys this consumer's cursors by once it has declared itself.
+     *
+     * The principal and the token, composed the way the producer composes them -- and the principal
+     * is [[transportPrincipal]], the application identity this channel's transport handshake
+     * established, because that is what scopes a declaration: a producer refuses a frame arriving
+     * with no authenticated principal outright, so a session's principal is always a real one.
+     */
+    def declaredIdentity: String =
+      transportPrincipal +
+        StreamingShuffleServerHandler.IDENTITY_TOKEN_SEPARATOR + consumerToken
 
     /** Acknowledges consumption through the given position, through a real ack frame. */
     def acknowledge(shuffleId: Int, mapId: Long, partitionId: Int, position: Long): Unit = {
@@ -230,6 +298,7 @@ class StreamingShuffleWriterSuite
      * readable, and reading it is exactly how a refusal is shown to have served nothing.
      */
     def drainOutbound(): Seq[StreamingShuffleMessage] = {
+      awaitDataPlane("outbound production")
       if (channel.isOpen) {
         channel.flushOutbound()
       }
@@ -253,7 +322,9 @@ class StreamingShuffleWriterSuite
 
     /** Closes the channel under the producer, which is what a consumer going away looks like. */
     def close(): Unit = {
+      awaitDataPlane("channel close")
       handler.channelInactive(client)
+      awaitDataPlane("channel-inactive processing")
       // Discards whatever is still queued and releases it, so a test that closes a channel with
       // frames on it does not leave Netty buffers for the leak detector to find.
       channel.finishAndReleaseAll()
@@ -369,17 +440,24 @@ class StreamingShuffleWriterSuite
   private class RecordingCoordinatorGateway(refuseStandDown: Boolean = false)
     extends StreamingShuffleCoordinatorGateway {
 
-    private val declared = new mutable.ArrayBuffer[StreamingShuffleFallbackReason]()
+    private val declared = new mutable.ArrayBuffer[StreamingShuffleStandDownCause]()
     private val invalidated = new mutable.ArrayBuffer[StreamingShuffleInvalidationReason]()
     private val completed = new mutable.ArrayBuffer[StreamingShuffleProducerGeneration]()
     private val heartbeats = new mutable.ArrayBuffer[StreamingShuffleProducerGeneration]()
+    private val mapOutputInvalidations = new mutable.ArrayBuffer[String]()
+    // Unattributed withdrawals, kept apart from `declared` so that a test can assert the
+    // distinction production makes: a withdrawal carries an account of what streaming declined,
+    // and it is not one of the four conditions.
+    private val withdrawals = new mutable.ArrayBuffer[String]()
     private var latched: StreamingShuffleFallbackState = StreamingShuffleFallbackState()
 
+    // The single abstract declaration, so this double records stand-downs of both kinds through one
+    // path exactly as the coordinator latches them through one path.
     override def declareFallback(
         shuffleId: Int,
-        reason: StreamingShuffleFallbackReason,
+        cause: StreamingShuffleStandDownCause,
         detail: String): StreamingShuffleFallbackState = synchronized {
-      declared += reason
+      declared += cause
       // A coordinator that cannot be reached, or that declines, is the one case in which a producer
       // may not use the sort-based delegate: a map output written by a second implementation while
       // its siblings stream is output no reduce-side read path can reassemble. Answering with a
@@ -388,7 +466,25 @@ class StreamingShuffleWriterSuite
         StreamingShuffleFallbackState()
       } else {
         if (!latched.fallenBack) {
-          latched = StreamingShuffleFallbackState(reason.toString, declaredEpoch)
+          latched = StreamingShuffleFallbackState(cause.toString, declaredEpoch)
+        }
+        latched
+      }
+    }
+
+    override def withdrawStreaming(
+        shuffleId: Int,
+        detail: String): StreamingShuffleFallbackState = synchronized {
+      withdrawals += detail
+      // Latched under the reserved unattributed verdict, exactly as the coordinator latches it:
+      // the shuffle has stood streaming down, and `reason` stays None because no condition was
+      // observed.
+      if (refuseStandDown) {
+        StreamingShuffleFallbackState()
+      } else {
+        if (!latched.fallenBack) {
+          latched = StreamingShuffleFallbackState(
+            StreamingShuffleCoordinator.WITHDRAWN_WITHOUT_CONDITION, declaredEpoch)
         }
         latched
       }
@@ -396,6 +492,15 @@ class StreamingShuffleWriterSuite
 
     override def fallbackState(shuffleId: Int): StreamingShuffleFallbackState =
       synchronized(latched)
+
+    override def invalidateStreamedMapOutput(shuffleId: Int, detail: String): Boolean =
+      synchronized {
+        mapOutputInvalidations += detail
+        // Confirmed unless this double stands in for a driver that cannot be reached, which is
+        // the same switch the refused stand-down uses: both are operations a producer may not
+        // act as though succeeded when it did not.
+        !refuseStandDown
+      }
 
     override def completeProducer(
         shuffleId: Int,
@@ -421,7 +526,10 @@ class StreamingShuffleWriterSuite
       declaredEpoch
     }
 
-    def declaredFallbacks: Seq[StreamingShuffleFallbackReason] = synchronized(declared.toSeq)
+    def declaredFallbacks: Seq[StreamingShuffleStandDownCause] = synchronized(declared.toSeq)
+
+    /** Details of every unattributed stand-down, which name no fallback condition at all. */
+    def unattributedWithdrawals: Seq[String] = synchronized(withdrawals.toSeq)
 
     def invalidations: Seq[StreamingShuffleInvalidationReason] = synchronized(invalidated.toSeq)
 
@@ -429,6 +537,9 @@ class StreamingShuffleWriterSuite
 
     def heartbeatedGenerations: Seq[StreamingShuffleProducerGeneration] =
       synchronized(heartbeats.toSeq)
+
+    /** Streamed map output withdrawals asked for, with the account each one carried. */
+    def streamedMapOutputInvalidations: Seq[String] = synchronized(mapOutputInvalidations.toSeq)
   }
 
   /**
@@ -452,6 +563,10 @@ class StreamingShuffleWriterSuite
     private val routed = new mutable.HashMap[(Int, Long), StreamingShuffleServerHandler]()
 
     private val live = new mutable.LinkedHashSet[(Int, Long)]()
+
+    private val released = new mutable.ArrayBuffer[(Int, Long)]()
+
+    private val faulted = new mutable.ArrayBuffer[(Int, Long, String)]()
 
     /**
      * Installs one generation's routing entry, as the manager installs it before the writer exists.
@@ -493,8 +608,46 @@ class StreamingShuffleWriterSuite
       }
     }
 
+    /**
+     * Records one producer giving up its participation in a consumer channel.
+     *
+     * Producer-local by contract: it releases this producer's participation and leaves the physical
+     * channel to its owner, closing it only when no producer is serving it any more. The fixture
+     * forwards to a real listener when it has one -- so an isolation assertion reads the production
+     * table's own verdict -- and otherwise records the release and reports that nothing was closed,
+     * because a fixture with no channel registry has no channel to close.
+     */
+    override def releaseChannelParticipation(
+        channel: Channel,
+        handler: StreamingShuffleServerHandler,
+        closeWhenLast: Boolean): Boolean = synchronized {
+      released += ((handler.shuffleId, handler.mapId))
+      listener.exists(_.releaseChannelParticipation(channel, handler, closeWhenLast))
+    }
+
+    /**
+     * Records one channel-global fault teardown.
+     *
+     * Kept distinct from [[releaseChannelParticipation]] because the distinction is the property
+     * under test: a fault that impugns the connection closes it, while a producer-local session
+     * ending must not.
+     */
+    override def closeFaultedChannel(
+        channel: Channel,
+        handler: StreamingShuffleServerHandler,
+        reason: String): Unit = synchronized {
+      faulted += ((handler.shuffleId, handler.mapId, reason))
+      listener.foreach(_.closeFaultedChannel(channel, handler, reason))
+    }
+
     /** Shuffle and map pairs whose routing entry was withdrawn, in withdrawal order. */
     def withdrawals: Seq[(Int, Long)] = synchronized(withdrawn.toSeq)
+
+    /** Shuffle and map pairs that gave up a channel participation, in release order. */
+    def participationReleases: Seq[(Int, Long)] = synchronized(released.toSeq)
+
+    /** Channel-global fault teardowns, with the reason each was asked for. */
+    def faultedChannelCloses: Seq[(Int, Long, String)] = synchronized(faulted.toSeq)
 
     /** Whether a generation is still routable through this table. */
     def isRouted(shuffleId: Int, mapId: Long): Boolean =
@@ -614,8 +767,9 @@ class StreamingShuffleWriterSuite
      *
      * @return the number of bytes reserved, which the caller must release
      */
-    def reserveRemainingAllowance(): Long = {
-      var request = quota.totalBytes - quota.reservedBytes
+    def reserveRemainingAllowance(headroomBytes: Long = 0L): Long = {
+      require(headroomBytes >= 0L, s"Headroom must be non-negative, but was $headroomBytes")
+      var request = math.max(0L, quota.totalBytes - quota.reservedBytes - headroomBytes)
       var taken = 0L
       while (request > 0L && taken == 0L) {
         if (quota.tryReserve(request)) {
@@ -666,7 +820,15 @@ class StreamingShuffleWriterSuite
       } catch {
         case failure: Throwable => primary = failure
       }
+      // The routing table is released first, and that ordering is production's own: stopping the
+      // manager releases the executor's listener, which deregisters every producer it routed and so
+      // drives each handler's own release. It is also the only step that stops the listener's
+      // upkeep sweep, which the listener starts on its first registration -- a daemon thread that
+      // outlives this fixture is a thread the suite leaked into the test JVM, and the stress
+      // suite's "no streaming-owned thread survives the manager" reading scans the whole JVM, so a
+      // thread left here fails a case in another suite that shares the fork.
       Seq[() => Unit](
+        () => routes.close(),
         () => serverHandler.releaseAll(),
         () => spillManager.close(),
         () => blockResolver.stop()
@@ -704,11 +866,20 @@ class StreamingShuffleWriterSuite
    * @param handler the producer's egress handler this consumer is attached to
    * @param channel the embedded channel the frames travel on
    * @param client the transport client the producer knows this consumer by
+   * @param consumerId the stable reduce-task identity carried by its heartbeats
    */
   private class ConsumerAttachment(
       val handler: StreamingShuffleServerHandler,
       val channel: EmbeddedChannel,
-      val client: TransportClient) {
+      val client: TransportClient,
+      val consumerId: String) {
+
+    private def awaitDataPlane(operation: String): Unit = {
+      if (!handler.awaitDataPlaneIdle(10000L)) {
+        throw new IllegalStateException(
+          s"The producer data plane did not settle after $operation")
+      }
+    }
 
     /**
      * Subscribes this consumer to one partition, from the position it has consumed through.
@@ -726,8 +897,21 @@ class StreamingShuffleWriterSuite
       // A heartbeat states the NEXT position its sender expects, so a consumer that has taken
       // nothing announces zero. Built through the protocol's own constructor so the frame this
       // fixture pushes in is byte-for-byte the one the production client handler sends.
-      val frame = new HeartbeatMessage(shuffleId, mapId, partitionId, consumedThrough + 1L)
+      val frame = new HeartbeatMessage(shuffleId, mapId, partitionId, consumedThrough + 1L,
+        BackpressureStreamKey.consumerTokenOf(consumerId))
       handler.receive(client, frame.toByteBuffer())
+      awaitDataPlane("consumer subscription")
+    }
+
+    /** Requests replay through one position and waits for the worker-owned transition. */
+    def retransmit(
+        shuffleId: Int,
+        mapId: Long,
+        partitionId: Int,
+        through: Long): Unit = {
+      handler.receive(client,
+        new RetransmitRequestMessage(shuffleId, mapId, partitionId, through).toByteBuffer())
+      awaitDataPlane("consumer retransmission request")
     }
 
     /**
@@ -737,6 +921,7 @@ class StreamingShuffleWriterSuite
      * what makes an assertion on the result meaningful.
      */
     def drainOutbound(): Seq[StreamingShuffleMessage] = {
+      awaitDataPlane("consumer outbound production")
       val decoded = mutable.ArrayBuffer.empty[StreamingShuffleMessage]
       var written = channel.readOutbound[AnyRef]()
       while (written != null) {
@@ -752,6 +937,9 @@ class StreamingShuffleWriterSuite
 
     /** Closes the channel under the consumer, which is what a dead reduce task looks like. */
     def close(): Unit = {
+      awaitDataPlane("consumer close")
+      handler.channelInactive(client)
+      awaitDataPlane("consumer channel-inactive processing")
       if (channel.isOpen) {
         channel.close().syncUninterruptibly()
       }
@@ -765,10 +953,17 @@ class StreamingShuffleWriterSuite
    * @return the attachment, whose channel the caller closes
    */
   private def attachConsumer(harness: WriterHarness): ConsumerAttachment = {
-    val channel = new EmbeddedChannel()
+    // A channel id of its own, so that two attachments are two sessions to the producer rather than
+    // one session reached twice.
+    val channel = new EmbeddedChannel(DefaultChannelId.newInstance())
     val client = new TransportClient(channel, new TransportResponseHandler(channel))
+    client.setClientId(authenticatedApplicationId)
     harness.serverHandler.channelActive(client)
-    new ConsumerAttachment(harness.serverHandler, channel, client)
+    if (!harness.serverHandler.awaitDataPlaneIdle(10000L)) {
+      throw new IllegalStateException(
+        "The producer data plane did not settle after attaching a consumer")
+    }
+    new ConsumerAttachment(harness.serverHandler, channel, client, consumerId)
   }
 
   /**
@@ -788,27 +983,60 @@ class StreamingShuffleWriterSuite
    *
    * @param handler the producer handler this consumer is reading from
    * @param consumerId the consumer session identity every frame carries
+   * @param transportPrincipal the application identity established by transport authentication
    */
   private class ConsumerChannel(
       handler: StreamingShuffleServerHandler,
-      val consumerId: String) {
+      val consumerId: String,
+      val transportPrincipal: String = authenticatedApplicationId) {
 
-    val channel: EmbeddedChannel = new EmbeddedChannel()
+    // A channel id of its own, and load bearing rather than tidy: Netty's no-argument
+    // `EmbeddedChannel` constructor uses a singleton channel id, so two such channels are
+    // indistinguishable to a producer that keys sessions by channel -- and a reconnection would
+    // then be the very same session refreshed rather than a new one arriving, which is the one
+    // thing these cases are trying to exercise.
+    val channel: EmbeddedChannel = new EmbeddedChannel(DefaultChannelId.newInstance())
     val client: TransportClient =
       new TransportClient(channel, new TransportResponseHandler(channel))
-    private var outboundSequence = 0L
+    client.setClientId(transportPrincipal)
+
+    private def awaitDataPlane(operation: String): Unit = {
+      if (!handler.awaitDataPlaneIdle(10000L)) {
+        throw new IllegalStateException(
+          s"The producer data plane did not settle after $operation")
+      }
+    }
 
     handler.channelActive(client)
+    awaitDataPlane("consumer channel activation")
 
     /**
      * Subscribes this consumer to one partition, which is what an in-progress block request is.
      *
      * @param partitionId the reduce partition to read
      */
-    def subscribe(partitionId: Int): Unit = {
+    def subscribe(partitionId: Int, nextPosition: Long = 0L): Unit = {
       deliver(new HeartbeatMessage(handler.shuffleId, handler.mapId, partitionId,
-        nextOutboundSequence()))
+        nextPosition, consumerToken))
     }
+
+    /**
+     * The stable session token every heartbeat from this consumer declares.
+     *
+     * Derived from [[consumerId]] exactly as the production client handler derives it, so that two
+     * instances of this class carrying one identity are one logical consumer to the producer -- the
+     * property the consumer-failure flow depends upon, and one that is now asserted on the wire
+     * rather than assumed by the fixture.
+     */
+    def consumerToken: Long = BackpressureStreamKey.consumerTokenOf(consumerId)
+
+    /**
+     * The identity the producer keys this consumer's cursors by, composed as the producer does:
+     * [[transportPrincipal]], the principal this channel's handshake established, and the token.
+     */
+    def declaredIdentity: String =
+      transportPrincipal +
+        StreamingShuffleServerHandler.IDENTITY_TOKEN_SEPARATOR + consumerToken
 
     /**
      * Acknowledges consumption up to a position, which is what releases producer memory.
@@ -826,10 +1054,12 @@ class StreamingShuffleWriterSuite
       val bytes = new Array[Byte](framed.remaining())
       framed.duplicate().get(bytes)
       handler.receive(client, ByteBuffer.wrap(bytes))
+      awaitDataPlane("consumer frame delivery")
     }
 
     /** Every frame this consumer has been sent since the last call, decoded in write order. */
     def drainInbound(): Seq[StreamingShuffleMessage] = {
+      awaitDataPlane("consumer inbound production")
       val received = new mutable.ArrayBuffer[StreamingShuffleMessage]()
       var next = channel.readOutbound[Object]()
       while (next != null) {
@@ -851,8 +1081,25 @@ class StreamingShuffleWriterSuite
 
     /** Closes the channel under the producer, which is what a consumer crash looks like. */
     def crash(): Unit = {
+      awaitDataPlane("consumer crash")
       channel.close().syncUninterruptibly()
       handler.channelInactive(client)
+      awaitDataPlane("consumer crash cleanup")
+    }
+
+    /**
+     * Closes the channel without telling the producer, which is what a consumer that vanished looks
+     * like.
+     *
+     * The distinction from [[crash]] is the whole reason both exist. A close the producer is told
+     * about releases the session at once; a peer that is killed, partitioned away, or whose host
+     * disappears takes its socket with it and tells nobody -- TCP alone can take minutes to notice.
+     * The session therefore survives, holding its subscription and its retained window, which is
+     * the state a reconnection actually arrives into and the state that makes supersession
+     * necessary.
+     */
+    def vanish(): Unit = {
+      channel.close().syncUninterruptibly()
     }
 
     /**
@@ -865,11 +1112,6 @@ class StreamingShuffleWriterSuite
      * on its own bookkeeping rather than on the producer's classification.
      */
     def disconnect(): Unit = crash()
-
-    private def nextOutboundSequence(): Long = {
-      outboundSequence += 1L
-      outboundSequence
-    }
   }
 
   /**
@@ -1030,19 +1272,20 @@ class StreamingShuffleWriterSuite
       maxBandwidthMBps = maxBandwidthMBps, clock = clock)
     // No coordinator in this process: the protocol documents and guards that case, falling back to
     // the shuffles registered locally when it asks how many an executor is serving.
-    val backpressure = new BackpressureProtocol(writerConf, null, egressBudget, clock)
+    val backpressure = new BackpressureProtocol(writerConf, null, egressBudget, clock, quota)
     val rateLimiter = egressBudget.limiterFor(handle.shuffleId)
     val errorNotifier = new StreamingShuffleErrorNotifier(handle.shuffleId, writerConf)
     val routes = new RecordingRouteRegistry(routeTable)
+    val fallbackPolicy = new StreamingShuffleFallbackPolicy(writerConf, clock)
     val serverHandler = new StreamingShuffleServerHandler(writerConf, handle.shuffleId, mapId,
-      taskAttemptId, blockResolver, routes, backpressure, rateLimiter, errorNotifier, clock)
+      taskAttemptId, handle.numPartitions, blockResolver, routes, backpressure, rateLimiter,
+      errorNotifier, fallbackPolicy, clock)
     // Mirrors what the manager does on the way to constructing this writer, and in its order: the
     // routing entry is installed once the handler exists and before the producer is announced, so
     // that a consumer acting on the published address reaches a handler rather than nothing. The
     // fixture has to make this call because the harness stands in for the manager here -- and a
     // registration that never happened cannot be asserted to have been withdrawn.
     routes.installRoute(handle.shuffleId, mapId, serverHandler)
-    val fallbackPolicy = new StreamingShuffleFallbackPolicy(writerConf, clock)
     val gateway = registration.gateway
     val components = StreamingShuffleWriterComponents(backpressure, rateLimiter, spillManager,
       blockResolver, serverHandler, fallbackPolicy, errorNotifier, gateway)
@@ -1462,20 +1705,41 @@ class StreamingShuffleWriterSuite
         protocolShuffleId, defaultMapId, 0, 0L, oversized)
     }
 
-    // All four control message types encode to the same number of bytes, so a discriminator must
-    // read the framing type byte or the concrete class and never the length.
+    // The control messages that carry no field of their own encode to the same number of bytes, so
+    // a discriminator must read the framing type byte or the concrete class, never the length.
     val fixedMessages = Seq(
       ack(protocolShuffleId, defaultMapId, 0, 0L),
-      heartbeat(protocolShuffleId, defaultMapId, 0, 0L),
-      retransmitRequest(protocolShuffleId, defaultMapId, 0, 0L),
       streamTermination(protocolShuffleId, defaultMapId, 0, 1L))
     assert(FixedMessageEncodedLength === 25,
-      "A control message is the specified twenty-five bytes, stated as a literal so that the " +
-        "contract is asserted rather than echoed from the encoder")
+      "An identity-free control message is the specified twenty-five bytes")
     assert(fixedMessages.forall(_.encodedLength() == FixedMessageEncodedLength),
       s"Every fixed-size streaming message must encode to $FixedMessageEncodedLength bytes")
     assert(fixedMessages.map(typeOf).distinct.size === fixedMessages.size,
       "Fixed-size messages of equal length must still be distinguished by their type discriminator")
+    // A heartbeat is wider by exactly the consumer session token, and is that width whether it
+    // declares one or not: the width of a frame may not depend on what a peer chose to say, or the
+    // producer's framing budget would be a figure it had to trust rather than one it computes.
+    assert(HeartbeatBaseEncodedLength === 33,
+      "A heartbeat is a control message plus the eight bytes of the consumer session token")
+    Seq(
+      heartbeat(protocolShuffleId, defaultMapId, 0, 0L),
+      heartbeat(protocolShuffleId, defaultMapId, 0, 0L, 987654321L)).foreach { beat =>
+      assert(beat.encodedLength() === HeartbeatBaseEncodedLength,
+        "A heartbeat is of one fixed width whether it declares an identity or not")
+      assert(framedLength(beat.encodedLength()) === HeartbeatBaseEncodedLength + 1,
+        "A framed heartbeat is its encoded length plus the one-byte type discriminator")
+    }
+    // A retransmission request is wider by exactly the inclusive upper bound that lets one frame
+    // name a whole repair window, and its width is the same whatever window it names.
+    assert(RetransmitRequestEncodedLength === 33,
+      "A retransmission request is a control message plus the eight bytes of its upper bound")
+    Seq(
+      retransmitRequest(protocolShuffleId, defaultMapId, 0, 0L),
+      retransmitRequest(protocolShuffleId, defaultMapId, 0, 0L, 64L)).foreach { request =>
+      assert(request.encodedLength() === RetransmitRequestEncodedLength,
+        s"A retransmission request must encode to $RetransmitRequestEncodedLength bytes but " +
+          s"encoded to ${request.encodedLength()}")
+    }
 
     // ==The blocks the producer actually put on the wire==
     //
@@ -1808,16 +2072,6 @@ class StreamingShuffleWriterSuite
           == 0),
         "No partition may retain a block after the attempt failed")
 
-      // Every block the retention window was holding has gone with it, read back through the same
-      // production accessor that proved they were there.
-      assert(retainedBlocks.forall { case (partitionId, sequence) =>
-          harness.spillManager.retainedPayload(partitionId, sequence).isEmpty
-        },
-        "No block may remain reachable in the retention window after the attempt failed")
-      assert(harness.writer.streamedPartitions.forall(harness.spillManager.retainedBlockCount(_)
-          == 0),
-        "No partition may retain a block after the attempt failed")
-
       // The producer never manufactures the reader's failure signal.
       assert(harness.errorNotifier.fetchFailure.isEmpty,
         "A producer must not construct a fetch failure, which belongs to the reading side")
@@ -1834,17 +2088,14 @@ class StreamingShuffleWriterSuite
     //
     // So this drives all three ways a task can end -- a successful stop, a failing stop, and a
     // cancellation that never stops the writer at all -- and after each one reads the ledgers the
-    // production code keeps: the task's own memory consumer, the executor-wide buffer allowance,
-    // the executor-wide framing budget the egress path reserves against, the retention window, the
-    // spill files on disk and the handler's sessions. Exactly once is then established by releasing
-    // a second time and asserting nothing moved and no failure was counted, because a release that
-    // ran twice would either double-count on the shared ledgers or fail deleting an absent file.
+    // production code keeps: the task's own memory consumer, every ownership category in the one
+    // executor-wide allowance, the retention window, the spill files on disk and the handler's
+    // sessions. Exactly once is then established by releasing a second time and asserting nothing
+    // moved and no failure was counted, because a release that ran twice would either double-count
+    // on the shared ledgers or fail deleting an absent file.
     val partitions = 4
     Seq("a successful stop", "a failing stop", "a cancellation with no stop at all").foreach {
       ending =>
-      // The framing budget is JVM-wide, so the baseline is established rather than assumed. A
-      // sibling suite's leftover reservation would otherwise read as this task's leak.
-      StreamingShuffleServerHandler.EgressFramingBudget.resetForTesting()
       val harness = newHarness(numPartitions = partitions)
       try {
         val consumer = new ProducerConsumerChannel(harness.serverHandler, consumerId)
@@ -1896,8 +2147,15 @@ class StreamingShuffleWriterSuite
           s"[$ending] no buffered byte may survive task completion")
         assert(harness.spillManager.scratchBytes === 0L,
           s"[$ending] no framing scratch reservation may survive task completion")
-        assert(harness.spillManager.executorReservedBytes === 0L,
-          s"[$ending] the executor-wide allowance must have every reserved byte back")
+        val retainedMetadataBytes =
+          if (ending == "a successful stop") {
+            harness.spillManager.allSpilledBlocks.size.toLong *
+              MemorySpillManager.SPILLED_RECORD_METADATA_BYTES
+          } else {
+            0L
+          }
+        assert(harness.spillManager.executorReservedBytes === retainedMetadataBytes,
+          s"[$ending] only resolver-owned durable-record metadata may survive task completion")
         assert(harness.spillManager.getUsed() === 0L,
           s"[$ending] the memory consumer still holds ${harness.spillManager.getUsed()} bytes of " +
             "task execution memory")
@@ -1924,6 +2182,8 @@ class StreamingShuffleWriterSuite
           assert(files.forall(file => !file.exists()),
             s"[$ending] the resolver left spill files behind when it retired the generation: " +
               files.filter(_.exists()).mkString(", "))
+          assert(harness.spillManager.executorReservedBytes === 0L,
+            s"[$ending] retiring retained output must return its durable-record metadata too")
         } else {
           assert(!harness.spillManager.spillFilesTransferred,
             s"[$ending] an attempt that did not succeed must not hand its spill files on")
@@ -1945,10 +2205,10 @@ class StreamingShuffleWriterSuite
           s"[$ending] no consumer session may survive task completion")
         assert(harness.serverHandler.pendingBytes === 0L,
           s"[$ending] no queued egress byte may survive task completion")
-        assert(StreamingShuffleServerHandler.EgressFramingBudget.inFlight === 0L,
-          s"[$ending] the executor-wide framing budget still holds " +
-            s"${StreamingShuffleServerHandler.EgressFramingBudget.inFlight} bytes, so a framing " +
-            "copy was reserved and never returned")
+        assert(harness.backpressure.reservedTransientQuotaBytes === 0L,
+          s"[$ending] the executor-wide transient category still holds " +
+            s"${harness.backpressure.reservedTransientQuotaBytes} bytes, so a framing copy was " +
+            "reserved and never returned")
 
         // Exactly once, not merely at least once. A second release of every kind must move nothing:
         // an over-release would show on the shared ledgers, and a second deletion of an unlinked
@@ -1963,11 +2223,10 @@ class StreamingShuffleWriterSuite
           s"[$ending] a repeated release must not over-free the task's execution memory")
         assert(harness.spillManager.spillFileDeletionFailures === deletionFailuresBefore,
           s"[$ending] a repeated release attempted to delete a spill file a second time")
-        assert(StreamingShuffleServerHandler.EgressFramingBudget.inFlight === 0L,
-          s"[$ending] a repeated release must leave the framing budget at zero")
+        assert(harness.backpressure.reservedTransientQuotaBytes === 0L,
+          s"[$ending] a repeated release must leave the transient category at zero")
       } finally {
         harness.close()
-        StreamingShuffleServerHandler.EgressFramingBudget.resetForTesting()
       }
     }
   }
@@ -2715,12 +2974,17 @@ class StreamingShuffleWriterSuite
 
       // An acknowledgement disarms it, which is the other half of the contract: the detector
       // measures silence, not elapsed time.
+      val acknowledgementsBefore = harness.serverHandler.ackCount
       consumer.acknowledge(partitionId = 0, position = delivered.last.sequenceNumber())
       assert(!harness.serverHandler.isConsumerStalled(0),
         "an acknowledgement must disarm the stall detector, because progress means the consumer " +
           "is alive")
-      assert(harness.serverHandler.acknowledgedPosition(0) === delivered.last.sequenceNumber(),
-        "the acknowledged position must have advanced to the block the consumer named")
+      assert(harness.serverHandler.ackCount === acknowledgementsBefore + 1L,
+        "the final acknowledgement must be applied before the completed consumer is retired")
+      assert(harness.serverHandler.sessionCount === 0,
+        "a consumer that confirmed its terminated stream must be finally unregistered")
+      assert(harness.spillManager.registeredConsumers.isEmpty,
+        "final completion must remove the retained cursor that would otherwise pin reclamation")
       consumer.crash()
     }
   }
@@ -2778,6 +3042,165 @@ class StreamingShuffleWriterSuite
             s"covered ${replayed.mkString(", ")} while ${spilled.mkString(", ")} were on disk")
       }
       resumed.crash()
+    }
+  }
+
+  test("a consumer that vanished is superseded on reconnect and resumes from its own cursor") {
+    // MA-01, and the half of FR-9 a per-connection identity cannot deliver. A consumer whose socket
+    // died without the producer being told leaves a session behind that holds a subscription, a
+    // credit window and a claim on the retained output, and TCP alone can take minutes to notice.
+    // When that consumer returns, the producer has to recognise it -- and recognition has to come
+    // from something the reconnection did not change. It comes from the token every heartbeat
+    // declares, and it buys two things this case asserts separately: the dead connection is
+    // released at once instead of at a sweep, and the returning one resumes from the position the
+    // first one acknowledged rather than from the beginning of the stream.
+    val clock = newManualClock()
+    withHarness(newHarness(numPartitions = DegradationPartitions,
+        executorMemoryBytes = DegradationExecutorMemoryBytes, clock = clock)) { harness =>
+      val handler = harness.serverHandler
+      // The producer publishes its retained output before it writes a record and long before any
+      // consumer can resolve its address, so a consumer subscribing to a map output that is already
+      // producing is the ordinary case rather than a special one -- and it is the case that has a
+      // cursor to inherit.
+      harness.writer.write(deterministicRecords(StreamedRecordsPerConsumerCase, seed = 91L,
+        keySpace = 8).iterator)
+      val first = new ConsumerChannel(handler, consumerId)
+      first.subscribe(partitionId = 0)
+      val delivered = first.drainInboundBlocks().map(_.sequenceNumber())
+      assert(delivered.length >= 2,
+        s"the first session must have been sent more than one block for a partial " +
+          s"acknowledgement to mean anything, but it was sent ${delivered.length}")
+
+      // The identity is a wire fact, not a fixture fact: the producer holds exactly the identity
+      // the consumer declared, composed with the principal that scopes it.
+      assert(handler.consumerIdentities === Set(first.declaredIdentity),
+        s"the producer must key this consumer by the identity it declared, but it holds " +
+          s"${handler.consumerIdentities.mkString(", ")}")
+
+      // A partial acknowledgement, which is what establishes a cursor there is something to
+      // inherit.
+      val acknowledgedThrough = delivered(delivered.length / 2)
+      first.acknowledge(partitionId = 0, position = acknowledgedThrough)
+      assert(handler.acknowledgedPosition(0) === acknowledgedThrough,
+        s"the producer must have recorded the acknowledgement, but its cursor stands at " +
+          s"${handler.acknowledgedPosition(0)}")
+      // And recorded it against the *identity*, in the store, which is the cursor that outlives the
+      // connection. The session's own cursor dies with the channel; this one is what a reconnection
+      // inherits, so a case that asserted only the former would prove nothing about resumption.
+      assert(harness.spillManager.registeredConsumers === Set(first.declaredIdentity),
+        s"the store must know this consumer by its declared identity, but it knows " +
+          s"${harness.spillManager.registeredConsumers.mkString(", ")}")
+      assert(harness.spillManager.consumerPosition(first.declaredIdentity, 0) ===
+          Some(acknowledgedThrough),
+        s"and must hold its acknowledged position against that identity, but it holds " +
+          s"${harness.spillManager.consumerPosition(first.declaredIdentity, 0)}")
+
+      // The socket dies and nobody tells the producer. The session survives, which is precisely the
+      // state a reconnection arrives into -- and precisely why it has to be superseded rather than
+      // waited out.
+      first.vanish()
+      assert(handler.liveConsumerCount === 1,
+        "a consumer that vanished silently leaves its session behind, which is the state that " +
+          "makes supersession necessary rather than optional")
+
+      val supersededBefore = handler.supersededSessionCount
+      val sessionsBefore = handler.sessionCount
+      clock.advance(RetryBaseBackoffMillis)
+
+      // The reconnection: a new channel, the same identity, announcing that it expects the very
+      // first block. A producer that could not recognise it would take that announcement at face
+      // value and replay the whole partition; one that recognises it serves from the cursor the
+      // identity holds, because the consumer acknowledged those blocks and therefore has them.
+      val resumed = new ConsumerChannel(handler, consumerId)
+      resumed.subscribe(partitionId = 0)
+
+      assert(handler.supersededSessionCount === supersededBefore + 1L,
+        s"the lost connection must be released the moment the consumer identifies itself again, " +
+          s"but the producer superseded ${handler.supersededSessionCount - supersededBefore}")
+      assert(handler.sessionCount === sessionsBefore,
+        s"so the producer holds the new connection in place of the old one rather than both, but " +
+          s"it holds ${handler.sessionCount} against $sessionsBefore before the reconnection")
+      assert(handler.liveConsumerCount === 1,
+        "and still exactly one logical consumer, because the two connections are one consumer")
+      assert(handler.consumerIdentities === Set(resumed.declaredIdentity),
+        s"under the one identity both declared, but the producer holds " +
+          s"${handler.consumerIdentities.mkString(", ")}")
+      assert(handler.subscriberCount(0) === 1,
+        s"and the superseded connection's subscriber slot must have come back with it, but " +
+          s"${handler.subscriberCount(0)} are claimed")
+
+      val replayed = resumed.drainInboundBlocks().map(_.sequenceNumber())
+      assert(replayed.nonEmpty,
+        "a resumed consumer must be served the window it had not acknowledged")
+      assert(replayed.forall(_ > acknowledgedThrough),
+        s"and must not be served again what it acknowledged before it vanished: the cursor that " +
+          s"stops that is the one the identity carries, but the replay covered " +
+          s"${replayed.mkString(", ")} against an acknowledgement through $acknowledgedThrough")
+      assert(delivered.exists(_ <= acknowledgedThrough),
+        "the case is only meaningful if the first session was in fact sent blocks at or below " +
+          "the acknowledged position, so that withholding them is an observable decision")
+      assert(replayed === replayed.sorted,
+        s"and the replay must arrive in sequence order, but arrived as ${replayed.mkString(", ")}")
+      resumed.crash()
+    }
+  }
+
+  test("a multi block gap is repaired by one request inside a single retry episode") {
+    // The producer half of the repair-window contract, driven through real frames rather than
+    // through the handler's own method, because the defect this case exists for lived in the
+    // arithmetic between a frame and the gate: a repair of n positions used to be n frames, the
+    // first of them armed the partition's backoff, and every sibling behind it was deferred. The
+    // run then spent the whole five-attempt budget re-asking for its first position and escalated
+    // to a stage recomputation while the producer still held every byte that had been asked for.
+    //
+    // One frame naming the closed interval is therefore asserted end to end: every position in the
+    // run is replayed, the run costs exactly ONE attempt, and the budget that remains is the budget
+    // for further repairs rather than for the rest of this one.
+    val clock = newManualClock()
+    withHarness(newHarness(numPartitions = DegradationPartitions,
+        executorMemoryBytes = DegradationExecutorMemoryBytes, clock = clock)) { harness =>
+      val consumer = new ConsumerChannel(harness.serverHandler, consumerId)
+      consumer.subscribe(partitionId = 0)
+      harness.writer.write(deterministicRecords(StreamedRecordsPerConsumerCase, seed = 84L,
+        keySpace = 8).iterator)
+      val delivered = consumer.drainInboundBlocks().map(_.sequenceNumber())
+      assert(delivered.size >= 3,
+        s"this case needs a gap of at least two positions inside a longer stream, but only " +
+          s"${delivered.size} block(s) were delivered")
+      val gap = delivered.slice(1, 4)
+      assert(gap.size >= 2 && gap === (gap.head to gap.last).toSeq,
+        s"the gap must be a contiguous run of at least two positions, but was " +
+          s"${gap.mkString(", ")}")
+
+      // Exactly the frame the consumer's repair path writes: one request, both ends inclusive.
+      val before = harness.serverHandler.retransmittedBlockCount
+      consumer.deliver(new RetransmitRequestMessage(
+        harness.shuffleId, defaultMapId, 0, gap.head, gap.last))
+      harness.serverHandler.flushPending()
+      val replayed = consumer.drainInboundBlocks().map(_.sequenceNumber())
+      assert(gap.forall(replayed.contains),
+        s"every position of the run must be replayed by the one request that named it, but " +
+          s"${gap.mkString(", ")} was answered with ${replayed.mkString(", ")}")
+      assert(harness.serverHandler.retransmittedBlockCount - before >= gap.size.toLong,
+        s"the producer must count a replay per block it re-queued, but its count moved from " +
+          s"$before to ${harness.serverHandler.retransmittedBlockCount} for a run of " +
+          s"${gap.size} block(s)")
+      assert(harness.errorNotifier.error.isEmpty,
+        s"a repair the producer could serve must not escalate, yet it latched " +
+          s"${harness.errorNotifier.error.map(_.getMessage).getOrElse("")}")
+
+      // One attempt, not one per position: the request that follows immediately is deferred by the
+      // single backoff the run armed, and the attempt after the base backoff is granted again. Had
+      // the run been charged per position it would already be past its budget here.
+      assert(harness.serverHandler.retransmit(0, gap.head, gap.last) === 0,
+        "a second request inside the backoff the run armed must be deferred rather than serviced")
+      clock.advance(RetryBaseBackoffMillis)
+      assert(harness.serverHandler.retransmit(0, gap.head, gap.last) > 0,
+        s"the run must still hold its remaining budget once the ${RetryBaseBackoffMillis} ms " +
+          "backoff has elapsed, because a repair spends one attempt however many blocks it covers")
+      assert(harness.errorNotifier.error.isEmpty,
+        "and the budget must not have been exhausted by a single multi block repair")
+      consumer.crash()
     }
   }
 
@@ -3060,12 +3483,9 @@ class StreamingShuffleWriterSuite
         sortWriterFactory = Some(() => delegate)),
       expectedReason = StreamingShuffleFallbackReason.NetworkSaturation,
       prepare = fixture => {
-        // Sustained, because one over-capacity sample is a pacing bucket's legal burst rather
-        // than a saturated link: see the policy's SATURATION_SUSTAINED_SAMPLES.
-        (1L to StreamingShuffleFallbackPolicy.SATURATION_SUSTAINED_SAMPLES).foreach { _ =>
-          fixture.fallbackPolicy.recordLinkUtilization(
-            usedBytesPerSecond = 990.0d, capacityBytesPerSecond = 1000.0d)
-        }
+        // One reading strictly above the ninety percent share, which is the whole of the condition.
+        fixture.fallbackPolicy.recordLinkUtilization(
+          usedBytesPerSecond = 990.0d, capacityBytesPerSecond = 1000.0d)
         assert(fixture.fallbackPolicy.hasTripped,
           "the fixture's policy must have latched a trip before the first record")
       })
@@ -3178,13 +3598,24 @@ class StreamingShuffleWriterSuite
       assert(fixture.writer.blockPayloadCapacityBytes === derivedCapacity,
         "the fixture must derive the same capacity as the control, or the arithmetic below is " +
           "about two different budgets")
-      // Exactly the halved envelope is left free, so the derived reservation cannot be taken and
-      // the first halving fits precisely. Nothing about this is approximate: a fixture that left a
-      // little more would pass whether the writer negotiated or not.
-      val committed = fixture.spillManager.totalBudgetBytes - expectedEnvelope
+      // What is left free is strictly less than the derived envelope and strictly more than the
+      // halved one, which is the only band in which this case says what it means to say. Less than
+      // the derived envelope is what forces the halving -- a fixture that left the derived envelope
+      // free would pass whether the writer negotiated or not. More than the halved envelope is what
+      // keeps the fixture a statement about the negotiation rather than about memory pressure: an
+      // allowance committed down to the last byte of framing scratch cannot buffer a single block,
+      // so every admission would be refused after its recovery rounds and would correctly trip the
+      // memory-pressure condition -- which is the thing this case asserts does NOT happen, and
+      // would be asserting it in a state where it should.
+      val blockHeadroom = expectedEnvelope * 3 / 4
+      val committed = fixture.spillManager.totalBudgetBytes - expectedEnvelope - blockHeadroom
       assert(committed > 0L, "the fixture must have budget left to commit")
+      assert(blockHeadroom < expectedEnvelope,
+        s"the free space of ${expectedEnvelope + blockHeadroom} bytes must stay below the " +
+          s"derived envelope of ${derivedCapacity.toLong * defaultPartitions} bytes, or the " +
+          s"derived reservation would simply be taken and no halving would be forced")
       assert(fixture.spillManager.reserveScratch(committed),
-        "the fixture must be able to commit all but the halved envelope")
+        "the fixture must be able to commit all but the halved envelope and the block headroom")
 
       val records = deterministicRecords(PreflightRecords, seed = 94L, keySpace = 16)
       var envelopeHeldAtFirstRecord = 0L
@@ -3211,6 +3642,10 @@ class StreamingShuffleWriterSuite
       assert(fixture.writer.recordsStreamed === records.size.toLong,
         s"every record must have been streamed, but ${fixture.writer.recordsStreamed} of " +
           s"${records.size} were")
+      assert(fixture.spillManager.durableAdmissionCount === 0L,
+        s"and the halved envelope must leave room to buffer blocks, or the refusals below would " +
+          s"be genuine memory pressure rather than none; ${
+            fixture.spillManager.durableAdmissionCount} block(s) took the disk route")
       assert(fixture.gateway.declaredFallbacks.isEmpty,
         s"a reservation negotiated down must not stand the shuffle down, but the gateway " +
           s"saw ${fixture.gateway.declaredFallbacks.mkString(", ")}")
@@ -3228,72 +3663,104 @@ class StreamingShuffleWriterSuite
     }
   }
 
-  test("a block the allowance cannot hold goes straight to disk and the shuffle keeps streaming") {
+  test("a block the allowance cannot hold reaches disk and then stands the shuffle down") {
     // What a full buffer allowance costs, and what it must NOT cost. The specified answer to a full
-    // buffer is to spill, so a block that cannot be held skips memory and is written straight to
-    // local disk: the map output stays complete and the shuffle keeps the streaming path it is
-    // already committed to. Standing the shuffle down here would be wrong twice over -- it would
-    // tell consumers to read output this producer has already streamed from a sort-based path that
-    // has none of it, and a task that fails to force the whole map stage to be recomputed takes the
-    // job with it wherever retries are unavailable.
+    // buffer is to spill, so the block that cannot be held skips memory and is written straight to
+    // local disk rather than being lost: the record it carries is still this map task's output and
+    // is still accounted for. What the refusal DOES cost is the streaming path itself. Every
+    // recovery round has run and the reservation is still refused, which is the second specified
+    // trip condition -- "memory pressure prevents buffer allocation" -- so the policy trips and the
+    // attempt finishes the same map output through the sort-based writer in place.
+    //
+    // This case previously asserted the opposite, that a refusal the fixture had made unevictable
+    // left the shuffle streaming, on the reasoning that an allowance which was never available is
+    // structural rather than a shortage. That reading made the documented degradation inert in the
+    // one condition FR-10 names most directly, and it is not a reading the specification supports:
+    // a refused allocation is a refused allocation. Degrading is safe here precisely because it is
+    // not a failure -- the map output is reconstructed in place and the streamed generation is
+    // withdrawn shuffle-wide, so no consumer is left reading a path this executor has abandoned.
     //
     // A single reduce partition, deliberately. Each partition's framing share is returned as that
     // partition finishes, so on a wider shuffle the share released by the first partition to end
     // makes room for the last block of the second -- which is the peak-lowering behaviour finishing
-    // is supposed to have, and which would make "every block took the disk route" false for a
-    // reason that has nothing to do with the branch under test.
+    // is supposed to have, and which would make "the block took the disk route" false for a reason
+    // that has nothing to do with the branch under test.
     //
-    // The control fixture goes first, because "every block took the disk route" says nothing unless
+    // The control fixture goes first, because "the block took the disk route" says nothing unless
     // the same records under the same shape would otherwise have gone to memory.
+    val directDiskDelegate = new WorkingSortShuffleDelegate
     val controlRecords = deterministicRecords(DirectDiskRecords, seed = 96L, keySpace = 8)
+    var expectedBlocks = 0L
     withHarness(newHarness(numPartitions = 1,
         executorMemoryBytes = DegradationExecutorMemoryBytes)) { control =>
       control.writer.write(controlRecords.iterator)
       control.writer.stop(success = true)
+      expectedBlocks = control.writer.blocksStreamed
       assert(control.writer.blocksStreamed > 1L,
         s"the control fixture must cut more than one block, or the fixture below is a " +
           s"statement about a single admission; it cut ${control.writer.blocksStreamed}")
       assert(control.spillManager.durableAdmissionCount === 0L,
         s"an unconstrained allowance must admit every block to memory, but " +
           s"${control.spillManager.durableAdmissionCount} went straight to disk")
+      assert(!control.fallbackPolicy.hasTripped,
+        s"and it must not trip anything, or the trip below would say nothing about the refusal; " +
+          s"it tripped with ${control.fallbackPolicy.trippedReason}")
     }
 
+    val delegate = new RecordingSortShuffleWriter(1)
     withHarness(newHarness(numPartitions = 1,
-        executorMemoryBytes = DegradationExecutorMemoryBytes)) { fixture =>
-      var committed = 0L
+        executorMemoryBytes = DegradationExecutorMemoryBytes,
+        sortWriterFactory = Some(() => delegate))) { fixture =>
+      var reservedBytes = 0L
       val records = deterministicRecords(DirectDiskRecords, seed = 96L, keySpace = 8)
       val constraining = records.iterator.map { record =>
-        if (committed == 0L) {
-          // Committed at the first record, which is after the framing reservation has been taken
-          // and before any block has been cut. What is left of the allowance goes to scratch -- the
-          // half of the budget that cannot be spilled -- so no arrangement of eviction can make
-          // room and every admission is refused rather than merely delayed.
-          val remaining = fixture.spillManager.totalBudgetBytes - fixture.spillManager.scratchBytes
-          assert(remaining > 0L, "the fixture must have allowance left to commit")
+        if (reservedBytes == 0L) {
+          // Taken at the first record, which is after the framing reservation has been made and
+          // before any block has been cut, so the producer is fully committed to streaming by the
+          // time the allowance runs out. The bytes are taken from the shared allowance directly,
+          // which is what makes the refusal unevictable: they belong to no partition of this
+          // producer, exactly as another task's framing scratch on the same executor would not.
           assert(fixture.spillManager.bufferedBytes === 0L,
             "nothing may be buffered yet, or eviction could free room and the refusal under test " +
               "would be a delay instead")
-          assert(fixture.spillManager.reserveScratch(remaining),
-            "the fixture must be able to commit what is left of the allowance")
-          committed = remaining
+          // Headroom for the metadata a durably retained record is charged, and load bearing: the
+          // allowance bounds the bookkeeping of a spilled block as well as the bytes of a buffered
+          // one, so a fixture that takes the allowance to the last byte starves the disk route of
+          // the little it needs and the block reaches neither memory nor disk. That is the
+          // genuinely unanswerable condition, which fails the attempt outright, and it is not the
+          // condition under test here -- this case is about a block the allowance cannot HOLD
+          // taking the disk route it is supposed to take. Sized well below one block, so the
+          // memory route stays refused.
+          reservedBytes = fixture.reserveRemainingAllowance(
+            64L * MemorySpillManager.SPILLED_RECORD_METADATA_BYTES)
+          assert(reservedBytes > 0L, "the fixture must have allowance left to commit")
         }
         record
       }
-      fixture.writer.write(constraining)
-      val status = fixture.writer.stop(success = true)
+      val status = try {
+        fixture.writer.write(constraining)
+        fixture.writer.stop(success = true)
+      } finally {
+        if (reservedBytes > 0L) {
+          fixture.quota.release(reservedBytes)
+        }
+      }
 
-      assert(status.isDefined && status.get.location === sc.env.blockManager.shuffleServerId,
-        s"the attempt must complete on the streaming path with its own status, but reported " +
-          s"${status.map(_.location)}")
-      assert(fixture.writer.recordsStreamed === records.size.toLong,
-        s"every record must still have been streamed, but ${fixture.writer.recordsStreamed} of " +
-          s"${records.size} were")
-      assert(fixture.spillManager.durableAdmissionCount === fixture.writer.blocksStreamed,
-        s"every one of the ${fixture.writer.blocksStreamed} block(s) must have taken the disk " +
-          s"route, but ${fixture.spillManager.durableAdmissionCount} did")
-      assert(fixture.writer.blocksStreamed > 1L,
-        s"the fixture must have cut more than one block, so the disk route is asserted over a " +
-          s"of admissions rather than over one; it cut ${fixture.writer.blocksStreamed}")
+      // The block was retained rather than dropped, and the retention was a last resort: every
+      // recovery round the writer is allowed was spent before the disk route was taken.
+      assert(fixture.spillManager.durableAdmissionCount > 0L,
+        s"a block the allowance cannot hold must be written straight to local disk, but " +
+          s"${fixture.spillManager.durableAdmissionCount} were")
+      assert(fixture.writer.admissionRetryCount >=
+          StreamingShuffleWriter.MAX_ADMISSION_RECOVERY_ROUNDS.toLong *
+            fixture.spillManager.durableAdmissionCount,
+        s"each refused admission must exhaust its ${
+          StreamingShuffleWriter.MAX_ADMISSION_RECOVERY_ROUNDS} recovery round(s) before going " +
+          s"to disk, but only ${fixture.writer.admissionRetryCount} retries were spent over " +
+          s"${fixture.spillManager.durableAdmissionCount} admission(s)")
+      assert(fixture.writer.memoryPressureBrushCount === 0L,
+        s"nothing was rescued by eviction, so nothing may be counted as a brush with pressure, " +
+          s"but ${fixture.writer.memoryPressureBrushCount} were")
 
       // Every spill event this fixture counted is a direct admission and nothing else: no eviction
       // ran, because there was never anything resident to evict. The event is still counted: the
@@ -3312,42 +3779,39 @@ class StreamingShuffleWriterSuite
       assert(fixture.spillManager.spillFailureCount === 0L,
         s"every direct admission must have succeeded, but " +
           s"${fixture.spillManager.spillFailureCount} failed")
-
-      // The recovery rounds were spent before the disk route was taken, which is what makes the
-      // direct admission a last resort rather than a first choice.
-      assert(fixture.writer.admissionRetryCount >=
-          StreamingShuffleWriter.MAX_ADMISSION_RECOVERY_ROUNDS.toLong *
-            fixture.writer.blocksStreamed,
-        s"each refused admission must exhaust its ${
-          StreamingShuffleWriter.MAX_ADMISSION_RECOVERY_ROUNDS} recovery round(s) before going " +
-          s"disk, but only ${fixture.writer.admissionRetryCount} retries were spent over " +
-          s"${fixture.writer.blocksStreamed} block(s)")
-      assert(fixture.writer.memoryPressureBrushCount === 0L,
-        s"nothing was rescued by eviction, so nothing may be counted as a brush with pressure, " +
-          s"but ${fixture.writer.memoryPressureBrushCount} were")
-
-      // Visible in the flow-control telemetry, and deliberately absent from the fallback policy --
-      // which is why it is reported through the non-degrading signal rather than as an allocation
-      // failure. A met allowance is answered by spilling, so declaring the subsystem degraded here
-      // would record that streaming should yield while this producer deliberately carries on.
       assert(fixture.backpressure.durableSpillAdmissionCount ===
           fixture.spillManager.durableAdmissionCount,
         s"every block that took the disk route must be visible in the backpressure telemetry an " +
           s"operator consults, but it counted " +
           s"${fixture.backpressure.durableSpillAdmissionCount} against " +
           s"${fixture.spillManager.durableAdmissionCount} admission(s)")
-      assert(!fixture.backpressure.isDegraded && fixture.backpressure.degradationReasons.isEmpty,
-        s"and nothing may declare the subsystem degraded for an allowance answered by spilling, " +
-          s"yet it holds ${fixture.backpressure.degradationReasons.mkString(", ")}")
-      assert(!fixture.fallbackPolicy.hasTripped,
-        "a full buffer is answered by spilling, not by standing the shuffle down: the verdict is " +
-          "shuffle-wide and this producer has already streamed output no sort-based path has")
-      assert(fixture.gateway.declaredFallbacks.isEmpty,
-        s"no stand-down may be declared for a block that reached disk, but the gateway saw " +
-          s"${fixture.gateway.declaredFallbacks.mkString(", ")}")
+
+      // And the refusal reached the fallback policy, which is the correction this case now pins.
+      assert(fixture.fallbackPolicy.hasTripped,
+        "a reservation still refused after every recovery round must trip the fallback policy")
+      assert(fixture.fallbackPolicy.trippedReason
+          .contains(StreamingShuffleFallbackReason.MemoryPressure),
+        s"and it must trip as memory pressure, but it tripped as " +
+          s"${fixture.fallbackPolicy.trippedReason}")
+      assert(fixture.gateway.declaredFallbacks.contains(
+          StreamingShuffleFallbackReason.MemoryPressure),
+        s"the trip must be declared shuffle-wide so every participant stands down, but the " +
+          s"gateway saw ${fixture.gateway.declaredFallbacks.mkString(", ")}")
+
+      // Degradation, not failure. The attempt finishes its own map output through the sort-based
+      // writer, and it finishes it exactly: a record lost or repeated here is a data loss no reduce
+      // task could detect.
+      assert(delegate.writeCallCount === 1,
+        s"the attempt must be finished by exactly one sort-based write, but the delegate was " +
+          s"written to ${delegate.writeCallCount} time(s)")
+      assert(delegate.recordsWritten.groupBy(identity).map(entry => (entry._1, entry._2.size)) ===
+          records.groupBy(identity).map(entry => (entry._1, entry._2.size)),
+        "the sort-based writer must receive this map task's input exactly, every duplicate " +
+          "preserved: a record lost or repeated here is a data loss no reduce task could detect")
+      assert(status.isDefined,
+        "a degraded attempt must still report a map status for the write path's dereference")
       assert(fixture.errorNotifier.error.isEmpty,
-        "a block that reached disk is not a failure")
-      fixture.spillManager.releaseScratch(committed)
+        "and standing down is not a failure, so nothing may have been raised")
     }
   }
 
@@ -3432,9 +3896,7 @@ class StreamingShuffleWriterSuite
           }
           val highest = harness.writer.blocksStreamed - 1L
           if (highest > 0L) {
-            harness.serverHandler.receive(consumer.client,
-              new RetransmitRequestMessage(harness.shuffleId, defaultMapId, 0, highest)
-                .toByteBuffer())
+            consumer.retransmit(harness.shuffleId, defaultMapId, 0, highest)
           }
           record
         }
@@ -3493,9 +3955,7 @@ class StreamingShuffleWriterSuite
           collectOutbound()
           val highest = harness.writer.blocksStreamed - 1L
           if (highest > 0L) {
-            harness.serverHandler.receive(consumer.client,
-              new RetransmitRequestMessage(harness.shuffleId, defaultMapId, 0, highest)
-                .toByteBuffer())
+            consumer.retransmit(harness.shuffleId, defaultMapId, 0, highest)
           }
           record
         }
@@ -3518,16 +3978,16 @@ class StreamingShuffleWriterSuite
   }
 
   test("an admission refused after eviction has spilled trips the memory-pressure fallback") {
-    // The second specified trip condition, on the path the whole subsystem actually takes. Memory
-    // pressure that eviction *rescues* is ordinary flow control and must not cost the job its fast
-    // path -- that is the direct-to-disk case above, where nothing was ever resident and no
-    // spilling could have helped. This is the other half: output IS resident, eviction runs and
-    // moves bytes to disk, and the reservation is still refused. That is "memory pressure prevents
-    // buffer allocation", it is the Spilling-to-Degraded transition the state machine names, and
-    // leaving it unreported made the documented degradation inert exactly when it was needed --
-    // ninety-nine percent buffer utilisation and dozens of spill events with the policy reporting
-    // that nothing had tripped, while the job absorbed repeated map-stage recomputation instead of
-    // yielding.
+    // The second specified trip condition, on the path the whole subsystem actually takes, in the
+    // shape where memory really was in play: output IS resident, eviction runs and moves bytes to
+    // disk, and the reservation is still refused afterwards. The other shape -- an allowance
+    // committed elsewhere before anything of this producer's was resident, so no eviction could
+    // have helped -- trips identically and is covered by the two direct-to-disk cases; a refused
+    // allocation is a refused allocation either way. That is "memory pressure prevents buffer
+    // allocation", it is the Spilling-to-Degraded transition the state machine names, and leaving
+    // it unreported made the documented degradation inert exactly when needed -- ninety-nine
+    // percent buffer utilisation and dozens of spill events with the policy reporting that nothing
+    // had tripped, while the job absorbed repeated map-stage recomputation instead of yielding.
     val delegate = new RecordingSortShuffleWriter(DegradationPartitions)
     val harness = newHarness(
       numPartitions = DegradationPartitions,
@@ -3546,7 +4006,8 @@ class StreamingShuffleWriterSuite
       val squeezing = records.iterator.map { record =>
         if (reservedBytes == 0L && fixture.spillManager.memoryBytesSpilled > 0L) {
           fixture.spillManager.spillAllRetained()
-          reservedBytes = fixture.reserveRemainingAllowance()
+          reservedBytes = fixture.reserveRemainingAllowance(
+            64L * MemorySpillManager.SPILLED_RECORD_METADATA_BYTES)
           assert(reservedBytes > 0L,
             "the fixture must be able to take what eviction released, or the admissions below " +
               "would simply succeed and the refusal under test would never happen")
@@ -3608,16 +4069,14 @@ class StreamingShuffleWriterSuite
       val records = deterministicRecords(DegradationRecords, seed = 71L, keySpace = 64)
       // The trip is applied from inside the iterator, after the first record has been consumed, so
       // that it is observed while production is under way rather than before it starts. Link
-      // saturation is used because it needs no clock: a run of samples above the trip percentage is
-      // enough on its own.
+      // saturation is used because it needs no clock: a run of over-capacity measurement intervals
+      // above the trip percentage is enough on its own, and every instant is supplied.
       var tripped = false
       val tripping = records.iterator.map { record =>
         if (!tripped) {
           tripped = true
-          (1L to StreamingShuffleFallbackPolicy.SATURATION_SUSTAINED_SAMPLES).foreach { _ =>
-            fixture.fallbackPolicy.recordLinkUtilization(
-              usedBytesPerSecond = 990.0d, capacityBytesPerSecond = 1000.0d)
-          }
+          fixture.fallbackPolicy.recordLinkUtilization(
+            usedBytesPerSecond = 990.0d, capacityBytesPerSecond = 1000.0d)
           assert(fixture.fallbackPolicy.hasTripped,
             "the link saturation condition must trip the policy the writer consults")
         }
@@ -3676,6 +4135,62 @@ class StreamingShuffleWriterSuite
     }
   }
 
+  test("a runtime stand down that cannot be agreed fails rather than rewriting through sort") {
+    // The midstream twin of the preflight case above, and the more dangerous of the two. By this
+    // point the attempt HAS streamed blocks, so finishing through the sort-based writer publishes
+    // sort-based output for a shuffle whose other producers may still be streaming and whose
+    // consumers may still be reading the streamed path -- one shuffle with two implementations of
+    // one map output, which no reduce-side read path can reassemble. Rewriting is therefore
+    // permitted only once the coordinator has latched the verdict for every participant; a
+    // declaration that did not take effect must fail the attempt so the scheduler retries it.
+    val delegate = new RecordingSortShuffleWriter(DegradationPartitions)
+    val refusing = new RecordingCoordinatorGateway(refuseStandDown = true)
+    val harness = newHarness(
+      numPartitions = DegradationPartitions,
+      executorMemoryBytes = DegradationExecutorMemoryBytes,
+      sortWriterFactory = Some(() => delegate),
+      registration = RegistrationFixture(gateway = refusing))
+    withHarness(harness) { fixture =>
+      val records = deterministicRecords(DegradationRecords, seed = 73L, keySpace = 64)
+      var tripped = false
+      val tripping = records.iterator.map { record =>
+        if (!tripped) {
+          tripped = true
+          // One reading, because the trip is immediate on any reading strictly above the
+          // tolerated share; there is no run of samples to accumulate.
+          fixture.fallbackPolicy.recordLinkUtilization(
+            usedBytesPerSecond = 990.0d, capacityBytesPerSecond = 1000.0d)
+          assert(fixture.fallbackPolicy.hasTripped,
+            "the link saturation condition must trip the policy the writer consults")
+        }
+        record
+      }
+
+      val refused = intercept[SparkException](fixture.writer.write(tripping))
+
+      assert(refused.getMessage.contains("could not be stood down for every participant"),
+        s"the failure must name what could not be agreed rather than reading as a streaming " +
+          s"fault, but was '${refused.getMessage}'")
+      assert(refusing.declaredFallbacks ===
+          Seq(StreamingShuffleFallbackReason.NetworkSaturation),
+        s"the stand-down must have been attempted exactly once, and for the condition actually " +
+          s"observed, but the gateway saw ${refusing.declaredFallbacks.mkString(", ")}")
+      assert(delegate.writeCallCount === 0,
+        s"the sort-based delegate must not have written anything while the rest of the shuffle " +
+          s"streams, but it was written to ${delegate.writeCallCount} time(s)")
+      assert(!fixture.fallbackPolicy.shuffleHasFallenBack(fixture.shuffleId),
+        "no shuffle-wide verdict may be cached from a declaration that did not take effect, or " +
+          "the retry would delegate on the strength of a decision nobody agreed to")
+
+      // The failed stop is the writer's own, and it must leave nothing behind for the retry.
+      assert(fixture.writer.stop(success = false).isEmpty,
+        "a failed attempt reports no map status")
+      assert(fixture.spillManager.bufferedBytes === 0L && fixture.spillManager.scratchBytes === 0L,
+        s"the failed attempt must hold no buffer and no framing scratch, but held " +
+          s"${fixture.spillManager.bufferedBytes} and ${fixture.spillManager.scratchBytes} bytes")
+    }
+  }
+
   test("a runtime stand down releases every buffer and spill file it had retained") {
     // Degradation is the one path that both retains streamed blocks and then abandons them, so the
     // release is asserted separately from the record-level correctness above. Nothing may survive
@@ -3691,9 +4206,7 @@ class StreamingShuffleWriterSuite
       fixture.writer.write(records.iterator.map { record =>
         if (!tripped) {
           tripped = true
-          (1L to StreamingShuffleFallbackPolicy.SATURATION_SUSTAINED_SAMPLES).foreach { _ =>
-            fixture.fallbackPolicy.recordLinkUtilization(990.0d, 1000.0d)
-          }
+          fixture.fallbackPolicy.recordLinkUtilization(990.0d, 1000.0d)
         }
         record
       })
@@ -3737,11 +4250,15 @@ class StreamingShuffleWriterSuite
     // A deliberately small executor-memory figure, because the framing capacity is derived from it
     // and the capacity decides when a block is cut. At the default figure one block holds more than
     // this test produces in total, so nothing would be committed until the writer had finished its
-    // iterator -- and a consumer cannot stall on output that has not been sent yet. A small budget
-    // cuts blocks of a few kilobytes instead, so the stall detector, the spill, the replay ladder
-    // and the escalation are all reached inside the record loop, where maintenance runs.
-    withHarness(newHarness(numPartitions = 1, clock = clock,
-        executorMemoryBytes = 96L * 1024L)) { harness =>
+    // iterator -- and a consumer cannot stall on output that has not been sent yet. A quarter MiB
+    // still cuts blocks below 32 KiB while leaving enough aggregate allowance for the replay
+    // ledger's bounded metadata. The minimum valid spill threshold makes the retained window cross
+    // the eviction boundary before the replay budget is spent, without exhausting the allowance.
+    withHarness(newHarness(
+        numPartitions = 1,
+        clock = clock,
+        executorMemoryBytes = 256L * 1024L,
+        spillThreshold = 50)) { harness =>
       val consumer = new ProducerConsumerChannel(harness.serverHandler, consumerId)
       consumer.activate()
       consumer.subscribe(harness.shuffleId, defaultMapId, 0)
@@ -3753,10 +4270,16 @@ class StreamingShuffleWriterSuite
       def tick(): Unit = {
         ticks += 1
         clock.advance(500L)
+        // Keep the session live without advancing its acknowledged position. A real consumer sends
+        // heartbeats even when record processing has made no progress; without them this drive can
+        // race the independent liveness expiry and test session retirement instead of the
+        // producer's five-attempt replay ladder.
+        if (ticks % 10 == 0) {
+          consumer.subscribe(harness.shuffleId, defaultMapId, 0, nextPosition = 0L)
+        }
         // Every frame is taken off the channel and none is ever confirmed. Taking them matters:
         // leaving them would let the socket's outbound buffer, rather than the protocol, decide
-        // when production stops. Never confirming them is what presents this consumer exactly as
-        // the specification describes a lost one -- connected, reading, silent.
+        // when production stops.
         consumer.drainBlocks()
       }
       val paced = deterministicRecords(20000, seed = 12L, keySpace = 32).iterator.zipWithIndex
@@ -3933,15 +4456,25 @@ class StreamingShuffleWriterSuite
         }
       }
 
-      // And the window closes normally once the returning consumer confirms it, which is what frees
-      // the producer's memory and unlinks the spill files behind it.
+      // And the window closes normally once the returning consumer confirms it. In-memory replay
+      // state and the consumer cursor are released; durable spill files remain map output until the
+      // resolver's shuffle lifecycle removes them.
+      val acknowledgementsBefore = harness.serverHandler.ackCount
+      val retainedCursor = harness.spillManager.registeredConsumers
+      assert(retainedCursor.size === 1,
+        s"The reconnecting task must own one stable retained cursor, but found $retainedCursor")
       replayed.foreach { case (partitionId, blocks) =>
         val lastSequence = blocks.map(_.sequenceNumber()).max
         reconnected.acknowledge(harness.shuffleId, defaultMapId, partitionId, lastSequence)
-        assert(harness.serverHandler.acknowledgedPosition(partitionId) === lastSequence,
-          s"The producer must record the returning consumer's acknowledgement of partition " +
-            s"$partitionId at $lastSequence")
       }
+      assert(harness.serverHandler.ackCount === acknowledgementsBefore + replayed.size,
+        "Every replayed partition acknowledgement must be applied before final retirement")
+      assert(harness.serverHandler.sessionCount === 0,
+        "The returning consumer must be retired once every terminated partition is confirmed")
+      assert(harness.spillManager.registeredConsumers.isEmpty,
+        "Final completion must unregister the stable retained cursor")
+      assert(reconnected.channel.isOpen,
+        "Completing one producer route must not close the executor-scoped multiplexed channel")
       reconnected.close()
     }
   }
@@ -4207,7 +4740,10 @@ class StreamingShuffleWriterSuite
       assert(!spillManager.memoryPressureDetected, "The pressure signal must be clearable")
 
       // Escalation: a short grant is trip condition two, and it stands the shuffle down rather than
-      // being tolerated in silence.
+      // being tolerated in silence. Asserted on the policy directly here, because what this case
+      // pins is the policy's own arithmetic including its un-evaluable boundary; that the writer
+      // really does make this call for every post-recovery refusal is pinned on the integrated path
+      // by the two direct-to-disk cases and by the post-eviction case above.
       val fallbackPolicy = harness.fallbackPolicy
       assert(!fallbackPolicy.hasTripped, "The policy must not have tripped before it is told")
       fallbackPolicy.recordAllocationGrant(beyondAllowance, 0L)
@@ -4287,16 +4823,25 @@ class StreamingShuffleWriterSuite
     }
   }
 
-  test("a block the allowance cannot admit goes to disk and nothing stands the shuffle down") {
-    // The cross-component contract behind "spill rather than fail". A buffer allowance that has
-    // been MET is answered by retaining the block on local disk, and no part of the subsystem may
-    // treat that as a reason to stop streaming: the fallback verdict is shuffle-wide, so declaring
-    // one here would tell consumers to read output this producer has already streamed from a
-    // sort-based path that has none of it. This case pins all three components at once -- the
-    // writer keeps streaming, the spill manager retains the block durably, and the backpressure
-    // protocol stays out of its Degraded state -- because the defect this replaces was precisely a
-    // disagreement between them: the writer reported a fallback-triggering allocation failure and
-    // then carried on regardless.
+  test("an unevictable refusal reaches disk, is reported everywhere, and stands the shuffle down") {
+    // The cross-component contract behind "spill rather than fail", and the integrated case for the
+    // second specified trip condition: the executor's buffer allowance is committed BEFORE anything
+    // of this producer's is resident, so no eviction could ever have helped, and the very first
+    // block that cannot be admitted is both retained durably and reported as memory pressure.
+    //
+    // That last clause is the correction this case now carries. It previously asserted that this
+    // refusal left the shuffle streaming, on the reasoning that an allowance never available to the
+    // attempt is structural rather than a shortage -- which meant the one shape of the condition
+    // FR-10 names most directly ("memory pressure prevents buffer allocation") was the one shape
+    // that never reached the policy, and the earlier coverage of the trip only ever exercised the
+    // post-eviction shape or called the policy by hand. Here nothing is called by hand: the writer
+    // is driven with records, and every component is then asked what it observed.
+    //
+    // All five are pinned at once, because the defect this replaces was a disagreement between
+    // them: the spill manager retains the block, the writer accounts for it and keeps the map
+    // output complete, the backpressure protocol counts the durable admission without latching a
+    // degradation of its own, the fallback policy trips as memory pressure, and the coordinator and
+    // the route registry are told so no consumer is left reading a withdrawn generation.
     //
     // The budget is sized so that the framing reservation fits and almost nothing is left over:
     // two partitions of a 4% allowance over a one-megabyte executor. The remainder is then
@@ -4304,8 +4849,9 @@ class StreamingShuffleWriterSuite
     // those bytes belong to no partition of this producer, exactly as another task's framing
     // scratch would not.
     val executorMemory = 1024L * 1024L
+    val delegate = new RecordingSortShuffleWriter(2)
     withHarness(newHarness(numPartitions = 2, executorMemoryBytes = executorMemory,
-        bufferSizePercent = 4)) { harness =>
+        bufferSizePercent = 4, sortWriterFactory = Some(() => delegate))) { harness =>
       val spillManager = harness.spillManager
       val backpressure = harness.backpressure
       val recordBound = 400000
@@ -4325,8 +4871,17 @@ class StreamingShuffleWriterSuite
             // Taken after the writer's own framing reservation, which is made before the first
             // record is consumed, so the producer is fully committed to streaming by the time the
             // allowance runs out. Reserving earlier would be the pre-flight memory-pressure
-            // condition instead, which correctly degrades the whole attempt.
-            reservedBytes = harness.reserveRemainingAllowance()
+            // condition instead, which degrades the whole attempt before it consumes a record.
+            //
+            // Headroom for the metadata each durably retained record is charged. The allowance
+            // bounds that bookkeeping too, so taking it to the last byte would starve the disk
+            // route as well as the memory one -- and a block that reaches neither is the
+            // unanswerable condition that fails the attempt, not the unevictable refusal this case
+            // is about. Sized between the two on purpose: enough for the records this fixture
+            // retains durably, and far less than the framed block it must still be unable to hold
+            // in memory, so the refusal under test is still a refusal.
+            reservedBytes = harness.reserveRemainingAllowance(
+              8L * MemorySpillManager.SPILLED_RECORD_METADATA_BYTES)
             assert(reservedBytes > 0L,
               "the fixture must be able to take what the framing reservation left, or the " +
                 "admission below would simply succeed; the buffer arithmetic has changed")
@@ -4349,41 +4904,81 @@ class StreamingShuffleWriterSuite
           s"after $offered records none was; buffered ${spillManager.bufferedBytes} of " +
           s"${spillManager.totalBudgetBytes} budgeted bytes with " +
           s"${spillManager.executorReservedBytes} reserved across the executor")
-      assert(spillManager.allSpilledBlocks.nonEmpty,
-        "and the retained block must be reachable on disk, because a consumer reads it exactly " +
-          "as it reads an evicted one")
-      assert(harness.writer.getPartitionLengths().sum > 0L,
-        "the map output must be complete: a durably retained block is streamed output like any " +
-          "other and is counted in the partition lengths")
+      assert(spillManager.diskBytesSpilled > 0L,
+        "and the retained bytes must be accounted on the existing disk-spill accumulator, since " +
+          "a durably retained block really did reach local disk")
 
-      // The signal the writer used. It counts the pressure and reports it, and it does NOT latch a
-      // degradation reason, which is the whole distinction being pinned here.
-      assert(backpressure.durableSpillAdmissionCount === spillManager.durableAdmissionCount,
-        s"every durable admission must be reported to the protocol exactly once, but it saw " +
+      // The signals the writer used, and the distinction between them is the point of this case.
+      //
+      // A block the allowance cannot HOLD is pressure: it is reported through the non-degrading
+      // transport signal, once per block, and it is answered by the disk route -- so every durable
+      // admission the store made has a report behind it.
+      assert(backpressure.durableSpillAdmissionCount >= spillManager.durableAdmissionCount,
+        s"every durable admission must be reported to the protocol, but it saw " +
           s"${backpressure.durableSpillAdmissionCount} and the store made " +
           s"${spillManager.durableAdmissionCount}")
-      assert(!backpressure.isDegraded,
-        "a met buffer allowance must not degrade the subsystem, but it latched " +
-          s"${backpressure.degradationReasons.mkString(", ")}")
-      assert(backpressure.degradationReasons.isEmpty,
-        "no degradation reason at all, because spilling is the specified answer to a full buffer")
-      assert(backpressure.state != BackpressureState.Degraded,
-        s"and the executor's flow-control state must not be Degraded, but it was " +
-          s"${backpressure.state.name}")
+      // A block that can reach NEITHER memory nor the disk route is something else, and this
+      // fixture ends there by construction: it holds the allowance to the byte, and the allowance
+      // bounds a retained record's own bookkeeping as well as a buffered block's bytes, so once the
+      // headroom above has been spent on retained records there is nowhere left to put a block.
+      // That is the genuinely unanswerable condition. It is raised exactly once, because the
+      // attempt stops streaming the moment it is raised, so it stands as one report with no
+      // admission behind it.
+      assert(backpressure.durableSpillAdmissionCount === spillManager.durableAdmissionCount + 1L,
+        s"the refusal that ended the attempt must account for exactly one reported occurrence " +
+          s"beyond the ${spillManager.durableAdmissionCount} admitted, but the protocol saw " +
+          s"${backpressure.durableSpillAdmissionCount}")
+      // And it is that call -- not the accounting of a met allowance -- which degrades the
+      // subsystem. Asserted as the single reason it names, so a met allowance degrading the
+      // subsystem from inside its own accounting call would still fail here.
+      assert(backpressure.degradationReasons ===
+          Seq(BackpressureDegradationReason.BufferAllocationFailure),
+        s"the unanswerable refusal must latch exactly the allocation failure, but the protocol " +
+          s"holds ${backpressure.degradationReasons.mkString(", ")}")
 
-      // And nothing anywhere decided the shuffle should stop streaming.
-      assert(!harness.fallbackPolicy.hasTripped,
-        s"the fallback policy must not trip on a met allowance, but it tripped with " +
+      // The verdict itself, reached by the policy and agreed shuffle-wide.
+      assert(harness.fallbackPolicy.hasTripped,
+        "a refusal no eviction could have repaired must trip the fallback policy")
+      assert(harness.fallbackPolicy.trippedReason
+          .contains(StreamingShuffleFallbackReason.MemoryPressure),
+        s"as memory pressure, which is trip condition two, but it tripped as " +
           s"${harness.fallbackPolicy.trippedReason}")
-      assert(!harness.fallbackPolicy.shouldDelegateToSortShuffle,
-        "so the shuffle must still be routed to the streaming path")
-      assert(!harness.fallbackPolicy.shuffleHasFallenBack(harness.shuffleId),
-        "and no shuffle-wide verdict may have been recorded locally")
-      assert(harness.gateway.declaredFallbacks.isEmpty,
-        s"nor announced to the coordinator, but it announced " +
+      assert(harness.fallbackPolicy.shouldDelegateToSortShuffle,
+        "so the shuffle must now be routed to the sort-based writer, which is unmodified")
+      assert(harness.gateway.declaredFallbacks.contains(
+          StreamingShuffleFallbackReason.MemoryPressure),
+        s"and the verdict must be announced to the coordinator, but it announced " +
           s"${harness.gateway.declaredFallbacks.mkString(", ")}")
-      assert(harness.routes.withdrawals.isEmpty,
-        "and this generation must still be routed, because it is still streaming")
+      assert(harness.fallbackPolicy.shuffleHasFallenBack(harness.shuffleId),
+        "and be readable locally as this shuffle's shuffle-wide verdict")
+      assert(harness.routes.withdrawals === Seq((harness.shuffleId, defaultMapId)),
+        s"this generation must be withdrawn exactly once, because a consumer must not resolve an " +
+          s"address for output the executor has stopped streaming, but the registry recorded " +
+          s"${harness.routes.withdrawals}")
+
+      // Degradation, not failure -- and on this fixture it is the withdraw-and-recompute form of
+      // it rather than the in-place rewrite, because the rewrite has a precondition this fixture
+      // deliberately removes. Reconstructing the map output through the sort-based writer means
+      // reading every block this attempt framed back out of the retained store, and reading them
+      // back needs allowance, which the fixture holds to the byte. So the attempt withdraws its
+      // output and completes: no task failure is counted, every reducer still ASKS for this output
+      // because the void status reports a non-zero size for each partition, every ask fails against
+      // the withdrawn generation, and the unmodified scheduler recomputes the map stage -- where
+      // the latched verdict routes the retry to the sort-based writer. The in-place rewrite, with
+      // its record-for-record equality against the input, is the case above: "a runtime stand down
+      // finishes the map output through sort rather than failing the task".
+      assert(delegate.writeCallCount === 0,
+        s"an allowance that cannot read the framed blocks back must not be rewritten in place, " +
+          s"but the delegate was written to ${delegate.writeCallCount} time(s)")
+      val status = harness.writer.stop(success = true)
+      assert(status.isDefined,
+        "a stood-down attempt must still report a map status for the write path's dereference")
+      assert((0 until 2).forall(partitionId => status.get.getSizeForBlock(partitionId) > 0L),
+        s"and every declared partition must report a non-zero size, so no reducer skips the " +
+          s"withdrawn output instead of asking for it and failing: sizes were " +
+          s"${(0 until 2).map(status.get.getSizeForBlock).mkString(", ")}")
+      assert(harness.errorNotifier.error.isEmpty,
+        "and nothing may have been raised, because standing down is not a failure")
     }
   }
 
@@ -4392,13 +4987,32 @@ class StreamingShuffleWriterSuite
     // executor, so every frame arriving on it is untrusted. Asserting that the handler's counters
     // move when its own methods are called establishes nothing about that surface; what has to be
     // established is that hostile *frames* -- an acknowledgement of bytes never sent, an
-    // acknowledgement on a partition the channel never subscribed to, a second channel claiming a
-    // live peer's identity, and a crowd of channels subscribing to one partition -- are refused
+    // acknowledgement on a partition the channel never subscribed to, a channel changing the task
+    // identity it declared, and a crowd of channels subscribing to one partition -- are refused
     // before they can advance a cursor, retire retained bytes or cost this executor per-stream
     // state. Each is delivered as encoded bytes through the transport entry point.
     val partitions = 2
     withHarness(newHarness(numPartitions = partitions)) { harness =>
       val handler = harness.serverHandler
+
+      // 0. No transport principal means no protocol surface at all. This invokes the producer
+      // handler directly, bypassing the authenticated listener, to pin its defense in depth.
+      val unauthenticatedChannel = new EmbeddedChannel(DefaultChannelId.newInstance())
+      val unauthenticatedClient = new TransportClient(
+        unauthenticatedChannel, new TransportResponseHandler(unauthenticatedChannel))
+      handler.receive(unauthenticatedClient,
+        new HeartbeatMessage(harness.shuffleId, defaultMapId, 0, 0L,
+          BackpressureStreamKey.consumerTokenOf(consumerId)).toByteBuffer())
+      assert(handler.awaitDataPlaneIdle(10000L),
+        "The producer data plane must settle after refusing an unauthenticated frame")
+      assert(handler.unauthenticatedRefusalCount === 1L,
+        "The producer must count a frame refused for lacking an authenticated transport principal")
+      assert(handler.sessionCount === 0 && handler.subscriptionCount === 0,
+        "An unauthenticated heartbeat must allocate neither a session nor a subscription")
+      assert(!unauthenticatedClient.isActive(),
+        "The producer must close a channel that attempts to create an unauthenticated session")
+      unauthenticatedChannel.finishAndReleaseAll()
+
       val honest = new ProducerConsumerChannel(handler, consumerId)
       honest.activate()
       honest.subscribe(harness.shuffleId, defaultMapId, 0)
@@ -4460,27 +5074,31 @@ class StreamingShuffleWriterSuite
       assert(handler.subscriberCount(1) === 0,
         "The stray channel's subscriber slot must be returned when it goes")
 
-      // 3. A channel that tries to rename itself mid-flight. A session that could be renamed could
-      //    be talked into adopting the cursors -- and therefore the unread output -- of a consumer
-      //    that is not the peer holding the socket. No frame carries an identity to rename with: a
-      //    session takes its identity from the transport's authenticated client id when the channel
-      //    is announced and nothing on the wire restates it, so the property holds structurally
-      //    rather than by a refusal. Both halves are asserted -- that a heartbeat has no identity
-      //    field to carry one, and that a further heartbeat therefore refreshes the session that
-      //    sent it instead of replacing it or moving its subscription.
-      assert(!classOf[HeartbeatMessage].getMethods.exists(_.getName == "consumerId"),
-        "A heartbeat must carry no consumer identity, or a peer could restate one on a channel " +
-          "of its own and be served the cursors of the peer that identity belongs to")
+      // 3. A channel that tries to rename itself mid-flight, and a channel that tries to name a
+      //    consumer this producer is already serving. A session that could be renamed could be
+      //    talked into adopting the cursors -- and so the unread output -- of a consumer that is
+      //    not the peer holding the socket, and a session that could be *displaced* would let any
+      //    peer able to reach this executor dispossess a reduce task mid-read. A heartbeat does
+      //    carry an identity, because a reconnection is otherwise unrecognisable, so both
+      //    properties are refusals rather than impossibilities and both are asserted as such.
       val renamer = new ProducerConsumerChannel(handler, s"$consumerId-renamer")
       renamer.activate()
       renamer.subscribe(harness.shuffleId, defaultMapId, 1)
       assert(handler.subscriberCount(1) === 1,
         "The channel must hold a subscription before a further frame is delivered on it")
+      assert(handler.consumerIdentities.contains(renamer.declaredIdentity),
+        s"The declared identity must have been adopted, but the producer holds " +
+          s"${handler.consumerIdentities.mkString(", ")}")
       // Whatever its legitimate subscription earned it, taken off the channel first, so that the
       // assertion below is about what the further heartbeat produced and not about frames the
       // subscription it was entitled to had already delivered.
       renamer.drainBlocks()
       val sessionsBefore = handler.sessionCount
+      // 3a. A repeat of the identity it already declared is an ordinary heartbeat, and a heartbeat
+      //     declaring nothing at all -- what a peer of an earlier revision sends -- is another.
+      //     Both must refresh the session that sent them rather than replace it or move its
+      //     subscription.
+      renamer.subscribe(harness.shuffleId, defaultMapId, 1)
       renamer.deliver(new HeartbeatMessage(harness.shuffleId, defaultMapId, 1, 0L))
       assert(handler.sessionCount === sessionsBefore,
         "A further heartbeat must refresh the session that sent it rather than creating or " +
@@ -4488,10 +5106,58 @@ class StreamingShuffleWriterSuite
       assert(handler.subscriberCount(1) === 1,
         s"and must leave that session's subscription exactly where it was, but " +
           s"${handler.subscriberCount(1)} are claimed")
-      renamer.close()
+      assert(handler.renameRefusalCount === 0L,
+        "and neither repeating an identity nor omitting one is a rename")
+
+      // 3b. A second, different identity on the same live channel. Every cursor and ledger this
+      //     session holds was opened under the first one, so re-keying would orphan each of them --
+      //     one leaked ledger per rename. The declaration is refused and the channel closed, which
+      //     turns an unbounded leak into a bounded rejection.
+      val renameRefusalsBefore = handler.renameRefusalCount
+      renamer.deliver(new HeartbeatMessage(harness.shuffleId, defaultMapId, 1, 0L,
+        BackpressureStreamKey.consumerTokenOf(s"$consumerId-someone-else")))
+      assert(handler.renameRefusalCount === renameRefusalsBefore + 1L,
+        "A second identity on a live session must be refused")
       assert(handler.subscriberCount(1) === 0,
-        s"The channel's subscriber slot must be returned when it goes, but " +
+        s"and the refused session's subscriber slot must come back with it, but " +
           s"${handler.subscriberCount(1)} remain claimed")
+      assert(!handler.consumerIdentities.contains(renamer.declaredIdentity),
+        "and the session must be gone from the identity index")
+      renamer.close()
+
+      // 3c. A channel naming the identity of a consumer that is still answering. This is the
+      //     dispossession case: the incumbent is live, has just been heard from, and is being
+      //     served, so the *newcomer* is refused and the incumbent is left exactly as it was.
+      //     Displacement is reserved for an incumbent whose own behaviour says it is gone -- a dead
+      //     channel, or one silent past the liveness window -- which no other peer can manufacture.
+      val incumbent = new ProducerConsumerChannel(handler, s"$consumerId-incumbent")
+      incumbent.activate()
+      incumbent.subscribe(harness.shuffleId, defaultMapId, 1)
+      incumbent.drainBlocks()
+      val incumbentSessions = handler.sessionCount
+      val supersededBefore = handler.supersededSessionCount
+      val impostor = new ProducerConsumerChannel(handler, s"$consumerId-incumbent")
+      impostor.activate()
+      impostor.subscribe(harness.shuffleId, defaultMapId, 1)
+      assert(handler.supersededSessionCount === supersededBefore,
+        "A live consumer may not be superseded by a peer that merely names it")
+      assert(handler.sessionCount === incumbentSessions,
+        s"and the impostor's session must be gone rather than added, but the producer holds " +
+          s"${handler.sessionCount} session(s) against $incumbentSessions before it arrived")
+      assert(handler.consumerIdentities.contains(incumbent.declaredIdentity),
+        "and the incumbent must still hold its identity")
+      assert(handler.subscriberCount(1) === 1,
+        s"and must still hold exactly its own subscription, but " +
+          s"${handler.subscriberCount(1)} are claimed")
+      assert(handler.isConsumerStalled(1) === false,
+        "and must not have been left in a state that looks like a stall")
+      incumbent.close()
+      assert(handler.subscriberCount(1) === 0,
+        s"The incumbent's subscriber slot must be returned when it goes, but " +
+          s"${handler.subscriberCount(1)} remain claimed")
+      assert(!renamer.channel.isOpen,
+        "An identity-conflicting channel must be closed before it can send another frame")
+      renamer.close()
 
       // 4. Fan-out: a partition is legitimately read by one reduce task, so the number of channels
       //    that may subscribe to it is bounded. The bound is enforced before a ledger, a queue
@@ -4537,7 +5203,8 @@ class StreamingShuffleWriterSuite
       val sessionsBeforeAlien = handler.sessionCount
       val slotsBeforeAlien = handler.claimedSessionSlots
       val framed =
-        new HeartbeatMessage(harness.shuffleId, defaultMapId, 0, 0L).toByteBuffer()
+        new HeartbeatMessage(
+          harness.shuffleId, defaultMapId, 0, 0L, alien.consumerToken).toByteBuffer()
       val alienBytes = new Array[Byte](framed.remaining())
       framed.duplicate().get(alienBytes)
       // The protocol version is the first byte of the header, immediately after the frame type.
@@ -4545,6 +5212,20 @@ class StreamingShuffleWriterSuite
       alien.deliverRaw(alienBytes)
       assert(handler.versionMismatchDetected,
         "A frame carrying an unsupported protocol version must be detected as a mismatch")
+      // And the detection must reach the component that ACTS on it. The flag alone is a diagnostic;
+      // what stands the shuffle down is the shared fallback policy every service-provider call
+      // consults, so the mismatch has to be reported there -- otherwise every attempt keeps
+      // streaming to a peer it cannot speak to and the mismatch costs the job its whole retry
+      // budget instead of one degraded attempt.
+      assert(harness.fallbackPolicy.hasTripped,
+        "A protocol version mismatch must trip the fallback policy the manager and the writer " +
+          "consult, not merely set a flag on the handler")
+      assert(harness.fallbackPolicy.trippedReason
+          .contains(StreamingShuffleFallbackReason.ProtocolVersionMismatch),
+        s"and it must trip as the compatibility failure it is, but tripped as " +
+          s"${harness.fallbackPolicy.trippedReason}")
+      assert(harness.fallbackPolicy.shouldDelegateToSortShuffle,
+        "so that the sort-based implementation is where this shuffle goes next")
       assert(handler.sessionCount === sessionsBeforeAlien,
         "A frame refused on its version must not allocate a session")
       assert(handler.claimedSessionSlots === slotsBeforeAlien,
@@ -4553,105 +5234,364 @@ class StreamingShuffleWriterSuite
         "A channel whose frame was refused on its version must not be served a block")
       alien.close()
 
-      // The honest consumer is unharmed by all of it: its position is still its own to advance, and
-      // advancing it still works.
+      // The honest consumer is unharmed by all of it: its acknowledgement is still applied on its
+      // own terms and the bytes it confirms are still released.
+      //
+      // Read as the applied count and the retained window rather than as this partition's aggregate
+      // position, and deliberately. `highestSent` is the last block the producer offered on a
+      // stream whose terminator was already delivered, so acknowledging it leaves this consumer
+      // owed nothing at all -- and a consumer owed nothing is retired, the orderly end of every
+      // healthy stream rather than a harm. The aggregate position of a partition with no subscriber
+      // then reports "nothing consumed", which is the truth about the partition and says nothing
+      // about whether this acknowledgement was honoured. These four assertions say that.
+      val acknowledgementsBefore = handler.ackCount
+      val refusalsBeforeHonestAck = handler.refusedAckCount
+      val lossyClosuresBefore = handler.lossyChannelClosureCount
       honest.acknowledge(harness.shuffleId, defaultMapId, 0, highestSent)
-      assert(handler.acknowledgedPosition(0) === highestSent,
-        s"The honest consumer must still be able to acknowledge through $highestSent")
+      assert(handler.ackCount === acknowledgementsBefore + 1L,
+        s"The honest consumer's acknowledgement through $highestSent must be applied, but " +
+          s"${handler.ackCount - acknowledgementsBefore} were")
+      assert(handler.refusedAckCount === refusalsBeforeHonestAck,
+        s"and must not be refused alongside the forged ones, but " +
+          s"${handler.refusedAckCount - refusalsBeforeHonestAck} further refusal(s) were counted")
+      assert(handler.lossyChannelClosureCount === lossyClosuresBefore,
+        "and the honest channel must not be counted lost with bytes owed, because it was owed " +
+          "nothing by the time it went")
+      assert(!harness.spillManager.registeredConsumers.contains(honest.declaredIdentity),
+        s"and the cursor it held must be released with it, because a consumer owed nothing keeps " +
+          s"nothing, yet the store still holds " +
+          s"${harness.spillManager.registeredConsumers.mkString(", ")}")
 
-      // 6. Last, the boundary the reconnection path depends on: a consumer that comes back arrives
-      //    on a new channel and is therefore a new session, and what makes its resumption correct
-      //    is the position its first heartbeat announces rather than any identity it restates. The
-      //    returning channel is admitted, is served under a subscription of its own, and the slot
-      //    ledger still agrees with the session registry -- which is what would expose a
-      //    reconnection that leaked either a slot or a subscriber entry.
-      val sessionsBeforeReturn = handler.sessionCount
+      // 6. Last, the boundary the reconnection path depends on. A consumer that comes back arrives
+      //    on a new channel, and it is a *return* only once the connection it is replacing has gone
+      //    -- while that connection is still answering, a channel declaring its identity is the
+      //    dispossession attempt refused in 3c above. So the honest consumer's channel goes first,
+      //    and then the returning channel is admitted rather than refused, and the round trip is
+      //    asserted to leave no residue -- which is what would expose a reconnection that leaked
+      //    either a session slot or a subscriber entry.
+      honest.close()
+      val acceptedBeforeReturn = handler.acceptedSessionCount
       val subscribersBeforeReturn = handler.subscriberCount(0)
       val returning = new ProducerConsumerChannel(handler, consumerId)
       returning.activate()
       returning.subscribe(harness.shuffleId, defaultMapId, 0, nextPosition = highestSent + 1L)
-      assert(handler.sessionCount === sessionsBeforeReturn + 1,
-        "A consumer reconnecting on a new channel must be admitted as a session of its own")
-      assert(handler.subscriberCount(0) === subscribersBeforeReturn + 1,
-        s"and must hold a subscription to the partition it resumed, but " +
-          s"${handler.subscriberCount(0)} are claimed")
+      assert(handler.acceptedSessionCount === acceptedBeforeReturn + 1L,
+        s"A consumer reconnecting on a new channel must be admitted rather than refused, but " +
+          s"${handler.acceptedSessionCount - acceptedBeforeReturn} session(s) were accepted")
+      // Admitted and then, in the same frame, finally retired: it announced a position past the
+      // last block of a stream whose terminator has already been delivered, so it is owed nothing
+      // and a consumer owed nothing keeps neither a session nor a subscription. Its admission is
+      // asserted through the cumulative count above precisely because the live count cannot show
+      // it -- and this is the honest reading of a caught-up return rather than a leak.
+      assert(handler.sessionCount === 0,
+        s"and a return that is already caught up must be retired rather than held, but the " +
+          s"producer holds ${handler.sessionCount} session(s)")
+      assert(handler.subscriberCount(0) === subscribersBeforeReturn,
+        s"leaving no subscriber of partition 0 behind it, but ${handler.subscriberCount(0)} " +
+          s"are claimed")
       assert(handler.claimedSessionSlots === handler.sessionCount,
         "Every live session must hold exactly one slot, and no more")
       returning.close()
       assert(handler.subscriberCount(0) === subscribersBeforeReturn,
-        "and must return that subscription when its channel goes")
-      honest.close()
+        "and a late teardown of the retired channel must not disturb that")
     }
   }
 
-  test("the executor-wide framing budget bounds transient egress copies and refuses the excess") {
-    // The ceiling on consumers is per map output while the budget is per executor, and per-channel
-    // bounds multiply: thousands of sessions each holding one high-water mark's worth of transient
-    // framing copies is an aggregate no per-channel limit constrains. The budget is the thing that
-    // constrains it, so its arithmetic is asserted directly -- reserving up to the ceiling, being
-    // refused past it, and returning what was taken. Driving thirty-two two-megabyte copies through
-    // a channel to observe the same three properties would assert them less precisely and cost
-    // sixty-four megabytes to do it.
-    val budget = StreamingShuffleServerHandler.EgressFramingBudget
-    budget.resetForTesting()
-    try {
-      assert(budget.capacity === 32L * StreamingShuffleServerHandler.MAX_FRAMED_BYTES,
-        "The executor framing ceiling must be thirty-two maximal frames, but is " +
-          budget.capacity)
-      assert(budget.inFlight === 0L, "A reset budget must hold nothing")
-      assert(budget.refusalCount === 0L, "A reset budget must have refused nothing")
-      // A zero-sized reservation costs nothing and is admitted, so no caller has to special-case
-      // it.
-      assert(budget.tryReserve(0L), "A zero-byte reservation must be admitted")
-      assert(budget.inFlight === 0L, "A zero-byte reservation must not touch the ledger")
+  test("a channel arriving before publication is bounded and a retired generation admits none") {
+    // The producer's address is published to the driver, and its routing entry installed, before
+    // the producing task reaches its first record -- so a consumer legitimately arrives at this
+    // handler in the gap before there is any retained output to serve, and a peer that is not a
+    // consumer at all can arrive in the same gap.
+    //
+    // Three properties have to hold across it. The partition domain is the handler's own, taken
+    // from the shuffle handle at construction, so it is fixed before a frame can arrive and nothing
+    // a peer sends can widen it; derived from the retained store it was unknown until publication
+    // and every non-negative id was accepted meanwhile, which let one channel be given a
+    // subscription, a subscriber counter and a credit ledger for unbounded distinct partitions --
+    // per-partition metadata proportional to what a remote caller chose to name. An in-range
+    // subscription in the gap is admitted, because that consumer is precisely the one served as
+    // output is produced rather than after it, and it costs only state the two ceilings already
+    // bound. And a generation that has been retired admits nothing at all, because nothing will
+    // ever advance what a subscription to it would open.
+    val partitions = 4
+    withHarness(newHarness(numPartitions = partitions)) { harness =>
+      val handler = harness.serverHandler
+      assert(handler.numPartitions === partitions,
+        s"The handler's partition domain must be the handle's ${partitions} but was " +
+          s"${handler.numPartitions}")
+      assert(!handler.servesRetainedOutput,
+        "This case is about the gap before publication, so no retained output may exist yet")
 
-      val frame = StreamingShuffleServerHandler.MAX_FRAMED_BYTES.toLong
-      (0 until 32).foreach { index =>
-        assert(budget.tryReserve(frame),
-          s"Reservation ${index + 1} of thirty-two must be admitted within the ceiling")
+      val early = new ProducerConsumerChannel(handler, s"$consumerId-early")
+      early.activate()
+      val refusalsBefore = handler.subscriptionRefusalCount
+      val misaddressedBefore = handler.misaddressedMessageCount
+
+      // 1. Out of range, and refused before decode-level state exists: the frame names no stream
+      //    this handler serves, so it is counted as misaddressed and dropped. The ids cover the
+      //    first past the domain, a moderately large one, and the extreme a peer reaches for.
+      val outOfRange = Seq(partitions, partitions + 1, 5000, Int.MaxValue)
+      outOfRange.foreach { partitionId =>
+        early.subscribe(harness.shuffleId, defaultMapId, partitionId)
+        assert(handler.subscriberCount(partitionId) === 0,
+          s"Partition $partitionId is outside the domain of $partitions, so it must hold no " +
+            s"subscriber, but holds ${handler.subscriberCount(partitionId)}")
       }
-      assert(budget.inFlight === budget.capacity,
-        s"The budget must be full at ${budget.capacity} bytes but holds ${budget.inFlight}")
-      assert(!budget.tryReserve(1L),
-        "A reservation of one byte past the ceiling must be refused")
-      assert(budget.refusalCount === 1L, "A refusal must be counted")
-      assert(budget.inFlight === budget.capacity,
-        "A refused reservation must leave the ledger exactly as it was")
+      assert(handler.misaddressedMessageCount === misaddressedBefore + outOfRange.size,
+        s"Every one of the ${outOfRange.size} out-of-range heartbeats must be counted as " +
+          s"misaddressed, but the count moved by " +
+          s"${handler.misaddressedMessageCount - misaddressedBefore}")
+      assert(handler.subscriptionRefusalCount === refusalsBefore,
+        "and none of them may reach the subscription path at all, because a frame for a stream " +
+          "this handler does not serve is not a subscription that was refused")
 
-      // Returning one frame makes room for exactly one more, which is what makes a refusal a delay
-      // rather than a loss: the caller holds its block and the next refill admits it.
-      budget.release(frame)
-      assert(budget.inFlight === budget.capacity - frame,
-        "A release must return exactly the bytes it names")
-      assert(budget.tryReserve(frame),
-        "The room a release made must be available to the next reservation")
-
-      // The release listener is what returns a reservation when the transport is done with the
-      // copy, on success, on failure and on cancellation alike -- so a failing consumer cannot
-      // retire the executor's allowance one block at a time.
-      val channel = new EmbeddedChannel(DefaultChannelId.newInstance())
-      try {
-        val before = budget.inFlight
-        val future = channel.newSucceededFuture()
-        budget.releaseOn(frame).operationComplete(future)
-        assert(budget.inFlight === before - frame,
-          "A completed write must return its framing reservation through the listener")
-      } finally {
-        channel.finishAndReleaseAll()
+      // 2. In range and before publication: admitted, and bounded by the domain. This is the
+      //    overlap case -- the consumer subscribes while the map task is still to produce, and is
+      //    served as production happens -- so refusing it would trade a security property this
+      //    handler already has for the pipelining the subsystem exists to provide.
+      (0 until partitions).foreach { partitionId =>
+        early.subscribe(harness.shuffleId, defaultMapId, partitionId)
+        assert(handler.subscriberCount(partitionId) === 1,
+          s"Partition $partitionId must admit the early consumer, but holds " +
+            s"${handler.subscriberCount(partitionId)} subscriber(s)")
       }
+      assert(handler.subscriptionRefusalCount === refusalsBefore,
+        s"No legitimate subscription may be refused, but the refusal count moved by " +
+          s"${handler.subscriptionRefusalCount - refusalsBefore}")
+      // The whole domain, and not one entry more: the per-session subscription map is bounded by
+      // the same immutable figure, so the flood above bought nothing at all.
+      assert(handler.subscriptionCount === partitions,
+        s"Exactly $partitions subscriptions may exist across every session, but " +
+          s"${handler.subscriptionCount} do")
 
-      // Floored rather than allowed to go negative: a ledger that could read negative would raise
-      // the effective ceiling for every other caller, turning one accounting mistake into an
-      // unbounded one.
-      budget.release(budget.capacity * 4L)
-      assert(budget.inFlight === 0L,
-        s"An over-release must floor the ledger at zero but left ${budget.inFlight}")
-      assert(budget.tryReserve(budget.capacity),
-        "The whole ceiling must be reservable again once everything has been returned")
-      assert(!budget.tryReserve(frame), "A full budget must refuse the next frame")
-    } finally {
-      budget.resetForTesting()
+      // 3. Production, and the early subscriber is served without another handshake -- which is
+      //    what makes the admission in step 2 worth having.
+      harness.writer.write(deterministicRecords(600, seed = 31L, keySpace = 12).iterator)
+      assert(handler.servesRetainedOutput,
+        "The producing task's first records must have published the retained output")
+      assert(drainAllBlocks(handler, early, Seq(0))(0).nonEmpty,
+        "The consumer that subscribed before publication must have been served the blocks of the " +
+          "partition it subscribed to, with no further subscription frame")
+
+      // The domain stays closed after publication too.
+      val misaddressedAfter = handler.misaddressedMessageCount
+      early.subscribe(harness.shuffleId, defaultMapId, partitions)
+      assert(handler.subscriberCount(partitions) === 0,
+        "An out-of-range partition must still hold no subscriber after publication")
+      assert(handler.misaddressedMessageCount === misaddressedAfter + 1L,
+        "and the out-of-range heartbeat must still be counted as misaddressed")
+      early.close()
+      assert((0 until partitions).forall(handler.subscriberCount(_) == 0),
+        "Every subscriber slot the channel held must be returned when it goes")
+
+      // 4. A retired generation. Withdrawal is the single cross-owner retirement, and after it this
+      //    handler can never serve a byte -- so a channel that arrives afterwards is refused before
+      //    a ledger, a slot or a cursor exists for it, and is refused as a subscription rather than
+      //    as a misaddressed frame, because the partition it named is one this handler does serve.
+      assert(handler.withdrawGeneration("the case retires the generation deliberately"),
+        "The generation must be withdrawn by this call, or step 4 asserts nothing")
+      val late = new ProducerConsumerChannel(handler, s"$consumerId-late")
+      late.activate()
+      val refusalsBeforeLate = handler.subscriptionRefusalCount
+      val misaddressedBeforeLate = handler.misaddressedMessageCount
+      late.subscribe(harness.shuffleId, defaultMapId, 0)
+      assert(handler.subscriberCount(0) === 0,
+        s"A retired generation must admit no subscriber, but partition 0 holds " +
+          s"${handler.subscriberCount(0)}")
+      assert(handler.subscriptionRefusalCount === refusalsBeforeLate + 1L,
+        "and the attempt must be counted as a refused subscription")
+      assert(handler.misaddressedMessageCount === misaddressedBeforeLate,
+        "and not as a misaddressed frame, because it named a partition this handler does serve")
+      assert(late.drainBlocks().isEmpty,
+        "and nothing may be served on its channel")
+      late.close()
     }
+  }
+
+  test("a reconnect atomically migrates one logical consumer session and retained cursor") {
+    withHarness(newHarness(numPartitions = 1)) { harness =>
+      val handler = harness.serverHandler
+      val first = new ProducerConsumerChannel(handler, consumerId)
+      first.activate()
+      first.subscribe(harness.shuffleId, defaultMapId, 0)
+      assert(handler.sessionCount === 1 && handler.subscriberCount(0) === 1,
+        "The first channel must own one bounded session and subscription")
+
+      val sessionsBefore = handler.sessionCount
+      val subscribersBefore = handler.subscriberCount(0)
+      val slotsBefore = handler.claimedSessionSlots
+      val supersededBefore = handler.supersededSessionCount
+      val releasesBefore = harness.routes.participationReleases.size
+
+      // The first consumer goes silent for a whole liveness window, its socket still open. That is
+      // what a consumer whose host disappeared looks like from here -- TCP can take minutes to
+      // report it -- and it is the state a reconnection actually arrives into. It is also the only
+      // state in which a declaration may take a session over: a session that is still answering
+      // punctually may NOT be dispossessed by a frame, because the token a declaration carries is a
+      // value any peer that can reach this executor could put on the wire. So the silence is not
+      // scene-setting; it is the precondition, and the case would be asserting that a hostile peer
+      // can evict a live consumer without it.
+      harness.clock.asInstanceOf[ManualClock].advance(
+        StreamingShuffleServerHandler.CONSUMER_LIVENESS_TIMEOUT_MS)
+      assert(first.channel.isOpen,
+        "the stale connection must still be open, or the supersession below would be closing a " +
+          "channel that had already gone")
+
+      val returning = new ProducerConsumerChannel(handler, consumerId)
+      returning.activate()
+      returning.subscribe(harness.shuffleId, defaultMapId, 0)
+
+      assert(handler.supersededSessionCount === supersededBefore + 1L,
+        "The replacement channel must supersede the stale session of the same logical task")
+      assert(handler.sessionCount === sessionsBefore,
+        "A reconnect must replace one session atomically rather than add a second session")
+      assert(handler.subscriberCount(0) === subscribersBefore,
+        "A reconnect must transfer the partition subscription rather than fan it out")
+      assert(handler.claimedSessionSlots === slotsBefore,
+        "A reconnect must transfer the existing session slot even when capacity is exact")
+      assert(handler.liveConsumerCount === 1,
+        "The stable logical identity must still name exactly one live consumer")
+      // The stale connection is given up as this producer's participation, with `closeWhenLast`, so
+      // the socket goes once no producer is serving it. Asserted as the release rather than as a
+      // closed socket, because the closing belongs to the channel registry and this fixture's
+      // registry is a recorder: one socket carries every producer an executor serves, so a producer
+      // ending one of its own sessions must never close it on the others' behalf.
+      assert(harness.routes.participationReleases.size > releasesBefore &&
+          harness.routes.participationReleases.contains((harness.shuffleId, defaultMapId)),
+        "Supersession must give up the stale channel as this producer's participation, leaving " +
+          "the socket to close when its last producer leaves")
+
+      harness.writer.write(deterministicRecords(600, seed = 19L, keySpace = 12).iterator)
+      val delivered = drainAllBlocks(handler, returning, Seq(0))(0)
+      assert(delivered.nonEmpty, "The replacement channel must receive the producer's output")
+      assert(delivered.size <= MemorySpillManager.MAX_RECLAIMED_BLOCKS_PER_BATCH,
+        "The fixture must fit in one bounded reclamation batch so immediate reclaim is observable")
+      val highestSent = delivered.map(_.sequenceNumber()).max
+      val cursorBefore = harness.spillManager.registeredConsumers
+      assert(cursorBefore.size === 1,
+        s"One logical task must own one retained cursor, but found ${cursorBefore.mkString(", ")}")
+      val retainedCursor = cursorBefore.head
+      assert(harness.spillManager.consumerPosition(retainedCursor, 0).isEmpty,
+        "The first channel has not acknowledged anything yet")
+      val retainedBefore = harness.spillManager.retainedBlockCount(0)
+      assert(retainedBefore === delivered.size,
+        s"Every delivered block must remain retained, but $retainedBefore of ${delivered.size} do")
+
+      // The second connection loses its socket the same silent way before the third arrives, for
+      // the same reason: a reconnection is a reconnection only once the connection it replaces has
+      // stopped answering, and a live one may not be taken over by a peer that merely names it.
+      val releasesBeforeFinal = harness.routes.participationReleases.size
+      harness.clock.asInstanceOf[ManualClock].advance(
+        StreamingShuffleServerHandler.CONSUMER_LIVENESS_TIMEOUT_MS)
+
+      val finalReturn = new ProducerConsumerChannel(handler, consumerId)
+      finalReturn.activate()
+      finalReturn.subscribe(harness.shuffleId, defaultMapId, 0, nextPosition = highestSent + 1L)
+
+      assert(handler.supersededSessionCount === supersededBefore + 2L,
+        "A caught-up reconnect must supersede the channel that delivered the retained window")
+      assert(harness.routes.participationReleases.size > releasesBeforeFinal,
+        "and must give up that channel as this producer's participation too")
+      assert(handler.sessionCount === 0 && handler.liveConsumerCount === 0,
+        "A caught-up consumer of a terminated stream must be finally retired")
+      assert(handler.subscriberCount(0) === 0 && handler.claimedSessionSlots === 0,
+        "Final retirement must return the transferred subscriber and session slots")
+      assert(harness.spillManager.registeredConsumers.isEmpty,
+        "The migrated cursor must be unregistered once no replay entitlement remains")
+      assert(harness.spillManager.retainedBlockCount(0) === 0,
+        "Migrating the final cursor must reclaim its confirmed in-memory prefix immediately")
+      assert(harness.spillManager.pendingReclamationCount === 0,
+        "A prefix within one bounded batch must not leave asynchronous reclamation behind")
+      assert(finalReturn.drainBlocks().isEmpty,
+        "A replacement already caught up through the retained window must receive no replay")
+
+      first.close()
+      returning.close()
+      finalReturn.close()
+      assert(handler.sessionCount === 0,
+        "Late teardowns of superseded channels must not recreate or remove another session")
+    }
+  }
+
+  test("logical consumer identities are scoped by the authenticated transport principal") {
+    withHarness(newHarness(numPartitions = 2)) { harness =>
+      val first = new ProducerConsumerChannel(
+        harness.serverHandler, consumerId, authenticatedApplicationId)
+      val otherApplication = new ProducerConsumerChannel(
+        harness.serverHandler, consumerId, s"$authenticatedApplicationId-other")
+      first.activate()
+      otherApplication.activate()
+      first.subscribe(harness.shuffleId, defaultMapId, 0)
+      otherApplication.subscribe(harness.shuffleId, defaultMapId, 1)
+
+      assert(harness.serverHandler.sessionCount === 2,
+        "Two authenticated applications declaring the same task text must hold separate sessions")
+      assert(harness.serverHandler.liveConsumerCount === 2,
+        "The transport principal must be part of the logical cursor identity")
+      assert(harness.serverHandler.supersededSessionCount === 0L,
+        "A task identity from another authenticated application must never supersede this one")
+      harness.writer.write(deterministicRecords(600, seed = 23L, keySpace = 2).iterator)
+      assert(harness.spillManager.registeredConsumers.size === 2,
+        "The retained store must keep principal-scoped cursor identities distinct")
+
+      first.close()
+      otherApplication.close()
+    }
+  }
+
+  test("one executor quota bounds producer, consumer, transient and metadata allocations") {
+    val frame = StreamingShuffleServerHandler.MAX_FRAMED_BYTES.toLong
+    val aggregateCapacity = 4L * frame
+    val quota = new MemorySpillManager.ExecutorBufferQuota(
+      bufferSizePercent = 50,
+      spillThresholdPercent = DefaultSpillThresholdPercent,
+      executorMemoryProvider = () => 2L * aggregateCapacity)
+    val clock = new ManualClock(ManualClockEpochMillis)
+    val conf = streamingConf()
+    val protocol = new BackpressureProtocol(
+      conf,
+      null,
+      new TokenBucketRateLimiter.ExecutorEgressBudget(None, clock),
+      clock,
+      quota)
+    val key = BackpressureStreamKey.forProducer(
+      protocolShuffleId, defaultMapId, defaultTaskAttemptId, 0, consumerId)
+    val metadataBytes = BackpressureProtocol.STREAM_LEDGER_BASE_BYTES
+    val producerBytes = 2L * frame
+
+    assert(quota.totalBytes === aggregateCapacity)
+    assert(protocol.registerStream(key, frame),
+      "The stream must reserve its base metadata before it can carry a block")
+    assert(protocol.reservedMetadataQuotaBytes === metadataBytes)
+    assert(quota.tryReserve(producerBytes),
+      "Retained producer bytes must be charged to the same aggregate quota")
+    assert(protocol.tryReserveReceiveQuota(frame),
+      "Consumer payload bytes must fit while aggregate headroom remains")
+    assert(quota.reservedBytes === producerBytes + frame + metadataBytes)
+
+    assert(!protocol.tryReserveTransientQuota(frame),
+      "A framing copy must be refused when the other categories leave less than one frame free")
+    assert(protocol.reservedTransientQuotaBytes === 0L,
+      "A refused transient reservation must not change its category")
+    assert(quota.refusalCount === 1L, "The aggregate quota must count the refusal")
+
+    protocol.releaseReceiveQuota(frame)
+    assert(protocol.tryReserveTransientQuota(frame),
+      "Returning consumer bytes must make the same aggregate room available to egress")
+    assert(protocol.reservedTransientQuotaBytes === frame)
+    assert(quota.reservedBytes === producerBytes + frame + metadataBytes)
+
+    protocol.releaseTransientQuota(aggregateCapacity * 4L)
+    assert(protocol.reservedTransientQuotaBytes === 0L,
+      "An over-release must floor only the transient category")
+    assert(quota.reservedBytes === producerBytes + metadataBytes,
+      "Returning transient bytes must not release producer or metadata ownership")
+
+    quota.release(producerBytes)
+    assert(quota.reservedBytes === metadataBytes)
+    assert(protocol.unregisterStream(key), "The last stream owner must close its ledger")
+    assert(quota.reservedBytes === 0L,
+      "Closing the final ledger must return the aggregate quota to zero")
   }
 
   test("the buffer and spill percentages are range validated and an absent cap means unlimited") {
@@ -4760,5 +5700,72 @@ class StreamingShuffleWriterSuite
     MemorySpillManager.resetSharedStateForTesting()
     assert(aggregation.occurrenceCount === 0L && aggregation.unreportedCount === 0L,
       "The one shared-state reset must clear the writer's aggregation as well as the manager's")
+  }
+
+  test("a producer's session-expiry report is bounded per executor, not per map output") {
+    // A session expiring is a consumer that stopped answering, and everything that causes it causes
+    // it in bulk: a stage resubmitted mid-read, an executor lost, reduce tasks that gave up. It is
+    // also emitted by a component that exists PER MAP OUTPUT, so a bound of one record per handler
+    // is one record per map task -- and a stage of a thousand map tasks then produces a thousand
+    // default-level records for a condition whose bound is meant to be one a minute. This case pins
+    // the bound where it has to be, and it pins it through two real producers rather than through
+    // the aggregator alone, because the defect was never in the window: it was in which window the
+    // call site consulted.
+    MemorySpillManager.resetSharedStateForTesting()
+    val aggregator = StreamingShuffleServerHandler.sessionExpiryLogAggregator
+    assert(aggregator.occurrenceCount === 0L && aggregator.unreportedCount === 0L,
+      s"The shared reset must leave the executor's window open and its tally at zero, but the " +
+        s"tally read ${aggregator.occurrenceCount} with ${aggregator.unreportedCount} unreported")
+
+    // One consumer per producer, each of which vanishes -- takes its socket with it and tells
+    // nobody -- and is then retired by that producer's own upkeep pass once the liveness window has
+    // elapsed. Two producers because one cannot distinguish a per-handler window from an
+    // executor-wide one.
+    def expireOneSession(harness: WriterHarness): Long = {
+      val consumer = new ConsumerChannel(harness.serverHandler, s"$consumerId-expiring")
+      consumer.subscribe(0)
+      assert(harness.serverHandler.sessionCount === 1,
+        s"The producer must hold the consumer's session before it vanishes, but holds " +
+          s"${harness.serverHandler.sessionCount}")
+      consumer.vanish()
+      harness.clock.asInstanceOf[ManualClock].advance(
+        StreamingShuffleServerHandler.CONSUMER_LIVENESS_TIMEOUT_MS)
+      assert(harness.serverHandler.runMaintenance() >= 1,
+        "The upkeep pass must retire the session of a consumer that stopped answering")
+      assert(harness.serverHandler.expiredSessionCount === 1L,
+        s"and must count exactly the one it retired, but counted " +
+          s"${harness.serverHandler.expiredSessionCount}")
+      harness.serverHandler.expiredSessionCount
+    }
+
+    val ((firstTally, secondTally), captured) = capturingStreamingLogs {
+      val first = withHarness(newHarness(numPartitions = 2))(expireOneSession)
+      val second = withHarness(newHarness(numPartitions = 2))(expireOneSession)
+      (first, second)
+    }
+
+    // Each map output counted its own expiry: a per-map-output tally is real information, and is
+    // what tells an operator whether one producer is affected or the whole executor is.
+    assert(firstTally === 1L && secondTally === 1L,
+      s"Each producer must count the one session it retired, but they counted $firstTally and " +
+        s"$secondTally")
+    assert(aggregator.occurrenceCount === 2L,
+      s"The executor's tally must hold both expiries, but read ${aggregator.occurrenceCount}")
+    assert(aggregator.unreportedCount === 1L,
+      s"The second expiry must have been accounted rather than reported, so exactly one must be " +
+        s"unreported, but ${aggregator.unreportedCount} were")
+    val released = captured.filter(record =>
+      record.isDefaultLevel && record.message.contains("released the egress session"))
+    assert(released.size === 1,
+      s"Two producers retiring a session must produce one default-level record between them, not " +
+        s"one each, but produced ${released.size}: ${released.map(_.message).mkString(" | ")}")
+    assert(released.head.message.contains("on this executor"),
+      s"The admitted record must state the executor-wide figure beside the per-map-output one, " +
+        s"but it read: ${released.head.message}")
+
+    // Left clean, because the aggregation outlives this test the way it outlives a task.
+    MemorySpillManager.resetSharedStateForTesting()
+    assert(aggregator.occurrenceCount === 0L && aggregator.unreportedCount === 0L,
+      "The one shared-state reset must clear the producer's aggregation as well as the manager's")
   }
 }

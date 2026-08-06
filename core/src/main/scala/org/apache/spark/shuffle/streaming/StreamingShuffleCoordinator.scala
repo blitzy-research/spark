@@ -19,19 +19,20 @@ package org.apache.spark.shuffle.streaming
 
 import java.nio.charset.StandardCharsets
 import java.security.{MessageDigest, SecureRandom}
-import java.util.Base64
+import java.util.{Base64, HashMap, LinkedHashSet, TreeMap}
 import java.util.concurrent.{ConcurrentHashMap, ScheduledFuture, TimeUnit}
 import java.util.concurrent.atomic.AtomicLong
 
+import scala.collection.immutable.SortedMap
+import scala.collection.mutable.ArrayBuffer
 import scala.jdk.CollectionConverters._
 import scala.util.control.NonFatal
 
 import org.apache.spark.{MapOutputTrackerMaster, SparkConf, SparkEnv}
 import org.apache.spark.internal.{config, Logging, LogKeys, MessageWithContext}
 import org.apache.spark.internal.LogKeys.{CLASS_NAME, COUNT, DESCRIPTION, ELAPSED_TIME, EPOCH,
-  EXECUTOR_ID, HOST, HOST_PORT, INDEX, MAP_ID, MAX_ATTEMPTS, MAX_SIZE, NEW_VALUE, NUM_EVENTS,
-  NUM_PARTITIONS, NUM_SKIPPED, NUM_TASKS, REASON, SHUFFLE_ID, STATUS, TASK_ATTEMPT_ID, THRESHOLD,
-  TIME_UNITS, TIMEOUT}
+  EXECUTOR_ID, HOST, HOST_PORT, INDEX, MAP_ID, MAX_SIZE, NEW_VALUE, NUM_EVENTS, NUM_PARTITIONS,
+  NUM_SKIPPED, NUM_TASKS, REASON, SHUFFLE_ID, STATUS, TASK_ATTEMPT_ID, TIME_UNITS, TIMEOUT}
 import org.apache.spark.network.shuffle.protocol.streaming.StreamingShuffleMessage
 import org.apache.spark.rpc.{RpcCallContext, RpcEndpointRef, RpcEnv, RpcTimeout,
   ThreadSafeRpcEndpoint}
@@ -237,21 +238,24 @@ private[spark] case class StreamingShuffleMapStage(
  * producer lookup and the direct query -- carries this value, so no participant can act on a stale
  * belief that streaming is still in force.
  *
- * The reason travels as the stable name of a [[StreamingShuffleFallbackReason]] rather than as the
+ * The cause travels as the stable name of a [[StreamingShuffleStandDownCause]] rather than as the
  * object, so that a value arriving over RPC is normalised back onto this build's own closed set
  * before it is stored or logged and a peer can neither author a driver log record nor smuggle an
- * unknown condition into the registry.
+ * unknown cause into the registry.
  *
- * @param reasonName name of the latched [[StreamingShuffleFallbackReason]], or
- *                   [[StreamingShuffleCoordinator.NO_FALLBACK_REASON]] while streaming is in force
- * The declared detail travels with the reason for a reason of its own. The set of conditions is
- * closed at four members, so a declaration whose true condition is narrower than any of them has to
- * pick the member it belongs under -- and the member's own prose would then be the only thing an
- * operator ever saw, stating a measurement that was never taken. Carrying the declarer's own
- * sentence alongside the name keeps the name a stable machine identifier while the prose an
- * operator reads is the one the declaring component actually meant.
+ * Two kinds of cause can be latched here and [[reason]] is what keeps them apart. One of the four
+ * specified fallback conditions resolves through it; a structural decline -- a request the
+ * streaming protocol cannot serve at all -- does not, however plainly it stood the shuffle down.
+ * That is deliberate: every one of the four asserts a measurement or an explicit check, so
+ * reporting a structural decline as one of them would put a claim about throughput, memory, link
+ * capacity or peer compatibility into a record for a shuffle in which none of those was ever
+ * observed.
  *
- * @param reasonName name of the latched [[StreamingShuffleFallbackReason]], or
+ * The declared detail travels alongside for a reason of its own: it is the declaring component's
+ * own sentence about what it actually saw, so the name stays a stable machine identifier while the
+ * prose an operator reads is the one the declarer meant.
+ *
+ * @param reasonName name of the latched [[StreamingShuffleStandDownCause]], or
  *                   [[StreamingShuffleCoordinator.NO_FALLBACK_REASON]] while streaming is in force
  * @param declaredAtEpoch coordinator epoch the shuffle advanced to when the fallback was declared,
  *                        or [[StreamingShuffleCoordinator.NO_EPOCH]] while streaming is in force.
@@ -269,30 +273,44 @@ private[spark] case class StreamingShuffleFallbackState(
   def fallenBack: Boolean = reasonName != StreamingShuffleCoordinator.NO_FALLBACK_REASON
 
   /**
-   * The latched condition, resolved against this build's closed set, or `None` while streaming is
-   * in force. Resolution can only fail for a name this build does not know, which the coordinator
+   * The latched cause, resolved against this build's closed set, or `None` while streaming is in
+   * force. Resolution can only fail for a name this build does not know, which the coordinator
    * refuses to store in the first place.
+   */
+  def cause: Option[StreamingShuffleStandDownCause] =
+    StreamingShuffleStandDownCause.fromName(reasonName)
+
+  /**
+   * The latched cause when, and only when, it is one of the four specified fallback conditions.
+   *
+   * `None` therefore means one of three things: streaming is still in force, the shuffle stood down
+   * for a structural decline rather than for a specified condition, or the name is one this build
+   * cannot resolve. A caller that wants "did this shuffle stop streaming" must ask [[fallenBack]];
+   * this answers the narrower question "was one of the four conditions observed", which is the only
+   * question whose answer an operator should act on by tuning something.
    */
   def reason: Option[StreamingShuffleFallbackReason] =
     StreamingShuffleFallbackReason.fromName(reasonName)
 
   /**
    * The operator-facing account of this verdict: the declarer's own detail when it gave one, this
-   * build's prose for the latched member when it did not, and the bare name only for a name this
+   * build's prose for the latched cause when it did not, and the bare name only for a name this
    * build cannot resolve.
    *
-   * Preferring the detail is what stops a declaration from being reported as a condition nobody
-   * measured. Three of the four members name a resource condition -- a throughput ratio held for a
-   * minute, a refused buffer reservation, a share of an administered link -- so rendering one of
-   * them for a declaration that observed none of those things tells an operator to go and tune
-   * something that was never the matter.
+   * Preferring the detail is what stops a declaration from being reported as something narrower or
+   * broader than what was seen. Three of the four fallback conditions name a resource condition --
+   * a throughput ratio held for a minute, a refused buffer reservation, a share of an administered
+   * link -- so rendering one of them for a declaration that observed none of those things tells an
+   * operator to go and tune something that was never the matter.
    */
   def condition: String = {
     if (detail != null && detail.nonEmpty &&
         detail != StreamingShuffleCoordinator.NO_INVALIDATION_DETAIL) {
       detail
+    } else if (reasonName == StreamingShuffleFallbackReason.UNAVAILABLE_NAME) {
+      StreamingShuffleFallbackReason.UNAVAILABLE_DESCRIPTION
     } else {
-      reason.map(_.description).getOrElse(reasonName)
+      cause.map(_.description).getOrElse(reasonName)
     }
   }
 }
@@ -745,9 +763,9 @@ private[spark] case class CompleteStreamingShuffleProducer(
  * output. Declaring is idempotent and latching: the first declaration is the one recorded, and
  * every later one is answered with the state already held.
  *
- * The reason travels as the stable name of a [[StreamingShuffleFallbackReason]] and is resolved
+ * The cause travels as the stable name of a [[StreamingShuffleStandDownCause]] and is resolved
  * against this build's own closed set before anything is stored or logged, so a peer can neither
- * introduce a condition this build does not know nor choose the text of a driver log record.
+ * introduce a cause this build does not know nor choose the text of a driver log record.
  *
  * Answered with the [[StreamingShuffleFallbackState]] in force once the declaration has been
  * processed, which is the state the caller must act on -- never the one it proposed.
@@ -756,7 +774,8 @@ private[spark] case class CompleteStreamingShuffleProducer(
  * @param capabilityToken token issued when the shuffle was registered on the driver, without which
  *                        the declaration is refused: forcing a shuffle onto the sort-based path is
  *                        a decision no stranger may drive
- * @param reasonName name of the [[StreamingShuffleFallbackReason]] that was observed
+ * @param reasonName name of the [[StreamingShuffleStandDownCause]] that was observed, which is
+ *                   either one of the four specified fallback conditions or a structural decline
  * @param detail free text describing the observation, sanitized before it reaches any log record
  */
 private[spark] case class DeclareStreamingShuffleFallback(
@@ -769,6 +788,34 @@ private[spark] case class DeclareStreamingShuffleFallback(
   override def toString: String =
     s"DeclareStreamingShuffleFallback(shuffleId=$shuffleId, " +
       s"capabilityToken=$redactedToken, reasonName=$reasonName, detail=$detail)"
+}
+
+/**
+ * Asks the driver to withdraw a shuffle's streamed map output so that its map stage is recomputed,
+ * '''without''' standing streaming down.
+ *
+ * The driver half of the specified producer-failure flow. A consumer that could resolve no live
+ * producer has no map index and no block-manager address to name, so a fetch failure alone leaves
+ * the map stage registered as available and the reduce stage retries against producers that are not
+ * there. This request is what makes the recomputation real -- and it claims no graceful-degradation
+ * condition, because an unreachable producer is none of the four: the recomputed map stage streams
+ * again, exactly as the producer-failure flow specifies.
+ *
+ * @param shuffleId shuffle whose streamed map output must be recomputed
+ * @param capabilityToken token issued when the shuffle was registered on the driver, without which
+ *                        the request is refused: forcing a recomputation is not a stranger's
+ *                        decision to take
+ * @param detail free text describing what could not be resolved, sanitized before it is logged
+ */
+private[spark] case class InvalidateStreamingShuffleMapOutput(
+    shuffleId: Int,
+    capabilityToken: String,
+    detail: String = null) extends StreamingShuffleCoordinatorMessage {
+
+  /** Renders the request without disclosing the credential it carries. */
+  override def toString: String =
+    s"InvalidateStreamingShuffleMapOutput(shuffleId=$shuffleId, " +
+      s"capabilityToken=$redactedToken, detail=$detail)"
 }
 
 /**
@@ -852,7 +899,7 @@ private[spark] case class StreamingShuffleProducerEntry(
  *                        in a second map so that a token check and the mutation it guards read
  *                        the same atomically-published snapshot, which is what makes the check
  *                        free of a check-then-act window.
- * @param producers live producers keyed by map task id
+ * @param producers live producers keyed and incrementally ordered by map task id
  * @param retiredAttempts highest task attempt id that has been invalidated or reaped, per map task
  *                        id. A generation at or below the recorded attempt is never published
  *                        again, which is what stops a producer that a consumer has already
@@ -861,10 +908,9 @@ private[spark] case class StreamingShuffleProducerEntry(
  *                        bounded by the same quantity the producer map is
  * @param producerExecutors reference count of live producers per executor id, maintained
  *                          incrementally by [[withProducer]] and [[withoutProducer]]. It exists so
- *                          that the executor-scoped concurrency count -- which every producer
- *                          registration answers with -- costs one map lookup per shuffle instead
- *                          of a scan of every producer, keeping registration linear in the number
- *                          of map tasks rather than quadratic
+ *                          that global executor-to-shuffle membership can be updated from the
+ *                          one executor whose producer count crossed zero, without scanning the
+ *                          producer map
  * @param fallback whether, and why, this shuffle has stood streaming down for every participant.
  *                 Held here, on the one value every participant reads through, so the decision is
  *                 agreed rather than made independently on each executor
@@ -879,7 +925,7 @@ private[spark] case class StreamingShuffleState(
     protocolVersion: Byte,
     coordinatorEpoch: Long,
     capabilityToken: String,
-    producers: Map[Int, StreamingShuffleProducerEntry],
+    producers: SortedMap[Int, StreamingShuffleProducerEntry],
     retiredAttempts: Map[Int, Long] = Map.empty,
     producerExecutors: Map[String, Int] = Map.empty,
     fallback: StreamingShuffleFallbackState = StreamingShuffleFallbackState(),
@@ -1239,18 +1285,17 @@ private[spark] class StreamingShuffleCoordinator(
   // single heartbeat without being reaped.
   private val livenessTimeoutMs: Long = StreamingShuffleCoordinator.PRODUCER_LIVENESS_TIMEOUT_MS
 
-  // How many consecutive attempts of one stage the scheduler will make before it aborts the job.
-  // Read here, once, because it is the budget every producer-liveness invalidation of this shuffle
-  // spends: each one fails a reduce attempt and costs one recomputation. Read rather than assumed,
-  // so an operator who raises their own tolerance for recomputation raises streaming's with it --
-  // which is exactly what a long-running stress workload does.
-  private val stageAttemptAllowance: Int = conf.get(config.STAGE_MAX_CONSECUTIVE_ATTEMPTS)
-
-  private val perMapProducerTimeoutTolerance: Int =
-    StreamingShuffleCoordinator.perMapProducerTimeoutTolerance(stageAttemptAllowance)
-
-  private val shuffleProducerTimeoutTolerance: Int =
-    StreamingShuffleCoordinator.shuffleProducerTimeoutTolerance(stageAttemptAllowance)
+  /**
+   * Shuffles whose repeated producer-liveness losses have already been reported once.
+   *
+   * Bounds that record to one per shuffle for the life of the application, because past the
+   * tolerance every further loss of the same shuffle satisfies the same predicate and an unbounded
+   * record would spend the log budget restating it. Entries are removed with the shuffle itself, so
+   * the set never outlives the registrations it describes. Backed by a concurrent set because the
+   * expiry sweep runs on the scheduler thread while RPCs run on the endpoint thread.
+   */
+  private val repeatedTimeoutsReported: java.util.Set[Int] =
+    ConcurrentHashMap.newKeySet[Int]()
 
   /**
    * Reports one shuffle registration change at default level at most once per window, and otherwise
@@ -1280,6 +1325,25 @@ private[spark] class StreamingShuffleCoordinator(
   // Active streaming shuffles, keyed by shuffle id. See StreamingShuffleState for why the values
   // are immutable and why every mutation goes through an atomic compute.
   private val shuffleStates = new ConcurrentHashMap[Int, StreamingShuffleState]()
+
+  /**
+   * Shuffle ids with at least one producer on each executor.
+   *
+   * Membership changes only when an executor's per-shuffle producer reference count crosses zero,
+   * so a concurrency query is one map lookup and one bounded-set size read instead of traversing
+   * every registered shuffle. The nested sets are concurrent because rate limiters query this index
+   * from producer threads while coordinator mutations run on the driver endpoint.
+   */
+  private val executorShuffles = new ConcurrentHashMap[String, java.util.Set[Int]]()
+
+  /**
+   * One deadline per live incomplete producer, plus one per empty non-fallback shuffle.
+   *
+   * Refresh replaces a target's previous deadline rather than appending another timer entry, which
+   * bounds the index by live registry state even when a peer heartbeats repeatedly. Reaping polls
+   * only expired targets and therefore never scans the capped shuffle or producer registries.
+   */
+  private val expiryIndex = new StreamingShuffleCoordinator.ExpiryIndex
 
   // Monotonic source of coordinator epochs. The first epoch handed out is 1, so NO_EPOCH (0) is
   // unambiguously "no epoch was assigned" and every real epoch satisfies the non-negativity
@@ -1345,6 +1409,9 @@ private[spark] class StreamingShuffleCoordinator(
     reaperThread.shutdownNow()
     val dropped = shuffleStates.size()
     shuffleStates.clear()
+    executorShuffles.clear()
+    expiryIndex.clear()
+    repeatedTimeoutsReported.clear()
     logInfo(log"StreamingShuffleCoordinator dropped ${MDC(COUNT, dropped)} active streaming " +
       log"shuffle registrations on stop")
   }
@@ -1426,14 +1493,14 @@ private[spark] class StreamingShuffleCoordinator(
       }
 
     case DeclareStreamingShuffleFallback(shuffleId, capabilityToken, reasonName, detail) =>
-      // The reason is resolved against this build's closed set before anything is stored or
+      // The cause is resolved against this build's closed set before anything is stored or
       // logged. A name this build does not know is refused rather than recorded as "unknown",
       // because standing a whole shuffle down is too consequential to do on the strength of a
-      // condition this build cannot reason about, and because an unrecognised name is far more
+      // cause this build cannot reason about, and because an unrecognised name is far more
       // likely to be a forged or skewed message than a real observation.
-      StreamingShuffleFallbackReason.fromName(reasonName) match {
-        case Some(reason) if shuffleId >= 0 =>
-          context.reply(declareFallback(shuffleId, capabilityToken, reason, detail))
+      StreamingShuffleStandDownCause.fromName(reasonName) match {
+        case Some(cause) if shuffleId >= 0 =>
+          context.reply(declareFallback(shuffleId, capabilityToken, cause, detail))
         case Some(_) =>
           recordPeerRejection(log"a streaming shuffle fallback declaration from " +
             log"${MDC(HOST_PORT, senderHostPort(context))}",
@@ -1443,8 +1510,25 @@ private[spark] class StreamingShuffleCoordinator(
           recordPeerRejection(log"a streaming shuffle fallback declaration for shuffle " +
             log"${MDC(SHUFFLE_ID, shuffleId)} from " +
             log"${MDC(HOST_PORT, senderHostPort(context))}",
-            "the fallback reason is not one this build recognises")
+            "the stand-down cause is not one this build recognises")
           context.reply(StreamingShuffleFallbackState())
+      }
+
+    case InvalidateStreamingShuffleMapOutput(shuffleId, capabilityToken, detail) =>
+      if (shuffleId < 0) {
+        recordPeerRejection(log"a streaming shuffle map output invalidation from " +
+          log"${MDC(HOST_PORT, senderHostPort(context))}",
+          s"the shuffle id $shuffleId is negative")
+        context.reply(false)
+      } else {
+        logRequestIfDebug(log"a streamed map output invalidation", shuffleId, context)
+        val withdrawn = invalidateStreamedMapOutput(shuffleId, capabilityToken)
+        if (withdrawn) {
+          logInfo(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} will recompute its map " +
+            log"stage after a consumer reported that it could not be read: " +
+            log"${MDC(REASON, StreamingShuffleCoordinator.sanitizeDetail(detail))}")
+        }
+        context.reply(withdrawn)
       }
 
     case GetStreamingShuffleFallbackState(shuffleId, capabilityToken) =>
@@ -1556,8 +1640,8 @@ private[spark] class StreamingShuffleCoordinator(
       var overCap = false
       val nowMs = clock.getTimeMillis()
       val state = shuffleStates.compute(shuffleId,
-        (_: Int, existing: StreamingShuffleState) =>
-          if (existing == null) {
+        (_: Int, existing: StreamingShuffleState) => {
+          val updated = if (existing == null) {
             // The cap is evaluated inside the atomic update so that the decision and the insertion
             // it guards cannot be separated. `size()` reads the map's counters without taking a
             // bin lock, so consulting it here neither deadlocks nor blocks another registration.
@@ -1568,12 +1652,17 @@ private[spark] class StreamingShuffleCoordinator(
               created = true
               StreamingShuffleState(numPartitions, StreamingShuffleMapStage(numMaps),
                 protocolVersion, epochCounter.incrementAndGet(),
-                StreamingShuffleCoordinator.newCapabilityToken(), Map.empty,
+                StreamingShuffleCoordinator.newCapabilityToken(), SortedMap.empty,
                 lastActivityMs = nowMs)
             }
           } else {
             existing.copy(lastActivityMs = nowMs)
-          })
+          }
+          if (updated != null) {
+            refreshEmptyShuffleExpiry(shuffleId, updated)
+          }
+          updated
+        })
       if (overCap) {
         // The registry is full, so nothing was inserted and there is no state to read below. This
         // is reported at warning level rather than under the debug gate and without aggregation,
@@ -1771,10 +1860,14 @@ private[spark] class StreamingShuffleCoordinator(
             }
             // An accepted registration is activity, so it defers the empty-state eviction that
             // would otherwise drop a registration whose producers were all reaped.
+            val entry = StreamingShuffleProducerEntry(stamp(location, epoch), nowMs)
             val published = existing
-              .withProducer(StreamingShuffleProducerEntry(stamp(location, epoch), nowMs))
+              .withProducer(entry)
               .copy(lastActivityMs = nowMs)
-            if (replacesOlder) published.copy(coordinatorEpoch = epoch) else published
+            val updated =
+              if (replacesOlder) published.copy(coordinatorEpoch = epoch) else published
+            producerPublished(shuffleId, existing, updated, entry)
+            updated
           }
         })
       if (!known) {
@@ -1849,8 +1942,10 @@ private[spark] class StreamingShuffleCoordinator(
               // Republished through the same path every other registration takes, so the executor
               // index has exactly one maintainer, and an accepted heartbeat also defers the
               // empty-state eviction.
-              existing.withProducer(entry.copy(lastSeenMs = nowMs))
-                .copy(lastActivityMs = nowMs)
+              val refreshed = entry.copy(lastSeenMs = nowMs)
+              val updated = existing.withProducer(refreshed).copy(lastActivityMs = nowMs)
+              producerPublished(shuffleId, existing, updated, refreshed)
+              updated
             case _ =>
               existing
           }
@@ -1919,7 +2014,9 @@ private[spark] class StreamingShuffleCoordinator(
           unauthorized = true
           existing
         } else {
-          existing.copy(lastActivityMs = nowMs)
+          val updated = existing.copy(lastActivityMs = nowMs)
+          refreshEmptyShuffleExpiry(shuffleId, updated)
+          updated
         })
     if (state == null) {
       None
@@ -1985,6 +2082,8 @@ private[spark] class StreamingShuffleCoordinator(
           existing
         } else {
           applied = true
+          expiryIndex.cancel(
+            StreamingShuffleCoordinator.ProducerExpiry(shuffleId, generation))
           existing.withCompletedMap(mapIndex, generation.taskAttemptId)
             .copy(lastActivityMs = nowMs)
         }
@@ -2030,25 +2129,73 @@ private[spark] class StreamingShuffleCoordinator(
    *
    * @param shuffleId shuffle that must stand streaming down; must be non-negative
    * @param capabilityToken token issued when the shuffle was registered on the driver
-   * @param reason condition that was observed, recorded by its stable name
+   * @param cause what was observed -- one of the four specified fallback conditions, or a
+   *              structural decline -- recorded by its stable name
    * @param detail free text describing the observation, sanitized before it reaches a log record
    * @return the fallback state in force once the declaration has been processed
    */
   def declareFallback(
       shuffleId: Int,
       capabilityToken: String,
-      reason: StreamingShuffleFallbackReason,
+      cause: StreamingShuffleStandDownCause,
       detail: String = null): StreamingShuffleFallbackState = {
+    require(cause != null, s"a stand-down cause is required for streaming shuffle $shuffleId")
+    latchStandDown(shuffleId, capabilityToken, cause.toString, cause.description, detail)
+  }
+
+  /**
+   * Latches one shuffle-wide stand-down under a record name this build is willing to store.
+   *
+   * The single implementation behind [[declareFallback]], kept separate from it so that the record
+   * name and its prose are the only things a caller varies -- never what is latched, what is
+   * dropped or what is withdrawn.
+   *
+   * @param reasonName the record name, already one this build recognises
+   * @param reasonDescription prose for that name, used in the one operator record this emits
+   */
+  private def latchStandDown(
+      shuffleId: Int,
+      capabilityToken: String,
+      reasonName: String,
+      reasonDescription: String,
+      detail: String): StreamingShuffleFallbackState = {
     require(shuffleId >= 0,
       s"shuffleId must be non-negative for a streaming shuffle fallback, but was $shuffleId")
-    require(reason != null, s"a fallback reason is required for streaming shuffle $shuffleId")
+    require(StreamingShuffleFallbackReason.isDeclarable(reasonName),
+      s"$reasonName is not a streaming shuffle stand-down record this build will store for " +
+        s"shuffle $shuffleId")
     val recordedDetail = StreamingShuffleCoordinator.sanitizeDetail(detail)
+    // The withdrawal is a PRECONDITION of the transition rather than a step after it, and that
+    // ordering is the whole of what makes a latched verdict actionable. A participant told that a
+    // shuffle has stood down delegates its work to the sort-based path, which is only correct if
+    // the streamed map output is gone: while it is still registered the map stage reports itself
+    // available, so a consumer's fetch failure resubmits the reduce stage alone, which fails the
+    // same way on its next attempt and the next until the stage-attempt limit aborts the job. So a
+    // withdrawal that cannot be confirmed leaves nothing latched: streaming continues, the caller
+    // learns the declaration did not take effect and fails locally rather than delegating, and the
+    // next declaration of the same condition retries the withdrawal.
+    //
+    // Ordering the withdrawal first is safe against a concurrent declaration and against a producer
+    // registering in the interval. A second declaration finds the verdict already latched and
+    // withdraws nothing; a producer that registers between the withdrawal and the latch is dropped
+    // by the latch itself, in the same registry update that records the reason.
+    val alreadyStoodDown = Option(shuffleStates.get(shuffleId)).exists(_.hasFallenBack)
+    val withdrawn = alreadyStoodDown || invalidateStreamedMapOutput(shuffleId)
     var unauthorized = false
     var declared = false
     var droppedProducers = 0
     var epoch = StreamingShuffleCoordinator.NO_EPOCH
     var state = StreamingShuffleFallbackState()
     val nowMs = clock.getTimeMillis()
+    if (!withdrawn) {
+      logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} was NOT stood down for " +
+        log"${MDC(REASON, reasonDescription)} (${MDC(DESCRIPTION, recordedDetail)}): its " +
+        log"streamed map output could not be withdrawn from the tracker, so a stand-down would " +
+        log"leave participants delegating to the sort-based path while the map stage still " +
+        log"reported streamed output as available. The shuffle keeps streaming and the " +
+        log"participant that observed the condition fails so that it is retried")
+      return StreamingShuffleFallbackState()
+    }
     shuffleStates.computeIfPresent(shuffleId,
       (_: Int, existing: StreamingShuffleState) => {
         if (unauthorizedFor(existing, capabilityToken)) {
@@ -2058,22 +2205,26 @@ private[spark] class StreamingShuffleCoordinator(
           existing
         } else if (existing.hasFallenBack) {
           state = existing.fallback
-          existing.copy(lastActivityMs = nowMs)
+          val updated = existing.copy(lastActivityMs = nowMs)
+          refreshEmptyShuffleExpiry(shuffleId, updated)
+          updated
         } else {
           declared = true
           droppedProducers = existing.producers.size
           epoch = epochCounter.incrementAndGet()
-          state = StreamingShuffleFallbackState(reason.toString, epoch, recordedDetail)
+          state = StreamingShuffleFallbackState(reasonName, epoch, recordedDetail)
           // Every live producer is dropped and its generation retired in the same update that
-          // latches the reason, so there is no interleaving in which a producer survives the
+          // latches the cause, so there is no interleaving in which a producer survives the
           // declaration or re-registers immediately after it.
-          existing.producers.values
+          val updated = existing.producers.values
             .foldLeft(existing) { (accumulated, entry) =>
               accumulated.withoutProducer(entry.location.mapIndex)
                 .withRetiredGeneration(entry.location.generation)
             }
-            .withFallback(reason.toString, epoch, recordedDetail)
+            .withFallback(reasonName, epoch, recordedDetail)
             .copy(lastActivityMs = nowMs)
+          allProducersRemoved(shuffleId, existing, updated)
+          updated
         }
       })
     if (unauthorized) {
@@ -2085,69 +2236,138 @@ private[spark] class StreamingShuffleCoordinator(
       // the difference between the fast path and the guaranteed one.
       logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} has stood streaming down " +
         log"for every participant at epoch ${MDC(EPOCH, epoch)}: " +
-        log"${MDC(REASON, reason.description)} (${MDC(DESCRIPTION, recordedDetail)}). " +
+        log"${MDC(REASON, reasonDescription)} (${MDC(DESCRIPTION, recordedDetail)}). " +
         log"${MDC(COUNT, droppedProducers)} live producer(s) were invalidated; the shuffle " +
         log"will be recomputed on the sort-based path")
-      // Outside the registry update, because it reaches a different component and must not run
-      // under this endpoint's own compute. This is the step that makes "recomputed on the
-      // sort-based path" true rather than merely intended -- see the method's own note.
-      invalidateStreamedMapOutput(shuffleId)
       state
     } else {
       if (debugEnabled) {
-        val cause =
+        val ignoredBecause =
           if (state.fallenBack) "a shuffle that had already stood down" else "an unknown shuffle"
         logDebug(log"Ignoring a streaming shuffle fallback declaration naming " +
-          log"${MDC(REASON, cause)} for shuffle ${MDC(SHUFFLE_ID, shuffleId)}: " +
-          log"${MDC(NEW_VALUE, reason.toString)}")
+          log"${MDC(REASON, ignoredBecause)} for shuffle ${MDC(SHUFFLE_ID, shuffleId)}: " +
+          log"${MDC(NEW_VALUE, reasonName)}")
       }
       state
     }
   }
 
   /**
-   * Withdraws every map output of a shuffle from the driver's map-output tracker.
+   * Withdraws every map output of a shuffle from the driver's map-output tracker, and reports
+   * whether the withdrawal is '''confirmed'''.
    *
-   * Called exactly once per shuffle, on the declaration that latches its fallback, and it is what
-   * turns the declaration into an actual recomputation. Without it a fallback is a decision nobody
-   * can act on: the streaming map outputs stay registered, so the map stage still reports itself
-   * available; a consumer's fetch failure therefore resubmits only the reduce stage, which fails
-   * the same way on its next attempt and the next, until the stage-attempt limit aborts the job.
-   * There is no per-map blame that would do instead, because a fallback invalidates the whole
-   * stage's streamed output rather than one task's.
+   * This is what turns a decision into an actual recomputation. Without it the streamed map outputs
+   * stay registered, so the map stage still reports itself available; a consumer's fetch failure
+   * therefore resubmits only the reduce stage, which fails the same way on its next attempt and the
+   * next, until the stage-attempt limit aborts the job. There is no per-map blame that would do
+   * instead: a consumer that cannot resolve a producer at all has no block-manager address to name,
+   * and a shuffle-wide stand-down invalidates the whole stage's streamed output rather than one
+   * task's.
    *
    * With it, the arithmetic works out on its own through machinery that already exists: the outputs
    * are gone, so the map stage reports itself unavailable, so the scheduler resubmits it with every
-   * partition missing, and the manager -- which reads the latched state -- serves those new
-   * attempts from its sort-based delegate. No scheduler, executor or sort-based class is modified,
-   * and this calls only the tracker's own public withdrawal method.
+   * partition missing, and its new attempts are served by whichever implementation the shuffle's
+   * state then names. No scheduler, executor or sort-based class is modified, and this calls only
+   * the tracker's own public withdrawal method.
    *
-   * Runs on the driver, where the tracker is the master instance; on anything else, and on a
-   * shuffle the tracker does not know, it does nothing. Every failure is absorbed: a declaration
-   * that has already latched must not be undone by a tracker that could not be reached, and the
-   * participants have already been told to stand down.
+   * <b>The return value is a confirmation and callers must honour it.</b> `true` means there is no
+   * longer a streamed map output for this shuffle to read -- either because it was withdrawn here,
+   * or because the tracker never held one, which is the same fact for a caller about to force a
+   * recomputation. `false` means the tracker refused or could not be reached, so the outputs are
+   * still registered and no caller may act as though the stage will be recomputed.
+   *
+   * Runs on the driver, where the tracker is the master instance. On anything else there is no
+   * registration to withdraw and nothing to do, which is reported as confirmed for the same reason
+   * an unknown shuffle is.
    *
    * @param shuffleId the shuffle whose streamed map output is no longer valid to read
+   * @return true when no streamed map output of this shuffle remains registered
    */
-  private def invalidateStreamedMapOutput(shuffleId: Int): Unit = {
+  private def invalidateStreamedMapOutput(shuffleId: Int): Boolean = {
     try {
       Option(SparkEnv.get).map(_.mapOutputTracker) match {
         case Some(master: MapOutputTrackerMaster) if master.containsShuffle(shuffleId) =>
           master.unregisterAllMapAndMergeOutput(shuffleId)
           logInfo(log"Withdrew every registered map output of streaming shuffle " +
-            log"${MDC(SHUFFLE_ID, shuffleId)} so that its map stage is recomputed on the " +
-            log"sort-based path")
+            log"${MDC(SHUFFLE_ID, shuffleId)} so that its map stage is recomputed")
+          true
         case _ =>
           if (debugEnabled) {
             logDebug(log"No driver map-output registration to withdraw for streaming shuffle " +
               log"${MDC(SHUFFLE_ID, shuffleId)}")
           }
+          true
       }
     } catch {
       case NonFatal(e) =>
-        logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} stood streaming down but " +
-          log"its map output could not be withdrawn from the tracker; the reduce side recovers " +
-          log"through its own fetch failures", e)
+        logWarning(log"The map output of streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} could " +
+          log"not be withdrawn from the tracker, so nothing may act as though its map stage will " +
+          log"be recomputed", e)
+        false
+    }
+  }
+
+  /**
+   * Withdraws a shuffle's streamed map output so that its map stage is recomputed, '''without'''
+   * standing streaming down.
+   *
+   * This is the driver half of the specified producer-failure flow. A consumer that cannot reach a
+   * producer invalidates its partial reads and raises a fetch failure, and the unmodified scheduler
+   * answers by recomputing the upstream output -- but only for output it has been told is no longer
+   * there. A consumer that could resolve no producer at all has no map index and no block-manager
+   * address to blame, so the fetch failure alone leaves the map stage registered as available and
+   * the reduce stage retries against the same unreachable producers. Withdrawing here is what makes
+   * the recomputation real.
+   *
+   * <b>It declares no fallback condition, deliberately.</b> The four graceful-degradation
+   * conditions are a closed set, each of them a specific measurement or compatibility check, and a
+   * producer that cannot be reached is none of them -- it is the producer-failure flow, whose
+   * specified answer is invalidation, recomputation and retry rather than abandoning the fast path.
+   * Recording one of the four here would send an operator to tune a condition nothing observed, and
+   * inventing a fifth would be a fifth way to leave the fast path. The recomputed map stage is
+   * therefore served by the streaming path again, exactly as the specification describes.
+   *
+   * Live producer generations of the shuffle are retired with the outputs, because a generation
+   * whose map output has been withdrawn must not be resolvable afterwards: a consumer handed that
+   * address would read output the scheduler has already decided to produce again.
+   *
+   * @param shuffleId shuffle whose streamed map output must be recomputed; must be non-negative
+   * @param capabilityToken token issued when the shuffle was registered on the driver
+   * @return true when no streamed map output of this shuffle remains registered, so the caller may
+   *         raise a fetch failure knowing the map stage will be recomputed
+   */
+  def invalidateStreamedMapOutput(shuffleId: Int, capabilityToken: String): Boolean = {
+    require(shuffleId >= 0,
+      s"shuffleId must be non-negative for a streamed map output invalidation, but was $shuffleId")
+    val existing = Option(shuffleStates.get(shuffleId))
+    if (existing.exists(state => unauthorizedFor(state, capabilityToken))) {
+      denyOperation("a streamed map output invalidation", shuffleId, unauthorizedReason)
+      false
+    } else if (existing.isEmpty) {
+      // Nothing is registered, so nothing streamed can be read and there is nothing to withdraw.
+      // Reported as confirmed for the same reason an unknown tracker registration is: the caller's
+      // question is whether streamed output of this shuffle remains readable, and it does not.
+      true
+    } else {
+      val withdrawn = invalidateStreamedMapOutput(shuffleId)
+      if (withdrawn) {
+        var retired = 0
+        val nowMs = clock.getTimeMillis()
+        shuffleStates.computeIfPresent(shuffleId,
+          (_: Int, state: StreamingShuffleState) => {
+            retired = state.producers.size
+            state.producers.values
+              .foldLeft(state) { (accumulated, entry) =>
+                accumulated.withoutProducer(entry.location.mapIndex)
+                  .withRetiredGeneration(entry.location.generation)
+              }
+              .copy(lastActivityMs = nowMs)
+          })
+        logInfo(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} withdrew its streamed map " +
+          log"output and retired ${MDC(COUNT, retired)} live producer generation(s) so that the " +
+          log"map stage is recomputed; streaming remains in force for the recomputed attempts")
+      }
+      withdrawn
     }
   }
 
@@ -2244,16 +2464,15 @@ private[spark] class StreamingShuffleCoordinator(
     var invalidated = false
     var newlyRetired = false
     var registeredAttemptId = Option.empty[Long]
-    // Producer-liveness accounting, read out of the same atomic update that records it so the
-    // decision below is taken on a consistent view rather than on a re-read that another
-    // invalidation could have moved.
+    // Whether this invalidation is a producer-liveness timeout, which is the only kind the
+    // per-map and shuffle-wide tallies count. The tallies are diagnostics: a lost producer is
+    // recovered by the specified producer-failure flow -- the partial reads taken from it are
+    // invalidated and the unmodified scheduler recomputes the upstream stage -- and never by
+    // standing the shuffle down, because a repeated timeout is not one of the four specified
+    // fallback conditions and this endpoint does not invent a fifth.
     val timedOut =
       StreamingShuffleInvalidationReason.sanitize(reason) ==
         StreamingShuffleInvalidationReason.ConnectionTimeout
-    var mapTimeouts = 0
-    var shuffleTimeouts = 0
-    var declaredMaps = 0
-    var alreadyStoodDown = false
     shuffleStates.computeIfPresent(shuffleId,
       (_: Int, existing: StreamingShuffleState) => {
         known = true
@@ -2266,19 +2485,15 @@ private[spark] class StreamingShuffleCoordinator(
         } else if (existing.generationOf(generation.mapIndex).contains(generation)) {
           invalidated = true
           epoch = epochCounter.incrementAndGet()
+          val removed = existing.producers(generation.mapIndex)
           val withdrawn = existing.withoutProducer(generation.mapIndex)
             .withRetiredGeneration(generation)
             .copy(coordinatorEpoch = epoch)
-          val counted = if (timedOut) {
+          if (timedOut) {
             withdrawn.withProducerTimeout(generation.mapIndex)
           } else {
             withdrawn
           }
-          mapTimeouts = counted.producerTimeoutsOf(generation.mapIndex)
-          shuffleTimeouts = counted.producerTimeoutTotal
-          declaredMaps = counted.mapStage.numMaps
-          alreadyStoodDown = counted.hasFallenBack
-          counted
         } else {
           epoch = existing.coordinatorEpoch
           newlyRetired = !existing.isRetired(generation)
@@ -2328,118 +2543,17 @@ private[spark] class StreamingShuffleCoordinator(
         log"${MDC(SHUFFLE_ID, shuffleId)} map ${MDC(MAP_ID, generation.mapId)} attempt " +
         log"${MDC(TASK_ATTEMPT_ID, generation.taskAttemptId)}: ${MDC(NEW_VALUE, recordedReason)}")
     }
-    if (invalidated && timedOut && !alreadyStoodDown) {
-      escalateProducerTimeouts(shuffleId, capabilityToken, generation.mapIndex, mapTimeouts,
-        shuffleTimeouts, declaredMaps)
-    }
     epoch
-  }
-
-  /**
-   * Stands a shuffle down once producer-liveness invalidations show that recomputing it on the
-   * streaming path is not converging.
-   *
-   * ==Why this exists==
-   *
-   * A consumer that receives nothing from a registered producer inside the connection timeout
-   * invalidates that producer and raises a fetch failure, and the unmodified scheduler answers by
-   * recomputing the upstream map output. That is the specified producer-failure flow and it is
-   * correct: the reduce side never mixes surviving pre-failure data with post-recomputation data,
-   * and every completing run produces exactly the output sort-based shuffle would have.
-   *
-   * What that flow lacks on its own is a '''bound'''. Nothing about a recomputation changes the
-   * condition that caused the timeout, so a shuffle whose producers cannot sustain the stream --
-   * because the executor is starved of buffer budget, of threads, or of both -- loses a producer,
-   * recomputes, loses one again, and repeats until `spark.stage.maxConsecutiveAttempts` is spent
-   * and the scheduler aborts the job. An abort is the one outcome graceful degradation exists to
-   * make impossible: the feature's guarantee is that no configuration and no resource condition
-   * leaves a job without a working shuffle, and sort-based shuffle is always a working shuffle.
-   *
-   * Neither of the two rate-based trip conditions can rescue that case, and for a structural reason
-   * rather than a tuning one. The consumer-slowness condition is sustained over sixty seconds,
-   * while the connection timeout fires at five, so the producer is invalidated and the reduce
-   * attempt is gone long before sixty seconds of evidence exists. And the memory-pressure trip is
-   * deliberately confined to a reservation that was actually '''prevented''': a full buffer whose
-   * block reached local disk instead is answered by spilling, which is the specified answer and
-   * which keeps a producer streaming output its consumers are already reading. So this is a third
-   * observation, made where it can be observed at all -- on the driver, the one participant that
-   * sees every consumer's invalidations across every attempt of the stage.
-   *
-   * ==The two bounds, and why they are derived rather than chosen==
-   *
-   * Both are expressed in the operator's own currency, `spark.stage.maxConsecutiveAttempts`, so the
-   * subsystem never spends more of the scheduler's budget than the scheduler has:
-   *
-   *  - '''per map output''' ([[perMapProducerTimeoutTolerance]]): two generations of one map index
-   *    lost to a timeout means the recomputation of that output was lost the same way the original
-   *    was. That is the specific signal, and it is the one that fires first in practice, because a
-   *    recomputed producer is the one a consumer is still waiting on.
-   *  - '''per shuffle''' ([[shuffleProducerTimeoutTolerance]]): losses spread evenly across map
-   *    indices would satisfy no per-index bound while still spending an attempt each, so the
-   *    shuffle-wide count is bounded one below the attempt allowance. That is the safety net that
-   *    makes termination unconditional rather than probable.
-   *
-   * Neither is a hair trigger: a healthy streaming shuffle records '''no''' producer-liveness
-   * invalidations at all, so this can only fire where the alternative was repeated recomputation.
-   *
-   * ==Why the reason recorded is consumer slowness==
-   *
-   * The four fallback conditions are a closed set, deliberately, and a fifth would be a fifth way
-   * to abandon the fast path. Of the four, this is a producer and consumer that could not be kept
-   * in step -- which is what the consumer-slowness condition names -- rather than memory, link
-   * capacity or protocol disagreement. The reader already declares the same reason when it cannot
-   * resolve a producer at all, for the same reason, and the detail recorded here states the counts
-   * and the derivation so the record is never ambiguous about which observation was made.
-   *
-   * @param shuffleId shuffle whose producers keep being lost
-   * @param capabilityToken token the invalidation presented, already validated by the caller
-   * @param mapIndex map output whose producer was just invalidated
-   * @param mapTimeouts producer-liveness invalidations recorded against that map index
-   * @param shuffleTimeouts producer-liveness invalidations recorded across the whole shuffle
-   * @param declaredMaps map outputs the shuffle declared, reported so the record is diagnosable
-   */
-  private def escalateProducerTimeouts(
-      shuffleId: Int,
-      capabilityToken: String,
-      mapIndex: Int,
-      mapTimeouts: Int,
-      shuffleTimeouts: Int,
-      declaredMaps: Int): Unit = {
-    val perMapExceeded = mapTimeouts >= perMapProducerTimeoutTolerance
-    val shuffleExceeded = shuffleTimeouts >= shuffleProducerTimeoutTolerance
-    if (perMapExceeded || shuffleExceeded) {
-      // Deliberately terse, and ordered with the facts first. The detail is sanitized and capped
-      // at MAX_INVALIDATION_DETAIL_CHARS before it reaches a log record, so prose placed ahead of
-      // the counts and of the key they derive from would be what survived. The reasoning belongs in
-      // this method's own documentation, to which no cap applies.
-      val observation = if (perMapExceeded) {
-        s"$mapTimeouts producer(s) of map index $mapIndex hit the " +
-          s"${StreamingShuffleCoordinator.PRODUCER_CONNECTION_TIMEOUT_MS} ms connection timeout, " +
-          s"at or past the per-map tolerance $perMapProducerTimeoutTolerance"
-      } else {
-        s"$shuffleTimeouts producer(s) of $declaredMaps map output(s) hit the " +
-          s"${StreamingShuffleCoordinator.PRODUCER_CONNECTION_TIMEOUT_MS} ms connection timeout, " +
-          s"at or past the shuffle-wide tolerance $shuffleProducerTimeoutTolerance"
-      }
-      declareFallback(shuffleId, capabilityToken,
-        StreamingShuffleFallbackReason.ConsumerTooSlow,
-        s"$observation derived from " +
-          s"${config.STAGE_MAX_CONSECUTIVE_ATTEMPTS.key}=$stageAttemptAllowance; yielding to " +
-          "sort-based shuffle")
-    } else if (debugEnabled) {
-      logDebug(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} has lost " +
-        log"${MDC(COUNT, mapTimeouts)} producer generation(s) of map index " +
-        log"${MDC(INDEX, mapIndex)} and ${MDC(NUM_EVENTS, shuffleTimeouts)} across the shuffle, " +
-        log"both inside the tolerances of ${MDC(THRESHOLD, perMapProducerTimeoutTolerance)} per " +
-        log"map output and ${MDC(MAX_ATTEMPTS, shuffleProducerTimeoutTolerance)} per shuffle; " +
-        log"recomputation continues on the streaming path")
-    }
   }
 
   /**
    * Producer-liveness invalidations recorded against one map output of a shuffle, or zero when the
    * shuffle is unknown. Exposed so a suite can observe the tally without being handed the registry
    * entry, which would hand it the capability token as well.
+   *
+   * Purely diagnostic. No count of these stands a shuffle down: a producer lost to the connection
+   * timeout is recovered by the specified producer-failure flow, and repeated loss is not one of
+   * the four specified fallback conditions.
    *
    * @param shuffleId shuffle to ask about
    * @param mapIndex map output to ask about
@@ -2452,7 +2566,7 @@ private[spark] class StreamingShuffleCoordinator(
 
   /**
    * Producer-liveness invalidations recorded across one whole shuffle, or zero when the shuffle is
-   * unknown.
+   * unknown. Diagnostic, for the same reason [[producerTimeoutCount]] is.
    *
    * @param shuffleId shuffle to ask about
    * @return invalidations recorded for that shuffle
@@ -2461,12 +2575,6 @@ private[spark] class StreamingShuffleCoordinator(
     val state = shuffleStates.get(shuffleId)
     if (state == null) 0 else state.producerTimeoutTotal
   }
-
-  /** Producer-liveness invalidations tolerated per map output before the shuffle stands down. */
-  def producerTimeoutTolerancePerMap: Int = perMapProducerTimeoutTolerance
-
-  /** Producer-liveness invalidations tolerated across a shuffle before it stands down. */
-  def producerTimeoutToleranceForShuffle: Int = shuffleProducerTimeoutTolerance
 
   /**
    * Drops all state for a shuffle. Driven from the streaming shuffle manager's `unregisterShuffle`
@@ -2492,6 +2600,7 @@ private[spark] class StreamingShuffleCoordinator(
         } else {
           removed = true
           producerCount = existing.producers.size
+          shuffleRemoved(shuffleId, existing)
           null
         })
     if (unauthorized) {
@@ -2504,6 +2613,9 @@ private[spark] class StreamingShuffleCoordinator(
       }
       false
     } else {
+      // The repeated-timeout marker is scoped to the registration it describes, so it goes with it.
+      // Keeping it would silence the record for a later shuffle that happened to reuse the id.
+      repeatedTimeoutsReported.remove(shuffleId)
       // On a window of its own, so that a burst of registrations cannot silence the withdrawals
       // that balance them and leave a reader inferring a registered count that never comes down.
       reportRegistrationBounded(
@@ -2511,6 +2623,95 @@ private[spark] class StreamingShuffleCoordinator(
           log"${MDC(COUNT, producerCount)} registered producers",
         unregistrationLogAggregator)
       true
+    }
+  }
+
+  /**
+   * Reaps only producer generations whose indexed deadlines have elapsed.
+   *
+   * A target is revalidated against the atomically current generation and clock stamp before it is
+   * removed, so a heartbeat or replacement racing the poll cannot be reaped from an old deadline.
+   *
+   * @return dropped entries, retained-state epoch, and idle duration when the shuffle was evicted
+   */
+  private def reapExpiredProducerTargets(
+      shuffleId: Int,
+      targets: Seq[StreamingShuffleCoordinator.ProducerExpiry],
+      nowMs: Long): (Seq[StreamingShuffleProducerEntry], Long, Option[Long]) = {
+    val dropped = ArrayBuffer.empty[StreamingShuffleProducerEntry]
+    var epoch = StreamingShuffleCoordinator.NO_EPOCH
+    var evictedIdleMs = Option.empty[Long]
+    shuffleStates.computeIfPresent(shuffleId,
+      (_: Int, existing: StreamingShuffleState) => {
+        var updated = existing
+        targets.foreach { target =>
+          updated.producers.get(target.generation.mapIndex) match {
+            case Some(entry) if entry.location.generation == target.generation &&
+                !updated.mapStage.completedBy(
+                  entry.location.mapIndex, entry.location.taskAttemptId) =>
+              val deadline = StreamingShuffleCoordinator.deadlineAfter(
+                entry.lastSeenMs, livenessTimeoutMs)
+              if (deadline < nowMs) {
+                val before = updated
+                updated = updated.withoutProducer(entry.location.mapIndex)
+                  .withRetiredGeneration(entry.location.generation)
+                producerRemoved(shuffleId, before, updated, entry)
+                dropped += entry
+              } else {
+                // A heartbeat refreshed the state after the old deadline was polled. Reinsert the
+                // one current deadline rather than letting that race disable liveness tracking.
+                refreshProducerExpiry(shuffleId, updated, entry)
+              }
+            case _ =>
+              // The generation was completed, replaced or removed after this target was indexed.
+              // Its current transition already owns whatever deadline, if any, should replace it.
+          }
+        }
+        val emptyDeadline = StreamingShuffleCoordinator.deadlineAfter(
+          updated.lastActivityMs, StreamingShuffleCoordinator.EMPTY_STATE_TTL_MS)
+        if (updated.producers.isEmpty && !updated.hasFallenBack && emptyDeadline < nowMs) {
+          evictedIdleMs = Some(math.max(0L, nowMs - updated.lastActivityMs))
+          shuffleRemoved(shuffleId, updated)
+          null
+        } else {
+          if (dropped.nonEmpty) {
+            epoch = epochCounter.incrementAndGet()
+            updated = updated.copy(coordinatorEpoch = epoch)
+          }
+          refreshEmptyShuffleExpiry(shuffleId, updated)
+          updated
+        }
+      })
+    (dropped.toSeq, epoch, evictedIdleMs)
+  }
+
+  /** Evicts one indexed empty shuffle if its refreshed activity deadline is still elapsed. */
+  private def evictExpiredEmptyShuffle(shuffleId: Int, nowMs: Long): Option[Long] = {
+    var evictedIdleMs = Option.empty[Long]
+    shuffleStates.computeIfPresent(shuffleId,
+      (_: Int, existing: StreamingShuffleState) => {
+        val deadline = StreamingShuffleCoordinator.deadlineAfter(
+          existing.lastActivityMs, StreamingShuffleCoordinator.EMPTY_STATE_TTL_MS)
+        if (existing.producers.isEmpty && !existing.hasFallenBack && deadline < nowMs) {
+          evictedIdleMs = Some(math.max(0L, nowMs - existing.lastActivityMs))
+          shuffleRemoved(shuffleId, existing)
+          null
+        } else {
+          // An authorized lookup may have refreshed an empty state after its old target was polled.
+          refreshEmptyShuffleExpiry(shuffleId, existing)
+          existing
+        }
+      })
+    evictedIdleMs
+  }
+
+  /** Reports one idle-shuffle eviction under the streaming debug gate. */
+  private def reportEmptyShuffleEviction(shuffleId: Int, idleMs: Long): Unit = {
+    if (debugEnabled) {
+      logDebug(log"Evicted the registration of streaming shuffle " +
+        log"${MDC(SHUFFLE_ID, shuffleId)}: it held no live producer and had seen no accepted " +
+        log"operation for ${MDC(ELAPSED_TIME, idleMs)} ms, beyond the " +
+        log"${MDC(TIMEOUT, StreamingShuffleCoordinator.EMPTY_STATE_TTL_MS)} ms time-to-live")
     }
   }
 
@@ -2547,6 +2748,11 @@ private[spark] class StreamingShuffleCoordinator(
    * A shuffle that has stood streaming down is never evicted at all: its latched verdict has to
    * outlive the producers that standing down retired, so only [[unregisterShuffle]] drops it.
    *
+   * The pass polls a deadline index containing one entry per incomplete producer and one per empty
+   * shuffle. It therefore examines only targets whose deadlines elapsed, not every registered
+   * shuffle and every producer on each timer tick; stale targets are revalidated atomically before
+   * removal, so a concurrent heartbeat remains safe.
+   *
    * Reaping is normally driven by this endpoint's own timer. It is public so that a round can also
    * be forced directly, against the clock the endpoint was given, rather than only on the cadence.
    *
@@ -2556,80 +2762,20 @@ private[spark] class StreamingShuffleCoordinator(
     val nowMs = clock.getTimeMillis()
     var reaped = 0
     var evictedShuffles = 0
-    // The scan is bounded by the registry cap, and the registry cap is enforceable because only
-    // driver-side registration creates entries. Empty states are evicted below, so the set this
-    // iterates shrinks back to the genuinely active shuffles instead of accumulating one entry per
-    // shuffle id any caller ever named.
-    shuffleStates.keySet().asScala.toSeq.foreach { shuffleId =>
-      // Staleness is decided inside the atomic update, so a producer that heartbeats concurrently
-      // is never reaped on the strength of an older snapshot. The dropped producers are logged
-      // afterwards to keep the update itself free of expensive work.
-      var dropped: Seq[StreamingShuffleProducerEntry] = Nil
-      var epoch = StreamingShuffleCoordinator.NO_EPOCH
-      var evicted = false
-      var idleMs = 0L
-      shuffleStates.computeIfPresent(shuffleId,
-        (_: Int, existing: StreamingShuffleState) => {
-          val stale = existing.producers.filter {
-            case (_, entry) =>
-              nowMs - entry.lastSeenMs > livenessTimeoutMs &&
-                !existing.mapStage.completedBy(
-                  entry.location.mapIndex, entry.location.taskAttemptId)
-          }
-          val idleFor = nowMs - existing.lastActivityMs
-          if (stale.size == existing.producers.size &&
-              idleFor > StreamingShuffleCoordinator.EMPTY_STATE_TTL_MS &&
-              !existing.hasFallenBack) {
-            // A shuffle that holds no live producer and has seen no accepted operation for longer
-            // than the time-to-live is dropped outright. Returning null removes the entry, which is
-            // what keeps the registry, the reaper's own scan and the concurrency divisor bounded
-            // over the lifetime of a long-running application.
-            //
-            // A shuffle that has stood streaming down is exempt, and the exemption is load-bearing
-            // rather than cautious. Standing down drops every producer by design, so a fallen-back
-            // shuffle looks exactly like an abandoned one to this branch; evicting it would erase
-            // the latched verdict, and the very next producer of that shuffle -- the recomputed map
-            // task the fallback exists to force onto the sort-based path -- would be admitted to
-            // stream again. The verdict has to outlive the producers it retired, so only
-            // [[unregisterShuffle]] may drop it. The registry stays bounded because a fallen-back
-            // shuffle holds no producers, is counted by no executor's concurrency divisor, and is
-            // unregistered along with every other shuffle when the application cleans it up.
-            dropped = stale.values.toSeq.sortBy(_.location.mapIndex)
-            evicted = true
-            idleMs = idleFor
-            null
-          } else if (stale.isEmpty) {
-            existing
-          } else {
-            dropped = stale.values.toSeq.sortBy(_.location.mapIndex)
-            epoch = epochCounter.incrementAndGet()
-            // Each reaped generation is retired as well as dropped, so a producer that is merely
-            // unresponsive rather than dead cannot re-register the generation a consumer has
-            // already been told to stop expecting. Dropping goes through withoutProducer so that
-            // the executor index stays exact.
-            dropped
-              .foldLeft(existing) { (state, entry) =>
-                state.withoutProducer(entry.location.mapIndex)
-                  .withRetiredGeneration(entry.location.generation)
-              }
-              .copy(coordinatorEpoch = epoch)
-          }
-        })
-      if (evicted) {
-        // Counted here rather than inside the atomic update, so that the update itself stays free
-        // of anything but the state transition. An eviction is not a failure -- it is the registry
-        // reclaiming a shuffle nobody has touched for ten liveness windows -- so it is reported
-        // under the debug gate, aggregated per pass, and the idle interval that justified it is
-        // reported with it because that interval is the only evidence an operator has that the
-        // time-to-live is set sensibly for their workload.
+    val producerExpiries = ArrayBuffer.empty[StreamingShuffleCoordinator.ProducerExpiry]
+    val emptyExpiries = ArrayBuffer.empty[StreamingShuffleCoordinator.EmptyShuffleExpiry]
+    expiryIndex.pollExpired(nowMs).foreach {
+      case producer: StreamingShuffleCoordinator.ProducerExpiry =>
+        producerExpiries += producer
+      case empty: StreamingShuffleCoordinator.EmptyShuffleExpiry =>
+        emptyExpiries += empty
+    }
+    producerExpiries.groupBy(_.shuffleId).foreach { case (shuffleId, targets) =>
+      val (dropped, epoch, evictedIdleMs) =
+        reapExpiredProducerTargets(shuffleId, targets.toSeq, nowMs)
+      evictedIdleMs.foreach { idleMs =>
         evictedShuffles += 1
-        if (debugEnabled) {
-          logDebug(log"Evicted the registration of streaming shuffle " +
-            log"${MDC(SHUFFLE_ID, shuffleId)}: it held no live producer and had seen no accepted " +
-            log"operation for ${MDC(ELAPSED_TIME, idleMs)} ms, beyond the " +
-            log"${MDC(TIMEOUT, StreamingShuffleCoordinator.EMPTY_STATE_TTL_MS)} ms " +
-            log"time-to-live")
-        }
+        reportEmptyShuffleEviction(shuffleId, idleMs)
       }
       if (dropped.nonEmpty) {
         // One record per reaping pass and per shuffle, never one per producer. A pass can reap
@@ -2640,11 +2786,15 @@ private[spark] class StreamingShuffleCoordinator(
         // shuffle advanced to. Per-producer identity, which is the part that scales with the
         // cluster, is available under the streaming debug key.
         val stalestMs = dropped.map(entry => nowMs - entry.lastSeenMs).max
+        val outcome = if (epoch == StreamingShuffleCoordinator.NO_EPOCH) {
+          log"and the abandoned shuffle registration was evicted"
+        } else {
+          log"so the shuffle advanced to epoch ${MDC(EPOCH, epoch)}"
+        }
         logWarning(log"Reaped ${MDC(COUNT, dropped.size)} streaming shuffle producers of shuffle " +
           log"${MDC(SHUFFLE_ID, shuffleId)}: the stalest was last seen " +
           log"${MDC(TIME_UNITS, stalestMs)} ms ago, exceeding the liveness timeout " +
-          log"${MDC(TIMEOUT, livenessTimeoutMs)} ms, so the shuffle advanced to epoch " +
-          log"${MDC(EPOCH, epoch)}")
+          log"${MDC(TIMEOUT, livenessTimeoutMs)} ms, " + outcome)
         if (debugEnabled) {
           dropped.foreach { entry =>
             logDebug(log"Reaped streaming shuffle producer for shuffle " +
@@ -2656,6 +2806,12 @@ private[spark] class StreamingShuffleCoordinator(
         }
       }
       reaped += dropped.size
+    }
+    emptyExpiries.foreach { target =>
+      evictExpiredEmptyShuffle(target.shuffleId, nowMs).foreach { idleMs =>
+        evictedShuffles += 1
+        reportEmptyShuffleEviction(target.shuffleId, idleMs)
+      }
     }
     if (evictedShuffles > 0 && debugEnabled) {
       logDebug(log"One reaping pass evicted ${MDC(COUNT, evictedShuffles)} empty streaming " +
@@ -2689,10 +2845,9 @@ private[spark] class StreamingShuffleCoordinator(
    * on account of shuffles it takes no part in. It is also the count reported by every producer
    * registration reply, so a producer never has to ask a second question to size its bucket.
    *
-   * The answer costs one map lookup per registered shuffle, because each shuffle state carries a
-   * per-executor producer index maintained as producers come and go. Counting producers instead
-   * would make each registration linear in the number of map tasks already registered, and the map
-   * stage as a whole quadratic.
+   * The answer costs one map lookup and one set-size read. Producer insertion, replacement and
+   * removal maintain the executor-to-shuffle membership only when a per-shuffle reference count
+   * crosses zero, so neither this query nor a registration scans the shuffle or producer registry.
    *
    * @param executorId executor to count for; must not be null
    * @return the number of shuffles for which the executor has a registered producer, never less
@@ -2700,12 +2855,26 @@ private[spark] class StreamingShuffleCoordinator(
    */
   def numConcurrentShufflesFor(executorId: String): Int = {
     require(executorId != null, "The executor id must not be null.")
-    val active = shuffleStates.values().asScala.count(_.hasProducerOn(executorId))
-    math.max(1, active)
+    math.max(1, indexedShuffleCountFor(executorId))
   }
 
   /** Ids of every registered streaming shuffle, ascending, for diagnostics and assertions. */
   def activeShuffleIds: Seq[Int] = shuffleStates.keySet().asScala.toSeq.sorted
+
+  /**
+   * Reduce partition count registered for one shuffle, or `None` when the shuffle has no
+   * registration.
+   *
+   * Intended for diagnostics and tests. Arbitration keys on this width, so a test asserting that
+   * concurrent shuffles genuinely arbitrate against one another has to be able to confirm that the
+   * registry holds the widths the workload submitted rather than assume it.
+   *
+   * @param shuffleId shuffle to read
+   * @return the registered width
+   */
+  def registeredNumPartitions(shuffleId: Int): Option[Int] = {
+    Option(shuffleStates.get(shuffleId)).map(_.numPartitions)
+  }
 
   /**
    * Live producers of one shuffle, ordered by map id, or an empty sequence when the shuffle has
@@ -2742,7 +2911,142 @@ private[spark] class StreamingShuffleCoordinator(
    */
   def reset(): Unit = {
     shuffleStates.clear()
+    executorShuffles.clear()
+    expiryIndex.clear()
+    repeatedTimeoutsReported.clear()
     epochCounter.set(StreamingShuffleCoordinator.NO_EPOCH)
+  }
+
+  /** Adds one shuffle to an executor's constant-time concurrency index. */
+  private def addExecutorShuffle(executorId: String, shuffleId: Int): Unit = {
+    executorShuffles.compute(executorId,
+      (_: String, existing: java.util.Set[Int]) => {
+        val active = if (existing == null) ConcurrentHashMap.newKeySet[Int]() else existing
+        active.add(shuffleId)
+        active
+      })
+  }
+
+  /** Removes one shuffle from an executor's concurrency index and drops an empty nested set. */
+  private def removeExecutorShuffle(executorId: String, shuffleId: Int): Unit = {
+    executorShuffles.computeIfPresent(executorId,
+      (_: String, existing: java.util.Set[Int]) => {
+        existing.remove(shuffleId)
+        if (existing.isEmpty) null else existing
+      })
+  }
+
+  /**
+   * Applies only the executor memberships that one producer replacement can have changed.
+   *
+   * The candidate list contains at most the old and new executor ids. Looking at those two
+   * per-shuffle reference counts is what avoids rebuilding either the producer or global index.
+   */
+  private def reconcileExecutorShuffles(
+      shuffleId: Int,
+      before: StreamingShuffleState,
+      after: StreamingShuffleState,
+      candidates: Seq[String]): Unit = {
+    candidates.distinct.foreach { executorId =>
+      val wasActive = before.hasProducerOn(executorId)
+      val isActive = after.hasProducerOn(executorId)
+      if (!wasActive && isActive) {
+        addExecutorShuffle(executorId, shuffleId)
+      } else if (wasActive && !isActive) {
+        removeExecutorShuffle(executorId, shuffleId)
+      }
+    }
+  }
+
+  /** Refreshes or cancels the one liveness deadline belonging to a producer generation. */
+  private def refreshProducerExpiry(
+      shuffleId: Int,
+      state: StreamingShuffleState,
+      entry: StreamingShuffleProducerEntry): Unit = {
+    val target =
+      StreamingShuffleCoordinator.ProducerExpiry(shuffleId, entry.location.generation)
+    if (state.mapStage.completedBy(
+        entry.location.mapIndex, entry.location.taskAttemptId)) {
+      expiryIndex.cancel(target)
+    } else {
+      expiryIndex.schedule(target,
+        StreamingShuffleCoordinator.deadlineAfter(entry.lastSeenMs, livenessTimeoutMs))
+    }
+  }
+
+  /** Maintains the one eviction deadline belonging to an empty, non-fallback shuffle. */
+  private def refreshEmptyShuffleExpiry(
+      shuffleId: Int,
+      state: StreamingShuffleState): Unit = {
+    val target = StreamingShuffleCoordinator.EmptyShuffleExpiry(shuffleId)
+    if (state.producers.isEmpty && !state.hasFallenBack) {
+      expiryIndex.schedule(target, StreamingShuffleCoordinator.deadlineAfter(
+        state.lastActivityMs, StreamingShuffleCoordinator.EMPTY_STATE_TTL_MS))
+    } else {
+      expiryIndex.cancel(target)
+    }
+  }
+
+  /** Reconciles all indexes after one producer has been inserted, refreshed or replaced. */
+  private def producerPublished(
+      shuffleId: Int,
+      before: StreamingShuffleState,
+      after: StreamingShuffleState,
+      entry: StreamingShuffleProducerEntry): Unit = {
+    val previous = before.producers.get(entry.location.mapIndex)
+    previous.foreach { old =>
+      expiryIndex.cancel(
+        StreamingShuffleCoordinator.ProducerExpiry(shuffleId, old.location.generation))
+    }
+    reconcileExecutorShuffles(shuffleId, before, after,
+      previous.map(_.location.executorId).toSeq :+ entry.location.executorId)
+    refreshProducerExpiry(shuffleId, after, entry)
+    refreshEmptyShuffleExpiry(shuffleId, after)
+  }
+
+  /** Reconciles all indexes after one producer has been removed. */
+  private def producerRemoved(
+      shuffleId: Int,
+      before: StreamingShuffleState,
+      after: StreamingShuffleState,
+      entry: StreamingShuffleProducerEntry): Unit = {
+    reconcileExecutorShuffles(
+      shuffleId, before, after, Seq(entry.location.executorId))
+    expiryIndex.cancel(
+      StreamingShuffleCoordinator.ProducerExpiry(shuffleId, entry.location.generation))
+    refreshEmptyShuffleExpiry(shuffleId, after)
+  }
+
+  /** Drops every producer-derived index entry while retaining the shuffle's resulting state. */
+  private def allProducersRemoved(
+      shuffleId: Int,
+      before: StreamingShuffleState,
+      after: StreamingShuffleState): Unit = {
+    before.producerExecutors.keys.foreach(removeExecutorShuffle(_, shuffleId))
+    before.producers.valuesIterator.foreach { entry =>
+      expiryIndex.cancel(
+        StreamingShuffleCoordinator.ProducerExpiry(shuffleId, entry.location.generation))
+    }
+    refreshEmptyShuffleExpiry(shuffleId, after)
+  }
+
+  /** Drops every secondary index entry belonging to a shuffle that is leaving the registry. */
+  private def shuffleRemoved(shuffleId: Int, state: StreamingShuffleState): Unit = {
+    state.producerExecutors.keys.foreach(removeExecutorShuffle(_, shuffleId))
+    state.producers.valuesIterator.foreach { entry =>
+      expiryIndex.cancel(
+        StreamingShuffleCoordinator.ProducerExpiry(shuffleId, entry.location.generation))
+    }
+    expiryIndex.cancel(StreamingShuffleCoordinator.EmptyShuffleExpiry(shuffleId))
+  }
+
+  /** Number of bounded expiry records, exposed for deterministic index tests. */
+  private[spark] def expiryEntryCount: Int = expiryIndex.size
+
+  /** Number of indexed shuffles for an executor before the public minimum-of-one rule. */
+  private[spark] def indexedShuffleCountFor(executorId: String): Int = {
+    val active = executorShuffles.get(executorId)
+    if (active == null) 0 else active.size()
   }
 
   /**
@@ -2818,7 +3122,7 @@ private[spark] class StreamingShuffleCoordinator(
 
   private def orderedLocations(
       state: StreamingShuffleState): Seq[StreamingShuffleProducerLocation] = {
-    state.producers.values.map(_.location).toSeq.sortBy(_.mapIndex)
+    state.producers.valuesIterator.map(_.location).toSeq
   }
 
   /**
@@ -3135,10 +3439,20 @@ private[spark] class StreamingShuffleCoordinator(
    * would silently widen an executor-scoped count into a global one. It must be no longer than the
    * declared maximum, because a peer choosing the length of a string the driver stores per producer
    * and writes per record is a peer choosing the driver's memory and log volume. And it must
-   * contain no control character, because a log record is line oriented: a carriage return or a
-   * line feed in a rendered value lets a peer end the driver's record early and forge a second,
-   * entirely plausible one after it. Rejecting control characters outright is safer than escaping,
-   * because it removes the question of whether every downstream sink escapes identically.
+   * contain no line-breaking character, because a log record is line oriented: a carriage return
+   * or a line feed in a rendered value lets a peer end the driver's record early and forge a
+   * second, entirely plausible one after it. Rejecting such characters outright is safer than
+   * escaping, because it removes the question of whether every downstream sink escapes identically.
+   *
+   * <b>Why the control-character test is not sufficient on its own.</b> `Character.isISOControl`
+   * covers only U+0000-U+001F and U+007F-U+009F, so it does NOT cover U+2028 LINE SEPARATOR or
+   * U+2029 PARAGRAPH SEPARATOR -- and those two are line terminators to a great many consumers of a
+   * log stream, including the JSON and JavaScript readers an operator's tooling is most likely to
+   * be built on. A peer that may not send a line feed but may send U+2028 has the same forgery
+   * available to it, which would leave this check closing a hole it only appears to close. The two
+   * separator categories are therefore refused on exactly the same terms, which also makes this
+   * predicate agree with [[sanitizeDetail]] rather than being narrower than the sanitiser applied
+   * to free text.
    *
    * @param name what the identifier is, used to compose the rejection reason
    * @param value the identifier as received, which may be `null`
@@ -3154,11 +3468,27 @@ private[spark] class StreamingShuffleCoordinator(
       // what is wrong. The offending text itself is never rendered.
       Some(s"the $name was ${value.length} characters long, exceeding the $maxLength character " +
         "maximum")
-    } else if (value.exists(Character.isISOControl)) {
-      Some(s"the $name contained a control character")
+    } else if (value.exists(isLineBreaking)) {
+      Some(s"the $name contained a control or line-separator character")
     } else {
       None
     }
+  }
+
+  /**
+   * Whether a character could end a line in a rendered log record.
+   *
+   * The ISO control range plus the two Unicode separator categories, which is the same set
+   * [[sanitizeDetail]] replaces in free text. Stated once, as a predicate, so an identifier and a
+   * detail string can never disagree about what a line terminator is.
+   *
+   * @param character the character to judge
+   * @return true when the character must not reach a log sink verbatim
+   */
+  private def isLineBreaking(character: Char): Boolean = {
+    val category = Character.getType(character)
+    Character.isISOControl(character) || category == Character.LINE_SEPARATOR ||
+      category == Character.PARAGRAPH_SEPARATOR
   }
 
   /** The map id of a location, but only when the location as a whole is well formed. */
@@ -3278,6 +3608,98 @@ private[spark] class StreamingShuffleCoordinator(
  */
 private[spark] object StreamingShuffleCoordinator extends Logging {
 
+  /** One bounded target tracked by the coordinator's deadline index. */
+  private sealed trait ExpiryTarget {
+    def shuffleId: Int
+  }
+
+  /** Liveness deadline for one exact producer generation. */
+  private case class ProducerExpiry(
+      shuffleId: Int,
+      generation: StreamingShuffleProducerGeneration) extends ExpiryTarget
+
+  /** Idle-eviction deadline for one empty shuffle registration. */
+  private case class EmptyShuffleExpiry(shuffleId: Int) extends ExpiryTarget
+
+  /**
+   * Mutable deadline index with one entry per target.
+   *
+   * Both maps are protected by this object's monitor. Replacing a deadline removes the old bucket
+   * membership first, so repeated heartbeat refreshes cannot grow the index beyond the registry
+   * state they describe. A linked set makes targets sharing one deadline deterministic without
+   * imposing an additional sort on a reaping pass.
+   */
+  private final class ExpiryIndex {
+
+    private val targetsByDeadline =
+      new TreeMap[java.lang.Long, LinkedHashSet[ExpiryTarget]]()
+    private val deadlineByTarget =
+      new HashMap[ExpiryTarget, java.lang.Long]()
+
+    def schedule(target: ExpiryTarget, deadlineMs: Long): Unit = synchronized {
+      val deadline = java.lang.Long.valueOf(deadlineMs)
+      val previous = deadlineByTarget.put(target, deadline)
+      if (previous != null) {
+        removeFromBucket(target, previous)
+      }
+      var bucket = targetsByDeadline.get(deadline)
+      if (bucket == null) {
+        bucket = new LinkedHashSet[ExpiryTarget]()
+        targetsByDeadline.put(deadline, bucket)
+      }
+      bucket.add(target)
+    }
+
+    def cancel(target: ExpiryTarget): Unit = synchronized {
+      val deadline = deadlineByTarget.remove(target)
+      if (deadline != null) {
+        removeFromBucket(target, deadline)
+      }
+    }
+
+    def pollExpired(nowMs: Long): Seq[ExpiryTarget] = synchronized {
+      val expired = ArrayBuffer.empty[ExpiryTarget]
+      while (!targetsByDeadline.isEmpty &&
+          targetsByDeadline.firstKey().longValue() < nowMs) {
+        val entry = targetsByDeadline.pollFirstEntry()
+        entry.getValue.asScala.foreach { target =>
+          val indexed = deadlineByTarget.get(target)
+          if (indexed != null && indexed == entry.getKey) {
+            deadlineByTarget.remove(target)
+            expired += target
+          }
+        }
+      }
+      expired.toSeq
+    }
+
+    def size: Int = synchronized {
+      deadlineByTarget.size()
+    }
+
+    def clear(): Unit = synchronized {
+      targetsByDeadline.clear()
+      deadlineByTarget.clear()
+    }
+
+    private def removeFromBucket(
+        target: ExpiryTarget,
+        deadline: java.lang.Long): Unit = {
+      val bucket = targetsByDeadline.get(deadline)
+      if (bucket != null) {
+        bucket.remove(target)
+        if (bucket.isEmpty) {
+          targetsByDeadline.remove(deadline)
+        }
+      }
+    }
+  }
+
+  /** Overflow-safe deadline used by both liveness and empty-state expiry. */
+  private def deadlineAfter(startMs: Long, intervalMs: Long): Long = {
+    if (startMs > Long.MaxValue - intervalMs) Long.MaxValue else startMs + intervalMs
+  }
+
   /**
    * Name the coordinator endpoint is registered under on the driver and looked up by on every
    * executor.
@@ -3342,48 +3764,6 @@ private[spark] object StreamingShuffleCoordinator extends Logging {
   val REAPER_INTERVAL_MS: Long = PRODUCER_CONNECTION_TIMEOUT_MS
 
   /**
-   * Fewest producer-liveness invalidations of one map output that may stand a shuffle down.
-   *
-   * Two, and it cannot sensibly be one: a single loss is the ordinary producer-failure flow, which
-   * the specification answers by invalidating the partial reads and recomputing the upstream stage,
-   * and standing a shuffle down for it would abandon the fast path for a fault the feature is
-   * designed to absorb. Two is the first count that says something a single loss cannot -- that the
-   * recomputation was lost the same way the original was.
-   */
-  val MIN_PRODUCER_TIMEOUT_TOLERANCE: Int = 2
-
-  /**
-   * Producer-liveness invalidations tolerated for one map output before a shuffle stands down.
-   *
-   * Derived from the scheduler's own consecutive-attempt allowance, less two: one attempt is the
-   * original and one is left for the sort-based recomputation the stand-down routes to, so the
-   * subsystem never spends the last attempt on a path that has already failed twice. Floored at
-   * [[MIN_PRODUCER_TIMEOUT_TOLERANCE]], so an installation that has tightened the allowance to one
-   * or zero cannot reduce this to a value that trips on the first ordinary producer failure.
-   *
-   * @param stageAttemptAllowance value of `spark.stage.maxConsecutiveAttempts`
-   * @return invalidations tolerated per map output
-   */
-  def perMapProducerTimeoutTolerance(stageAttemptAllowance: Int): Int =
-    math.max(MIN_PRODUCER_TIMEOUT_TOLERANCE, stageAttemptAllowance - 2)
-
-  /**
-   * Producer-liveness invalidations tolerated across a whole shuffle before it stands down.
-   *
-   * One below the scheduler's consecutive-attempt allowance, because each invalidation fails a
-   * reduce attempt and costs one recomputation: at the allowance less one the scheduler still has
-   * an attempt in hand, and that attempt is the one the sort-based delegate completes the job on.
-   * This is the bound that makes termination unconditional, since losses spread one per map index
-   * satisfy no per-index bound while spending an attempt each. Never below the per-map tolerance,
-   * so the two bounds can never be ordered the wrong way round.
-   *
-   * @param stageAttemptAllowance value of `spark.stage.maxConsecutiveAttempts`
-   * @return invalidations tolerated per shuffle
-   */
-  def shuffleProducerTimeoutTolerance(stageAttemptAllowance: Int): Int =
-    math.max(perMapProducerTimeoutTolerance(stageAttemptAllowance), stageAttemptAllowance - 1)
-
-  /**
    * Epoch value meaning "no epoch has been assigned". Real epochs start at one, so this can never
    * collide with a live generation, and it is non-negative, so it is safe to carry anywhere an
    * epoch is expected.
@@ -3399,6 +3779,37 @@ private[spark] object StreamingShuffleCoordinator extends Logging {
    * name is not empty" and needs no second boolean to be kept consistent with it.
    */
   val NO_FALLBACK_REASON: String = ""
+
+  /**
+   * Verdict name recorded when a shuffle has stood streaming down without any of the four
+   * graceful-degradation conditions having been observed.
+   *
+   * A stand-down and a degradation are not the same statement. Some requests the streaming path
+   * structurally cannot serve -- a read of a narrowed map-index range is the standing example --
+   * and serving them from the sort-based delegate requires the shuffle's streamed output to be
+   * withdrawn exactly as a real fallback withdraws it. Nothing has degraded, so no condition may
+   * be asserted.
+   *
+   * This name is therefore deliberately outside [[StreamingShuffleFallbackReason.all]]: it is
+   * non-empty, so `StreamingShuffleFallbackState.fallenBack` is true and every participant reads
+   * the shuffle as no longer streaming; and it resolves to `None` through
+   * [[StreamingShuffleFallbackReason.fromName]], so no consumer can mistake it for a measurement
+   * nobody made. It is prefixed with a character no `case object` name can begin with, which is
+   * what guarantees it can never collide with a member of that closed set however the set evolves.
+   *
+   * @see [[StreamingShuffleCoordinator.withdrawStreaming]]
+   */
+  val WITHDRAWN_WITHOUT_CONDITION: String = "(withdrawn-without-condition)"
+
+  /**
+   * Operator-facing prose for [[WITHDRAWN_WITHOUT_CONDITION]].
+   *
+   * Deliberately says what happened and what did not, because the free-text detail that travels
+   * with the verdict is what states the actual request that could not be served.
+   */
+  val WITHDRAWN_WITHOUT_CONDITION_DESCRIPTION: String =
+    "streaming was withdrawn for a request the streaming shuffle cannot serve; none of the four " +
+      "graceful-degradation conditions was observed"
 
   /**
    * Longest peer-supplied identifier -- executor id or host name -- the coordinator will accept.
@@ -3635,15 +4046,36 @@ private[spark] trait StreamingShuffleCoordinatorGateway {
    * Declares that a shuffle must stand streaming down for every participant, and answers with the
    * state in force once the declaration has been processed.
    *
+   * One member for every stand-down, so that a substitute implements the mechanism once: the closed
+   * cause set carries both the four measured conditions and the structural declines, so there is no
+   * second vocabulary for an implementation to handle differently.
+   *
    * @param shuffleId shuffle that must stand streaming down
-   * @param reason condition that was observed
+   * @param cause what was observed -- one of the four specified fallback conditions, or a
+   *              structural decline
    * @param detail free text describing the observation
    * @return the fallback state in force, which is what the caller must act on
    */
   def declareFallback(
       shuffleId: Int,
-      reason: StreamingShuffleFallbackReason,
+      cause: StreamingShuffleStandDownCause,
       detail: String): StreamingShuffleFallbackState
+
+  /**
+   * Withdraws a shuffle from streaming without naming a fallback condition, for a request the
+   * streaming path structurally cannot serve, and answers with the state in force once the
+   * withdrawal has been processed.
+   *
+   * The consequences are those of a fallback declaration -- producers dropped and retired, epoch
+   * advanced, streamed map output invalidated so the scheduler recomputes on the sort-based path --
+   * and only the recorded verdict differs: no condition is asserted, because none was observed. See
+   * [[StreamingShuffleCoordinator.withdrawStreaming]].
+   *
+   * @param shuffleId shuffle to withdraw from streaming
+   * @param detail free text stating what was asked for and why streaming declined it
+   * @return the fallback state in force, which is what the caller must act on
+   */
+  def withdrawStreaming(shuffleId: Int, detail: String): StreamingShuffleFallbackState
 
   /**
    * The fallback state in force for a shuffle.
@@ -3652,6 +4084,26 @@ private[spark] trait StreamingShuffleCoordinatorGateway {
    * @return the fallback state in force
    */
   def fallbackState(shuffleId: Int): StreamingShuffleFallbackState
+
+  /**
+   * Withdraws a shuffle's streamed map output so that its map stage is recomputed, without standing
+   * streaming down, and answers whether the withdrawal is confirmed.
+   *
+   * The driver half of the specified producer-failure flow, for the one case a fetch failure cannot
+   * express on its own: a consumer that could resolve no live producer has no map index and no
+   * block-manager address to blame, so the scheduler is told nothing is missing and resubmits the
+   * reduce stage against the same unreachable producers. Withdrawing here is what makes the
+   * recomputation real -- and no graceful-degradation condition is claimed, because an unreachable
+   * producer is none of the four.
+   *
+   * @param shuffleId shuffle whose streamed map output must be recomputed
+   * @param detail free text describing what could not be resolved
+   * @return true when no streamed map output of this shuffle remains registered, so the caller may
+   *         raise a fetch failure knowing the map stage will be recomputed; false when the driver
+   *         could not be reached or refused, in which case the caller must say so rather than
+   *         promise a recomputation that will not happen
+   */
+  def invalidateStreamedMapOutput(shuffleId: Int, detail: String): Boolean
 
   /**
    * Reports that one producer has streamed its whole map output to completion.
@@ -3775,11 +4227,30 @@ private[spark] class RpcStreamingShuffleCoordinatorGateway(
 
   override def declareFallback(
       shuffleId: Int,
-      reason: StreamingShuffleFallbackReason,
+      cause: StreamingShuffleStandDownCause,
+      detail: String): StreamingShuffleFallbackState = {
+    declareVerdict(cause.toString, shuffleId, detail)
+  }
+
+  override def withdrawStreaming(
+      shuffleId: Int,
+      detail: String): StreamingShuffleFallbackState = {
+    declareVerdict(StreamingShuffleCoordinator.WITHDRAWN_WITHOUT_CONDITION, shuffleId, detail)
+  }
+
+  /**
+   * Sends one stand-down verdict, whichever entry point produced it.
+   *
+   * The two public forms differ only in the name they latch, and the transport, the failure
+   * absorption and the unexpected-answer handling are identical, so they share one body.
+   */
+  private def declareVerdict(
+      verdictName: String,
+      shuffleId: Int,
       detail: String): StreamingShuffleFallbackState = {
     val operation = "a streaming shuffle fallback declaration"
     askAny(operation, shuffleId,
-      DeclareStreamingShuffleFallback(shuffleId, capabilityToken, reason.toString, detail)) match {
+      DeclareStreamingShuffleFallback(shuffleId, capabilityToken, verdictName, detail)) match {
       case Some(state: StreamingShuffleFallbackState) => state
       case answer => unexpected(operation, shuffleId, answer, StreamingShuffleFallbackState())
     }
@@ -3791,6 +4262,18 @@ private[spark] class RpcStreamingShuffleCoordinatorGateway(
       GetStreamingShuffleFallbackState(shuffleId, capabilityToken)) match {
       case Some(state: StreamingShuffleFallbackState) => state
       case answer => unexpected(operation, shuffleId, answer, StreamingShuffleFallbackState())
+    }
+  }
+
+  override def invalidateStreamedMapOutput(shuffleId: Int, detail: String): Boolean = {
+    val operation = "a streaming shuffle map output invalidation"
+    val request = InvalidateStreamingShuffleMapOutput(shuffleId, capabilityToken, detail)
+    askAny(operation, shuffleId, request) match {
+      case Some(withdrawn: java.lang.Boolean) => withdrawn.booleanValue()
+      // An unreachable or unusable driver is reported as "not withdrawn", which is the safe
+      // direction: the caller then states that the recomputation is unconfirmed rather than
+      // promising one that may not happen.
+      case answer => unexpected(operation, shuffleId, answer, false)
     }
   }
 

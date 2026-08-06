@@ -20,7 +20,7 @@ package org.apache.spark.shuffle.streaming
 import java.io.InputStream
 import java.nio.ByteBuffer
 import java.util.concurrent.{ConcurrentHashMap, CountDownLatch, TimeUnit}
-import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong}
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong, AtomicReference}
 
 import scala.collection.mutable
 import scala.concurrent.duration.DurationLong
@@ -29,18 +29,25 @@ import scala.util.control.NonFatal
 
 import io.netty.channel.{Channel, EventLoopGroup}
 
-import org.apache.spark.{Aggregator, InterruptibleIterator, SparkConf, SparkEnv, TaskContext}
+import org.apache.spark.{Aggregator, InterruptibleIterator, SecurityManager, SparkConf, SparkEnv,
+  TaskContext}
 import org.apache.spark.internal.{config, Logging}
-import org.apache.spark.internal.LogKeys.{BLOCK_ID, CHECKSUM, COUNT, EPOCH, ERROR, EXECUTOR_ID, HOST_PORT, MAP_ID, MAX_ATTEMPTS, NUM_BLOCKS, NUM_BYTES, NUM_PARTITIONS, NUM_SKIPPED, NUM_TASKS, PARTITION_ID, PROTOCOL_VERSION, REASON, SHUFFLE_ID, STATUS, THRESHOLD, TIMEOUT, VALUE, VERSION_NUM}
+import org.apache.spark.internal.LogKeys.{BLOCK_ID, CHECKSUM, COUNT, EPOCH, ERROR, EXECUTOR_ID,
+  HOST_PORT, MAP_ID, MAX_ATTEMPTS, NUM_BLOCKS, NUM_BYTES, NUM_PARTITIONS, NUM_SKIPPED, NUM_TASKS,
+  PARTITION_ID, PROTOCOL_VERSION, REASON, SHUFFLE_ID, STATUS, THRESHOLD, TIMEOUT, TOTAL, VALUE,
+  VERSION_NUM}
 import org.apache.spark.network.TransportContext
-import org.apache.spark.network.client.{RpcResponseCallback, TransportClient, TransportClientBootstrap, TransportClientFactory}
+import org.apache.spark.network.client.{RpcResponseCallback, TransportClient,
+  TransportClientBootstrap, TransportClientFactory}
 import org.apache.spark.network.server.{OneForOneStreamManager, RpcHandler, StreamManager}
-import org.apache.spark.network.shuffle.protocol.streaming.{DataBlockMessage, StreamingShuffleChecksum, StreamingShuffleMessage}
+import org.apache.spark.network.shuffle.protocol.streaming.{DataBlockMessage,
+  StreamingShuffleChecksum, StreamingShuffleMessage}
 import org.apache.spark.network.util.TransportConf
 import org.apache.spark.rpc.{RpcEndpointRef, RpcTimeout, RpcTimeoutException}
 import org.apache.spark.serializer.{DeserializationStream, SerializerInstance, SerializerManager}
 import org.apache.spark.shuffle.{FetchFailedException, ShuffleReader, ShuffleReadMetricsReporter}
-import org.apache.spark.shuffle.streaming.StreamingShuffleClientHandler.{BlockReceived, ProducerLost, StreamCompleted}
+import org.apache.spark.shuffle.streaming.StreamingShuffleClientHandler.{BlockReceived,
+  ProducerLost, StreamCompleted}
 import org.apache.spark.storage.{BlockManagerId, ShuffleBlockId}
 import org.apache.spark.util.{Clock, CompletionIterator, SystemClock}
 import org.apache.spark.util.collection.ExternalSorter
@@ -132,10 +139,11 @@ import org.apache.spark.util.collection.ExternalSorter
  * every timer on the consumer side is reproducible under a manual clock.
  *
  * @param handle registration state for the shuffle being read, produced by `registerShuffle`
- * @param startMapIndex first map index to read, inclusive. Streaming serves whole map ranges only
- *                      (see [[StreamingShuffleReader.servesFullMapRange]]), because a live producer
- *                      location names a map id and a task attempt id but no map index
- * @param endMapIndex map index one past the last to read
+ * @param startMapIndex first map index to read, inclusive. A narrowed range is served exactly as a
+ *                      whole one is: a producer registration carries the map INDEX with the map
+ *                      id, so the resolved locations are filtered to the requested range and only
+ *                      that range has to be resolvable before the read begins
+ * @param endMapIndex map index one past the last to read; `Int.MaxValue` for the whole range
  * @param startPartition first reduce partition to read, inclusive
  * @param endPartition reduce partition one past the last to read
  * @param context the task context of the reduce task performing the read
@@ -372,11 +380,8 @@ private[spark] class StreamingShuffleReader[K, C](
     s"${config.SHUFFLE_STREAMING_ENABLED.key} is false, so no streaming shuffle reader may be " +
       "constructed. The streaming shuffle manager delegates to the sort-based manager instead.")
 
-  require(servesFullMapRange(startMapIndex, endMapIndex),
-    s"Streaming shuffle reads whole map ranges only, but [$startMapIndex, $endMapIndex) was " +
-      s"requested for shuffle $shuffleId. A live producer location carries a map id and a task " +
-      "attempt id but no map index, so a narrowed range cannot be honoured; the manager must " +
-      "delegate such a read to the sort-based shuffle.")
+  require(startMapIndex >= 0 && endMapIndex >= startMapIndex,
+    s"Invalid map index range [$startMapIndex, $endMapIndex) for shuffle $shuffleId.")
 
   require(startPartition >= 0 && endPartition >= startPartition,
     s"Invalid reduce partition range [$startPartition, $endPartition) for shuffle $shuffleId.")
@@ -421,14 +426,12 @@ private[spark] class StreamingShuffleReader[K, C](
     // Makes this shuffle visible to the executor-wide ledger, which is what lets the protocol
     // arbitrate between concurrent shuffles and what the token bucket's refill rate is divided by.
     backpressure.registerShuffle(shuffleId, handle.numPartitions)
-    // The consumer side deliberately contributes nothing to `bufferUtilizationPercent`. That gauge
-    // reports the producer buffer budget the spill threshold is evaluated against, and the receive
-    // quota this side holds is a different budget entirely: adding it would put unrelated bytes in
-    // the numerator and unrelated capacity in the denominator, so a producer genuinely at its
-    // eighty percent spill point would read as roughly forty the moment one idle reader started.
-    // The spill manager's executor-shared quota is therefore the gauge's sole owner. What the
-    // consumer side holds is observable in its own right through the protocol's receive-quota
-    // accessors and through the backpressure-event counter.
+    // The consumer and producer draw from one executor-wide quota, but only the producer's retained
+    // bytes define the spill-threshold gauge: consumer payloads cannot be evicted by the producer's
+    // spill manager, so including them in that numerator would make the gauge claim a producer
+    // spill threshold had been crossed when no producer buffer was at that threshold. Aggregate
+    // usage remains observable through the protocol's quota accessors; this gauge keeps its
+    // narrower, actionable meaning.
 
     // Deduplicated before anything is claimed or opened, so that the credit split, the streams
     // and the reduce input all describe the same set of producers.
@@ -583,6 +586,22 @@ private[spark] class StreamingShuffleReader[K, C](
           streamsLock.synchronized {
             registeredStreams.add(key)
           }
+        } else {
+          backpressure.reportBufferAllocationFailure(key)
+          val detail =
+            s"a consumer of partitions [$startPartition, $endPartition) could not reserve " +
+              s"${BackpressureProtocol.STREAM_LEDGER_BASE_BYTES} bytes of credit-ledger metadata"
+          val declared =
+            declareShuffleFallback(StreamingShuffleFallbackReason.MemoryPressure, detail)
+          throw new FetchFailedException(
+            null,
+            shuffleId,
+            UNKNOWN_MAP_ID,
+            location.mapIndex,
+            partitionId,
+            s"Streaming shuffle $shuffleId could not register the consumer stream for map " +
+              s"${location.mapId}, partition $partitionId within the executor-wide memory " +
+              s"budget. The shuffle fallback state is ${declared.condition}.")
         }
       }
     }
@@ -644,14 +663,16 @@ private[spark] class StreamingShuffleReader[K, C](
     resolved match {
       case Some(reply) =>
         validateRendezvous(reply)
+        val served = servedLocations(reply)
         if (debugEnabled) {
           // The completion count is reported alongside the producer count because together they are
           // the only honest answer to "did this read overlap its map stage": a reply in which every
           // declared map index has already streamed to completion is a read of retained output,
           // while any shortfall is a read that genuinely overlaps production.
           logDebug(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} resolved " +
-            log"${MDC(COUNT, reply.locations.size)} live producer(s) of " +
-            log"${MDC(NUM_TASKS, reply.numMaps)} declared map task(s) for partitions " +
+            log"${MDC(COUNT, served.size)} live producer(s) of the " +
+            log"${MDC(NUM_TASKS, expectedMapCount(reply))} map task(s) it reads, out of " +
+            log"${MDC(TOTAL, reply.numMaps)} the stage declared, for partitions " +
             log"[${MDC(PARTITION_ID, startPartition)}, ${MDC(VALUE, endPartition)}) after " +
             log"${MDC(MAX_ATTEMPTS, attempts + 1)} lookup attempt(s); the map stage had " +
             log"${MDC(STATUS, if (reply.mapStageComplete) "finished" else "not finished")} " +
@@ -659,23 +680,29 @@ private[spark] class StreamingShuffleReader[K, C](
             log"${MDC(REASON, if (reply.mapStageComplete) "retained output" else "output in " +
               "progress")}")
         }
-        reply.locations
+        served
       case None =>
         // The declaration is what makes this terminate. A fetch failure on its own resubmits the
         // reduce stage against a map stage the tracker still reports as available, so the next
         // attempt reaches this same unresolvable rendezvous and the one after that, until the
-        // stage-attempt limit aborts the job. Declaring the fallback has the coordinator withdraw
+        // stage-attempt limit aborts the job. Declaring the stand-down has the coordinator withdraw
         // the shuffle's streamed map output, so the scheduler resubmits the *map* stage and the
         // manager serves its new attempts from the sort-based delegate: one recomputation, then a
         // job that completes. This is also the terminus for a consumer that arrives after every
         // producer of its shuffle has been reaped for silence -- a producer whose task has ended
         // cannot be streamed from, however complete its output was, so the only correct answer is
         // to read a map stage recomputed onto the sort-based path.
-        val declared = declareShuffleFallback(StreamingShuffleFallbackReason.ConsumerTooSlow,
+        //
+        // Declared as the structural decline it is. There is no pipeline here to have been paced,
+        // so there is no throughput to have measured, and reporting sustained consumer slowness --
+        // as this once did -- would send an operator to tune a consumer that was never behind.
+        val declared = declareShuffleFallback(
+          StreamingShuffleStandDownCause.ProducerUnavailable,
           s"a consumer of partitions [$startPartition, $endPartition) could not resolve every " +
             s"producer after $attempts lookup attempt(s)")
         throw new FetchFailedException(null, shuffleId, UNKNOWN_MAP_ID, UNKNOWN_MAP_INDEX,
-          startPartition, unresolvedRendezvousMessage(lastReply, attempts, declared))
+          startPartition,
+          unresolvedRendezvousMessage(lastReply, attempts, declared.fallenBack))
     }
   }
 
@@ -700,13 +727,13 @@ private[spark] class StreamingShuffleReader[K, C](
     val known = fallbackPolicy.knownShuffleFallback(shuffleId)
     val state = known match {
       case Some(latched) => Some(latched)
-      case None if fallbackPolicy.hasTripped =>
-        val reason =
-          fallbackPolicy.trippedReason.getOrElse(StreamingShuffleFallbackReason.ConsumerTooSlow)
-        Some(declareShuffleFallback(reason,
+      // The condition the policy actually latched, never a stand-in for it: a trip always carries
+      // its reason, so a default here could only ever record a condition nobody observed.
+      case None => fallbackPolicy.trippedReason.map { reason =>
+        declareShuffleFallback(reason,
           s"a consumer of partitions [$startPartition, $endPartition) observed the condition " +
-            "on its own executor"))
-      case None => None
+            "on its own executor")
+      }
     }
     state.filter(_.fallenBack).foreach { latched =>
       val description = latched.condition
@@ -832,39 +859,83 @@ private[spark] class StreamingShuffleReader[K, C](
    * An unreachable coordinator therefore costs the extra recomputation the declaration would have
    * avoided, and never correctness.
    *
-   * The claim is taken through the policy so that concurrent readers and writers of one shuffle on
-   * one executor produce a single ask; when the claim is refused the verdict already cached is
-   * returned instead, which is the same answer the coordinator would have given.
+   * A verdict already cached by the policy is returned without another ask. Concurrent declarations
+   * that race before the cache is populated are safe because the coordinator latches the first
+   * verdict and returns that same state to every later declaration.
    *
-   * @param reason which of the four documented conditions is being declared
+   * @param cause what is being declared -- one of the four documented fallback conditions, or a
+   *              structural decline the streaming protocol cannot serve
    * @param detail operator-facing context recorded alongside the verdict
    * @return the verdict in force after the declaration, empty when it could not be made
    */
   private def declareShuffleFallback(
-      reason: StreamingShuffleFallbackReason,
+      cause: StreamingShuffleStandDownCause,
       detail: String): StreamingShuffleFallbackState = {
     fallbackPolicy.knownShuffleFallback(shuffleId) match {
       case Some(latched) => latched
       case None =>
         val declared = try {
           coordinatorRef.askSync[Any](DeclareStreamingShuffleFallback(
-            shuffleId, capabilityToken, reason.toString, detail), coordinatorTimeout) match {
+            shuffleId, capabilityToken, cause.toString, detail), coordinatorTimeout) match {
             case state: StreamingShuffleFallbackState => state
             case other =>
               logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} received " +
-                log"${MDC(VALUE, describe(other))} for a fallback declaration; treating the " +
+                log"${MDC(VALUE, describe(other))} for a stand-down declaration; treating the " +
                 log"shuffle as still streaming and relying on the fetch failure alone")
               StreamingShuffleFallbackState()
           }
         } catch {
           case NonFatal(e) =>
             logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} could not declare " +
-              log"a fallback for ${MDC(REASON, reason.description)}; the reduce side still " +
+              log"a fallback for ${MDC(REASON, cause.description)}; the reduce side still " +
               log"recovers through its fetch failure", e)
             StreamingShuffleFallbackState()
         }
         fallbackPolicy.observeShuffleFallback(shuffleId, declared)
         declared
+    }
+  }
+
+  /**
+   * Asks the driver to withdraw this shuffle's streamed map output so that its map stage is
+   * recomputed, and reports whether the withdrawal was '''confirmed'''.
+   *
+   * The recovery for a rendezvous that cannot be resolved, and the reason it needs an ask at all is
+   * that a fetch failure cannot express it: this consumer resolved no producer, so it has no map
+   * index and no block-manager address to blame, and a fetch failure that blames nothing leaves the
+   * map stage registered as available. Withdrawing the streamed output is what makes the scheduler
+   * resubmit the map stage rather than the reduce stage alone.
+   *
+   * It declares no fallback condition. An unreachable producer is the specified producer-failure
+   * flow -- invalidate, recompute, retry -- and not one of the four degradation conditions,
+   * so the recomputed map stage streams again rather than being pushed onto the sort-based path.
+   *
+   * Failure is absorbed and '''reported''', never assumed away: the fetch failure is raised either
+   * way, because a consumer that cannot read its input must not return a short answer, but the
+   * message states whether a recomputation was actually arranged so that an operator reading it is
+   * not told a recovery happened when it did not.
+   *
+   * @param detail free text describing what could not be resolved
+   * @return true when the driver confirmed that no streamed map output of this shuffle remains
+   */
+  private def withdrawStreamedMapOutput(detail: String): Boolean = {
+    try {
+      coordinatorRef.askSync[Any](
+        InvalidateStreamingShuffleMapOutput(shuffleId, capabilityToken, detail),
+        coordinatorTimeout) match {
+        case withdrawn: java.lang.Boolean => withdrawn.booleanValue()
+        case other =>
+          logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} received " +
+            log"${MDC(VALUE, describe(other))} for a streamed map output invalidation; the " +
+            log"recomputation cannot be treated as arranged")
+          false
+      }
+    } catch {
+      case NonFatal(e) =>
+        logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} could not have its " +
+          log"streamed map output withdrawn, so the reduce side recovers only through its own " +
+          log"fetch failure", e)
+        false
     }
   }
 
@@ -889,10 +960,91 @@ private[spark] class StreamingShuffleReader[K, C](
    * A stage that declared no map tasks is accounted for by definition, which is precisely the
    * legitimately-empty case, and a stage that has stood streaming down never reaches here because
    * [[checkShuffleFallback]] has already failed the fetch.
+   *
+   * Readiness is judged over the map indexes '''this''' consumer asked for rather than over the
+   * whole stage, because those are the only ones it will read. For the whole-stage request the
+   * trait's five-argument `getReader` makes -- `[0, Int.MaxValue)` -- the two are the same
+   * question; for the narrowed range adaptive execution produces they are not, and requiring the
+   * whole stage would make a narrowed read wait for producers whose output it is not entitled to
+   * and then fail when they never arrive.
    */
   private def rendezvousSatisfied(reply: StreamingShuffleProducerLocations): Boolean = {
-    reply.locations.map(_.mapIndex).toSet.size >= reply.numMaps
+    servedLocations(reply).map(_.mapIndex).toSet.size >= expectedMapCount(reply)
   }
+
+  /**
+   * The producers of this read's own map range, out of everything the coordinator named.
+   *
+   * <b>Why the range can be honoured at all.</b> A producer registration carries the map INDEX
+   * beside the map id -- the index is the logical identity every attempt of a map task shares and
+   * the one `MapOutputTracker` removes an output by -- so "map indexes 3 to 7" is answerable by
+   * selecting registrations, with no index mapping to invent and no coordinator change to make. The
+   * whole-range case is not special-cased: `[0, Int.MaxValue)` selects everything, which is exactly
+   * what the five-argument overload asks for.
+   *
+   * <b>Why filtering rather than declining.</b> The seven-argument `getReader` is part of the
+   * service-provider contract, and adaptive execution narrows a map range whenever it coalesces
+   * or splits a stage. Declining stood the whole shuffle down for an ordinary, correct request, and
+   * recorded the decline as a protocol-version mismatch -- a compatibility failure that had not
+   * happened -- so every adaptive plan lost the fast path and its operator was pointed at the wrong
+   * cause. Serving the request is both simpler and truthful.
+   */
+  private def servedLocations(
+      reply: StreamingShuffleProducerLocations): Seq[StreamingShuffleProducerLocation] = {
+    if (servesFullMapRange(startMapIndex, endMapIndex)) {
+      reply.locations
+    } else {
+      reply.locations.filter(location =>
+        location.mapIndex >= startMapIndex && location.mapIndex < endMapIndex)
+    }
+  }
+
+  /**
+   * The map indexes this read would select from one coordinator reply, in ascending order.
+   *
+   * Published so that the range filtering can be asserted where it is decided, against the very
+   * production predicate a live read uses, rather than inferred from which reader class a manager
+   * returned.
+   *
+   * @param reply a coordinator reply to select from
+   * @return the map indexes this read is entitled to, ascending
+   */
+  private[streaming] def servedMapIndexesOf(
+      reply: StreamingShuffleProducerLocations): Seq[Int] = {
+    servedLocations(reply).map(_.mapIndex).distinct.sorted
+  }
+
+  /**
+   * Map outputs this read must be able to resolve before it may begin.
+   *
+   * The declared cardinality intersected with the requested range, so a narrowed read waits for its
+   * own producers and not for the stage's. Clamped at both ends and never negative: a range wholly
+   * beyond the declared count expects nothing, which is the legitimately-empty case a stage with no
+   * map tasks also produces.
+   */
+  private def expectedMapCount(reply: StreamingShuffleProducerLocations): Int = {
+    val first = math.max(0, startMapIndex)
+    val last = math.min(reply.numMaps, math.max(endMapIndex, 0))
+    math.max(0, last - first)
+  }
+
+  /**
+   * The map indexes this consumer must be able to reach a producer for.
+   *
+   * The requested window intersected with the stage the coordinator declared. The intersection is
+   * what makes both ends safe: `Int.MaxValue` as the upper bound is the whole stage rather than two
+   * billion indexes to check, and a window that runs past the declared cardinality asks only for
+   * the outputs that exist.
+   *
+   * @param numMaps map outputs the shuffle declared
+   * @return the indexes that must be resolvable, empty for a stage that declared no map tasks
+   */
+  private def requiredMapIndexes(numMaps: Int): Range =
+    math.max(0, startMapIndex) until math.min(endMapIndex, math.max(0, numMaps))
+
+  /** Whether a resolved producer belongs to the map-index window this consumer asked for. */
+  private def inRequestedMapRange(location: StreamingShuffleProducerLocation): Boolean =
+    location.mapIndex >= startMapIndex && location.mapIndex < endMapIndex
 
   /**
    * Fails the fetch when the shuffle has stood streaming down for every participant.
@@ -913,7 +1065,7 @@ private[spark] class StreamingShuffleReader[K, C](
   private def checkShuffleFallback(reply: StreamingShuffleProducerLocations): Unit = {
     if (reply.fallback.fallenBack) {
       val fallback = reply.fallback
-      val description = fallback.reason.map(_.description).getOrElse(fallback.reasonName)
+      val description = fallback.cause.map(_.description).getOrElse(fallback.reasonName)
       // Cached before the fetch is failed, so a producer of this shuffle running on this executor
       // stands down on its next block boundary rather than waiting to be declined by the driver.
       fallbackPolicy.observeShuffleFallback(shuffleId, fallback)
@@ -936,11 +1088,11 @@ private[spark] class StreamingShuffleReader[K, C](
   private def unresolvedRendezvousMessage(
       lastReply: Option[StreamingShuffleProducerLocations],
       attempts: Int,
-      declared: StreamingShuffleFallbackState): String = {
+      recomputed: Boolean): String = {
     val spanMs = attempts * COORDINATOR_LOOKUP_INTERVAL_MS
     val observed = lastReply match {
       case Some(reply) =>
-        val located = reply.locations.map(_.mapIndex).toSet.size
+        val located = servedLocations(reply).map(_.mapIndex).toSet.size
         // Whether more output was still expected is what separates the two diagnoses that share
         // this message: a rendezvous that ran out of attempts while producers were still arriving
         // is a pacing problem, whereas one that ran out after the stage had finished or stood down
@@ -950,18 +1102,18 @@ private[spark] class StreamingShuffleReader[K, C](
         } else {
           "no further map output was expected at that point"
         }
-        s"the coordinator last named a live producer for $located of ${reply.numMaps} declared " +
-          s"map task(s), ${reply.completedMapIndexes.size} of which had streamed to completion, " +
-          s"at epoch ${reply.coordinatorEpoch}, and $outlook"
+        s"the coordinator last named a live producer for $located of the " +
+          s"${expectedMapCount(reply)} map task(s) this read covers, out of ${reply.numMaps} the " +
+          s"stage declared, ${reply.completedMapIndexes.size} of which had streamed to " +
+          s"completion, at epoch ${reply.coordinatorEpoch}, and $outlook"
       case None => "the shuffle had no registration at all"
     }
-    val recovery = if (declared.fallenBack) {
-      s"The shuffle has stood streaming down at epoch ${declared.declaredAtEpoch}, so its " +
-        "streamed map output has been withdrawn and the upstream stage is recomputed on the " +
-        "sort-based shuffle path."
+    val recovery = if (recomputed) {
+      "Its streamed map output has been withdrawn, so the upstream stage is recomputed and this " +
+        "read is served from the recomputed output."
     } else {
-      "Recomputing the upstream stage is the recovery, because map output that never " +
-        "registered a producer cannot be streamed from."
+      "Its streamed map output could NOT be withdrawn, so the recomputation of the upstream " +
+        "stage is not confirmed and this read recovers only through the fetch failure itself."
     }
     s"Streaming shuffle $shuffleId could not resolve every producer of partitions " +
       s"[$startPartition, $endPartition) after $attempts lookup attempt(s) spanning $spanMs ms: " +
@@ -1046,7 +1198,8 @@ private[spark] class StreamingShuffleReader[K, C](
       // recovers this reduce attempt, and only the withdrawal of the streamed map output makes the
       // recomputation land on the sort-based path instead of on producers that would announce the
       // very same version again.
-      declareShuffleFallback(StreamingShuffleFallbackReason.ProtocolVersionMismatch,
+      declareShuffleFallback(
+        StreamingShuffleFallbackReason.ProtocolVersionMismatch,
         s"producers announced protocol version ${reply.protocolVersion} but this build speaks " +
           s"${StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION}")
       throw new FetchFailedException(null, shuffleId, UNKNOWN_MAP_ID, UNKNOWN_MAP_INDEX,
@@ -1059,13 +1212,17 @@ private[spark] class StreamingShuffleReader[K, C](
       logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} producers registered " +
         log"${MDC(NUM_PARTITIONS, reply.numPartitions)} partition(s) but this consumer holds a " +
         log"handle for ${MDC(COUNT, handle.numPartitions)}; the streams cannot be reconciled")
-      // A partition-count disagreement is a compatibility failure between the two ends of one
-      // shuffle, detected by an explicit check rather than inferred from a parse error, which is
-      // precisely what the documented version-mismatch condition covers. Declaring it under that
-      // reason keeps the set of four trip conditions closed -- a fifth would be a fifth way for
-      // streaming to be unavailable -- while still standing the shuffle down for every
-      // participant, which is the only outcome that makes the recomputation reconcilable.
-      declareShuffleFallback(StreamingShuffleFallbackReason.ProtocolVersionMismatch,
+      // A partition-count disagreement, detected by an explicit check rather than inferred from a
+      // parse error, means the two ends of the shuffle do not agree about how many partitions it
+      // has, so no partition range this consumer could name is servable from those producers. That
+      // is StreamingShuffleStandDownCause.UnsupportedReadShape and not the version-mismatch
+      // condition: the wire revision the two ends speak is identical, and reporting a disagreement
+      // about partitioning as a disagreement about the protocol would send an operator to look for
+      // a rolling upgrade that is not happening. The stand-down itself is unchanged, because
+      // standing the shuffle down for every participant is the only outcome that makes the
+      // recomputation reconcilable.
+      declareShuffleFallback(
+        StreamingShuffleStandDownCause.UnsupportedReadShape,
         s"producers registered ${reply.numPartitions} partition(s) but a consumer holds a handle " +
           s"for ${handle.numPartitions}")
       throw new FetchFailedException(null, shuffleId, UNKNOWN_MAP_ID, UNKNOWN_MAP_INDEX,
@@ -1636,6 +1793,11 @@ private[spark] class StreamingShuffleReader[K, C](
      * blocks.
      */
     def openRecords(partitionId: Int, payload: InputStream): Iterator[(Any, Any)] = {
+      if (!handler.authenticatedTransportBound) {
+        throw new SecurityException(
+          s"Streaming shuffle $shuffleId map ${location.mapId} partition $partitionId refuses " +
+            "deserialization because its producer channel did not complete Spark authentication.")
+      }
       val blockId = ShuffleBlockId(shuffleId, location.mapId, partitionId)
       val wrapped = serializerManager.wrapStream(blockId, payload)
       val deserializationStream = serializerInstance.deserializeStream(wrapped)
@@ -1697,18 +1859,15 @@ private[spark] class StreamingShuffleReader[K, C](
      */
     private def checkFallbackWhileReading(partitionId: Int): Unit = {
       val latched = fallbackPolicy.knownShuffleFallback(shuffleId).orElse {
-        if (fallbackPolicy.hasTripped) {
-          val reason =
-            fallbackPolicy.trippedReason.getOrElse(StreamingShuffleFallbackReason.ConsumerTooSlow)
-          Some(declareShuffleFallback(reason,
+        // The latched reason and nothing substituted for it, exactly as at rendezvous.
+        fallbackPolicy.trippedReason.map { reason =>
+          declareShuffleFallback(reason,
             s"a consumer reading partition $partitionId observed the condition on its own " +
-              "executor while streaming"))
-        } else {
-          None
+              "executor while streaming")
         }
       }
       latched.filter(_.fallenBack).foreach { state =>
-        val description = state.reason.map(_.description).getOrElse(state.reasonName)
+        val description = state.cause.map(_.description).getOrElse(state.reasonName)
         // StaleEpoch, because that is what a fallback makes of every generation registered before
         // it: the coordinator has advanced the shuffle past the epoch this producer belongs to and
         // retired it, so the invalidation being reported is the epoch and not a fault of the
@@ -2293,7 +2452,8 @@ private[spark] class StreamingShuffleReader[K, C](
           // recompute the upstream stage into producers that announce it again. Latching the trip
           // locally governs only this executor, and the log line below would otherwise be claiming
           // a fallback that no other participant had been told about.
-          declareShuffleFallback(StreamingShuffleFallbackReason.ProtocolVersionMismatch,
+          declareShuffleFallback(
+            StreamingShuffleFallbackReason.ProtocolVersionMismatch,
             s"a producer streamed protocol version $version but this build speaks " +
               s"${StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION}")
           logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} saw protocol version " +
@@ -2663,17 +2823,34 @@ private[spark] object StreamingShuffleReader {
   val UNSIGNED_BYTE_MASK: Int = 0xFF
 
   /**
-   * Whether a map range can be served by streaming.
+   * Whether a map range is one streaming can serve, which is any well-formed window.
    *
-   * A live producer location names a map id and a task attempt id, but not a map index, so a
-   * narrowed range -- as adaptive execution produces when it coalesces or splits -- cannot be
-   * honoured without inventing an index mapping that the coordinator does not have. Streaming
-   * therefore serves whole ranges only, and the manager delegates anything narrower to the
-   * sort-based reader, which is a fallback and not a failure.
+   * A narrowed range -- what adaptive execution produces when it coalesces or splits a stage -- is
+   * served exactly as a whole one is, because a producer registration carries the map '''index'''
+   * it produced alongside its map id, so the window a consumer asks for is resolved by selecting
+   * the producers whose index falls inside it. Only a malformed window is refused.
    *
    * @param startMapIndex first map index requested, inclusive
    * @param endMapIndex map index one past the last requested
-   * @return true when the request covers every map output of the shuffle
+   * @return true when the window is well formed
+   */
+  def servesMapRange(startMapIndex: Int, endMapIndex: Int): Boolean = {
+    startMapIndex >= 0 && endMapIndex >= startMapIndex
+  }
+
+  /**
+   * Whether a map range covers every map output of its shuffle.
+   *
+   * Both ranges are served by streaming; this predicate exists because the two are handled
+   * differently in two narrow places. A whole range is what the five-argument `getReader` overload
+   * passes and what an ordinary reduce task reads, so the coordinator's reply needs no filtering at
+   * all; a narrowed range is filtered to the requested window. Knowing which one a read is also
+   * makes an unresolvable rendezvous interpretable: "no producer for map index 4" means something
+   * different when map index 4 was the only one asked for.
+   *
+   * @param startMapIndex first map index requested, inclusive
+   * @param endMapIndex map index one past the last requested
+   * @return true when the window covers every map output the shuffle can have
    */
   def servesFullMapRange(startMapIndex: Int, endMapIndex: Int): Boolean = {
     startMapIndex == 0 && endMapIndex == Int.MaxValue
@@ -2835,25 +3012,34 @@ private[spark] class NettyStreamingShuffleProducerConnector(
     clock: Clock = new SystemClock)
   extends RpcHandler with StreamingShuffleProducerConnector with Logging {
 
+  /**
+   * Security material used by both transport configuration and client bootstraps.
+   *
+   * A running executor always supplies SparkEnv's manager. A directly constructed connector, as in
+   * the ownership-race tests, builds the equivalent manager from its immutable configuration rather
+   * than weakening the channel to an empty bootstrap list.
+   */
+  private val securityManager: SecurityManager =
+    Option(SparkEnv.get).map(_.securityManager).getOrElse(new SecurityManager(conf))
+
   private val transportConf: TransportConf =
-    StreamingShuffleServerHandler.streamingTransportConf(conf)
+    StreamingShuffleServerHandler.streamingTransportConf(conf, security = Some(securityManager))
 
   private val transportContext: TransportContext = new TransportContext(transportConf, this)
 
   /**
    * The bootstraps every channel this connector opens completes before a frame is exchanged.
    *
-   * Empty only when the application itself has authentication disabled. When it is enabled this
-   * carries the platform's own auth handshake, which is what makes the channel's identity the
-   * capability that admits a consumer to a producer's output. It matters more here than it does for
-   * a block fetch: a streaming frame's payload goes straight into Spark's deserialization, and the
-   * per-block CRC32C detects corruption rather than forgery, so the channel is the only place the
-   * question "may this peer send me bytes to deserialize" can be answered. `createClientFactory`
-   * runs them synchronously on the connecting thread, so a client is handed back already
-   * authenticated -- there is no window in which an unauthenticated channel could deliver anything.
+   * This always carries the platform's own auth handshake; construction fails when the application
+   * has authentication disabled. It matters more here than it does for a block fetch: a streaming
+   * frame's payload goes straight into Spark's deserialization, and the per-block CRC32C detects
+   * corruption rather than forgery, so the channel is the only place the question "may this peer
+   * send me bytes to deserialize" can be answered. `createClientFactory` runs the bootstraps
+   * synchronously on the connecting thread, so a client is handed back already authenticated.
    */
   private val clientBootstraps: java.util.List[TransportClientBootstrap] =
-    StreamingShuffleServerHandler.streamingClientBootstraps(conf, transportConf)
+    StreamingShuffleServerHandler.streamingClientBootstraps(
+      conf, transportConf, Some(securityManager))
 
   private val clientFactory: TransportClientFactory =
     transportContext.createClientFactory(clientBootstraps)
@@ -2895,6 +3081,18 @@ private[spark] class NettyStreamingShuffleProducerConnector(
    * map holds only channels a further handler could actually join.
    */
   private val shareable = new ConcurrentHashMap[String, ChannelShare]()
+
+  /**
+   * The same shares, keyed by channel identity rather than by endpoint.
+   *
+   * Two lookups are needed because the two questions are different. A handler about to connect asks
+   * "does this consumer already hold a channel to that executor", which is an endpoint question; a
+   * handler releasing itself, or a transport callback reporting a loss, asks "which share owns this
+   * channel", which is a channel question. Answering the second by scanning the first was what made
+   * the release path identity-based and therefore unable to be value-qualified; keying it makes the
+   * withdrawal exact and constant-time.
+   */
+  private val sharesByChannel = new ConcurrentHashMap[String, ChannelShare]()
 
   /**
    * The claim on the connection currently being created on this thread.
@@ -2975,6 +3173,12 @@ private[spark] class NettyStreamingShuffleProducerConnector(
   /** Channels that were still open when the shutdown deadline passed. Zero until [[close]] runs. */
   private val unreleasedChannelCount = new AtomicInteger(0)
 
+  /** Whether the transport event-loop termination future completed during [[close]]. */
+  private val transportTerminatedOnClose = new AtomicBoolean(false)
+
+  /** Client-factory event-loop group retained after its last channel leaves the registries. */
+  private val transportEventLoopGroup = new AtomicReference[EventLoopGroup]()
+
   private val debugEnabled: Boolean = conf.get(config.SHUFFLE_STREAMING_DEBUG)
 
   private val closed = new AtomicBoolean(false)
@@ -3050,17 +3254,31 @@ private[spark] class NettyStreamingShuffleProducerConnector(
       } else if (!share.client.isActive() || closed.get()) {
         // A dead channel must not be handed to a handler that would then wait out its whole
         // connection timeout on it. Withdrawn conditionally, so a concurrent replacement survives.
+        // The claim count is deliberately left alone: the channel's participants still own its
+        // release, and whichever of them takes the count to zero performs it.
         shareable.remove(key, share)
-      } else if (share.join()) {
-        val channelKey = channelKeyOf(share.client)
-        val participants = handlers.get(channelKey)
-        if (participants == null) {
-          // The channel is being released or has already been forgotten. Give the claim straight
-          // back and look again: leaving it taken would keep the socket alive with no participant.
-          share.leave()
+      } else if (reserveShare(share)) {
+        // The claim is held from here on, and it is what makes everything below safe: a concurrent
+        // release cannot take the count to zero while this claim stands, so the participant set and
+        // the receive window this handler is about to be bound to cannot be withdrawn underneath
+        // it.
+        share.participants.add(handler)
+        if (!share.client.isActive() || closed.get()) {
+          // The channel died inside the join. Give the participation and the claim straight back
+          // and look again rather than announcing a subscription on a socket that cannot deliver:
+          // the handler has not been told anything yet, so nothing is lost by opening a fresh
+          // channel. The endpoint entry is withdrawn so the next pass does not find it again, and
+          // the claim goes back through the same transition every other release uses -- so if this
+          // handler was the last participant, the dead socket is released here rather than left
+          // registered.
+          share.participants.remove(handler)
           shareable.remove(key, share)
+          releaseClaim(share)
         } else {
-          participants.add(handler)
+          // The channel's window, not this handler's own: a socket carrying several producers is
+          // closed while ANY of them is throttled and reopened only when none is, so a joiner has
+          // to adopt the shared gate before it can be given a reason to throttle.
+          handler.joinReadGate(share.readGate)
           // Announced on this thread, exactly as a freshly created channel's subscription is, so
           // the in-progress request for this producer is issued once the handler is reachable. The
           // producer treats a repeat announcement as a no-op.
@@ -3070,15 +3288,35 @@ private[spark] class NettyStreamingShuffleProducerConnector(
             logDebug(log"Streaming shuffle ${MDC(SHUFFLE_ID, handler.shuffleId)} joined map " +
               log"${MDC(MAP_ID, handler.mapId)} to the channel this consumer already holds to " +
               log"${MDC(HOST_PORT, location.hostPort)}, now carrying " +
-              log"${MDC(COUNT, participants.size)} producer(s)")
+              log"${MDC(COUNT, share.participants.size)} producer(s) on " +
+              log"${MDC(NUM_BLOCKS, share.claimCount)} claim(s)")
           }
           joined = Some(share.client)
           keepLooking = false
         }
+      } else {
+        // The share is sealed: its last participant has left, or it has been withdrawn as unusable.
+        // Withdraw the entry so the next pass finds nothing and a fresh channel is opened.
+        shareable.remove(key, share)
       }
     }
     joined
   }
+
+  /**
+   * Takes a place on a shared channel, as one step with whatever a subclass needs to observe.
+   *
+   * `protected` for the same reason [[createTransportClient]] is, and used the same way: the
+   * interval between reserving a place and publishing the handler into it is where a joining reduce
+   * task and a departing participant race, and an interval that cannot be held open cannot be
+   * proved safe. A test overrides this to stand inside it. Production never overrides it, so this
+   * costs one virtual call per joined producer -- of which there is one per map output a reduce
+   * task reads from one executor -- and nothing else.
+   *
+   * @param share the channel being joined
+   * @return true when a place was reserved and the caller may publish into the share
+   */
+  protected def reserveShare(share: ChannelShare): Boolean = share.join()
 
   /**
    * Opens a new channel for a handler and publishes it as this consumer's share for that endpoint.
@@ -3096,13 +3334,12 @@ private[spark] class NettyStreamingShuffleProducerConnector(
       claims.add(claim)
       try {
         val client = createTransportClient(location.host, location.port)
-        if (bind(client, handler, claim)) {
-          // Offered for this consumer's other producers on the same executor to join, and only once
-          // the binding has succeeded: publishing a share for a channel that was then declined
-          // would hand a further handler a socket nothing owns. The claim the share starts with
-          // belongs to the handler just bound, so the channel cannot be judged unreferenced before
-          // it is used.
-          shareable.put(shareKey(location, handler), new ChannelShare(client))
+        rememberTransportEventLoop(client)
+        // The share is published by the binding, and only once the binding has succeeded: a share
+        // for a channel that was then declined would hand a further handler a socket nothing owns.
+        // The claim it starts with belongs to the handler just bound, so the channel cannot be
+        // judged unreferenced between being published and being used.
+        if (bind(client, handler, claim, shareKey(location, handler)).isDefined) {
           // The transport raises channelActive from the pipeline before the client is returned,
           // which is earlier than the binding above on a channel that connected before this thread
           // resumed. Announcing here as well is idempotent -- the producer treats a repeat
@@ -3159,6 +3396,29 @@ private[spark] class NettyStreamingShuffleProducerConnector(
     clientFactory.createUnmanagedClient(host, port)
 
   /**
+   * Pauses inbound traffic on every live channel without closing it.
+   *
+   * Package-scoped for deterministic end-to-end fault injection. A real network partition leaves a
+   * socket open while delivering no bytes; disabling Netty auto-read has the same observable
+   * contract for the reader and therefore exercises its application-level connection timeout
+   * rather than the immediate channel-closed path. The pause is intentionally not remembered:
+   * failed-task cleanup closes these channels and a retry opens fresh channels in the normal state.
+   *
+   * @return the number of active channels that were paused
+   */
+  private[streaming] def pauseInboundTraffic(): Int = {
+    var paused = 0
+    clients.values().asScala.foreach { client =>
+      val channel = client.getChannel
+      if (channel != null && channel.isActive && channel.config().isAutoRead) {
+        channel.config().setAutoRead(false)
+        paused += 1
+      }
+    }
+    paused
+  }
+
+  /**
    * Releases the transport this connector owns, once, and does not return until it is released or a
    * bounded deadline has passed.
    *
@@ -3200,7 +3460,7 @@ private[spark] class NettyStreamingShuffleProducerConnector(
       // consumer rather than one handler. The channels themselves are closed and awaited below, so
       // each handler is released without touching its socket.
       handlers.values().asScala.foreach { participants =>
-        participants.drain().foreach { handler =>
+        participants.retire().foreach { handler =>
           try {
             handler.close(releaseChannel = false)
           } catch {
@@ -3211,15 +3471,21 @@ private[spark] class NettyStreamingShuffleProducerConnector(
         }
       }
       handlers.clear()
+      // Sealed before the maps are emptied, so a connecting thread that already holds a share
+      // cannot take a claim on a channel this method is about to close.
+      sharesByChannel.values().asScala.foreach(_.seal())
+      sharesByChannel.clear()
       shareable.clear()
+      sharesByChannel.values().asScala.foreach(_.retire())
+      sharesByChannel.clear()
       val channels = liveChannels()
-      val group = channels.flatMap(channel => Option(channel.eventLoop())
-        .flatMap(loop => Option(loop.parent()))).headOption
+      val group = Option(transportEventLoopGroup.get())
       val straggling = closeChannels(channels)
       clients.clear()
       clientFactory.close()
       transportContext.close()
       val terminated = awaitEventLoopTermination(group)
+      transportTerminatedOnClose.set(terminated)
       unreleasedChannelCount.set(straggling)
       if (straggling > 0 || !terminated) {
         logWarning(log"Streaming shuffle producer connector for module " +
@@ -3246,6 +3512,10 @@ private[spark] class NettyStreamingShuffleProducerConnector(
    * number of sockets left behind is what distinguishes one slow peer from a systematic leak.
    */
   def unreleasedChannels: Int = unreleasedChannelCount.get()
+
+  /** Whether this connector's transport event-loop group completed termination during close. */
+  private[streaming] def transportResourcesTerminated: Boolean =
+    transportTerminatedOnClose.get()
 
   /**
    * Received frames that arrived on a channel this connector could not route, since it was created.
@@ -3280,6 +3550,31 @@ private[spark] class NettyStreamingShuffleProducerConnector(
 
   /** Whether this connector still holds a registration for any channel. */
   def boundChannelCount: Int = handlers.size()
+
+  /**
+   * Retains the exact event-loop group this connector must await after its final channel is gone.
+   *
+   * The client factory owns one group for all channels it creates. Capturing it at creation time is
+   * essential: an orderly channel close removes the client from [[clients]], so reconstructing the
+   * group from the live-channel registry during shutdown would miss the resource precisely on the
+   * clean path.
+   */
+  private def rememberTransportEventLoop(client: TransportClient): Unit = {
+    Option(client.getChannel()).flatMap(channel => Option(channel.eventLoop()))
+      .flatMap(loop => Option(loop.parent())).foreach { group =>
+        val existing = transportEventLoopGroup.get()
+        val retained = if (existing == null) {
+          transportEventLoopGroup.compareAndSet(null, group)
+          transportEventLoopGroup.get()
+        } else {
+          existing
+        }
+        if (!(retained eq group)) {
+          throw new IllegalStateException(
+            "One streaming shuffle connector received channels from multiple event-loop groups.")
+        }
+      }
+  }
 
   /** The channels this connector still holds, snapshotted before the factory is closed. */
   private def liveChannels(): Seq[Channel] = {
@@ -3431,11 +3726,18 @@ private[spark] class NettyStreamingShuffleProducerConnector(
     // The share goes with the channel, so no further handler can be given a socket that has just
     // died and then wait out its whole connection timeout on it.
     forgetShare(client)
-    Option(handlers.remove(key)) match {
+    Option(handlers.get(key)) match {
       case Some(participants) =>
+        // Retired before it is unregistered, and in that order: retirement is what refuses a
+        // reservation another thread may be holding, so doing it first means no joiner can publish
+        // itself into a set this method is about to abandon. Everything already bound comes back
+        // from the retirement exactly once, which is what makes the fan-out below exhaustive
+        // without being repeatable.
+        val held = participants.retire()
+        handlers.remove(key, participants)
         // Every participant is told, because a lost channel is lost for all of them, and each has
         // to convert that loss into the fetch failure that recomputes its own map task.
-        participants.snapshot().foreach(_.channelInactive(client))
+        held.foreach(_.channelInactive(client))
       case None =>
         recordEarlyInactive(key)
         currentlyConnecting.foreach(_.channelInactive(client))
@@ -3526,9 +3828,22 @@ private[spark] class NettyStreamingShuffleProducerConnector(
       handler: StreamingShuffleClientHandler): String =
     s"${handler.consumerId}@${location.hostPort}"
 
-  /** Withdraws whichever share names this channel, so no further handler can join a dead socket. */
+  /**
+   * Withdraws the share of a channel that has gone, so no further handler can join a dead socket.
+   *
+   * The claim count is left alone rather than zeroed: the participants still own the channel's
+   * release, and the one that takes the count to zero finds the socket already closed and skips
+   * closing it again. A thread that had already taken this share out of the endpoint map can still
+   * claim it, which is harmless -- [[joinShare]] re-checks liveness after claiming and hands the
+   * claim straight back rather than announcing a subscription on a socket that cannot deliver.
+   *
+   * @param client the channel that has gone
+   */
   private def forgetShare(client: TransportClient): Unit = {
-    shareable.entrySet().removeIf(entry => entry.getValue.client.eq(client))
+    val share = sharesByChannel.remove(channelKeyOf(client))
+    if (share != null) {
+      shareable.remove(share.shareKey, share)
+    }
   }
 
   /**
@@ -3537,46 +3852,82 @@ private[spark] class NettyStreamingShuffleProducerConnector(
    * <b>Why the last participant closes and no earlier one may.</b> The channel carries every
    * producer this reduce task is reading from one executor, so a handler that closed the socket
    * when its own producer ended would cut off the producers the task had not finished with --
-   * turning an orderly end of one stream into a lost channel on all the others. The claim count is
-   * what makes "last" exact without a lock, and the share is withdrawn before the socket is closed
-   * so that no handler can join a channel that is on its way out.
+   * turning an orderly end of one stream into a lost channel on all the others.
    *
-   * Idempotent in both halves: a handler releases itself once, and a channel with no participants
-   * is closed once. Safe for a channel already gone, because it runs from a task-completion
-   * listener and therefore also runs after the failure that lost the channel in the first place.
+   * <b>Why "last" is the claim count and not an empty participant set.</b> Becoming empty and being
+   * withdrawn are two steps, and a joiner can arrive between them: the releasing thread saw an
+   * empty set, removed the registration and closed the socket, while a joining thread that had
+   * already taken the share added itself to that same set and was handed the channel being closed.
+   * [[ChannelShare.leave]] collapses the decision into one atomic transition -- it reports the move
+   * to zero to exactly one caller, and refuses every join from that moment -- so the caller that
+   * closes the socket provably has no joiner behind it. The participant set is still maintained,
+   * because routing needs it; it is simply not the authority on lifetime.
+   *
+   * Idempotent in both halves: a handler releases itself once, and a channel is closed once. Safe
+   * for a channel already gone, because it runs from a task-completion listener and therefore also
+   * runs after the failure that lost the channel in the first place.
    */
   override def release(
       handler: StreamingShuffleClientHandler,
       client: TransportClient): Unit = {
     val key = channelKeyOf(client)
-    val participants = handlers.get(key)
+    val share = sharesByChannel.get(key)
+    val participants = if (share != null) share.participants else handlers.get(key)
     val wasParticipant = participants != null && participants.remove(handler)
     // The handler is released whether or not it was still registered: a channel lost earlier
     // already removed the whole participant set, and the handler still holds receive quota that
-    // must come back. `close` is itself idempotent.
+    // must come back. `close` is itself idempotent, and it withdraws this handler's throttle from
+    // the channel's receive window so a departing handler cannot leave the socket wedged shut.
     handler.close(releaseChannel = false)
-    if (wasParticipant && participants.isEmpty) {
-      // Withdrawn first, so the interval between deciding to close and closing cannot be used to
-      // join. A conditional removal, so a share published for a replacement channel survives.
-      shareable.entrySet().removeIf(entry => entry.getValue.client.eq(client))
-      // Conditional, so a handler that joined between the emptiness test and here keeps its
-      // channel.
-      if (handlers.remove(key, participants)) {
-        clients.remove(key)
-        if (client.isActive()) {
-          client.close()
-        }
-        if (debugEnabled) {
-          logDebug(log"Streaming shuffle released the consumer channel to " +
-            log"${MDC(HOST_PORT, String.valueOf(client.getSocketAddress()))} after its last " +
-            log"producer finished")
-        }
-      }
+    if (wasParticipant && share != null) {
+      releaseClaim(share)
     }
+  }
+
+  /**
+   * Whether this connector still holds a joinable share for one channel. Exposed for assertions.
+   *
+   * @param client the channel to ask about
+   * @return true when a further handler of the same consumer could still join it
+   */
+  private[streaming] def isShareJoinable(client: TransportClient): Boolean = {
+    val share = sharesByChannel.get(channelKeyOf(client))
+    share != null && share.isJoinable
+  }
+
+  /**
+   * How many claims stand on one channel, which is how many participants must leave before it is
+   * released. Exposed for assertions.
+   *
+   * @param client the channel to ask about
+   * @return the outstanding claim count, or zero when this connector holds no share for it
+   */
+  private[streaming] def channelClaimCount(client: TransportClient): Int = {
+    val share = sharesByChannel.get(channelKeyOf(client))
+    if (share == null) 0 else share.claimCount
   }
 
   /** Handlers joined to a channel this consumer already held, since this connector was created. */
   private[streaming] def sharedJoinCount: Long = sharedJoins.get()
+
+  /**
+   * Stable snapshot of the live consumer routes and the real transport clients carrying them.
+   *
+   * Used by package-local integration tests to inject a fault into the same channel and handler a
+   * running reduce task owns. Returning a snapshot prevents test orchestration from mutating the
+   * connector's registries directly; ordinary lifecycle callbacks remain the only removal path.
+   */
+  private[streaming] def activeRoutes:
+      Seq[(StreamingShuffleClientHandler, TransportClient)] = {
+    handlers.entrySet().asScala.toSeq.flatMap { entry =>
+      val client = clients.get(entry.getKey)
+      if (client == null) {
+        Nil
+      } else {
+        entry.getValue.snapshot().map(handler => handler -> client)
+      }
+    }
+  }
 
   /**
    * Routes one received frame to the handler that owns the channel it arrived on.
@@ -3634,38 +3985,48 @@ private[spark] class NettyStreamingShuffleProducerConnector(
    * @param client the transport client the factory returned
    * @param handler the consumer handler that owns it
    * @param claim the claim registered before the client was created
-   * @return true when the channel is published and owned, false when it has been declined and
+   * @param sharePublishKey the key the channel's share is published under
+   * @return the published share when the channel is owned, `None` when it has been declined and
    * closed
    */
   private def bind(
       client: TransportClient,
       handler: StreamingShuffleClientHandler,
-      claim: ConnectionClaim): Boolean = {
+      claim: ConnectionClaim,
+      sharePublishKey: String): Option[ChannelShare] = {
     val key = channelKeyOf(client)
-    if (closed.get() || claim.isCancelled) {
+    if (StreamingShuffleServerHandler.authenticatedPrincipal(client).isEmpty) {
+      declineConnection(client, "the channel did not complete Spark authentication")
+      None
+    } else if (closed.get() || claim.isCancelled) {
       declineConnection(client, "the connector closed while the channel was being created")
-      false
+      None
     } else {
       // A participant set rather than a single handler, because further handlers of this same
       // consumer join this channel instead of opening one of their own. It is created holding this
       // handler and one claim, so the channel is never momentarily unreferenced between being
       // published and being used.
       val participants = new ChannelParticipants(handler)
+      // The channel's receive window is this handler's own to begin with, because a frame can reach
+      // the handler on this very thread before the share exists; every handler that joins later
+      // adopts the same gate, so the socket obeys the union of their intents rather than the last
+      // one to state an intent.
+      val share = new ChannelShare(
+        client, sharePublishKey, key, participants, handler.currentReadGate)
       handlers.put(key, participants)
       clients.put(key, client)
+      sharesByChannel.put(key, share)
       if (closed.get() || claim.isCancelled) {
-        handlers.remove(key)
-        clients.remove(key)
+        withdrawChannel(share)
         declineConnection(client, "the connector closed as the channel was being published")
-        false
+        None
       } else if (earlyInactiveChannels.remove(key)) {
         // The channel died before it could be published. It is withdrawn rather than left
         // registered -- there is nothing for a registration to route to -- and the handler is told,
         // which is what tells the reduce task the producer is gone instead of leaving it to a
         // timeout.
         earlyTerminalCallbacks.incrementAndGet()
-        handlers.remove(key)
-        clients.remove(key)
+        withdrawChannel(share)
         if (debugEnabled) {
           logDebug(log"A streaming shuffle channel to " +
             log"${MDC(HOST_PORT, String.valueOf(client.getSocketAddress()))} went inactive " +
@@ -3673,10 +4034,62 @@ private[spark] class NettyStreamingShuffleProducerConnector(
             log"connecting thread so the reduce task learns of the loss at once")
         }
         handler.channelInactive(client)
-        false
+        None
       } else {
-        true
+        shareable.put(sharePublishKey, share)
+        Some(share)
       }
+    }
+  }
+
+  /**
+   * Withdraws one channel from every registry that names it, without closing it.
+   *
+   * Used by the two paths that publish a channel and then discover they may not keep it. Sealing
+   * the share first is what stops a concurrent join from taking a claim on a channel whose
+   * registration is being torn down; the caller closes the socket itself, because only the caller
+   * knows whether the channel is being declined or merely forgotten.
+   *
+   * @param share the share to withdraw
+   */
+  private def withdrawChannel(share: ChannelShare): Unit = {
+    share.seal()
+    shareable.remove(share.shareKey, share)
+    handlers.remove(share.channelKey, share.participants)
+    clients.remove(share.channelKey)
+    sharesByChannel.remove(share.channelKey, share)
+  }
+
+  /**
+   * Gives one claim back and releases the channel when it was the last.
+   *
+   * The single place a channel's socket is released on the ordinary path, and the transition that
+   * decides it is [[ChannelShare.leave]]: exactly one caller is told it took the count to zero, and
+   * from that moment no join can succeed, so the release cannot race a joiner. Everything the
+   * channel was registered under is withdrawn before the socket is closed, and each removal is
+   * value-qualified so that a replacement channel registered under the same key survives.
+   *
+   * @param share the share whose claim is being given back
+   * @return true when this call released the channel
+   */
+  private def releaseClaim(share: ChannelShare): Boolean = {
+    if (share.leave()) {
+      shareable.remove(share.shareKey, share)
+      handlers.remove(share.channelKey, share.participants)
+      clients.remove(share.channelKey)
+      sharesByChannel.remove(share.channelKey, share)
+      val client = share.client
+      if (client.isActive()) {
+        client.close()
+      }
+      if (debugEnabled) {
+        logDebug(log"Streaming shuffle released the consumer channel to " +
+          log"${MDC(HOST_PORT, String.valueOf(client.getSocketAddress()))} after its last " +
+          log"producer finished")
+      }
+      true
+    } else {
+      false
     }
   }
 
@@ -3743,44 +4156,85 @@ private[spark] class NettyStreamingShuffleProducerConnector(
    * linear scan would be defensible at that size, but the map is keyed so that routing cost does
    * not grow with shuffle width at all.
    *
+   * <b>Occupancy, and why it lives here rather than beside the set.</b> "Is this the last
+   * participant" and "is this set empty" are not the same question, and answering the first with
+   * the second is what strands a joiner. A handler reserves its place before it is published --
+   * there is a real interval, because the reservation must be taken before the channel
+   * can be handed out and the publication happens after -- so during that interval the channel is
+   * referenced by a participant the set does not yet contain. A release that read emptiness would
+   * see none, declare itself last, withdraw the share, unregister this set and close the socket,
+   * while the joining thread went on to publish itself into a set nothing routes through and
+   * announce a subscription on a channel that was already closed: a reduce task that then waits out
+   * its whole producer-liveness timeout and recomputes an upstream stage for nothing.
+   *
+   * The count and the set are therefore mutated under '''one''' monitor, and the transition to
+   * unreferenced is one-shot and irreversible. A reservation refuses once that transition has
+   * happened, so a joiner is either admitted -- in which case no concurrent release can reach zero,
+   * because this reservation is one of the references it counts -- or told to look elsewhere. There
+   * is no third outcome, and in particular no outcome in which both threads believe they own the
+   * channel.
+   *
    * @param initial the handler this channel was opened for, so the set is never momentarily empty
    */
-  private final class ChannelParticipants(initial: StreamingShuffleClientHandler) {
+  protected final class ChannelParticipants(initial: StreamingShuffleClientHandler) {
 
     private val byProducer = new ConcurrentHashMap[(Int, Long), StreamingShuffleClientHandler]()
 
+    /** Guards [[retired]] and every mutation of [[byProducer]]. */
+    private val lifecycle = new Object()
+
+    /** Whether the channel has been retired outright; one-shot and irreversible. */
+    private var retired: Boolean = false
+
     byProducer.put((initial.shuffleId, initial.mapId), initial)
 
-    /** Binds one more handler to this channel. */
-    def add(handler: StreamingShuffleClientHandler): Unit =
+    /**
+     * Binds one more handler so frames for its producer can be routed to it.
+     *
+     * <b>Why this does not decide anything about lifetime.</b> The channel is released by the
+     * participant that takes [[ChannelShare]]'s claim count to zero, which is one atomic
+     * transition; a set that also counted references would be a second, unsynchronised answer to
+     * the same question. The caller has already taken a claim through [[reserveShare]] before it
+     * reaches here, so the channel provably outlives this binding.
+     */
+    def add(handler: StreamingShuffleClientHandler): Unit = lifecycle.synchronized {
       byProducer.put((handler.shuffleId, handler.mapId), handler)
+    }
 
     /**
-     * Unbinds one handler.
+     * Unbinds one handler, value-qualified so a handler already replaced by a later attempt of the
+     * same map task cannot unbind the one that replaced it.
      *
-     * Value-qualified, so a handler that has already been replaced by a later attempt of the same
-     * map task cannot unbind the one that replaced it.
-     *
-     * @return true when this call was the one that removed it
+     * @return true when this handler was still bound, which is what tells its caller to give the
+     *         corresponding claim back exactly once
      */
-    def remove(handler: StreamingShuffleClientHandler): Boolean =
+    def remove(handler: StreamingShuffleClientHandler): Boolean = lifecycle.synchronized {
       byProducer.remove((handler.shuffleId, handler.mapId), handler)
+    }
 
-    /** Whether no handler is bound to this channel any more. */
-    def isEmpty: Boolean = byProducer.isEmpty
+    /**
+     * Retires this channel outright and returns everything it held, for a lost channel and for the
+     * connector's own shutdown.
+     *
+     * Unconditional, because in both cases the channel is gone whatever the reference count says:
+     * what matters is that no reservation taken beforehand can publish itself afterwards, and that
+     * every handler already bound is handed back exactly once so its caller can tell it.
+     */
+    def retire(): Seq[StreamingShuffleClientHandler] = lifecycle.synchronized {
+      retired = true
+      val held = byProducer.values().asScala.toSeq
+      byProducer.clear()
+      held
+    }
+
+    /** Whether this channel has been retired outright. */
+    def isRetired: Boolean = lifecycle.synchronized(retired)
 
     /** How many handlers are bound to this channel. */
     def size: Int = byProducer.size()
 
     /** The handlers bound now, as a stable sequence a callback can be fanned out over. */
     def snapshot(): Seq[StreamingShuffleClientHandler] = byProducer.values().asScala.toSeq
-
-    /** Empties the set and returns what it held, for the connector's own shutdown. */
-    def drain(): Seq[StreamingShuffleClientHandler] = {
-      val held = snapshot()
-      byProducer.clear()
-      held
-    }
 
     /**
      * The handler a frame belongs to, by the producer its header names.
@@ -3807,38 +4261,122 @@ private[spark] class NettyStreamingShuffleProducerConnector(
   }
 
   /**
-   * One channel offered for further handlers of the same consumer to join, with the claims on it.
+   * One physical channel, everything bound to it, and the claim count that decides its lifetime.
    *
-   * The claim count is what makes "the last participant" exact without a lock, and it is separate
-   * from [[ChannelParticipants]] deliberately: a claim is taken before a handler is published and
-   * given back if publishing fails, so during that interval the channel is referenced by a claim
-   * that no participant set yet reflects. Without that, a concurrent release could observe an empty
-   * participant set and close a socket another thread was in the middle of joining.
+   * <b>Why the claim count and not the participant set.</b> A channel is released when its last
+   * participant has finished with it, and "last" has to be decided by a single atomic transition or
+   * it is not decided at all. Deciding it from the participant set could not be: a releasing thread
+   * observed the set empty, withdrew the share and closed the socket, while a joining thread that
+   * had already taken the share went on to add itself to that same set -- and got back a channel
+   * the releaser was closing. The set cannot answer the question because becoming empty and being
+   * withdrawn are two steps with a joinable interval between them.
+   *
+   * The claim count answers it in one step. A claim is taken by [[join]] and refused once the count
+   * has reached zero, and [[leave]] reports the transition to zero to exactly one caller -- so the
+   * caller that closes the socket is the caller that took the count to zero, and no join can
+   * succeed after that moment. The count starts at one, held by the handler the channel was opened
+   * for, so the channel is never momentarily unclaimed between being published and being used.
+   *
+   * The share also owns the participant set and the channel's receive window, which is what makes
+   * the transition atomic with respect to everything a joiner needs: a successful [[join]] hands
+   * back a channel whose participants and whose window are guaranteed to outlive the joiner's own
+   * claim.
    *
    * @param client the channel being shared
+   * @param shareKey the key this share is published under, so it can be withdrawn without a scan
+   * @param channelKey the identity of the channel, matching the routing registries
+   * @param participants the handlers bound to this channel
+   * @param readGate the receive window of this channel, shared by every participant
    */
-  private final class ChannelShare(val client: TransportClient) {
+  protected final class ChannelShare(
+      val client: TransportClient,
+      val shareKey: String,
+      val channelKey: String,
+      val participants: ChannelParticipants,
+      val readGate: StreamingShuffleChannelReadGate) {
 
-    private val claims = new AtomicInteger(1)
+    /** Outstanding claims on this channel. Guarded by this object's monitor. */
+    private var claims: Int = 1
+
+    /** Whether the share has been sealed, after which no further claim may be taken. */
+    private var sealedOff: Boolean = false
 
     /**
-     * Takes a claim, refusing once the channel is on its way out.
+     * Takes one claim, or refuses because this channel can no longer be joined.
      *
-     * @return true when the claim was taken
+     * Refusal is what makes the release safe: once the count has reached zero, or the share has
+     * been sealed for a channel known to be unusable, no joiner can be handed the socket the
+     * releasing thread is about to close.
+     *
+     * @return true when a claim was taken and the caller must give it back exactly once
      */
-    def join(): Boolean = {
-      var current = claims.get()
-      while (current > 0) {
-        if (claims.compareAndSet(current, current + 1)) {
-          return true
-        }
-        current = claims.get()
+    def join(): Boolean = synchronized {
+      if (sealedOff || claims <= 0) {
+        false
+      } else {
+        claims += 1
+        true
       }
-      false
     }
 
-    /** Gives a claim back. */
-    def leave(): Unit = claims.decrementAndGet()
+    /**
+     * Gives a claim back, and says whether it was the last one.
+     *
+     * The transition to zero is reported to exactly one caller, and it is permanent: [[join]]
+     * refuses from that point on, so the caller that observes `true` owns the release of the socket
+     * and cannot be racing a joiner. A count already at zero is left there rather than driven
+     * negative.
+     *
+     * @return true when this call took the claim count to zero and thereby sealed the share
+     */
+    def leave(): Boolean = synchronized {
+      if (claims <= 0) {
+        false
+      } else {
+        claims -= 1
+        if (claims == 0) {
+          sealedOff = true
+          true
+        } else {
+          false
+        }
+      }
+    }
+
+    /**
+     * Refuses every further join without waiting for the participants to leave.
+     *
+     * Used when the channel is known to be unusable -- it has gone inactive, or the connector is
+     * closing -- so that no further handler is handed a socket that cannot deliver anything. It
+     * does not release the participants: they release themselves, and whichever of them takes the
+     * count to zero still owns the socket's release.
+     *
+     * @return true when this call was the one that sealed the share
+     */
+    def seal(): Boolean = synchronized {
+      val wasJoinable = !sealedOff && claims > 0
+      claims = 0
+      sealedOff = true
+      wasJoinable
+    }
+
+    /**
+     * Seals the share and hands back everything the channel still carried.
+     *
+     * For a channel that is gone whatever the claim count says -- a lost socket, or the connector's
+     * own shutdown -- so that no claim taken beforehand can publish itself afterwards and every
+     * handler already bound is returned exactly once for its caller to finish.
+     */
+    def retire(): Seq[StreamingShuffleClientHandler] = {
+      seal()
+      participants.retire()
+    }
+
+    /** Whether this share can still be joined. */
+    def isJoinable: Boolean = synchronized(!sealedOff && claims > 0)
+
+    /** How many claims are outstanding on this channel. Exposed for assertions. */
+    def claimCount: Int = synchronized(math.max(0, claims))
   }
 
   /**

@@ -17,8 +17,12 @@
 
 package org.apache.spark.shuffle.streaming
 
-import java.util.concurrent.{ConcurrentHashMap, ConcurrentSkipListMap}
+import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
+import java.util.concurrent.{ArrayBlockingQueue, ConcurrentHashMap, ConcurrentSkipListMap,
+  RejectedExecutionException, ThreadPoolExecutor, TimeUnit}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong}
+import java.util.concurrent.locks.ReentrantLock
 
 import scala.collection.mutable
 import scala.jdk.CollectionConverters._
@@ -27,10 +31,10 @@ import org.apache.spark.SparkConf
 import org.apache.spark.internal.{config, Logging}
 import org.apache.spark.internal.LogKeys.{COUNT, MAX_ATTEMPTS, MAX_SIZE, NUM_BYTES, NUM_EVENTS,
   NUM_SKIPPED, PARTITION_ID, PERCENT, PROTOCOL_VERSION, REASON, SHUFFLE_ID, THRESHOLD, VERSION_NUM}
-import org.apache.spark.network.shuffle.protocol.streaming.{AckMessage, DataBlockMessage,
-  HeartbeatMessage, RetransmitRequestMessage, StreamingShuffleMessage,
-  StreamingShuffleMessageType, StreamTerminationMessage}
-import org.apache.spark.util.{Clock, SystemClock}
+import org.apache.spark.network.shuffle.protocol.streaming.{AckMessage, HeartbeatMessage,
+  RetransmitRequestMessage, StreamingShuffleMessage, StreamingShuffleMessageType,
+  StreamTerminationMessage}
+import org.apache.spark.util.{Clock, SystemClock, ThreadUtils}
 
 /**
  * The state a streaming shuffle stream, or the executor's whole streaming shuffle, is in as far as
@@ -165,6 +169,21 @@ private[spark] case class BackpressureStreamKey(
     partitionId: Int,
     consumerId: String) {
 
+  /**
+   * The identity this stream's heartbeats declare on the wire, or nothing when it declares none.
+   *
+   * Only the receiving end declares one. A consumer's heartbeat announces who is asking, because
+   * the producer keys the cursor that bounds replay -- what this consumer has acknowledged -- by
+   * that identity, and a cursor keyed by anything the connection supplies would be lost on the very
+   * reconnection the resume handshake exists to serve. A producer's heartbeat declares none,
+   * because a producer keeps no cursor on its peer and naming the consumer it happens to be serving
+   * would invite that consumer's identity to be adopted from a frame it never sent.
+   */
+  def consumerToken: Long = role match {
+    case BackpressureStreamRole.Consumer => BackpressureStreamKey.consumerTokenOf(consumerId)
+    case _ => HeartbeatMessage.NO_CONSUMER_TOKEN
+  }
+
   override def toString: String =
     s"$role stream for shuffle $shuffleId map $mapId attempt $taskAttemptId partition " +
       s"$partitionId consumer $consumerId"
@@ -211,6 +230,47 @@ private[spark] object BackpressureStreamKey {
    * accounting.
    */
   val ANY_CONSUMER: String = "*"
+
+  /**
+   * Reduces a consumer session identity to the fixed-width token a heartbeat declares.
+   *
+   * <b>Why a digest rather than the identity itself.</b> The identity is a string whose length the
+   * consumer chooses, and a frame carrying it would be the one frame on this protocol whose size a
+   * peer decides -- which is precisely the property every other bound in this subsystem exists to
+   * remove. A fixed-width field keeps a heartbeat's encoded length a constant, so a producer's
+   * framing budget stays a figure it computes rather than one it has to trust.
+   *
+   * <b>Why a cryptographic digest rather than a string hash.</b> The token is what a producer keys
+   * a replay cursor by, so two distinct consumer sessions colliding on one token would share that
+   * cursor -- and one of them would be resumed past output it had never received. A 32-bit hash,
+   * `String.hashCode` or any of its relatives, collides at a rate a large reduce side would
+   * actually reach; the leading eight bytes of SHA-256 do not. The cost is one digest per heartbeat
+   * interval per stream, which is ten seconds of wall clock for a few hundred nanoseconds of work.
+   *
+   * The result is positive: the message type refuses a negative token, and
+   * [[HeartbeatMessage.NO_CONSUMER_TOKEN]] is reserved for a heartbeat that declares no identity,
+   * so a digest landing on it is displaced by one rather than allowed to mean the opposite of
+   * itself.
+   *
+   * @param consumerId the consumer session identity, stable for the life of one reduce task attempt
+   * @return the token to declare, always positive
+   */
+  def consumerTokenOf(consumerId: String): Long = {
+    require(consumerId != null && consumerId.nonEmpty,
+      "The streaming shuffle consumer session id must not be empty.")
+    val digest = MessageDigest.getInstance("SHA-256")
+      .digest(consumerId.getBytes(StandardCharsets.UTF_8))
+    var accumulated = 0L
+    var index = 0
+    while (index < java.lang.Long.BYTES) {
+      accumulated = (accumulated << java.lang.Byte.SIZE) | (digest(index) & 0xffL)
+      index += 1
+    }
+    // The sign bit is cleared rather than the value shifted right, so all sixty three bits that
+    // remain still come from the digest.
+    val bounded = accumulated & Long.MaxValue
+    if (bounded == HeartbeatMessage.NO_CONSUMER_TOKEN) 1L else bounded
+  }
 
   /** A key for the sending end of a stream. */
   def forProducer(
@@ -324,17 +384,45 @@ private[spark] case class BackpressureShuffleDemand(
  *                     shuffle's share belongs to the shuffle. Must not be null
  * @param clock time source for every liveness and rate decision, so each timer trips at exactly
  *              its bound rather than at whatever wall time happens to be
+ * @param aggregateQuota the one executor-wide heap allowance shared by producer buffers, consumer
+ *                       payloads, queue and ledger metadata, and transient frame copies
  */
 private[spark] class BackpressureProtocol(
     conf: SparkConf,
     coordinator: StreamingShuffleCoordinator,
     egressBudget: TokenBucketRateLimiter.ExecutorEgressBudget,
-    clock: Clock = new SystemClock)
+    clock: Clock = new SystemClock,
+    aggregateQuotaOverride: MemorySpillManager.ExecutorBufferQuota = null)
   extends Logging {
 
   require(conf != null, "The Spark configuration must not be null.")
   require(egressBudget != null, "The streaming shuffle egress budget must not be null.")
   require(clock != null, "The streaming shuffle clock must not be null.")
+  private val aggregateQuota: MemorySpillManager.ExecutorBufferQuota =
+    Option(aggregateQuotaOverride).getOrElse(MemorySpillManager.executorQuota(conf))
+
+  /**
+   * Submits data-plane work to the executor-wide bounded worker stripes.
+   *
+   * The owner selects a stable stripe, so work belonging to one handler is processed in submission
+   * order while unrelated handlers may run in parallel. A refusal means the bounded queue is full;
+   * callers must fail closed or apply backpressure rather than running the work on the submitting
+   * Netty event loop.
+   */
+  def executeDataPlane(owner: AnyRef, task: Runnable): Boolean = {
+    require(owner != null, "The streaming shuffle data-plane owner must not be null.")
+    require(task != null, "The streaming shuffle data-plane task must not be null.")
+    BackpressureProtocol.executeDataPlane(owner, task)
+  }
+
+  /**
+   * Waits until the shared data-plane workers have no accepted task left to settle.
+   *
+   * Callers that require a lifecycle barrier first stop the transports that can submit new work.
+   * Intended for bounded lifecycle waits and deterministic tests, never for a Netty callback.
+   */
+  def awaitDataPlaneIdle(timeoutMs: Long): Boolean =
+    BackpressureProtocol.awaitDataPlaneIdle(timeoutMs)
 
   // Read once at construction and held immutably. The streaming shuffle has no dynamic
   // reconfiguration by design, so holding the value is what makes an executor restart the only way
@@ -383,39 +471,6 @@ private[spark] class BackpressureProtocol(
   // stalled either. The resolution is idempotent, so two threads racing to fill the same entry
   // both receive the one limiter the budget holds for that shuffle.
   private val shuffleLimiters = new ConcurrentHashMap[Int, TokenBucketRateLimiter]()
-
-  /**
-   * The one consumer-side receive budget of this executor, in bytes.
-   *
-   * <b>Why it lives here and not in the reader.</b> A reduce task's own budget cannot bound the
-   * executor: a reader that computed `bufferSizePercent` of executor memory for itself would be
-   * joined by every other reduce task in the same JVM, each computing the same figure, and by every
-   * partition and every producer each of those readers happened to be reading from -- so the
-   * aggregate would be the configured percentage multiplied by a number nobody chose. The budget
-   * therefore has to be owned by a component every consumer on the executor already shares, and
-   * this is that component: it is constructed once per executor, it is handed to every reader and
-   * every consumer handler, and it already aggregates buffer utilisation across concurrent shuffles
-   * for exactly the same reason.
-   *
-   * It is the *same* percentage of the *same* executor memory the producer side is bounded by, read
-   * from the same entry, so the two halves of a streaming shuffle are sized from one number instead
-   * of two that could drift. Floored at one maximum-size frame, because a budget that could not
-   * admit the largest legal block would refuse every block and make no progress at all.
-   */
-  private val receiveQuotaTotalBytes: Long = {
-    val percent = conf.get(config.SHUFFLE_STREAMING_BUFFER_SIZE_PERCENT).toLong
-    val executorMemoryMib = conf.get(config.EXECUTOR_MEMORY)
-    math.max(DataBlockMessage.MAX_ENCODED_FRAME_BYTES.toLong,
-      executorMemoryMib * TokenBucketRateLimiter.BYTES_PER_MIB /
-        BackpressureProtocol.PERCENT_SCALE * percent)
-  }
-
-  // Bytes of that budget currently held by consumers, summed over every reader, every producer
-  // channel and every partition on this executor. Advanced when a frame is admitted anywhere on the
-  // consumer side and retired when the reduce task that owns it acknowledges consumption, so the
-  // reading covers the whole interval during which the bytes are on the heap -- the handler's
-  // hand-off queue and the reader's decoded payload alike, which are one interval and not two.
-  private val reservedReceiveBytes = new AtomicLong(0L)
 
   // Reservations refused because the executor-wide budget was exhausted. Counted rather than logged
   // per occurrence: a refusal is a throttle rather than a fault, it is repaired by the replay the
@@ -509,19 +564,6 @@ private[spark] class BackpressureProtocol(
   private val egressWindow = new BackpressureProtocol.RateWindow(clock)
 
   private val ingressWindow = new BackpressureProtocol.RateWindow(clock)
-
-  /**
-   * The run of consecutive measurement intervals in which the link has read over capacity, and the
-   * interval the most recent of them was observed in.
-   *
-   * Two fields rather than one, because a run has both a length and an end: the length is what the
-   * sustained threshold is compared against, and the end is what distinguishes the next observation
-   * being a continuation of the run from it starting a new one. See [[recordSaturatedInterval]].
-   */
-  private val saturatedIntervals = new AtomicLong(0L)
-
-  private val lastSaturatedInterval =
-    new AtomicLong(BackpressureProtocol.NO_SATURATED_INTERVAL)
 
   /**
    * The link capacity the operator declared, in bytes per second, or zero when none was declared.
@@ -736,25 +778,58 @@ private[spark] class BackpressureProtocol(
    *
    * @param key identity of the stream, including producer generation and consumer session
    * @param creditLimitBytes bytes the producer may hold unacknowledged; must be positive
-   * @return true if a new ledger was opened, false if an existing one gained another owner
+   * @return true when this caller acquired an ownership claim, whether it opened or retained the
+   *         ledger; false when the aggregate metadata quota had no room for a new ledger
    */
   def registerStream(key: BackpressureStreamKey, creditLimitBytes: Long): Boolean = {
+    registerStreamInternal(key, creditLimitBytes, baseMetadataReserved = false)
+  }
+
+  /**
+   * Opens or retains a stream using one base-metadata charge the caller reserved in advance.
+   *
+   * The writer uses this after reserving one slot per declared partition before it consumes a
+   * record. A newly opened ledger adopts that slot; an existing ledger needs no second base charge,
+   * so the surplus slot is returned immediately.
+   */
+  private[streaming] def registerStreamWithReservedMetadata(
+      key: BackpressureStreamKey,
+      creditLimitBytes: Long): Boolean = {
+    registerStreamInternal(key, creditLimitBytes, baseMetadataReserved = true)
+  }
+
+  private def registerStreamInternal(
+      key: BackpressureStreamKey,
+      creditLimitBytes: Long,
+      baseMetadataReserved: Boolean): Boolean = {
     require(key != null, "The streaming shuffle stream key must not be null.")
     require(key.shuffleId >= 0, s"The shuffle id must be non-negative but was ${key.shuffleId}.")
     require(key.partitionId >= 0,
       s"The partition id must be non-negative but was ${key.partitionId}.")
     require(creditLimitBytes > 0L,
       s"The credit limit of $key must be positive but was $creditLimitBytes.")
-    // compute() decides and mutates in one indivisible step, so two threads registering the same
-    // stream concurrently cannot each conclude that they opened it.
+    // compute() serializes registration and unregistration of this key. An existing ledger gains an
+    // owner without another charge; a new one is published only after its base metadata has been
+    // reserved. A refusal therefore cannot leave an absent stream that later admissions fail open.
+    var claimed = false
     var opened = false
     streams.compute(key, (_, existing) => {
-      if (existing == null) {
-        opened = true
-        new BackpressureProtocol.StreamLedger(key, creditLimitBytes, clock.getTimeMillis())
-      } else {
+      if (existing != null) {
         existing.retain()
+        if (baseMetadataReserved) {
+          aggregateQuota.release(
+            BackpressureProtocol.STREAM_LEDGER_BASE_BYTES, MemorySpillManager.MetadataMemory)
+        }
+        claimed = true
         existing
+      } else if (baseMetadataReserved || aggregateQuota.tryReserve(
+          BackpressureProtocol.STREAM_LEDGER_BASE_BYTES, MemorySpillManager.MetadataMemory)) {
+        opened = true
+        claimed = true
+        new BackpressureProtocol.StreamLedger(
+          key, creditLimitBytes, clock.getTimeMillis(), aggregateQuota)
+      } else {
+        null
       }
     })
     if (opened && debugEnabled) {
@@ -763,7 +838,7 @@ private[spark] class BackpressureProtocol(
         log"${MDC(PARTITION_ID, key.partitionId)} with " +
         log"${MDC(NUM_BYTES, creditLimitBytes)} bytes of credit")
     }
-    opened
+    claimed
   }
 
   /**
@@ -788,8 +863,9 @@ private[spark] class BackpressureProtocol(
       streams.compute(key, (_, existing) => {
         if (existing == null) {
           null
-        } else if (existing.release()) {
+        } else if (existing.releaseOwner()) {
           closed = true
+          existing.close()
           null
         } else {
           existing
@@ -858,10 +934,13 @@ private[spark] class BackpressureProtocol(
     } else if (!limiterFor(key.shuffleId).tryAcquire(bytes)) {
       enterThrottled(ledger, BackpressureProtocol.THROTTLE_CAUSE_RATE)
       false
-    } else {
-      ledger.recordSent(sequenceNumber, bytes)
+    } else if (ledger.recordSent(sequenceNumber, bytes)) {
       recordEgress(bytes)
       true
+    } else {
+      limiterFor(key.shuffleId).refund(bytes)
+      enterThrottled(ledger, BackpressureProtocol.THROTTLE_CAUSE_MEMORY)
+      false
     }
   }
 
@@ -1194,21 +1273,19 @@ private[spark] class BackpressureProtocol(
   /**
    * Whether a retransmission request can be served in full.
    *
-   * A request names exactly one position, so the only question is whether that block is still
-   * retained -- that is, still inside the unacknowledged window. A consumer that has lost a run of
-   * blocks emits one request per position, and each is answered on its own merits; a request that
-   * cannot be served is refused rather than answered in part, because a consumer splicing a partial
-   * replay into its input would reorder the partition. The reader escalates such a refusal to a
-   * fetch failure and the upstream stage is recomputed.
+   * A request names one closed interval of positions, so the question is whether the whole of that
+   * interval is still retained -- that is, still inside the unacknowledged window. A request that
+   * cannot be served in full is refused rather than answered in part, because a consumer splicing a
+   * partial replay into its input would reorder the partition. The reader escalates such a refusal
+   * to a fetch failure and the upstream stage is recomputed.
    *
    * Serviceability is decided by counting the blocks the window actually retains within the range
    * the request names and requiring that count to equal the range's full width, which is the only
-   * form of the test that says what it means. It also survives a widening of the request shape
-   * without becoming wrong: comparing endpoints against the window's total size would agree on
-   * every state the protocol can reach today, because a cumulative acknowledgement retires a prefix
-   * and therefore leaves a contiguous suffix -- but it would agree by accident, resting on an
-   * invariant maintained in a different method, and it would keep agreeing right up until an
-   * interior block was released for some other reason.
+   * form of the test that says what it means for a range of any width. Comparing endpoints against
+   * the window's total size would agree on every state the protocol can reach today, because a
+   * cumulative acknowledgement retires a prefix and therefore leaves a contiguous suffix -- but it
+   * would agree by accident, resting on an invariant maintained in a different method, and it would
+   * keep agreeing right up until an interior block was released for some other reason.
    *
    * A pure predicate: it records nothing and changes no state, so it can be consulted as often as a
    * caller likes.
@@ -1233,8 +1310,11 @@ private[spark] class BackpressureProtocol(
    *
    * A request is also evidence that the peer is alive, so it refreshes the stream's inbound
    * activity instant in the same way a heartbeat does. A serviceable request advances the stream's
-   * retry count, which is what bounds replay at five attempts with an exponentially growing pause;
-   * an unserviceable one advances nothing, because there is nothing to retry.
+   * retry count ONCE, whatever the width of the window it names, which is what bounds replay at
+   * five attempts with an exponentially growing pause while still letting a multi-block gap be
+   * repaired: the budget counts repair attempts, not blocks, so a run of positions asked for
+   * together costs the one attempt it is. An unserviceable request advances nothing, because there
+   * is nothing to retry.
    *
    * @return true if the producer may replay every block the request names
    */
@@ -1342,10 +1422,13 @@ private[spark] class BackpressureProtocol(
     } else if (!limiterFor(key.shuffleId).tryAcquire(bytes)) {
       enterThrottled(ledger, BackpressureProtocol.THROTTLE_CAUSE_RATE)
       false
-    } else {
-      ledger.recordReplay(sequenceNumber, bytes)
+    } else if (ledger.recordReplay(sequenceNumber, bytes)) {
       recordEgress(bytes)
       true
+    } else {
+      limiterFor(key.shuffleId).refund(bytes)
+      enterThrottled(ledger, BackpressureProtocol.THROTTLE_CAUSE_MEMORY)
+      false
     }
   }
 
@@ -1371,16 +1454,16 @@ private[spark] class BackpressureProtocol(
   def onDataReceived(
       key: BackpressureStreamKey,
       sequenceNumber: Long,
-      bytes: Long): Unit = {
+      bytes: Long): Boolean = {
     require(sequenceNumber >= 0L,
       s"The sequence number must be non-negative but was $sequenceNumber.")
     val ledger = streams.get(key)
-    if (ledger != null) {
-      ledger.recordReceived(sequenceNumber, bytes, clock.getTimeMillis())
-    }
+    val recorded =
+      ledger == null || ledger.recordReceived(sequenceNumber, bytes, clock.getTimeMillis())
     // Recorded whether or not a ledger exists, because the link carried these bytes regardless of
     // whether this protocol had been told about the stream that carried them.
     recordIngress(bytes)
+    recorded
   }
 
   /**
@@ -1482,10 +1565,8 @@ private[spark] class BackpressureProtocol(
    * consumer would never be sent them again. The handler that owns the channel knows the true next
    * position; this method owns the interval and the stamping, and takes the position on trust.
    *
-   * The heartbeat message type takes its timestamp from the caller and reads no clock of its own,
-   * which is exactly what allows this protocol's notion of time to be the single one in play and to
-   * be frozen by a test. Emitting is recorded here, so [[shouldSendHeartbeat]] answers false again
-   * until the interval has elapsed once more.
+   * The heartbeat message reads no clock of its own. Emitting is recorded here against the injected
+   * clock, so [[shouldSendHeartbeat]] answers false again until the interval has elapsed once more.
    *
    * A consumer's heartbeat declares that consumer's stable identity, taken from the key rather than
    * from the channel, because it is what the producer keys its per-consumer acknowledgement cursor
@@ -1506,9 +1587,11 @@ private[spark] class BackpressureProtocol(
     } else {
       ledger.recordHeartbeatSent(clock.getTimeMillis())
       // The position is clamped because the message type refuses a negative sequence number, and a
-      // side that has not started announces zero rather than a sentinel.
+      // side that has not started announces zero rather than a sentinel. The identity comes from
+      // the key, which is what makes it stable: the key is fixed for the life of a reduce task
+      // attempt, whereas everything the connection could supply changes when the connection does.
       Some(new HeartbeatMessage(key.shuffleId, key.mapId, key.partitionId,
-        math.max(0L, nextPosition)))
+        math.max(0L, nextPosition), key.consumerToken))
     }
   }
 
@@ -1573,9 +1656,9 @@ private[spark] class BackpressureProtocol(
   /**
    * Applies one inbound control message to the ledger, dispatching on its concrete type.
    *
-   * Dispatch is on the type of the message, never on its encoded length: all four fixed-shape
-   * control messages encode to the same number of bytes, so length distinguishes nothing and a
-   * codec that tried to use it would silently read one message as another.
+   * Dispatch is on the type of the message, never on its encoded length. Three control messages
+   * share one fixed length while heartbeat length varies with its bounded identity, so length is
+   * not a discriminator and a codec that tried to use it would silently read one type as another.
    *
    * A data block is not a control message and is reported as unhandled rather than rejected,
    * because the block path belongs to the writer and the reader; this method exists so a channel
@@ -1896,29 +1979,34 @@ private[spark] class BackpressureProtocol(
     }
   }
 
-  // The executor-wide consumer receive quota.
-
-  /** The whole consumer-side receive budget of this executor, in bytes. */
-  def receiveQuotaBytes: Long = receiveQuotaTotalBytes
+  // The consumer's share of the executor-wide aggregate quota.
 
   /**
-   * Bytes of that budget currently held by consumers anywhere on this executor.
-   *
-   * Deliberately not published to `shuffle.streaming.bufferUtilizationPercent`. That gauge reports
-   * the producer buffer budget the spill threshold is evaluated against, and the receive quota is a
-   * different budget entirely: summing the two would put unrelated bytes in the numerator and
-   * unrelated capacity in the denominator, so a producer genuinely at its eighty percent spill
-   * point would read as roughly forty the moment one idle reader appeared on the same executor.
-   * The spill manager's executor-shared quota is that gauge's sole contributor. What the consumer
-   * side holds is observable in its own right, here and through the backpressure-event counter.
+   * The aggregate allowance consumers share with every other streaming allocation on the executor.
    */
-  def reservedReceiveQuotaBytes: Long = math.max(0L, reservedReceiveBytes.get())
+  def receiveQuotaBytes: Long = aggregateQuota.totalBytes
 
-  /** How many reservations have been refused because the executor-wide budget was exhausted. */
+  /**
+   * Bytes of that allowance currently held by consumers anywhere on this executor.
+   *
+   * This is one ownership category inside the aggregate allowance, not a second allowance. The
+   * buffer-utilisation gauge reads the aggregate directly, so producer and consumer bytes can never
+   * each claim the configured percentage independently.
+   */
+  def reservedReceiveQuotaBytes: Long =
+    aggregateQuota.reservedBytes(MemorySpillManager.ConsumerMemory)
+
+  /** Bytes held by every streaming allocation category on this executor. */
+  def aggregateReservedBytes: Long = aggregateQuota.reservedBytes
+
+  /** Bytes still available to every streaming allocation category on this executor. */
+  def aggregateAvailableBytes: Long = aggregateQuota.availableBytes
+
+  /** How many consumer-side reservations have been refused because the allowance was exhausted. */
   def receiveQuotaRefusalCount: Long = receiveQuotaRefusals.get()
 
-  /** Whether the executor-wide consumer budget is fully committed right now. */
-  def receiveQuotaExhausted: Boolean = reservedReceiveBytes.get() >= receiveQuotaTotalBytes
+  /** Whether the executor-wide aggregate allowance is fully committed right now. */
+  def receiveQuotaExhausted: Boolean = aggregateQuota.availableBytes <= 0L
 
   /**
    * Reserves consumer-side heap for one frame, or refuses it.
@@ -1930,63 +2018,36 @@ private[spark] class BackpressureProtocol(
    * business to leave the position repairable: the consumer handler does not advance its sequence
    * cursor for a refused block, so the position is asked for again and no byte is lost.
    *
-   * <b>Why compare-and-set rather than an unconditional add.</b> An add that overshot and then
-   * subtracted would admit the frame that broke the budget, which is exactly the frame the budget
-   * exists to refuse, and two concurrent admissions could each observe a total that was briefly
-   * larger than either of them caused. The loop admits only what fits.
-   *
-   * <b>Why the bound is a subtraction and the argument is validated.</b> Both readings are decided
-   * on a byte count that arrived over the network, and `bytes` is a signed sixty-four bit quantity.
-   * Testing `current + bytes > total` would let a request near `Long.MaxValue` wrap to a negative
-   * sum, compare as comfortably under the budget, and be charged -- so the one input the budget
-   * exists to bound would be the one input that escaped it. Comparing `bytes` against the remaining
-   * headroom instead cannot overflow, because `current` and `total` are both non-negative and their
-   * difference therefore lies in `[0, total]`. A negative request is refused outright rather than
-   * absorbed: it can only be a defect or a hostile frame, and treating it as free would let a peer
-   * hand back budget it never reserved.
-   *
    * Exactly zero is granted without touching the ledger: a block may legitimately carry an empty
    * payload, and charging zero would be an atomic operation with no effect on the hot path.
    *
    * @param bytes payload bytes the caller is about to retain; must not be negative
-   * @return true when the bytes were charged, false when the executor's budget is exhausted
+   * @return true when the bytes were charged, false when the executor's allowance is exhausted
    * @throws IllegalArgumentException when `bytes` is negative
    */
   def tryReserveReceiveQuota(bytes: Long): Boolean = {
     require(bytes >= 0L, s"Reserved receive bytes must be non-negative but was $bytes.")
     if (bytes == 0L) {
       true
+    } else if (aggregateQuota.tryReserve(bytes, MemorySpillManager.ConsumerMemory)) {
+      true
     } else {
-      var granted = false
-      var settled = false
-      while (!settled) {
-        val current = reservedReceiveBytes.get()
-        val headroom = receiveQuotaTotalBytes - current
-        if (bytes > headroom) {
-          receiveQuotaRefusals.incrementAndGet()
-          // Counted as a throttle rather than latched as a degradation: an exhausted consumer
-          // budget is the backpressure mechanism working as designed, and it becomes a fallback
-          // condition only if allocation keeps failing after a spill, which the producer side
-          // reports on its own account.
-          enterReceiveQuotaThrottle()
-          settled = true
-        } else if (reservedReceiveBytes.compareAndSet(current, current + bytes)) {
-          granted = true
-          settled = true
-        }
-      }
-      granted
+      receiveQuotaRefusals.incrementAndGet()
+      // Counted as a throttle rather than latched as a degradation: an exhausted aggregate
+      // allowance is flow control working as designed. A producer that cannot spill or retain the
+      // refused block reports the MemoryPressure fallback condition on its own path.
+      enterReceiveQuotaThrottle()
+      false
     }
   }
 
   /**
-   * Returns consumer-side heap to the executor's budget.
+   * Returns consumer-side heap to the executor's allowance.
    *
-   * Clamped at zero, so a double release -- which a close racing an acknowledgement can produce --
-   * cannot drive the reading negative and hand out budget that was never reserved. Exactly zero is
-   * ignored for the same reason [[tryReserveReceiveQuota]] grants it, and a negative release is
-   * refused rather than absorbed: subtracting a negative quantity would ADD budget nobody reserved,
-   * which is the same escape the reservation side refuses in the other direction.
+   * The clamping, the zero fast path and the refusal of a negative release all belong to
+   * [[MemorySpillManager.ExecutorBufferQuota.releaseReceive]]. What is added here is the end of
+   * the throttling episode: clearing it on the release rather than on the next refusal is what
+   * makes one episode span a whole run of refusals instead of counting each of them.
    *
    * @param bytes payload bytes the caller has finished with; must not be negative
    * @throws IllegalArgumentException when `bytes` is negative
@@ -1994,24 +2055,52 @@ private[spark] class BackpressureProtocol(
   def releaseReceiveQuota(bytes: Long): Unit = {
     require(bytes >= 0L, s"Released receive bytes must be non-negative but was $bytes.")
     if (bytes > 0L) {
-      var settled = false
-      while (!settled) {
-        val current = reservedReceiveBytes.get()
-        val proposed = math.max(0L, current - bytes)
-        settled = reservedReceiveBytes.compareAndSet(current, proposed)
-        if (settled && proposed < receiveQuotaTotalBytes) {
-          // The episode ends here, so the next refusal counts a fresh edge. Clearing on the release
-          // rather than on the next refusal is what makes one episode span a run of refusals.
-          receiveQuotaThrottled.set(false)
-        }
-      }
+      aggregateQuota.release(bytes, MemorySpillManager.ConsumerMemory)
+      // The episode ends here, so the next refusal counts a fresh edge. Clearing on the release
+      // rather than on the next refusal is what makes one episode span a run of refusals.
+      receiveQuotaThrottled.set(false)
     }
   }
 
+  /** Reserves transient frame-copy bytes inside the executor's aggregate allowance. */
+  def tryReserveTransientQuota(bytes: Long): Boolean = {
+    require(bytes >= 0L, s"Reserved transient bytes must be non-negative but was $bytes.")
+    bytes == 0L ||
+      aggregateQuota.tryReserve(bytes, MemorySpillManager.TransientMemory)
+  }
+
+  /** Returns transient frame-copy bytes to the executor's aggregate allowance. */
+  def releaseTransientQuota(bytes: Long): Unit = {
+    require(bytes >= 0L, s"Released transient bytes must be non-negative but was $bytes.")
+    aggregateQuota.release(bytes, MemorySpillManager.TransientMemory)
+  }
+
+  /** Transient frame-copy bytes currently in flight across this executor. */
+  def reservedTransientQuotaBytes: Long =
+    aggregateQuota.reservedBytes(MemorySpillManager.TransientMemory)
+
+  /** Reserves queue or ledger metadata inside the executor's aggregate allowance. */
+  def tryReserveMetadataQuota(bytes: Long): Boolean = {
+    require(bytes >= 0L, s"Reserved metadata bytes must be non-negative but was $bytes.")
+    bytes == 0L ||
+      aggregateQuota.tryReserve(bytes, MemorySpillManager.MetadataMemory)
+  }
+
+  /** Returns queue or ledger metadata to the executor's aggregate allowance. */
+  def releaseMetadataQuota(bytes: Long): Unit = {
+    require(bytes >= 0L, s"Released metadata bytes must be non-negative but was $bytes.")
+    aggregateQuota.release(bytes, MemorySpillManager.MetadataMemory)
+  }
+
+  /** Queue and ledger metadata bytes currently held across this executor. */
+  def reservedMetadataQuotaBytes: Long =
+    aggregateQuota.reservedBytes(MemorySpillManager.MetadataMemory)
+
   /**
-   * Counts the edge into an episode of executor-wide consumer budget exhaustion.
+   * Counts the edge into an episode of executor-wide allowance exhaustion seen from the consumer
+   * side.
    *
-   * One `shuffle.streaming.backpressureEvents` increment per episode, and one warn line, however
+   * One `shuffle.streaming.backpressureEvents` increment per episode, and one info record, however
    * many frames are refused inside it. The compare-and-set is what makes that exact without a lock,
    * and it is also what bounds the log volume: an operator whose consumers are persistently behind
    * sees the condition once per episode rather than once per frame a producer chose to retry.
@@ -2021,7 +2110,7 @@ private[spark] class BackpressureProtocol(
       throttleTransitions.incrementAndGet()
       StreamingShuffleMetricsSource.incrementBackpressureEvents(1L)
       logInfo(log"Streaming shuffle throttled every consumer on this executor: the shared " +
-        log"receive budget of ${MDC(MAX_SIZE, receiveQuotaTotalBytes)} byte(s) is fully " +
+        log"aggregate budget of ${MDC(MAX_SIZE, aggregateQuota.totalBytes)} byte(s) is fully " +
         log"committed after ${MDC(COUNT, receiveQuotaRefusals.get())} refusal(s). Blocks refused " +
         log"here are asked for again, so nothing is lost; the reduce side is behind its producers")
     }
@@ -2141,73 +2230,22 @@ private[spark] class BackpressureProtocol(
    * Whether the link is saturated beyond ninety percent, which is the third condition under which
    * streaming steps aside. Latches the reason when it holds, and reports it; the trip decision
    * belongs to the fallback policy.
+   *
+   * The '''first''' reading over the threshold is the answer. The specification states this
+   * condition as utilisation exceeding [[BackpressureProtocol.LINK_SATURATION_PERCENT]] of the link
+   * capacity and attaches no sustaining requirement to it, so none is imposed here and there is no
+   * run of intervals to accumulate. What keeps the reading honest is the measurement itself rather
+   * than a counter over it: the rate is published from a whole
+   * [[BackpressureProtocol.SATURATION_SAMPLE_WINDOW_MS]] window of observed bytes, and a window
+   * with too little history to publish a rate reports zero rather than a guess, so an interval that
+   * cannot be evaluated cannot read as saturated.
    */
   def isLinkSaturated: Boolean = {
-    val over = linkSaturationPercent > BackpressureProtocol.LINK_SATURATION_PERCENT
-    val sustained = if (over) recordSaturatedInterval() else clearSaturatedIntervals()
-    if (sustained) {
+    val saturated = linkSaturationPercent > BackpressureProtocol.LINK_SATURATION_PERCENT
+    if (saturated) {
       latchDegradation(BackpressureDegradationReason.LinkSaturation)
     }
-    sustained
-  }
-
-  /**
-   * Counts one measurement interval in which the link read as over-saturated, and reports whether
-   * enough consecutive intervals have now done so for the condition to be a sustained one.
-   *
-   * <b>Why a single over-capacity reading is not saturation.</b> The pacing bucket must be able to
-   * admit one maximum-sized block, so its burst allowance is at least
-   * `DataBlockMessage.MAX_ENCODED_FRAME_BYTES` however small the paced share is -- a bucket that
-   * could not hold one block would refuse every block forever, which is not a rate limit but a
-   * deadlock. A bucket that starts full therefore legitimately delivers its burst plus one
-   * interval's refill inside the first interval, and with several concurrent shuffles the sum of
-   * those bursts is a multiple of the administered capacity for exactly one interval. That is the
-   * shape this class already documents as "routine on an idle link", and treating it as saturation
-   * stood streaming down on a link that was never saturated -- measured at nearly twice the
-   * administered capacity with not one stream throttled, followed by every producer being
-   * invalidated and the shuffle recomputed on the sort-based path. The recomputation is the
-   * expensive part: it duplicated more than a quarter of the records the shuffle had already
-   * written.
-   *
-   * Requiring consecutive intervals is what distinguishes a burst from saturation, and it is the
-   * same shape the sustained-slowness condition already uses -- that one requires the ratio to hold
-   * for sixty seconds rather than for one observation, and for the same reason. A link that really
-   * is saturated stays over capacity interval after interval and trips within
-   * [[BackpressureProtocol.LINK_SATURATION_SUSTAINED_INTERVALS]] of them, which is a small multiple
-   * of one second and still far inside the sixty-second window; a burst clears on the very next
-   * interval.
-   *
-   * Intervals rather than observations: this is polled on a hundred-millisecond cadence and the
-   * rate is republished once a second, so counting observations would reach any threshold inside a
-   * single interval and count one burst several times over. Distinct intervals are identified by
-   * the instant at which each was observed, quantised to the sample window, on the injected clock
-   * -- so the bound is deterministic under test rather than dependent on polling speed.
-   *
-   * @return true when the link has read over capacity for enough consecutive intervals
-   */
-  private def recordSaturatedInterval(): Boolean = {
-    val interval = clock.getTimeMillis() / BackpressureProtocol.SATURATION_SAMPLE_WINDOW_MS
-    val previous = lastSaturatedInterval.getAndSet(interval)
-    val consecutive =
-      if (previous == interval) {
-        // Same interval as the last observation: already counted. Report the standing verdict
-        // rather than advancing, so a fast poll cannot reach the threshold inside one interval.
-        saturatedIntervals.get()
-      } else if (previous == interval - 1L) {
-        saturatedIntervals.incrementAndGet()
-      } else {
-        // A gap means at least one interval was not saturated, so the run restarts at this one.
-        saturatedIntervals.set(1L)
-        1L
-      }
-    consecutive >= BackpressureProtocol.LINK_SATURATION_SUSTAINED_INTERVALS
-  }
-
-  /** Ends any run of saturated intervals, because this observation was under capacity. */
-  private def clearSaturatedIntervals(): Boolean = {
-    saturatedIntervals.set(0L)
-    lastSaturatedInterval.set(BackpressureProtocol.NO_SATURATED_INTERVAL)
-    false
+    saturated
   }
 
   /**
@@ -2575,10 +2613,190 @@ private[spark] class BackpressureProtocol(
  */
 private[spark] object BackpressureProtocol {
 
+  /** Worker stripes shared by every streaming producer and consumer in one executor JVM. */
+  val DATA_PLANE_WORKER_THREADS: Int =
+    math.max(2, math.min(8, Runtime.getRuntime.availableProcessors()))
+
+  /** Pending tasks allowed on each worker stripe before the data plane fails closed. */
+  val DATA_PLANE_TASKS_PER_STRIPE: Int = 1024
+
+  /** Time allowed for the executor-wide data-plane workers to stop at manager shutdown. */
+  val DATA_PLANE_SHUTDOWN_TIMEOUT_MS: Long = 10000L
+
+  private val dataPlaneLock = new Object()
+
+  @volatile private var dataPlaneWorkers: DataPlaneWorkers = null
+
+  /** Queue element whose executor-wide admission can be settled before it starts. */
+  private trait CancellableDataPlaneTask extends Runnable {
+    def cancel(): Unit
+  }
+
+  /** Submits one task to the stable stripe selected by its owner. */
+  private def executeDataPlane(owner: AnyRef, task: Runnable): Boolean =
+    currentDataPlaneWorkers.execute(owner, task)
+
+  /** Waits until the shared worker stripes have no accepted task left to run. */
+  private def awaitDataPlaneIdle(timeoutMs: Long): Boolean = {
+    val workers = dataPlaneWorkers
+    workers == null || workers.awaitIdle(timeoutMs)
+  }
+
+  /**
+   * Stops and awaits the executor-wide data-plane workers.
+   *
+   * The manager calls this after closing both transports. The reference is cleared first so a later
+   * manager in the same JVM, as happens in suites, creates a fresh set rather than submitting to a
+   * stopped one.
+   */
+  def shutdownDataPlaneWorkers(): Unit = {
+    val workers = dataPlaneLock.synchronized {
+      val current = dataPlaneWorkers
+      dataPlaneWorkers = null
+      current
+    }
+    if (workers != null) {
+      workers.shutdown()
+    }
+  }
+
+  private def currentDataPlaneWorkers: DataPlaneWorkers = {
+    var current = dataPlaneWorkers
+    if (current == null || current.isStopped) {
+      dataPlaneLock.synchronized {
+        current = dataPlaneWorkers
+        if (current == null || current.isStopped) {
+          current = new DataPlaneWorkers
+          dataPlaneWorkers = current
+        }
+      }
+    }
+    current
+  }
+
+  /**
+   * A fixed set of bounded single-thread stripes.
+   *
+   * A single-thread executor per stripe gives each handler FIFO processing without one thread per
+   * handler. The number of threads and the total number of queued tasks are both fixed for the JVM,
+   * so a peer cannot turn frame arrival into unbounded executor creation or an unbounded work list.
+   */
+  private final class DataPlaneWorkers {
+
+    private val stopped = new AtomicBoolean(false)
+    private val acceptedTasks = new AtomicInteger(0)
+    private val idleLock = new ReentrantLock()
+    private val becameIdle = idleLock.newCondition()
+
+    private val stripes: Array[ThreadPoolExecutor] =
+      Array.tabulate(DATA_PLANE_WORKER_THREADS) { stripe =>
+        new ThreadPoolExecutor(
+          1,
+          1,
+          0L,
+          TimeUnit.MILLISECONDS,
+          new ArrayBlockingQueue[Runnable](DATA_PLANE_TASKS_PER_STRIPE),
+          ThreadUtils.namedThreadFactory(s"streaming-shuffle-data-plane-$stripe"),
+          new ThreadPoolExecutor.AbortPolicy())
+      }
+
+    def isStopped: Boolean = stopped.get()
+
+    def execute(owner: AnyRef, task: Runnable): Boolean = {
+      if (stopped.get()) {
+        false
+      } else {
+        val tracked = new TrackedDataPlaneTask(task)
+        acceptedTasks.incrementAndGet()
+        val stripe = Math.floorMod(System.identityHashCode(owner), stripes.length)
+        try {
+          stripes(stripe).execute(tracked)
+          true
+        } catch {
+          case _: RejectedExecutionException =>
+            tracked.cancel()
+            false
+        }
+      }
+    }
+
+    def awaitIdle(timeoutMs: Long): Boolean = {
+      var remainingNanos =
+        TimeUnit.MILLISECONDS.toNanos(math.max(0L, timeoutMs))
+      idleLock.lock()
+      try {
+        while (acceptedTasks.get() > 0 && remainingNanos > 0L) {
+          try {
+            remainingNanos = becameIdle.awaitNanos(remainingNanos)
+          } catch {
+            case _: InterruptedException =>
+              Thread.currentThread().interrupt()
+              return false
+          }
+        }
+        acceptedTasks.get() == 0
+      } finally {
+        idleLock.unlock()
+      }
+    }
+
+    def shutdown(): Unit = {
+      if (stopped.compareAndSet(false, true)) {
+        stripes.foreach { stripe =>
+          stripe.shutdownNow().asScala.foreach {
+            case tracked: CancellableDataPlaneTask => tracked.cancel()
+            case _ => ()
+          }
+        }
+      }
+      awaitIdle(DATA_PLANE_SHUTDOWN_TIMEOUT_MS)
+      stripes.foreach { stripe =>
+        try {
+          stripe.awaitTermination(DATA_PLANE_SHUTDOWN_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        } catch {
+          case _: InterruptedException =>
+            Thread.currentThread().interrupt()
+        }
+      }
+    }
+
+    private def taskSettled(): Unit = {
+      if (acceptedTasks.decrementAndGet() == 0) {
+        idleLock.lock()
+        try {
+          becameIdle.signalAll()
+        } finally {
+          idleLock.unlock()
+        }
+      }
+    }
+
+    private final class TrackedDataPlaneTask(delegate: Runnable)
+      extends CancellableDataPlaneTask {
+
+      private val settled = new AtomicBoolean(false)
+
+      override def run(): Unit = {
+        try {
+          delegate.run()
+        } finally {
+          settle()
+        }
+      }
+
+      def cancel(): Unit = settle()
+
+      private def settle(): Unit = {
+        if (settled.compareAndSet(false, true)) {
+          taskSettled()
+        }
+      }
+    }
+  }
+
   /**
    * Producer-liveness bound: a stream that receives nothing at all for this long is treated as
-   * having lost its producer. It is also the interval at which a heartbeat is emitted, so a
-   * producer with no data to send stays alive by heartbeating at the cadence the detector expects.
+   * having lost its producer.
    *
    * Enforced at application level and not by TCP. The transport exposes keepalive as a boolean only
    * and the JDK offers no socket option for a keepalive interval, so this timer is the whole of the
@@ -2586,8 +2804,29 @@ private[spark] object BackpressureProtocol {
    */
   val ACK_TIMEOUT_MS: Long = 5000L
 
-  /** Interval at which a stream emits a heartbeat, equal to the producer-liveness bound. */
-  val HEARTBEAT_INTERVAL_MS: Long = ACK_TIMEOUT_MS
+  /**
+   * How many heartbeat intervals fit inside the liveness bound, and therefore how many consecutive
+   * heartbeats may be lost before a healthy peer is declared gone.
+   *
+   * Three, so that two may be lost. A cadence equal to the bound leaves no margin at all: the
+   * detector fires at exactly the instant the next heartbeat is due, so any ordinary delay --
+   * a garbage collection pause, an event loop briefly saturated by a two-megabyte block, a
+   * scheduling hiccup on a loaded executor -- makes a healthy idle producer look lost, and
+   * the cost of that mistake is not a retry but the atomic invalidation of every partial read from
+   * that producer followed by a recomputation of the upstream stage.
+   */
+  val HEARTBEAT_SAFETY_DIVISOR: Long = 3L
+
+  /**
+   * Interval at which a stream emits a heartbeat, strictly below the liveness bound it refreshes.
+   *
+   * Derived from [[ACK_TIMEOUT_MS]] rather than chosen, so the two can never drift out of the
+   * relationship they have to keep: the detector's bound is the specified five seconds and stays
+   * exactly that, while the cadence that refreshes it sits a whole [[HEARTBEAT_SAFETY_DIVISOR]]
+   * inside it. Never below one millisecond, so a hypothetical sub-millisecond bound could not
+   * produce a zero-length cadence that heartbeats on every poll.
+   */
+  val HEARTBEAT_INTERVAL_MS: Long = math.max(1L, ACK_TIMEOUT_MS / HEARTBEAT_SAFETY_DIVISOR)
 
   /**
    * Consumer-liveness bound: a consumer that has bytes outstanding and acknowledges none of them
@@ -2620,6 +2859,15 @@ private[spark] object BackpressureProtocol {
 
   /** Divisor and multiplier of every percentage this protocol computes. */
   val PERCENT_SCALE: Long = 100L
+
+  /** Conservative heap charge for one stream ledger and its atomic state. */
+  val STREAM_LEDGER_BASE_BYTES: Long = 512L
+
+  /** Conservative heap charge for one sorted unacknowledged-window entry. */
+  val STREAM_LEDGER_ENTRY_BYTES: Long = 64L
+
+  /** Most block positions one stream ledger may retain at once. */
+  val MAX_LEDGER_ENTRIES_PER_STREAM: Int = 4096
 
   /** Milliseconds in one second; every rate this protocol reports is per second. */
   val MILLIS_PER_SECOND: Long = 1000L
@@ -2680,27 +2928,11 @@ private[spark] object BackpressureProtocol {
    *
    * One second, which is long enough for the quotient to describe a link rather than the
    * instantaneous speed of one two-megabyte memcpy, and short enough that a link which really does
-   * saturate is noticed well inside the sixty-second sustained-slowness window.
+   * saturate is noticed within a second of doing so. It is also what makes a single reading
+   * sufficient evidence: the rate describes a whole window of observed bytes rather than one
+   * transfer, and a window with too little history to publish a rate reports zero instead.
    */
   val SATURATION_SAMPLE_WINDOW_MS: Long = 1000L
-
-  /**
-   * Consecutive measurement intervals the link must read over capacity in before saturation is
-   * treated as sustained and streaming stands down.
-   *
-   * Three, which at a one-second sample window is three seconds. Sized against what it has to
-   * discriminate rather than picked round: the thing being excluded is the pacing buckets' burst
-   * allowance, which by construction can exceed the administered capacity for exactly one interval
-   * apiece and then cannot again until it has refilled at the paced rate, so two consecutive
-   * over-capacity intervals already rule a burst out and three leave margin for a second wave of
-   * limiters being created mid-shuffle. Against what it has to catch it costs almost nothing: a
-   * link that really is saturated stands streaming down three seconds in, twenty times faster than
-   * the sixty-second sustained-slowness condition beside it.
-   */
-  val LINK_SATURATION_SUSTAINED_INTERVALS: Long = 3L
-
-  /** The interval identifier meaning "no saturated interval has been observed". */
-  val NO_SATURATED_INTERVAL: Long = Long.MinValue
 
   /** The pause before the first replay attempt, which each further attempt doubles. */
   val RETRY_BASE_BACKOFF_MS: Long = 1000L
@@ -2729,6 +2961,9 @@ private[spark] object BackpressureProtocol {
 
   /** Reason recorded when a stream is throttled because the pacing bucket refused it. */
   val THROTTLE_CAUSE_RATE: String = "the egress rate limit was reached"
+
+  /** Reason recorded when the aggregate heap allowance cannot admit ledger metadata. */
+  val THROTTLE_CAUSE_MEMORY: String = "the executor streaming memory allowance was reached"
 
   /**
    * The pause before a given replay attempt: one second doubled once per attempt, so the five
@@ -2808,7 +3043,8 @@ private[spark] object BackpressureProtocol {
   private[streaming] class StreamLedger(
       val key: BackpressureStreamKey,
       val creditLimitBytes: Long,
-      openedAtMillis: Long) {
+      openedAtMillis: Long,
+      aggregateQuota: MemorySpillManager.ExecutorBufferQuota) {
 
     // Sequence number to encoded size, for every block sent and not yet acknowledged. Sorted so
     // that an acknowledgement can drain the window from its low end without scanning it, and
@@ -2878,6 +3114,8 @@ private[spark] object BackpressureProtocol {
 
     private val announcedBlocks = new AtomicLong(NO_BLOCK_TOTAL)
 
+    private val closed = new AtomicBoolean(false)
+
     /** Records one further owner of this ledger, reporting the resulting owner count. */
     def retain(): Int = owners.incrementAndGet()
 
@@ -2888,7 +3126,29 @@ private[spark] object BackpressureProtocol {
      * the count negative, which keeps the answer honest for a caller that has already removed the
      * entry.
      */
-    def release(): Boolean = owners.decrementAndGet() <= 0
+    def releaseOwner(): Boolean = owners.decrementAndGet() <= 0
+
+    /**
+     * Releases every metadata reservation this ledger owns.
+     *
+     * Each map removal is conditional, so a racing acknowledgement and this close can never both
+     * return the same entry's charge. A send that races the close observes the closed latch either
+     * before or immediately after insertion and removes its own entry.
+     */
+    def close(): Unit = {
+      if (closed.compareAndSet(false, true)) {
+        val iterator = unacknowledged.entrySet().iterator()
+        while (iterator.hasNext) {
+          val entry = iterator.next()
+          if (unacknowledged.remove(entry.getKey, entry.getValue)) {
+            outstanding.addAndGet(-entry.getValue.longValue())
+            aggregateQuota.release(
+              STREAM_LEDGER_ENTRY_BYTES, MemorySpillManager.MetadataMemory)
+          }
+        }
+        aggregateQuota.release(STREAM_LEDGER_BASE_BYTES, MemorySpillManager.MetadataMemory)
+      }
+    }
 
     /** Owners currently holding this ledger. */
     def ownerCount: Int = math.max(0, owners.get())
@@ -3003,13 +3263,16 @@ private[spark] object BackpressureProtocol {
      * consume credit twice for the same bytes. Use [[recordReplay]] for a retransmission, so that
      * repaired bytes are not counted as newly produced ones.
      */
-    def recordSent(sequenceNumber: Long, bytes: Long): Unit = {
+    def recordSent(sequenceNumber: Long, bytes: Long): Boolean = {
       require(sequenceNumber >= 0L,
         s"The sequence number must be non-negative but was $sequenceNumber.")
       require(bytes >= 0L, s"The block size must be non-negative but was $bytes.")
-      charge(sequenceNumber, bytes)
-      sentTotal.addAndGet(bytes)
-      advance(highestSent, sequenceNumber)
+      val charged = charge(sequenceNumber, bytes)
+      if (charged) {
+        sentTotal.addAndGet(bytes)
+        advance(highestSent, sequenceNumber)
+      }
+      charged
     }
 
     /**
@@ -3019,13 +3282,16 @@ private[spark] object BackpressureProtocol {
      * because they are in flight again -- but the volume lands on the replay total rather than the
      * send total, so the producer's measured rate continues to describe the output it produced.
      */
-    def recordReplay(sequenceNumber: Long, bytes: Long): Unit = {
+    def recordReplay(sequenceNumber: Long, bytes: Long): Boolean = {
       require(sequenceNumber >= 0L,
         s"The sequence number must be non-negative but was $sequenceNumber.")
       require(bytes >= 0L, s"The block size must be non-negative but was $bytes.")
-      charge(sequenceNumber, bytes)
-      replayedTotal.addAndGet(bytes)
-      advance(highestSent, sequenceNumber)
+      val charged = charge(sequenceNumber, bytes)
+      if (charged) {
+        replayedTotal.addAndGet(bytes)
+        advance(highestSent, sequenceNumber)
+      }
+      charged
     }
 
     /**
@@ -3121,16 +3387,19 @@ private[spark] object BackpressureProtocol {
      * without charging it would leave the receiving end reporting full credit no matter how far
      * behind it had fallen, which is precisely the condition `autoRead` exists to prevent.
      */
-    def recordReceived(sequenceNumber: Long, bytes: Long, nowMillis: Long): Unit = {
+    def recordReceived(sequenceNumber: Long, bytes: Long, nowMillis: Long): Boolean = {
       require(sequenceNumber >= 0L,
         s"The sequence number must be non-negative but was $sequenceNumber.")
       require(bytes >= 0L, s"The block size must be non-negative but was $bytes.")
-      charge(sequenceNumber, bytes)
-      if (bytes > 0L) {
-        receivedTotal.addAndGet(bytes)
+      val charged = charge(sequenceNumber, bytes)
+      if (charged) {
+        if (bytes > 0L) {
+          receivedTotal.addAndGet(bytes)
+        }
+        advance(highestReceived, sequenceNumber)
+        recordInbound(nowMillis)
       }
-      advance(highestReceived, sequenceNumber)
-      recordInbound(nowMillis)
+      charged
     }
 
     /**
@@ -3269,13 +3538,47 @@ private[spark] object BackpressureProtocol {
      * replaces its entry and adjusts the total by the difference, so neither a repeated send nor a
      * replay of the same block can be counted twice.
      */
-    private def charge(sequenceNumber: Long, bytes: Long): Unit = {
-      val previous =
-        unacknowledged.put(java.lang.Long.valueOf(sequenceNumber), java.lang.Long.valueOf(bytes))
-      if (previous == null) {
-        outstanding.addAndGet(bytes)
+    private def charge(sequenceNumber: Long, bytes: Long): Boolean = {
+      if (closed.get()) {
+        return false
+      }
+      val key = java.lang.Long.valueOf(sequenceNumber)
+      val value = java.lang.Long.valueOf(bytes)
+      val existing = unacknowledged.get(key)
+      if (existing != null) {
+        if (unacknowledged.replace(key, existing, value)) {
+          outstanding.addAndGet(bytes - existing.longValue())
+          true
+        } else {
+          charge(sequenceNumber, bytes)
+        }
+      } else if (unacknowledged.size() >= MAX_LEDGER_ENTRIES_PER_STREAM) {
+        false
+      } else if (!aggregateQuota.tryReserve(
+          STREAM_LEDGER_ENTRY_BYTES, MemorySpillManager.MetadataMemory)) {
+        false
       } else {
-        outstanding.addAndGet(bytes - previous.longValue())
+        val raced = unacknowledged.putIfAbsent(key, value)
+        if (raced == null) {
+          outstanding.addAndGet(bytes)
+          if (closed.get() && unacknowledged.remove(key, value)) {
+            outstanding.addAndGet(-bytes)
+            aggregateQuota.release(
+              STREAM_LEDGER_ENTRY_BYTES, MemorySpillManager.MetadataMemory)
+            false
+          } else {
+            true
+          }
+        } else {
+          aggregateQuota.release(
+            STREAM_LEDGER_ENTRY_BYTES, MemorySpillManager.MetadataMemory)
+          if (unacknowledged.replace(key, raced, value)) {
+            outstanding.addAndGet(bytes - raced.longValue())
+            true
+          } else {
+            charge(sequenceNumber, bytes)
+          }
+        }
       }
     }
 
@@ -3299,6 +3602,7 @@ private[spark] object BackpressureProtocol {
           val bytes = entry.getValue.longValue()
           released += bytes
           outstanding.addAndGet(-bytes)
+          aggregateQuota.release(STREAM_LEDGER_ENTRY_BYTES, MemorySpillManager.MetadataMemory)
         }
       }
       released

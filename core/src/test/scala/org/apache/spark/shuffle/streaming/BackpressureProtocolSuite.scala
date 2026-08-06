@@ -20,13 +20,15 @@ package org.apache.spark.shuffle.streaming
 import java.io.File
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
-import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.{CountDownLatch, TimeUnit}
+import java.util.concurrent.atomic.{AtomicInteger, AtomicLong}
 
 import org.mockito.Mockito.mock
 import org.scalatest.matchers.should.Matchers
 
 import org.apache.spark.{SparkConf, SparkFunSuite, SparkIllegalArgumentException, TaskContext}
-import org.apache.spark.internal.config.{EXECUTOR_MEMORY, SHUFFLE_STREAMING_MAX_BANDWIDTH_MBPS}
+import org.apache.spark.internal.config.{EXECUTOR_MEMORY, SHUFFLE_STREAMING_BUFFER_SIZE_PERCENT,
+  SHUFFLE_STREAMING_MAX_BANDWIDTH_MBPS, SHUFFLE_STREAMING_SPILL_THRESHOLD}
 import org.apache.spark.network.shuffle.protocol.streaming.{AckMessage, StreamingShuffleMessageType}
 import org.apache.spark.rpc.RpcEnv
 import org.apache.spark.shuffle.{ShuffleReadMetricsReporter, ShuffleWriteMetricsReporter}
@@ -101,7 +103,30 @@ class BackpressureProtocolSuite extends SparkFunSuite
    */
   protected override def beforeEach(): Unit = {
     super.beforeEach()
+    // Two pieces of process-scoped state outlive a case and are returned to a known one here. The
+    // metrics source is an `object`, so its counters accumulate; and the streaming buffer allowance
+    // the protocol reserves consumer receive bytes from is executor-scoped by design, so a case
+    // asserting "the budget is fully committed" would otherwise be asserting on whatever the case
+    // before it left charged.
+    MemorySpillManager.resetSharedStateForTesting()
     resetStreamingShuffleMetrics()
+  }
+
+  /**
+   * Returns the same process-scoped state to zero after every case as well as before it.
+   *
+   * A case's teardown is still running code -- a stopping context reports task ends and drains its
+   * metrics system -- so a counter can advance after the body returned, and whatever it advanced by
+   * would become the starting point of the next case in this JVM. Resetting on both edges is what
+   * makes each case's arithmetic its own.
+   */
+  protected override def afterEach(): Unit = {
+    try {
+      super.afterEach()
+    } finally {
+      resetStreamingShuffleMetrics()
+      MemorySpillManager.resetSharedStateForTesting()
+    }
   }
 
   /**
@@ -188,6 +213,11 @@ class BackpressureProtocolSuite extends SparkFunSuite
       conf: SparkConf,
       clock: ManualClock,
       coordinator: StreamingShuffleCoordinator): BackpressureProtocol = {
+    // Every protocol this suite builds stands for a fresh executor. The consumer receive budget is
+    // drawn from the executor-wide streaming buffer allowance, which is derived once per executor
+    // and memoised, so a case that hands this helper a different configuration would otherwise be
+    // handed the allowance an earlier construction derived from a different one.
+    MemorySpillManager.resetSharedStateForTesting()
     new BackpressureProtocol(
       conf, coordinator, TokenBucketRateLimiter.executorBudget(conf, clock), clock)
   }
@@ -225,6 +255,74 @@ class BackpressureProtocolSuite extends SparkFunSuite
    */
   private def accrueExecutorEgressCeiling(clock: ManualClock): Unit = {
     clock.advance(millisPerSecond / 100L)
+  }
+
+  test("data-plane worker stripes preserve per-owner FIFO and expose idle completion") {
+    val protocol = newProtocol(newManualClock())
+    val owner = new Object()
+    val observed = new Array[Int](128)
+    val next = new AtomicInteger(0)
+
+    observed.indices.foreach { value =>
+      assert(protocol.executeDataPlane(owner, new Runnable {
+        override def run(): Unit = {
+          observed(next.getAndIncrement()) = value
+        }
+      }), s"task $value must fit in an otherwise empty worker stripe")
+    }
+
+    assert(protocol.awaitDataPlaneIdle(10000L),
+      "the completion primitive must report when every accepted worker task has settled")
+    assert(next.get() === observed.length)
+    assert(observed.toSeq === observed.indices,
+      "one handler's tasks must execute in submission order on its stable worker stripe")
+  }
+
+  test("data-plane stripes reject beyond their fixed queue instead of running on the caller") {
+    val protocol = newProtocol(newManualClock())
+    assert(protocol.awaitDataPlaneIdle(10000L), "the shared workers must start this case idle")
+    val owner = new Object()
+    val blockerStarted = new CountDownLatch(1)
+    val releaseBlocker = new CountDownLatch(1)
+    val executed = new AtomicInteger(0)
+
+    assert(protocol.executeDataPlane(owner, new Runnable {
+      override def run(): Unit = {
+        blockerStarted.countDown()
+        try {
+          releaseBlocker.await(30L, TimeUnit.SECONDS)
+        } catch {
+          case _: InterruptedException => Thread.currentThread().interrupt()
+        }
+        executed.incrementAndGet()
+      }
+    }))
+    assert(blockerStarted.await(10L, TimeUnit.SECONDS),
+      "the first task must occupy its stripe before the queue is filled")
+
+    try {
+      (0 until BackpressureProtocol.DATA_PLANE_TASKS_PER_STRIPE).foreach { index =>
+        assert(protocol.executeDataPlane(owner, new Runnable {
+          override def run(): Unit = {
+            executed.incrementAndGet()
+          }
+        }), s"bounded queue slot $index must be admitted")
+      }
+      val overflowRan = new AtomicInteger(0)
+      assert(!protocol.executeDataPlane(owner, new Runnable {
+        override def run(): Unit = {
+          overflowRan.incrementAndGet()
+        }
+      }), "the first task beyond the fixed stripe capacity must fail closed")
+      assert(overflowRan.get() === 0,
+        "a refused task must never run synchronously on the submitting thread")
+    } finally {
+      releaseBlocker.countDown()
+    }
+
+    assert(protocol.awaitDataPlaneIdle(10000L),
+      "every admitted task must settle after the blocked stripe is released")
+    assert(executed.get() === BackpressureProtocol.DATA_PLANE_TASKS_PER_STRIPE + 1)
   }
 
   test("consumer acknowledgement processing and buffer reclamation") {
@@ -742,9 +840,26 @@ class BackpressureProtocolSuite extends SparkFunSuite
     assert(ProducerConnectionTimeoutMillis === 5000L,
       "the producer connection timeout is five seconds")
     assert(ConsumerLivenessTimeoutMillis === 10000L, "the consumer liveness window is ten seconds")
-    assert(HeartbeatIntervalMillis === ProducerConnectionTimeoutMillis,
-      "a heartbeat is emitted at the cadence the producer detector expects, so a producer with " +
-        "nothing to send stays alive by heartbeating alone")
+    // The cadence that refreshes liveness must sit STRICTLY INSIDE the bound it refreshes, with
+    // room for more than one lost heartbeat. A cadence equal to the bound leaves none: the detector
+    // fires at the very instant the next heartbeat is due, so an ordinary garbage collection pause
+    // or an event loop briefly saturated by a two-megabyte block declares a healthy idle producer
+    // lost -- and that mistake costs the atomic invalidation of every partial read from it plus a
+    // recomputation of the upstream stage, not a retry.
+    assert(HeartbeatIntervalMillis < ProducerConnectionTimeoutMillis,
+      s"the heartbeat cadence ($HeartbeatIntervalMillis ms) must be strictly below the producer " +
+        s"detector's bound ($ProducerConnectionTimeoutMillis ms), or a healthy idle producer is " +
+        "one scheduling delay away from being declared dead")
+    assert(HeartbeatIntervalMillis * BackpressureProtocol.HEARTBEAT_SAFETY_DIVISOR <=
+        ProducerConnectionTimeoutMillis,
+      s"${BackpressureProtocol.HEARTBEAT_SAFETY_DIVISOR} heartbeat intervals must fit inside the " +
+        s"bound, so ${BackpressureProtocol.HEARTBEAT_SAFETY_DIVISOR - 1L} consecutive heartbeats " +
+        s"may be lost before a producer is judged gone, but it is $HeartbeatIntervalMillis")
+    assert(BackpressureProtocol.HEARTBEAT_SAFETY_DIVISOR >= 2L,
+      "a divisor of one would be a cadence equal to the bound by another name")
+    assert(StreamingShuffleServerHandler.PRODUCER_HEARTBEAT_INTERVAL_MS === HeartbeatIntervalMillis,
+      "the producer's own cadence must be the protocol's, derived rather than restated, so the " +
+        "two ends of the same timer can never drift apart")
 
     val clock = newManualClock()
     val protocol = newProtocol(clock)
@@ -849,16 +964,24 @@ class BackpressureProtocolSuite extends SparkFunSuite
     protocol.registerShuffle(firstShuffleId, partitionCount)
     assert(protocol.registerStream(key, creditLimitBytes), "the ledger must open")
 
+    val openedAtMillis = clock.getTimeMillis()
     assert(!protocol.shouldSendHeartbeat(key), "a stream that has just opened is not due")
-    advanceJustBeforeProducerTimeout(clock)
-    assert(!protocol.shouldSendHeartbeat(key), "a heartbeat is NOT due at 4999 ms")
+    clock.advance(HeartbeatIntervalMillis - 1L)
+    assert(!protocol.shouldSendHeartbeat(key),
+      s"a heartbeat is NOT due one millisecond short of the $HeartbeatIntervalMillis ms cadence")
     clock.advance(1L)
-    assert(protocol.shouldSendHeartbeat(key), "and is due at exactly the five-second interval")
+    assert(protocol.shouldSendHeartbeat(key),
+      s"and is due at exactly the $HeartbeatIntervalMillis ms cadence, which is a whole safety " +
+        s"divisor inside the $ProducerConnectionTimeoutMillis ms bound it refreshes")
+    // Due well before the detector could fire, which is the property the margin exists for: the
+    // producer has emitted, and would have emitted again, long before the bound elapses.
+    assert(clock.getTimeMillis() - openedAtMillis < ProducerConnectionTimeoutMillis,
+      "the first heartbeat must fall strictly inside the producer detector's window")
 
-    // A heartbeat carries no time value and no identity. It reports the position the sender has
-    // reached and nothing else, because both of the fields it used to carry were peer-controlled
-    // inputs to a local decision: a remote stamp would let skew masquerade as liveness, and a wire
-    // identity would let a frame claim a session the connection it arrived on does not own.
+    // A heartbeat carries no time value: the receiver measures its local arrival instant, so clock
+    // skew cannot masquerade as liveness. A consumer heartbeat does carry the stable task-attempt
+    // identity that lets the producer resume the same cursor on a replacement channel; the producer
+    // binds that claim to the transport-authenticated application before using it.
     val nextPosition = 7L
     val emitted = protocol.heartbeatFor(key, nextPosition)
     assert(emitted.isDefined, "a registered stream must be able to build its heartbeat")
@@ -868,13 +991,17 @@ class BackpressureProtocolSuite extends SparkFunSuite
     assert(message.shuffleId() === firstShuffleId, "and names the stream it belongs to")
     assert(message.partitionId() === partitionId, "including its reduce partition")
     assert(message.mapId() === mapId, "and the producer whose stream it paces")
+    assert(message.consumerToken() === key.consumerToken,
+      "and declares exactly the identity the ledger key carries")
+    assert(message.consumerToken() !== NoConsumerToken,
+      "which for a consumer's own ledger is a real identity rather than the reserved value")
 
-    // The framing of a heartbeat: the shared header plus the producer identifier, exactly as every
-    // other control message, so no decoder can tell them apart by length.
-    assert(HeartbeatBaseEncodedLength === FixedMessageEncodedLength,
-      "a heartbeat is the same fixed size as every other control message")
-    assert(message.encodedLength() === 25,
-      "which the specification fixes at twenty-five bytes")
+    // The framing of a heartbeat: the shared header, the producer identifier and the consumer
+    // session token, which is a fixed width and not one a peer chooses.
+    assert(HeartbeatBaseEncodedLength === FixedMessageEncodedLength + 8,
+      "a heartbeat is a control message plus the eight bytes of the consumer session token")
+    assert(message.encodedLength() === 33,
+      "which the specification fixes at thirty-three bytes")
     assert(framedLength(message.encodedLength()) === message.encodedLength() + 1,
       "framing adds exactly the one-byte type discriminator")
 
@@ -896,9 +1023,9 @@ class BackpressureProtocolSuite extends SparkFunSuite
     assert(protocol.remoteHeartbeatTimestamp(key) === Some(arrivalInstant),
       "and the instant recorded for diagnostics is that same local reading")
 
-    // The control-message dispatcher applies each message by its concrete type, never by its
-    // encoded length: every control message encodes to exactly the same length, so a codec that
-    // tried to use length would silently read one message as another.
+    // The control-message dispatcher applies each message by its concrete type, never by encoded
+    // length: three controls share one length and the heartbeat varies with its identity, so length
+    // cannot identify any of them.
     assert(protocol.onControlMessage(
       key, heartbeat(firstShuffleId, mapId, partitionId, 9L)) ===
         Some(StreamingShuffleMessageType.HEARTBEAT), "a heartbeat dispatches as a heartbeat")
@@ -938,8 +1065,10 @@ class BackpressureProtocolSuite extends SparkFunSuite
     assert(protocol.isWithinUnacknowledgedWindow(key, 0L), "so it can still be replayed")
     assert(!protocol.isWithinUnacknowledgedWindow(key, 1L), "a block never sent cannot be")
     val retained = retransmitRequest(firstShuffleId, mapId, partitionId, 0L)
-    assert(retained.blockCount() === RequestedBlocksPerRequest,
-      "a request names exactly one block, which is what keeps every control message one size")
+    assert(retained.blockCount() === 1L,
+      "a request built from one position names exactly that one block")
+    assert(retained.lastSequenceNumber() === retained.firstSequenceNumber(),
+      "and expresses it as the inclusive single-element window it is")
     assert(protocol.canServeRetransmit(key, retained),
       "a request naming a retained block is serviceable")
     val unretained = retransmitRequest(firstShuffleId, mapId, partitionId, 1L)
@@ -984,6 +1113,65 @@ class BackpressureProtocolSuite extends SparkFunSuite
       "and each is the previous one plus that attempt's pause")
     assert(clock.getTimeMillis() - startMillis === RetryBackoffLadderMillis.sum,
       "so the whole ladder spans thirty-one seconds of injected time and no real time at all")
+  }
+
+  test("a multi block repair window is charged as one attempt, not one per position") {
+    // The gate the consumer's repair path actually drives, exercised with the exact frame that path
+    // emits. A repair of a run of positions is ONE request naming the closed interval, and the
+    // budget bounds repair attempts rather than blocks: charged per position instead, a gap of five
+    // blocks would exhaust the five-attempt budget on its first and only attempt and escalate to a
+    // stage recomputation while the producer still retained every byte the consumer had asked for.
+    val clock = newManualClock()
+    val protocol = newProtocol(clock)
+    val key = producerKey()
+    protocol.registerShuffle(firstShuffleId, partitionCount)
+    assert(protocol.registerStream(key, creditLimitBytes * 8L), "the ledger must open")
+
+    val runLength = 5
+    (0 until runLength).foreach { position =>
+      assert(protocol.tryAdmit(key, blockBytes, position.toLong),
+        s"block $position must be sent and retained so that it can be replayed")
+    }
+    assert(protocol.unacknowledgedWindow(key).contains((0L, runLength - 1L)),
+      s"the whole run must be inside the unacknowledged window, but it was " +
+        s"${protocol.unacknowledgedWindow(key)}")
+
+    val window = retransmitRequest(firstShuffleId, mapId, partitionId, 0L, runLength - 1L)
+    assert(window.blockCount() === runLength.toLong,
+      s"one request must name the whole run of $runLength block(s) but named " +
+        s"${window.blockCount()}")
+    assert(protocol.canServeRetransmit(key, window),
+      "a run wholly inside the unacknowledged window must be serviceable in full")
+    assert(protocol.onRetransmitRequest(key, window),
+      "and the gate must admit it")
+    assert(protocol.retransmitAttempts(key) === 1,
+      s"the whole run must cost exactly one attempt, but the gate charged " +
+        s"${protocol.retransmitAttempts(key)}")
+    assert(!protocol.isRetryExhausted(key),
+      "so a single multi block repair can never exhaust the budget on its own")
+    assert(protocol.nextRetryBackoffMillis(key) === Some(RetryBackoffLadderMillis(1)),
+      "and the pause owed next is the second rung of the ladder, not its last")
+
+    // The remaining budget is the budget for further repairs of this stream. Four more attempts are
+    // permitted, which is what makes "five attempts at this range" the bound the failure protocol
+    // prescribes rather than "five blocks".
+    (2 to MaxRetryAttempts).foreach { attempt =>
+      assert(protocol.onRetransmitRequest(key, window),
+        s"repair attempt $attempt of the same run must still be admitted")
+      assert(protocol.retransmitAttempts(key) === attempt,
+        s"and must be counted as attempt $attempt")
+    }
+    assert(protocol.isRetryExhausted(key),
+      "five attempts at the range spend the budget, whatever the width of the range")
+
+    // A run that reaches one position past what was retained is refused as a whole rather than
+    // answered in part, because a consumer splicing a partial replay into its input would reorder
+    // the partition.
+    val overreaching = retransmitRequest(firstShuffleId, mapId, partitionId, 0L, runLength.toLong)
+    assert(!protocol.canServeRetransmit(key, overreaching),
+      "a run naming one position that was never retained must be refused entirely")
+    assert(!protocol.onRetransmitRequest(key, overreaching),
+      "and the gate must refuse it rather than serve the retained prefix")
   }
 
   // Priority arbitration under concurrent load. Buffer utilisation is an executor-wide quantity no
@@ -1146,7 +1334,11 @@ class BackpressureProtocolSuite extends SparkFunSuite
     try {
       val budget = TokenBucketRateLimiter.executorBudget(
         conf, clock, () => Some(coordinator.numConcurrentShuffles))
-      val protocol = new BackpressureProtocol(conf, coordinator, budget, clock)
+      val quota = new MemorySpillManager.ExecutorBufferQuota(
+        conf.get(SHUFFLE_STREAMING_BUFFER_SIZE_PERCENT),
+        conf.get(SHUFFLE_STREAMING_SPILL_THRESHOLD),
+        () => conf.get(EXECUTOR_MEMORY) * BytesPerMebibyte)
+      val protocol = new BackpressureProtocol(conf, coordinator, budget, clock, quota)
 
       assert(coordinator.activeShuffleIds.isEmpty, "the registry starts empty")
       assert(coordinator.numConcurrentShuffles === 1,
@@ -1277,8 +1469,11 @@ class BackpressureProtocolSuite extends SparkFunSuite
     // the volume, and they are different questions.
     assert(protocol.receiveQuotaBytes > 0L, "the executor has a consumer receive budget")
     assert(protocol.reservedReceiveQuotaBytes === 0L, "and none of it is held yet")
-    assert(protocol.tryReserveReceiveQuota(protocol.receiveQuotaBytes),
-      "a reservation for the whole budget fits exactly")
+    val availableForReceive = protocol.aggregateAvailableBytes
+    assert(availableForReceive > 0L && availableForReceive < protocol.receiveQuotaBytes,
+      "the open stream's metadata must already occupy part of the one aggregate budget")
+    assert(protocol.tryReserveReceiveQuota(availableForReceive),
+      "a consumer reservation for all remaining aggregate room fits exactly")
     assert(protocol.receiveQuotaExhausted, "and commits it in full")
     (0 until refusals).foreach { attempt =>
       assert(!protocol.tryReserveReceiveQuota(1L),
@@ -1290,7 +1485,7 @@ class BackpressureProtocolSuite extends SparkFunSuite
         "reduce side is")
     assert(protocol.backpressureEventCount === 4L,
       "but the episode is ONE backpressure event however many frames were refused inside it")
-    protocol.releaseReceiveQuota(protocol.receiveQuotaBytes)
+    protocol.releaseReceiveQuota(availableForReceive)
     assert(protocol.reservedReceiveQuotaBytes === 0L, "releasing returns the whole budget")
     assert(!protocol.receiveQuotaExhausted, "so it is no longer committed")
     assert(!protocol.tryReserveReceiveQuota(protocol.receiveQuotaBytes + 1L),
@@ -1549,40 +1744,19 @@ class BackpressureProtocolSuite extends SparkFunSuite
       "the trip is strictly beyond ninety percent, so exactly ninety does NOT fire")
     assert(protocol.state === BackpressureState.Flowing, "and the executor stays flowing")
 
-    // Beyond ninety, and then beyond ninety again, and again: saturation is a sustained condition
-    // and one interval of it is not enough. The reason is the pacing bucket rather than caution. A
-    // bucket has to be able to admit one maximum-sized block or it would refuse every block
-    // forever, so its burst allowance is at least one frame however small its paced share is -- and
-    // a bucket that starts full therefore legitimately delivers that burst inside a single
-    // interval, which with several concurrent shuffles sums to a multiple of the administered
-    // capacity for exactly one interval. Tripping on one reading turned that legal burst into a
-    // stand-down: measured at nearly twice the administered capacity with not one stream throttled,
-    // every producer invalidated, and over a quarter of the shuffle's records written a second time
-    // by the recomputation. A burst clears on the next interval; a saturated link does not, and
-    // still trips three seconds in -- twenty times sooner than the sustained-slowness condition
-    // beside it.
-    var interval = 2L
-    while (interval < BackpressureProtocol.LINK_SATURATION_SUSTAINED_INTERVALS + 1L) {
-      clock.advance(BackpressureProtocol.SATURATION_SAMPLE_WINDOW_MS)
-      protocol.onDataReceived(observedKey, interval, aboveNinetyPercent)
-      assert(protocol.ingressBytesPerSecond === aboveNinetyPercent,
-        s"interval $interval carries the same over-capacity volume and publishes the same rate")
-      assert(protocol.linkSaturationPercent > LinkSaturationTripPercent,
-        s"so interval $interval reads beyond ninety percent")
-      assert(!protocol.isLinkSaturated,
-        s"but interval $interval is short of the sustained run, so saturation must not trip yet")
-      assert(protocol.state === BackpressureState.Flowing,
-        s"and the executor stays flowing through interval $interval")
-      interval += 1L
-    }
-
+    // One rung up, and the very next reading trips. The condition is utilisation above ninety
+    // percent of the declared capacity and nothing more: no run of intervals is required, so a link
+    // that has genuinely gone past the share stands streaming down on the interval it did so rather
+    // than several intervals later, which is the whole point of a ceiling on a shared link. The
+    // reading is trustworthy on its own because it is a rate over a full sampling window -- the
+    // assertion above, where a link quiet for two windows reads as idle rather than saturated, is
+    // the other half of that property.
     clock.advance(BackpressureProtocol.SATURATION_SAMPLE_WINDOW_MS)
-    protocol.onDataReceived(observedKey, interval, aboveNinetyPercent)
+    protocol.onDataReceived(observedKey, 2L, aboveNinetyPercent)
     assert(protocol.ingressBytesPerSecond === aboveNinetyPercent, "one interval later, one rung up")
     assert(protocol.linkSaturationPercent > LinkSaturationTripPercent, "the link is beyond ninety")
     assert(protocol.isLinkSaturated,
-      s"so saturation trips once ${BackpressureProtocol.LINK_SATURATION_SUSTAINED_INTERVALS} " +
-        "consecutive intervals have read over capacity")
+      "so saturation trips on the FIRST interval that reads over capacity")
     assert(protocol.state === BackpressureState.Degraded, "and the executor degrades")
     assert(protocol.degradationReasons === Seq(BackpressureDegradationReason.LinkSaturation),
       "naming the third of the four conditions")
@@ -1891,21 +2065,95 @@ class BackpressureProtocolSuite extends SparkFunSuite
     val quotaProtocol = protocolWith(quotaConf, clock, null)
     val executorMemoryBytes = quotaConf.get(EXECUTOR_MEMORY) * BytesPerMebibyte
     assert(quotaProtocol.receiveQuotaBytes ===
-      executorMemoryBytes / PercentScale * MaxBufferSizePercent.toLong,
+      StreamingShuffleTestHelper.aggregateBudgetBytes(executorMemoryBytes, MaxBufferSizePercent),
       "the budget is bufferSizePercent of the executor's memory")
     assert(quotaProtocol.receiveQuotaBytes > MaxEncodedFrameBytes.toLong,
       "which on a default executor is comfortably more than one maximum-sized frame")
 
-    // On an executor too small for that percentage to cover one frame the budget is floored at one
-    // frame, because a budget that could not admit the largest legal block would refuse every block
-    // and make no progress at all.
+    // The consumer no longer has an independent one-frame minimum. It draws from the same exact
+    // percentage as producer retention, transient copies and metadata; an executor too small for
+    // one legal frame refuses it and takes the MemoryPressure fallback rather than exceeding the
+    // configured aggregate ceiling.
     val tinyConf = streamingConfWithOverrides(bufferSizePercent = MinBufferSizePercent)
       .set(EXECUTOR_MEMORY, 1L)
     val tinyProtocol = protocolWith(tinyConf, clock, null)
-    assert(tinyProtocol.receiveQuotaBytes === MaxEncodedFrameBytes.toLong,
-      "the receive budget is floored at one maximum-sized encoded frame")
-    assert(tinyProtocol.tryReserveReceiveQuota(MaxEncodedFrameBytes.toLong),
-      "so the largest legal frame is always admissible")
+    val tinyExpected =
+      tinyConf.get(EXECUTOR_MEMORY) * BytesPerMebibyte / PercentScale * MinBufferSizePercent
+    assert(tinyProtocol.receiveQuotaBytes === tinyExpected,
+      "the aggregate budget must remain the configured percentage even on a tiny executor")
+    assert(!tinyProtocol.tryReserveReceiveQuota(MaxEncodedFrameBytes.toLong),
+      "a frame larger than the whole aggregate allowance must be refused before allocation")
+  }
+
+  test("stream-ledger registration is charged and fails closed when metadata has no room") {
+    val capacity = 2L * BackpressureProtocol.STREAM_LEDGER_BASE_BYTES
+    val quota = new MemorySpillManager.ExecutorBufferQuota(
+      bufferSizePercent = 50,
+      spillThresholdPercent = DefaultSpillThresholdPercent,
+      executorMemoryProvider = () => 2L * capacity)
+    val clock = newManualClock()
+    val protocol = new BackpressureProtocol(
+      streamingConfWithOverrides(),
+      null,
+      TokenBucketRateLimiter.executorBudget(streamingConfWithOverrides(), clock),
+      clock,
+      quota)
+    val key = producerKey()
+    val occupied = capacity - BackpressureProtocol.STREAM_LEDGER_BASE_BYTES + 1L
+    assert(quota.tryReserve(occupied), "The fixture must leave one byte too little for a ledger")
+
+    assert(!protocol.registerStream(key, creditLimitBytes),
+      "A new stream must be refused when its base metadata cannot be charged")
+    assert(!protocol.isStreamRegistered(key),
+      "A refused registration must not leave an unaccounted fail-open ledger")
+    assert(protocol.reservedMetadataQuotaBytes === 0L)
+
+    quota.release(occupied)
+    assert(protocol.registerStream(key, creditLimitBytes),
+      "Returning aggregate room must make the stream registrable")
+    assert(protocol.registerStream(key, creditLimitBytes),
+      "A second owner must join the existing charged ledger without another base allocation")
+    assert(protocol.reservedMetadataQuotaBytes === BackpressureProtocol.STREAM_LEDGER_BASE_BYTES)
+    assert(!protocol.unregisterStream(key),
+      "The first owner release must preserve the ledger for its second owner")
+    assert(protocol.unregisterStream(key), "The final owner release must close the ledger")
+    assert(protocol.reservedMetadataQuotaBytes === 0L)
+    assert(quota.reservedBytes === 0L)
+  }
+
+  test("one stream ledger refuses entries beyond its bounded metadata window") {
+    val entries = BackpressureProtocol.MAX_LEDGER_ENTRIES_PER_STREAM
+    val metadataCapacity = BackpressureProtocol.STREAM_LEDGER_BASE_BYTES +
+      (entries + 1L) * BackpressureProtocol.STREAM_LEDGER_ENTRY_BYTES
+    val quota = new MemorySpillManager.ExecutorBufferQuota(
+      bufferSizePercent = 50,
+      spillThresholdPercent = DefaultSpillThresholdPercent,
+      executorMemoryProvider = () => 2L * metadataCapacity)
+    val clock = newManualClock()
+    val conf = streamingConfWithOverrides()
+    val protocol = new BackpressureProtocol(
+      conf, null, TokenBucketRateLimiter.executorBudget(conf, clock), clock, quota)
+    val key = producerKey()
+    assert(protocol.registerStream(key, Long.MaxValue), "The bounded ledger must open")
+
+    (0 until entries).foreach { sequenceNumber =>
+      assert(protocol.tryAdmit(key, 1L, sequenceNumber.toLong),
+        s"Entry $sequenceNumber must be admitted through the exact per-stream cap")
+    }
+    assert(protocol.unacknowledgedBlockCount(key) === entries)
+    assert(protocol.reservedMetadataQuotaBytes ===
+      BackpressureProtocol.STREAM_LEDGER_BASE_BYTES +
+        entries.toLong * BackpressureProtocol.STREAM_LEDGER_ENTRY_BYTES)
+    assert(!protocol.tryAdmit(key, 1L, entries.toLong),
+      "The first entry beyond the cap must be held back without growing metadata")
+    assert(protocol.unacknowledgedBlockCount(key) === entries)
+
+    assert(protocol.onAck(key, entries - 1L) === entries.toLong,
+      "Acknowledging the bounded window must release every entry")
+    assert(protocol.reservedMetadataQuotaBytes === BackpressureProtocol.STREAM_LEDGER_BASE_BYTES,
+      "Only the stream's base charge may remain after its window drains")
+    assert(protocol.unregisterStream(key))
+    assert(quota.reservedBytes === 0L)
   }
 
   // -----------------------------------------------------------------------------------------------

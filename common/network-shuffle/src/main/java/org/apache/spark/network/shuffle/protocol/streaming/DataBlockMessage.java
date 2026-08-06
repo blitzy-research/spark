@@ -20,8 +20,10 @@ package org.apache.spark.network.shuffle.protocol.streaming;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
 
 import org.apache.spark.annotation.Private;
 import org.apache.spark.network.protocol.Encoders;
@@ -163,6 +165,9 @@ public final class DataBlockMessage extends StreamingShuffleMessage {
    */
   private static final int PAYLOAD_LENGTH_PREFIX_LENGTH = 4;
 
+  /** Sentinel outside the unsigned CRC32C range, meaning no local checksum has been computed. */
+  private static final long CHECKSUM_NOT_COMPUTED = -1L;
+
   /**
    * Bytes a data block occupies on the wire over and above its payload.
    *
@@ -198,6 +203,8 @@ public final class DataBlockMessage extends StreamingShuffleMessage {
 
   private final long checksum;
   private final byte[] payload;
+  private final PayloadReservation payloadReservation;
+  private final AtomicBoolean payloadReservationHeld;
 
   /**
    * Whether this block has already been shown to match the checksum it arrived with.
@@ -232,6 +239,15 @@ public final class DataBlockMessage extends StreamingShuffleMessage {
   private transient volatile boolean checksumVerified;
 
   /**
+   * The locally computed CRC32C value, cached for both success and failure.
+   *
+   * A corrupt block needs the computed value in its diagnostic after verification has already
+   * scanned the payload. Caching it avoids a second scan and, importantly, avoids cloning the whole
+   * payload merely to pass an array to the checksum helper.
+   */
+  private transient volatile long computedChecksum = CHECKSUM_NOT_COMPUTED;
+
+  /**
    * The one constructor that assigns the payload field, and therefore the single place where
    * ownership of the array is decided.
    *
@@ -259,12 +275,29 @@ public final class DataBlockMessage extends StreamingShuffleMessage {
       long checksum,
       byte[] payload,
       boolean ownsPayload) {
+    this(protocolVersion, shuffleId, mapId, partitionId, sequenceNumber, checksum, payload,
+      ownsPayload, null, false);
+  }
+
+  private DataBlockMessage(
+      byte protocolVersion,
+      int shuffleId,
+      long mapId,
+      int partitionId,
+      long sequenceNumber,
+      long checksum,
+      byte[] payload,
+      boolean ownsPayload,
+      PayloadReservation payloadReservation,
+      boolean reservationHeld) {
     super(protocolVersion, shuffleId, mapId, partitionId, sequenceNumber);
     this.checksum = checksum;
     // Validated here, in the one constructor every other route funnels through, so that neither a
     // producer nor the decoder can construct an over-size block.
     byte[] checked = checkPayload(payload);
     this.payload = ownsPayload ? checked : checked.clone();
+    this.payloadReservation = payloadReservation;
+    this.payloadReservationHeld = new AtomicBoolean(reservationHeld);
   }
 
   /**
@@ -418,10 +451,45 @@ public final class DataBlockMessage extends StreamingShuffleMessage {
     // Checked before the payload is read, so an over-size block is rejected without first paying
     // for a checksum over bytes that are about to be discarded.
     checkPayload(payload);
-    return new DataBlockMessage(CURRENT_PROTOCOL_VERSION, shuffleId, mapId, partitionId,
-      sequenceNumber,
-      StreamingShuffleChecksum.computeBlock(shuffleId, mapId, partitionId, sequenceNumber, payload),
-      payload, false);
+    long computed =
+      StreamingShuffleChecksum.computeBlock(shuffleId, mapId, partitionId, sequenceNumber, payload);
+    DataBlockMessage block = new DataBlockMessage(CURRENT_PROTOCOL_VERSION, shuffleId, mapId,
+      partitionId, sequenceNumber, computed, payload, false);
+    block.computedChecksum = computed;
+    block.checksumVerified = true;
+    return block;
+  }
+
+  /**
+   * Creates a data block that computes its checksum and adopts the caller's immutable payload.
+   *
+   * This is the producer egress factory. The retained store is the sole mutable owner of the array
+   * and never changes it after admission; the block keeps that immutable array alive until the
+   * transport completes the write. Avoiding the defensive clone removes one full-payload copy per
+   * consumer while preserving the ordinary factory's caller-may-mutate contract.
+   *
+   * @param shuffleId identifier of the shuffle this block belongs to
+   * @param mapId identifier of the map task whose output this block carries
+   * @param partitionId identifier of the reduce partition this block belongs to
+   * @param sequenceNumber position of this block within its partition's stream
+   * @param payload immutable retained payload surrendered for the lifetime of this block
+   * @return a data block backed directly by the supplied payload
+   */
+  @Private
+  public static DataBlockMessage withComputedChecksumAndOwnedPayload(
+      int shuffleId,
+      long mapId,
+      int partitionId,
+      long sequenceNumber,
+      byte[] payload) {
+    checkPayload(payload);
+    long computed =
+      StreamingShuffleChecksum.computeBlock(shuffleId, mapId, partitionId, sequenceNumber, payload);
+    DataBlockMessage block = new DataBlockMessage(CURRENT_PROTOCOL_VERSION, shuffleId, mapId,
+      partitionId, sequenceNumber, computed, payload, true);
+    block.computedChecksum = computed;
+    block.checksumVerified = true;
+    return block;
   }
 
   /**
@@ -480,6 +548,36 @@ public final class DataBlockMessage extends StreamingShuffleMessage {
   }
 
   /**
+   * Transfers a decoder reservation to the consumer's own per-sequence accounting.
+   *
+   * After this returns true the message no longer releases the reservation; the consumer that
+   * accepted it must return the same payload byte count when acknowledgement or cleanup retires it.
+   */
+  @Private
+  public boolean transferPayloadReservation() {
+    return payloadReservationHeld.compareAndSet(true, false);
+  }
+
+  /**
+   * Returns a decoder reservation for a block that was rejected before consumer accounting adopted
+   * it. Idempotent, so a catch path and a final cleanup may both call it safely.
+   */
+  @Private
+  public boolean releasePayloadReservation() {
+    if (payloadReservationHeld.compareAndSet(true, false)) {
+      payloadReservation.release(payload.length);
+      return true;
+    }
+    return false;
+  }
+
+  /** Whether a decoder reservation is still owned by this message. */
+  @Private
+  public boolean hasPayloadReservation() {
+    return payloadReservationHeld.get();
+  }
+
+  /**
    * Recomputes this block's checksum and compares it with the value the producer sent, which is the
    * check a consumer runs before making the block's records visible.
    *
@@ -491,9 +589,8 @@ public final class DataBlockMessage extends StreamingShuffleMessage {
    * byte survived, which a payload-only checksum could not detect.
    *
    * When this returns false the caller needs both numbers for its diagnostic: the expected value is
-   * {@link #checksum()} and the recomputed one is {@code
-   * StreamingShuffleChecksum.computeBlock(shuffleId(), mapId(), partitionId(), sequenceNumber(),
-   * copyPayload())}.
+   * {@link #checksum()} and the locally computed one is available from {@link #computedChecksum()}
+   * without another payload scan or copy.
    *
    * @return true if the block matches the checksum it arrived with, false if it is corrupt or
    *         misaddressed
@@ -502,12 +599,32 @@ public final class DataBlockMessage extends StreamingShuffleMessage {
     if (checksumVerified) {
       return true;
     }
-    boolean intact = StreamingShuffleChecksum.verifyBlock(
-      shuffleId(), mapId(), partitionId(), sequenceNumber(), payload, checksum);
+    boolean intact = computedChecksum() == checksum;
     if (intact) {
       checksumVerified = true;
     }
     return intact;
+  }
+
+  /**
+   * Returns the checksum computed locally over this block, scanning the immutable payload at most
+   * once.
+   *
+   * The value is cached on both the success and corruption paths. Multiple racing readers may
+   * perform the first computation concurrently, but they compute the same deterministic value and
+   * publish the same result, so no lock is required.
+   *
+   * @return the locally computed unsigned CRC32C value
+   */
+  @Private
+  public long computedChecksum() {
+    long computed = computedChecksum;
+    if (computed == CHECKSUM_NOT_COMPUTED) {
+      computed = StreamingShuffleChecksum.computeBlock(
+        shuffleId(), mapId(), partitionId(), sequenceNumber(), payload);
+      computedChecksum = computed;
+    }
+    return computed;
   }
 
   @Override
@@ -563,6 +680,27 @@ public final class DataBlockMessage extends StreamingShuffleMessage {
   }
 
   /**
+   * Builds a gathering frame for the transport: a small contiguous header followed by the retained
+   * immutable payload.
+   *
+   * The payload component wraps the block's own array and therefore performs no full-frame
+   * allocation or payload copy. The composite buffer owns both components and releases them when
+   * the transport completes the write.
+   */
+  @Override
+  protected ByteBuf encodeManagedFrame() {
+    ByteBuf header = Unpooled.buffer(FRAMING_OVERHEAD_BYTES);
+    header.writeByte(type().id());
+    encodeHeader(header);
+    encodeProducerId(header);
+    header.writeLong(checksum);
+    header.writeInt(payload.length);
+    assert header.writableBytes() == 0 : "Writable header bytes remain: " + header.writableBytes();
+    return Unpooled.wrappedUnmodifiableBuffer(
+      header, Unpooled.wrappedBuffer(payload).asReadOnly());
+  }
+
+  /**
    * Reads a data block back off the wire, in the same field order {@link #encode(ByteBuf)} wrote.
    *
    * The buffer's bytes arrive from a remote peer, so every length this method depends on is checked
@@ -585,6 +723,10 @@ public final class DataBlockMessage extends StreamingShuffleMessage {
    *                                 the bytes the buffer holds
    */
   static DataBlockMessage decode(ByteBuf buf) {
+    return decode(buf, null);
+  }
+
+  static DataBlockMessage decode(ByteBuf buf, PayloadReservation payloadReservation) {
     // readHeader rejects a null buffer, a header too short to be read, an unsupported protocol
     // version and a negative identifier.
     Header header = readHeader(buf);
@@ -599,13 +741,31 @@ public final class DataBlockMessage extends StreamingShuffleMessage {
     }
     long mapId = readProducerId(buf);
     long checksum = buf.readLong();
-    checkPayloadLengthPrefix(buf);
-    byte[] payload = Encoders.ByteArrays.decode(buf);
-    // The array was allocated by the decoder a line ago and is reachable from nowhere else, so
-    // handing ownership to the block is safe and saves copying up to two mebibytes per block on the
-    // receive path.
-    return withOwnedPayload(header.protocolVersion(), header.shuffleId(), mapId,
-      header.partitionId(), header.sequenceNumber(), checksum, payload);
+    int payloadLength = checkPayloadLengthPrefix(buf);
+    boolean reserved = payloadReservation != null;
+    if (reserved && !payloadReservation.tryReserve(
+        header.shuffleId(), mapId, header.partitionId(), header.sequenceNumber(), payloadLength)) {
+      throw new PayloadReservationRejectedException(
+        header.shuffleId(), mapId, header.partitionId(), header.sequenceNumber(), payloadLength);
+    }
+    boolean transferred = false;
+    try {
+      // Consume the prefix only after the reservation has succeeded, then allocate exactly the
+      // validated length. Encoders.ByteArrays.decode cannot be used here because it allocates
+      // before any caller-owned admission hook can run.
+      buf.readInt();
+      byte[] payload = new byte[payloadLength];
+      buf.readBytes(payload);
+      DataBlockMessage decoded = new DataBlockMessage(
+        header.protocolVersion(), header.shuffleId(), mapId, header.partitionId(),
+        header.sequenceNumber(), checksum, payload, true, payloadReservation, reserved);
+      transferred = true;
+      return decoded;
+    } finally {
+      if (reserved && !transferred) {
+        payloadReservation.release(payloadLength);
+      }
+    }
   }
 
   /**
@@ -622,7 +782,7 @@ public final class DataBlockMessage extends StreamingShuffleMessage {
    * @throws IllegalArgumentException if the prefix is absent, negative, over-size, or does not
    *                                 account for exactly the bytes that follow it
    */
-  private static void checkPayloadLengthPrefix(ByteBuf buf) {
+  private static int checkPayloadLengthPrefix(ByteBuf buf) {
     if (buf.readableBytes() < PAYLOAD_LENGTH_PREFIX_LENGTH) {
       throw new IllegalArgumentException("Truncated streaming shuffle data block: expected " +
         PAYLOAD_LENGTH_PREFIX_LENGTH + " payload length byte(s) but only " + buf.readableBytes() +
@@ -651,6 +811,7 @@ public final class DataBlockMessage extends StreamingShuffleMessage {
       throw new IllegalArgumentException(problem + " streaming shuffle data block payload: the " +
         "length prefix declares " + length + " byte(s) but " + available + " byte(s) remain");
     }
+    return length;
   }
 
   /**

@@ -19,7 +19,8 @@ package org.apache.spark.shuffle.streaming
 
 import java.io.{BufferedInputStream, ByteArrayOutputStream, File, FileInputStream, InputStream}
 import java.nio.file.Files
-import java.util.concurrent.{ConcurrentHashMap, ScheduledExecutorService, TimeUnit}
+import java.util.concurrent.{ConcurrentHashMap, ConcurrentLinkedQueue, ScheduledExecutorService,
+  TimeUnit}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong, AtomicReference}
 
 import scala.collection.mutable
@@ -31,8 +32,8 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.internal.LogKeys.{BLOCK_ID, BYTE_SIZE, CLASS_NAME, COUNT, DURATION,
   FILE_NAME, MAX_SIZE, MEMORY_SIZE, NUM_BYTES, NUM_EVENTS, NUM_PARTITIONS, NUM_SKIPPED,
   PARTITION_ID, PATH, REASON, THREAD_NAME, THRESHOLD, TIMEOUT}
-import org.apache.spark.internal.config.{CPUS_PER_TASK, EXECUTOR_CORES, SHUFFLE_FILE_BUFFER_SIZE,
-  SHUFFLE_STREAMING_BUFFER_SIZE_PERCENT, SHUFFLE_STREAMING_DEBUG,
+import org.apache.spark.internal.config.{CPUS_PER_TASK, EXECUTOR_CORES, EXECUTOR_MEMORY,
+  SHUFFLE_FILE_BUFFER_SIZE, SHUFFLE_STREAMING_BUFFER_SIZE_PERCENT, SHUFFLE_STREAMING_DEBUG,
   SHUFFLE_STREAMING_SPILL_THRESHOLD}
 import org.apache.spark.memory.{MemoryConsumer, MemoryMode, TaskMemoryManager}
 import org.apache.spark.network.shuffle.protocol.streaming.DataBlockMessage
@@ -79,18 +80,14 @@ import org.apache.spark.util.{Clock, SystemClock, ThreadUtils, Utils}
  * this class exists to enforce.
  *
  * Budget derivation, and why it is executor scoped. The aggregate allowance is
- * `onHeapUnifiedMemory * bufferSizePercent / 100` and the per-partition allowance is that aggregate
+ * `executorMemory * bufferSizePercent / 100` and the per-partition allowance is that aggregate
  * divided by the reduce partition count, which is exactly the contracted
  * `(executorMemory * bufferPercent) / numPartitions` with `bufferPercent` read as the percentage it
- * is named for. The on-heap unified region is recovered from
- * the callable public surface of `MemoryManager` as
- * `maxOnHeapStorageMemory + onHeapExecutionMemoryUsed`, because `UnifiedMemoryManager` defines
- * `maxOnHeapStorageMemory` as `maxHeapMemory - onHeapExecutionMemoryUsed`; the two therefore sum
- * back to the region size, and both accessors are read inside a single `synchronized` block on the
- * memory manager's own monitor so the pair is one consistent observation rather than two that a
- * concurrent acquisition can perturb between. Reading it that way is deliberate: `getMaxMemory`,
- * `maxHeapMemory` and `RESERVED_SYSTEM_MEMORY_BYTES` are all private to the memory package and are
- * not callable from here, and reaching for them would have meant widening a preservation zone.
+ * is named for. `executorMemory` is `spark.executor.memory`, the configured figure the property is
+ * documented against, and it is the '''same''' figure the consumer side of a shuffle is bounded by
+ * -- one property with one basis. A configuration value rather than a live reading of the memory
+ * manager, which also means the allowance can be derived, and the utilisation gauge read, without
+ * dereferencing `SparkEnv`.
  *
  * Crucially, that allowance is held by one [[MemorySpillManager.ExecutorBufferQuota]] shared by
  * every instance on the executor, not recomputed per instance. An executor runs many tasks at once,
@@ -221,13 +218,15 @@ import org.apache.spark.util.{Clock, SystemClock, ThreadUtils, Utils}
  * @param autoPoll whether to join the executor's shared 100 ms threshold ticker; disabled by tests
  *                 that drive [[pollOnce]] themselves so that no background thread perturbs what
  *                 they are measuring
+ * @param diskQuotaOverride explicit executor disk allowance supplied only by quota-bound tests
  */
 private[spark] class MemorySpillManager(
     taskMemoryManager: TaskMemoryManager,
     conf: SparkConf,
     clock: Clock = new SystemClock,
     quotaOverride: Option[MemorySpillManager.ExecutorBufferQuota] = None,
-    autoPoll: Boolean = true)
+    autoPoll: Boolean = true,
+    diskQuotaOverride: Option[MemorySpillManager.ExecutorDiskQuota] = None)
   extends MemoryConsumer(taskMemoryManager, MemoryMode.ON_HEAP) with Logging {
 
   import MemorySpillManager._
@@ -310,6 +309,10 @@ private[spark] class MemorySpillManager(
   private lazy val quota: ExecutorBufferQuota =
     quotaOverride.getOrElse(MemorySpillManager.executorQuota(conf))
 
+  /** Executor-wide disk allowance shared by every streaming producer in this JVM. */
+  private lazy val diskQuota: ExecutorDiskQuota =
+    diskQuotaOverride.getOrElse(MemorySpillManager.executorDiskQuota(conf, quota))
+
   // Mutable state. Everything in this block is guarded by `lock` except the atomics, which are
   // deliberately lock free so that a diagnostic read never contends with a producer.
 
@@ -359,13 +362,11 @@ private[spark] class MemorySpillManager(
 
   private val spillFileBlockIds = new mutable.HashMap[File, TempShuffleBlockId]()
 
-  // Retained spill records across every partition. Guarded by `lock`. Evicting a block returns its
-  // whole charge -- payload and per-block overhead alike -- to the quota while its record stays on
-  // the heap, and an acknowledgement does not remove it either, since the segment it names stays
-  // readable for the shuffle's lifetime. So the record count is the one thing the byte budget stops
-  // bounding, and `MAX_RETAINED_SPILL_RECORDS_TOTAL` is what bounds it instead. Tracked as a
-  // running total rather than derived, because admission consults it on the hot path.
+  // Retained spill records across every partition. Guarded by `lock`, and separately charged to the
+  // aggregate metadata category for as long as they remain reachable.
   private var spilledRecordCount = 0
+
+  private var spilledMetadataReservedBytes = 0L
 
   // Acknowledged position per registered consumer, per partition. Guarded by `lock`, because a
   // position and the memory retirement it authorises must be decided in the same indivisible step.
@@ -375,11 +376,24 @@ private[spark] class MemorySpillManager(
   // acknowledgement that retires the last of them can arrive after the task has ended.
   private val consumerPositions = new mutable.HashMap[String, mutable.HashMap[Int, Long]]()
 
+  // Partitions whose acknowledged prefix extends beyond the most recent bounded reclamation batch.
+  // Guarded by `lock`. The set makes queueing idempotent; the queue preserves fair arrival order.
+  private val pendingReclamationPartitions = new mutable.ArrayDeque[Int]()
+  private val pendingReclamationSet = new mutable.HashSet[Int]()
+  private val reclamationRequestedAtMs = new mutable.HashMap[Int, Long]()
+
+  // At most one entry for this manager may sit on the executor-scoped dispatch queue.
+  private val reclamationDispatchQueued = new AtomicBoolean(false)
+
+  private val reclamationBatchTotal = new AtomicLong(0L)
+
   private var lastPollTimeMs = -1L
 
   private val partitionCount = new AtomicInteger(UNREGISTERED_PARTITION_COUNT)
 
   private val memoryPressure = new AtomicBoolean(false)
+
+  private val diskPressure = new AtomicBoolean(false)
 
   private val memoryPressureCount = new AtomicLong(0L)
 
@@ -451,6 +465,8 @@ private[spark] class MemorySpillManager(
   private val reclamationBreachTotal = new AtomicLong(0L)
 
   private val rejectedAcknowledgements = new AtomicLong(0L)
+
+  private val rejectedConsumerRegistrations = new AtomicLong(0L)
 
   private val spillFileDeletionFailureTotal = new AtomicLong(0L)
 
@@ -581,9 +597,9 @@ private[spark] class MemorySpillManager(
   }
 
   /**
-   * The aggregate streaming buffer allowance in bytes, that is `bufferSizePercent` of the on-heap
-   * unified memory region. This ceiling is hard, it is shared by every instance on the executor,
-   * and admission never exceeds it -- not even to let a single block through.
+   * The aggregate streaming buffer allowance in bytes, that is `bufferSizePercent` of configured
+   * executor memory. This ceiling is hard, it is shared by every instance on the executor and by
+   * every consumer on it, and admission never exceeds it -- not even to let a single block through.
    */
   def totalBudgetBytes: Long = quota.totalBytes
 
@@ -766,6 +782,21 @@ private[spark] class MemorySpillManager(
    */
   def retainedSpillRecordCount: Int = lock.synchronized(spilledRecordCount)
 
+  /** Aggregate heap charged for durable spill-record metadata retained by this store. */
+  def retainedSpillMetadataBytes: Long = lock.synchronized(spilledMetadataReservedBytes)
+
+  /** Executor-wide retained-output disk byte ceiling. */
+  def diskQuotaBytes: Long = diskQuota.totalBytes
+
+  /** Disk bytes currently reserved by pending and committed streaming spill files. */
+  def reservedDiskBytes: Long = diskQuota.reservedBytes
+
+  /** Executor-wide retained-output spill-file ceiling. */
+  def diskFileQuota: Int = diskQuota.fileLimit
+
+  /** Spill files currently reserved or committed across the executor. */
+  def reservedDiskFiles: Int = diskQuota.reservedFileCount
+
   /** Elapsed milliseconds, measured on the injected clock, of the most recent reclamation. */
   def lastReclamationDurationMs: Long = lastReclamationMs.get()
 
@@ -783,6 +814,9 @@ private[spark] class MemorySpillManager(
    * that samples it, rather than being lost between samples.
    */
   def memoryPressureDetected: Boolean = memoryPressure.get()
+
+  /** Whether the retained-output disk byte, file or physical-headroom bound refused a write. */
+  def diskPressureDetected: Boolean = diskPressure.get()
 
   /** Total number of refused or partially granted reservations observed. */
   def memoryPressureEvents: Long = memoryPressureCount.get()
@@ -1376,8 +1410,14 @@ private[spark] class MemorySpillManager(
           s"partition $partitionId expected sequence $expected but was offered $sequenceNumber " +
           "for a durable admission")
     } else if (spilledRecordCount >= MAX_RETAINED_SPILL_RECORDS_TOTAL) {
+      diskPressure.set(true)
+      memoryPressure.set(true)
+      memoryPressureCount.incrementAndGet()
       None
     } else if (existing.exists(_.retainedBlockCount >= MAX_RETAINED_BLOCKS_PER_PARTITION)) {
+      diskPressure.set(true)
+      memoryPressure.set(true)
+      memoryPressureCount.incrementAndGet()
       None
     } else {
       val buffer = partitionBuffers.getOrElseUpdate(partitionId, new PartitionBuffer(partitionId))
@@ -1405,6 +1445,7 @@ private[spark] class MemorySpillManager(
       case Some(buffer) if !closed.get() =>
         buffer.spilledBlockRecords ++= records
         spilledRecordCount += records.size
+        spilledMetadataReservedBytes += records.size.toLong * SPILLED_RECORD_METADATA_BYTES
         records.foreach { record =>
           spillFilesByBlockId.update(record.blockId, record.file)
           spillFileBlockIds.update(record.file, record.blockId)
@@ -1412,6 +1453,7 @@ private[spark] class MemorySpillManager(
         buffer.lastAccessTimeMs = clock.getTimeMillis()
         records.foldLeft(0L)((acc, record) => acc + record.length)
       case _ =>
+        quota.release(records.size.toLong * SPILLED_RECORD_METADATA_BYTES, MetadataMemory)
         records.map(_.file).distinct.foreach { file =>
           if (retireSpillFileLocked(file)) {
             deleteSpillFile(file)
@@ -2117,6 +2159,8 @@ private[spark] class MemorySpillManager(
               // the copy on disk that a later reduce attempt has to be able to read.
               buffer.spilledBlockRecords ++= records
               spilledRecordCount += records.size
+              spilledMetadataReservedBytes +=
+                records.size.toLong * SPILLED_RECORD_METADATA_BYTES
               records.foreach { record =>
                 spillFilesByBlockId.update(record.blockId, record.file)
                 spillFileBlockIds.update(record.file, record.blockId)
@@ -2144,6 +2188,8 @@ private[spark] class MemorySpillManager(
               }
           }
         case _ =>
+          outcome.foreach(records =>
+            quota.release(records.size.toLong * SPILLED_RECORD_METADATA_BYTES, MetadataMemory))
           spilledFiles.foreach(filesToDelete += _)
       }
     }
@@ -2227,33 +2273,108 @@ private[spark] class MemorySpillManager(
   private def spillPartitionBlocks(
       partitionId: Int,
       blocks: Seq[BufferedBlock]): Option[Seq[SpilledBlock]] = {
-    // A freshly allocated ShuffleWriteMetrics, never the task's own shuffle-write reporter.
-    // DiskBlockObjectWriter reports bytes, records and write time to whatever reporter it is
-    // handed, so reusing the task's would double count spilled bytes as shuffle-written bytes.
-    // Spilled volume belongs on the spill accumulators, which this class reports separately.
+    if (blocks.isEmpty) {
+      return Some(Seq.empty)
+    }
+    val metadataBytes = blocks.size.toLong * SPILLED_RECORD_METADATA_BYTES
+    if (!quota.tryReserve(metadataBytes, MetadataMemory)) {
+      recordMemoryPressure(metadataBytes, 0L)
+      return None
+    }
+    val batches = new mutable.ArrayBuffer[Seq[BufferedBlock]]()
+    val batch = new mutable.ArrayBuffer[BufferedBlock](MAX_SPILL_SEGMENTS_PER_FILE)
+    var batchBytes = 0L
+    blocks.foreach { block =>
+      val wouldExceedBytes =
+        batch.nonEmpty && batchBytes + block.data.length.toLong > MAX_SPILL_FILE_PAYLOAD_BYTES
+      if (batch.size >= MAX_SPILL_SEGMENTS_PER_FILE || wouldExceedBytes) {
+        batches += batch.toSeq
+        batch.clear()
+        batchBytes = 0L
+      }
+      batch += block
+      batchBytes += block.data.length.toLong
+    }
+    if (batch.nonEmpty) {
+      batches += batch.toSeq
+    }
+
+    val records = new mutable.ArrayBuffer[SpilledBlock](blocks.size)
+    val committedFiles = new mutable.ArrayBuffer[File](batches.size)
+    var failed = false
+    val iterator = batches.iterator
+    while (iterator.hasNext && !failed) {
+      spillBlockBatch(partitionId, iterator.next()) match {
+        case Some(written) =>
+          records ++= written
+          written.headOption.foreach(record => committedFiles += record.file)
+        case None =>
+          failed = true
+      }
+    }
+    if (failed) {
+      committedFiles.distinct.foreach(deleteSpillFile)
+      quota.release(metadataBytes, MetadataMemory)
+      None
+    } else {
+      Some(records.toSeq)
+    }
+  }
+
+  /** Writes one bounded group of blocks into one quota-reserved spill file. */
+  private def spillBlockBatch(
+      partitionId: Int,
+      blocks: Seq[BufferedBlock]): Option[Seq[SpilledBlock]] = {
+    val rawBytes = blocks.foldLeft(0L)((total, block) => total + block.data.length.toLong)
+    val expandedBytes = saturatingMultiply(rawBytes, DISK_RESERVATION_MULTIPLIER)
+    val estimatedBytes =
+      if (expandedBytes > Long.MaxValue - DISK_RESERVATION_OVERHEAD_BYTES) {
+        Long.MaxValue
+      } else {
+        expandedBytes + DISK_RESERVATION_OVERHEAD_BYTES
+      }
+    val reservation = diskQuota.tryReserve(estimatedBytes) match {
+      case Some(granted) => granted
+      case None =>
+        recordDiskPressure(estimatedBytes,
+          s"the executor disk quota of ${diskQuota.totalBytes} bytes or " +
+            s"${diskQuota.fileLimit} files is fully committed")
+        return None
+    }
+    // A freshly allocated reporter, never the task's shuffle-write reporter. DiskBlockObjectWriter
+    // mutates whichever reporter it receives, so sharing the task reporter would double count.
     val spillMetrics = new ShuffleWriteMetrics
     var file: File = null
-    // Held outside the try so that the failure report can name the destination by its block id even
-    // when the failure was the allocation itself.
     var spillBlockId: TempShuffleBlockId = null
     var writer: DiskBlockObjectWriter = null
     var succeeded = false
+    val allocated = try {
+      Some(diskBlockManager.createTempShuffleBlock())
+    } catch {
+      case NonFatal(e) =>
+        recordDiskPressure(estimatedBytes,
+          s"the selected local directory could not allocate a spill path: " +
+            s"${e.getClass.getSimpleName}")
+        reservation.cancel()
+        None
+    }
+    if (allocated.isEmpty) {
+      return None
+    }
+    val (blockId, tempFile) = allocated.get
+    spillBlockId = blockId
+    file = tempFile
     try {
-      // Allocated inside the failure boundary, not before it. Local scratch allocation is itself a
-      // filesystem operation and fails for exactly the reasons a write does -- a full disk, an
-      // unwritable directory, a device error -- so leaving it outside would let a disk failure
-      // escape uncounted, past the rollback, and out of an eviction that has already detached
-      // blocks.
-      val (blockId, tempFile) = diskBlockManager.createTempShuffleBlock()
-      spillBlockId = blockId
-      file = tempFile
+      if (!diskQuota.hasUsableSpace(tempFile, estimatedBytes)) {
+        recordDiskPressure(estimatedBytes,
+          s"the selected local directory has less than $MIN_LOCAL_DISK_HEADROOM_BYTES bytes of " +
+            "headroom beyond this write")
+        return None
+      }
       writer = newSpillWriter(blockId, tempFile, serializerInstance, fileBufferSizeBytes,
         spillMetrics)
       val records = new mutable.ArrayBuffer[SpilledBlock](blocks.size)
       blocks.foreach { block =>
-        // Raw bytes: the payload is already framed, so re-serializing it as a key/value pair would
-        // be pure overhead. `recordWritten` keeps the writer's record tally honest, since the raw
-        // byte overload deliberately does not advance it.
         writer.write(block.data, 0, block.data.length)
         writer.recordWritten()
         val segment = writer.commitAndGet()
@@ -2261,40 +2382,24 @@ private[spark] class MemorySpillManager(
           segment.offset, segment.length, block.data.length)
       }
       writer.close()
-      succeeded = true
-      Some(records.toSeq)
+      writer = null
+      val actualBytes = tempFile.length()
+      if (!reservation.commit(tempFile, actualBytes)) {
+        recordDiskPressure(actualBytes,
+          s"the committed file would exceed the executor disk quota of ${diskQuota.totalBytes} " +
+            "bytes")
+        None
+      } else {
+        succeeded = true
+        Some(records.toSeq)
+      }
     } catch {
       case NonFatal(e) =>
         spillFailureTotal.incrementAndGet()
-        // A failing disk fails every eviction of every task on the executor, which makes this the
-        // most prolific of the recurring conditions, so it is bounded executor-wide exactly like
-        // the success path. Two deliberate choices keep the bounded line both safe and useful: the
-        // destination is named by its temporary block id rather than by its path, so an executor's
-        // local storage layout is not written into a default-level record, and the cause is named
-        // by its exception class, because the exception's own message routinely embeds that path.
-        // The full path and the complete stack trace are emitted together under the streaming debug
-        // key, which is where an operator investigating repeated spill failures should look.
-        spillFailureLogAggregator.record(clock.getTimeMillis()) match {
-          case Some(summary) =>
-            val destination =
-              if (spillBlockId == null) "an unallocated spill block" else spillBlockId.name
-            logError(log"Failed to evict streaming shuffle partition " +
-              log"${MDC(PARTITION_ID, partitionId)} to spill block " +
-              log"${MDC(BLOCK_ID, destination)}: ${MDC(CLASS_NAME, e.getClass.getName)} " +
-              log"(${MDC(COUNT, summary.occurrences)} spill failures on this executor so far, " +
-              log"${MDC(NUM_SKIPPED, summary.unreported)} not reported individually)")
-          case None =>
-            if (debugEnabled) {
-              val target = if (file == null) "an unallocated spill file" else file.getAbsolutePath
-              logError(log"Failed to evict streaming shuffle partition " +
-                log"${MDC(PARTITION_ID, partitionId)} to spill file ${MDC(PATH, target)}", e)
-            }
-        }
+        reportSpillFailure(partitionId, spillBlockId, file, e)
         None
     } finally {
       if (!succeeded) {
-        // Roll the file back to its last committed position and then remove it outright: nothing
-        // from a partially written spill file may ever be served.
         if (writer != null) {
           Utils.tryLogNonFatalError {
             writer.revertPartialWritesAndClose()
@@ -2303,7 +2408,32 @@ private[spark] class MemorySpillManager(
         if (file != null) {
           deleteSpillFile(file)
         }
+        reservation.cancel()
       }
+    }
+  }
+
+  /** Reports one bounded spill-write failure without exposing local paths at default log level. */
+  private def reportSpillFailure(
+      partitionId: Int,
+      spillBlockId: TempShuffleBlockId,
+      file: File,
+      failure: Throwable): Unit = {
+    spillFailureLogAggregator.record(clock.getTimeMillis()) match {
+      case Some(summary) =>
+        val destination =
+          if (spillBlockId == null) "an unallocated spill block" else spillBlockId.name
+        logError(log"Failed to evict streaming shuffle partition " +
+          log"${MDC(PARTITION_ID, partitionId)} to spill block " +
+          log"${MDC(BLOCK_ID, destination)}: ${MDC(CLASS_NAME, failure.getClass.getName)} " +
+          log"(${MDC(COUNT, summary.occurrences)} spill failures on this executor so far, " +
+          log"${MDC(NUM_SKIPPED, summary.unreported)} not reported individually)")
+      case None =>
+        if (debugEnabled) {
+          val target = if (file == null) "an unallocated spill file" else file.getAbsolutePath
+          logError(log"Failed to evict streaming shuffle partition " +
+            log"${MDC(PARTITION_ID, partitionId)} to spill file ${MDC(PATH, target)}", failure)
+        }
     }
   }
 
@@ -2326,6 +2456,11 @@ private[spark] class MemorySpillManager(
    * Idempotent: re-registering a consumer already present keeps the position it has reached, so a
    * reconnecting consumer does not rewind the window it has already advanced.
    *
+   * New identities are admitted only while both the per-store cursor cap and the executor-wide
+   * unique-identity cap have room. The latter is reference counted, so one reduce task may register
+   * with many map outputs without being counted as many identities, while identity churn cannot
+   * create permanent cursor state without bound.
+   *
    * A consumer may be admitted after the producing task has finished, and normally is: the
    * scheduler starts no reduce task before its map stage completes, so almost every consumer
    * subscribes to a store that has already released its memory and handed its files to the block
@@ -2334,16 +2469,23 @@ private[spark] class MemorySpillManager(
    * that owns its files and has been closed serves nothing, because those files are gone.
    *
    * @param consumerId identity of the consumer, as the producer knows it; must be non-empty
-   * @return true when the consumer is now registered, false when this store no longer serves
+   * @return true when the consumer is now registered, false when this store no longer serves or a
+   *         consumer-registration cap is full
    */
   def registerConsumer(consumerId: String): Boolean = {
     require(consumerId != null && consumerId.nonEmpty, "consumerId must be non-empty")
     lock.synchronized {
-      if (servesRetainedOutputLocked) {
-        consumerPositions.getOrElseUpdate(consumerId, new mutable.HashMap[Int, Long]())
-        true
-      } else {
+      if (!servesRetainedOutputLocked) {
         false
+      } else if (consumerPositions.contains(consumerId)) {
+        true
+      } else if (consumerPositions.size >= MAX_REGISTERED_CONSUMERS_PER_STORE ||
+          !MemorySpillManager.acquireConsumerIdentity(consumerId)) {
+        rejectedConsumerRegistrations.incrementAndGet()
+        false
+      } else {
+        consumerPositions.put(consumerId, new mutable.HashMap[Int, Long]())
+        true
       }
     }
   }
@@ -2363,18 +2505,57 @@ private[spark] class MemorySpillManager(
    */
   def unregisterConsumer(consumerId: String): Long = {
     require(consumerId != null && consumerId.nonEmpty, "consumerId must be non-empty")
-    val partitions = lock.synchronized {
-      if (consumerPositions.remove(consumerId).isEmpty || consumerPositions.isEmpty) {
-        Nil
-      } else {
-        partitionBuffers.keys.toList
-      }
+    val (removed, partitions) = lock.synchronized {
+      val removed = consumerPositions.remove(consumerId).isDefined
+      val partitions =
+        if (!removed || consumerPositions.isEmpty) Nil else partitionBuffers.keys.toList
+      (removed, partitions)
     }
-    partitions.foldLeft(0L)((freed, partitionId) => freed + reclaim(partitionId))
+    if (removed) {
+      MemorySpillManager.releaseConsumerIdentity(consumerId)
+    }
+    partitions.foldLeft(0L)((freed, partitionId) => freed + requestReclamation(partitionId))
   }
 
   /** The consumers currently entitled to acknowledge. */
   def registeredConsumers: Set[String] = lock.synchronized(consumerPositions.keySet.toSet)
+
+  /** Consumer registrations refused by the per-store or executor-wide identity cap. */
+  def rejectedConsumerRegistrationCount: Long = rejectedConsumerRegistrations.get()
+
+  /**
+   * Releases every retained consumer cursor when the block resolver drops this producer.
+   *
+   * A successful map task detaches its spill files and closes its task-owned memory while keeping
+   * these cursors alive for post-task consumers. The resolver is therefore the final owner and must
+   * release the cursor registrations when the generation is superseded, the shuffle is unregistered
+   * or the resolver stops.
+   *
+   * @return the number of consumer identities released
+   */
+  private[streaming] def releaseRetainedConsumerState(): Int = {
+    var metadataBytes = 0L
+    val consumers = lock.synchronized {
+      val snapshot = consumerPositions.keys.toSeq
+      consumerPositions.clear()
+      pendingReclamationPartitions.clear()
+      pendingReclamationSet.clear()
+      reclamationRequestedAtMs.clear()
+      reclamationDispatchQueued.set(false)
+      if (closed.get() && spillFilesDetached) {
+        metadataBytes = spilledMetadataReservedBytes
+        spilledMetadataReservedBytes = 0L
+        partitionBuffers.values.foreach(_.spilledBlockRecords.clear())
+        spilledRecordCount = 0
+      }
+      snapshot
+    }
+    consumers.foreach(MemorySpillManager.releaseConsumerIdentity)
+    if (metadataBytes > 0L) {
+      quota.release(metadataBytes, MetadataMemory)
+    }
+    consumers.size
+  }
 
   /**
    * The position a consumer has acknowledged for a partition, or `None` when it has acknowledged
@@ -2423,10 +2604,11 @@ private[spark] class MemorySpillManager(
    * Unlinking it on acknowledgement would destroy output a later attempt of the same reduce task is
    * entitled to read, which is the re-readability Spark's recovery model assumes of map output.
    *
-   * The whole operation is synchronous and does no work proportional to anything but the retired
-   * prefix, which is what keeps it inside the 100 ms reclamation target. The target is measured
-   * rather than enforced: the achieved latency is recorded on [[lastReclamationDurationMs]], and a
-   * breach is counted on [[reclamationDeadlineBreaches]] and logged.
+   * Per-acknowledgement work is bounded. The call retires at most
+   * [[MemorySpillManager.MAX_RECLAIMED_BLOCKS_PER_BATCH]] blocks under the store lock and
+   * dispatches any remaining prefix to the executor-scoped reclaimer in equally bounded batches.
+   * The achieved end-to-end latency is recorded on [[lastReclamationDurationMs]], and a breach is
+   * counted on [[reclamationDeadlineBreaches]] and logged.
    *
    * @param consumerId identity of the acknowledging consumer; must be non-empty and registered
    * @param partitionId the reduce partition being acknowledged; must be non-negative
@@ -2451,7 +2633,7 @@ private[spark] class MemorySpillManager(
       rejectedAcknowledgements.incrementAndGet()
       0L
     } else {
-      reclaim(partitionId)
+      requestReclamation(partitionId)
     }
   }
 
@@ -2511,67 +2693,157 @@ private[spark] class MemorySpillManager(
   }
 
   /**
-   * Releases the acknowledged prefix of one partition's *memory*, and only its memory.
+   * Starts reclamation for one partition and performs the first bounded batch synchronously.
    *
-   * The asymmetry between the two things this class retains is the whole of this method. In-memory
-   * blocks are task-managed execution memory: they must be handed back as soon as every consumer
-   * entitled to them has confirmed receipt, which is what the hundred-millisecond reclamation bound
-   * is about. Spilled segments are not memory at all -- they are the map output, on local disk,
-   * whose lifetime is the shuffle's rather than any one reduce attempt's. Unlinking them because a
-   * consumer acknowledged them would destroy output a *later* attempt of that same reduce task is
-   * entitled to read, and Spark's recovery model depends on map output being re-readable until the
-   * shuffle is unregistered. So an acknowledgement never unlinks a segment: a segment is unlinked
-   * either by an owning [[close]] -- the producing task failed, so its output is going away anyway
-   * -- or by the block resolver once [[releaseSpillFileOwnership]] has made the resolver the owner,
-   * at generation withdrawal, at shuffle unregistration or at resolver shutdown.
-   *
-   * The watermark still advances on every acknowledgement, because it is what an eviction in flight
-   * consults to avoid re-publishing memory this method has already released.
+   * The acknowledgement-facing call can therefore retire the common small prefix immediately while
+   * never scanning or removing more than [[MAX_RECLAIMED_BLOCKS_PER_BATCH]] entries under the store
+   * lock. Any remainder is queued once for the executor-scoped reclamation worker.
    */
-  private def reclaim(partitionId: Int): Long = {
-    val startTimeMs = clock.getTimeMillis()
-    var memoryFreed = 0L
+  private def requestReclamation(partitionId: Int): Long = {
     lock.synchronized {
-      // The retirement position is the minimum across every registered consumer, recomputed here
-      // rather than passed in, so that a departing consumer and an advancing one reach the same
-      // decision through the same code and neither can retire on the strength of its own position
-      // alone.
+      reclamationRequestedAtMs.getOrElseUpdate(partitionId, clock.getTimeMillis())
+    }
+    val (freedBytes, hasMore) = reclaimBatch(partitionId)
+    if (hasMore) {
+      queueReclamation(partitionId)
+    }
+    freedBytes
+  }
+
+  /**
+   * Releases at most one bounded prefix of one partition's memory.
+   *
+   * Spilled segments are deliberately untouched: they are durable map output whose lifetime belongs
+   * to the shuffle. The acknowledgement watermark still advances before any in-memory block is
+   * removed, so an eviction already in flight cannot publish a block this batch retired.
+   *
+   * @return bytes released by this batch and whether another eligible in-memory block remains
+   */
+  private def reclaimBatch(partitionId: Int): (Long, Boolean) = {
+    var memoryFreed = 0L
+    var hasMore = false
+    var requestedAtMs = clock.getTimeMillis()
+    lock.synchronized {
+      requestedAtMs = reclamationRequestedAtMs.getOrElseUpdate(partitionId, requestedAtMs)
       val position = retirementPositionLocked(partitionId)
       partitionBuffers.get(partitionId).foreach { buffer =>
-        // Record the watermark before retiring anything. Blocks an eviction has already detached
-        // are deliberately not touched here: they are the eviction's to account for, and this
-        // watermark is how it learns they no longer need publishing. Advancing monotonically means
-        // a late, lower acknowledgement can never un-retire what a higher one already covered.
         if (position > buffer.acknowledgedThroughSequence) {
           buffer.acknowledgedThroughSequence = position
         }
-        while (buffer.memoryBlocks.nonEmpty &&
+        var retiredBlocks = 0
+        while (retiredBlocks < MAX_RECLAIMED_BLOCKS_PER_BATCH &&
+            buffer.memoryBlocks.nonEmpty &&
             buffer.memoryBlocks.head.sequenceNumber <= position) {
           val retired = buffer.memoryBlocks.removeHead()
           val bytes = retired.chargeBytes
           buffer.bufferedBytes -= bytes
           bufferedMemoryBytes -= bytes
           memoryFreed += bytes
+          retiredBlocks += 1
         }
+        hasMore = buffer.memoryBlocks.nonEmpty &&
+          buffer.memoryBlocks.head.sequenceNumber <= position
         buffer.lastAccessTimeMs = clock.getTimeMillis()
-        // The partition's bookkeeping is deliberately retained even when it holds no memory. It
-        // carries the sequence watermark that keeps the stream gap-free, and the durable segment
-        // records through which a later consumer -- or a later attempt of the same one -- is
-        // served. The number of entries is bounded by the reduce partition count either way.
+      }
+      if (!hasMore) {
+        reclamationRequestedAtMs.remove(partitionId)
       }
     }
     if (memoryFreed > 0L) {
       releaseReclaimedBytes(memoryFreed)
     }
-    val elapsedMs = clock.getTimeMillis() - startTimeMs
+    reclamationBatchTotal.incrementAndGet()
+    if (!hasMore) {
+      recordReclamationCompletion(partitionId, requestedAtMs)
+    }
+    (memoryFreed, hasMore)
+  }
+
+  /** Adds one partition to this manager's coalesced asynchronous reclamation queue. */
+  private def queueReclamation(partitionId: Int): Unit = {
+    val added = lock.synchronized {
+      if (pendingReclamationSet.add(partitionId)) {
+        pendingReclamationPartitions.append(partitionId)
+        true
+      } else {
+        false
+      }
+    }
+    if (added) {
+      scheduleReclamationDispatch()
+    }
+  }
+
+  /** Queues this manager once on the executor-scoped dispatcher when background work is enabled. */
+  private def scheduleReclamationDispatch(): Unit = {
+    if (autoPoll && reclamationDispatchQueued.compareAndSet(false, true)) {
+      MemorySpillManager.enqueueForReclamation(this)
+    }
+  }
+
+  /** Runs one queued partition batch on the executor-scoped reclamation worker. */
+  private def runScheduledReclamationBatch(): Unit = {
+    reclamationDispatchQueued.set(false)
+    if (!closed.get()) {
+      drainOnePendingReclamationBatch()
+      if (lock.synchronized(pendingReclamationPartitions.nonEmpty)) {
+        scheduleReclamationDispatch()
+      }
+    }
+  }
+
+  /** Drains one queued partition batch, re-queueing it when another bounded prefix remains. */
+  private def drainOnePendingReclamationBatch(): Long = {
+    val partition = lock.synchronized {
+      if (pendingReclamationPartitions.nonEmpty) {
+        val next = pendingReclamationPartitions.removeHead()
+        pendingReclamationSet.remove(next)
+        Some(next)
+      } else {
+        None
+      }
+    }
+    partition.map { partitionId =>
+      val (freedBytes, hasMore) = reclaimBatch(partitionId)
+      if (hasMore) {
+        queueReclamation(partitionId)
+      }
+      freedBytes
+    }.getOrElse(0L)
+  }
+
+  /**
+   * Deterministically drains queued batches when the background worker is disabled by a test.
+   *
+   * @return bytes released by the batches this call ran
+   */
+  private[streaming] def drainPendingReclamationForTesting(): Long = {
+    var total = 0L
+    var continue = true
+    while (continue) {
+      val pending = lock.synchronized(pendingReclamationPartitions.nonEmpty)
+      if (pending) {
+        total += drainOnePendingReclamationBatch()
+      } else {
+        continue = false
+      }
+    }
+    total
+  }
+
+  /** Partitions awaiting an asynchronous reclamation batch. */
+  private[streaming] def pendingReclamationCount: Int =
+    lock.synchronized(pendingReclamationPartitions.size)
+
+  /** Bounded reclamation batches run by this producer store. */
+  private[streaming] def reclamationBatchCount: Long = reclamationBatchTotal.get()
+
+  /** Records end-to-end latency from acknowledgement acceptance to the final batch. */
+  private def recordReclamationCompletion(partitionId: Int, requestedAtMs: Long): Unit = {
+    val elapsedMs = math.max(0L, clock.getTimeMillis() - requestedAtMs)
     lastReclamationMs.set(elapsedMs)
     if (elapsedMs > RECLAMATION_DEADLINE_MS) {
       reclamationBreachTotal.incrementAndGet()
-      // Reclamation runs once per acknowledgement of every task on the executor, so a machine that
-      // is merely slow breaches this bound on nearly every acknowledgement. Bounding the record
-      // executor-wide keeps a latency symptom from becoming a log-volume problem, and the running
-      // breach count preserves the one thing an operator actually needs from the suppressed lines:
-      // how often it is happening.
       reclamationLogAggregator.record(clock.getTimeMillis()) match {
         case Some(summary) =>
           logWarning(log"Streaming shuffle buffer reclamation for partition " +
@@ -2586,7 +2858,6 @@ private[spark] class MemorySpillManager(
           }
       }
     }
-    memoryFreed
   }
 
   // Lifecycle
@@ -2631,7 +2902,9 @@ private[spark] class MemorySpillManager(
   private def closeInternal(context: Option[TaskContext]): Unit = {
     val filesToDelete = new mutable.ArrayBuffer[File]()
     var accountedBytes = 0L
+    var metadataBytesToRelease = 0L
     var admissionsInFlight = 0
+    var consumerIdsToRelease = Seq.empty[String]
     // The lifecycle flip and the tally capture are one indivisible step, taken under the same
     // monitor that refuses admission. Once this block returns, no further admission can be reserved
     // and no further eviction can be planned, so the captured tally is final.
@@ -2663,6 +2936,8 @@ private[spark] class MemorySpillManager(
         // would leave files on disk that nothing could name and no consumer could ever be served
         // from -- the files would outlive the task and be useless, which is the worst of both.
         if (ownsFiles) {
+          metadataBytesToRelease = spilledMetadataReservedBytes
+          spilledMetadataReservedBytes = 0L
           partitionBuffers.clear()
           spilledRecordCount = 0
         }
@@ -2690,8 +2965,13 @@ private[spark] class MemorySpillManager(
         // served -- and it is precisely after task completion that consumers do their reading. An
         // owning close has nothing left to replay, so its registry is only heap.
         if (ownsFiles) {
+          consumerIdsToRelease = consumerPositions.keys.toSeq
           consumerPositions.clear()
         }
+        pendingReclamationPartitions.clear()
+        pendingReclamationSet.clear()
+        reclamationRequestedAtMs.clear()
+        reclamationDispatchQueued.set(false)
         true
       } else {
         false
@@ -2704,6 +2984,9 @@ private[spark] class MemorySpillManager(
       if (accountedBytes > 0L) {
         quota.release(accountedBytes)
         freeMemory(accountedBytes)
+      }
+      if (metadataBytesToRelease > 0L) {
+        quota.release(metadataBytesToRelease, MetadataMemory)
       }
       // Residual reconciliation, and only when nothing was in flight. The memory manager's view is
       // the one the task-level leak detector checks, so a drift in this class's own bookkeeping
@@ -2720,6 +3003,7 @@ private[spark] class MemorySpillManager(
         }
       }
       MemorySpillManager.deregisterFromPolling(this)
+      consumerIdsToRelease.foreach(MemorySpillManager.releaseConsumerIdentity)
       filesToDelete.distinct.foreach(deleteSpillFile)
       reportTaskMetrics(context)
       if (debugEnabled) {
@@ -2956,6 +3240,33 @@ private[spark] class MemorySpillManager(
   }
 
   /**
+   * Publishes retained-output disk exhaustion as the existing MemoryPressure fallback condition.
+   *
+   * The fallback contract has exactly four reasons and local disk exhaustion is not a fifth one.
+   * It is resource pressure preventing a buffer from being retained, so it deliberately sets the
+   * same sticky memory-pressure signal the policy already maps to `MemoryPressure`.
+   */
+  private def recordDiskPressure(requested: Long, reason: String): Unit = {
+    diskPressure.set(true)
+    memoryPressure.set(true)
+    memoryPressureCount.incrementAndGet()
+    diskPressureLogAggregator.record(clock.getTimeMillis(), requested) match {
+      case Some(summary) =>
+        logWarning(log"Streaming shuffle refused ${MDC(NUM_BYTES, requested)} retained-output " +
+          log"disk byte(s): ${MDC(REASON, reason)}. Streaming will yield to sort-based shuffle " +
+          log"before exhausting local storage " +
+          log"(${MDC(COUNT, summary.occurrences)} disk-pressure refusals totalling " +
+          log"${MDC(MEMORY_SIZE, summary.volumeBytes)} requested byte(s) on this executor, " +
+          log"${MDC(NUM_SKIPPED, summary.unreported)} not reported individually)")
+      case None =>
+        if (debugEnabled) {
+          logInfo(log"Streaming shuffle refused ${MDC(NUM_BYTES, requested)} retained-output " +
+            log"disk byte(s): ${MDC(REASON, reason)}")
+        }
+    }
+  }
+
+  /**
    * Reports a refusal that no eviction can ever reverse.
    *
    * Reported at warning level exactly once and at debug level thereafter. A permanent refusal
@@ -2980,7 +3291,9 @@ private[spark] class MemorySpillManager(
   /** Removes a spill file. A non-fatal failure is logged rather than escalated. */
   private def deleteSpillFile(file: File): Unit = {
     try {
-      if (!Files.deleteIfExists(file.toPath) && debugEnabled) {
+      val deleted = Files.deleteIfExists(file.toPath)
+      MemorySpillManager.releaseDiskQuota(file)
+      if (!deleted && debugEnabled) {
         logInfo(log"Streaming shuffle spill file ${MDC(FILE_NAME, file.getName)} was already " +
           log"removed")
       }
@@ -3061,6 +3374,17 @@ private[spark] object MemorySpillManager extends Logging {
     wholeHundreds + remainder
   }
 
+  /** Multiplies two non-negative byte counts, saturating instead of wrapping. */
+  def saturatingMultiply(left: Long, right: Long): Long = {
+    if (left <= 0L || right <= 0L) {
+      0L
+    } else if (left > Long.MaxValue / right) {
+      Long.MaxValue
+    } else {
+      left * right
+    }
+  }
+
   /**
    * Sentinel meaning that no reduce partition count has been registered yet. Distinct from one, so
    * that a legitimate single-partition registration is told apart from the degenerate default.
@@ -3129,7 +3453,7 @@ private[spark] object MemorySpillManager extends Logging {
    * raises memory pressure, which routes the shuffle to sort-based fallback rather than stalling
    * it.
    */
-  val MAX_RETAINED_BLOCKS_PER_PARTITION: Int = 8192
+  val MAX_RETAINED_BLOCKS_PER_PARTITION: Int = 4096
 
   /**
    * Transfer buffer used when a spilled block is decoded back into its payload.
@@ -3150,6 +3474,26 @@ private[spark] object MemorySpillManager extends Logging {
   val MAX_TRACKED_PARTITIONS: Int = 1 << 20
 
   /**
+   * Most logical consumers one retained producer store may hold cursors for at once.
+   *
+   * This matches the producer handler's live-session ceiling. A reconnect with the same identity is
+   * idempotent and consumes no additional entry; identity churn beyond the ceiling is refused
+   * before it can pin another reclamation cursor.
+   */
+  val MAX_REGISTERED_CONSUMERS_PER_STORE: Int = 4096
+
+  /**
+   * Most distinct logical consumer identities admitted across the executor.
+   *
+   * The quota is shared across every producer store and reference-counted, so the same reduce task
+   * may register with many map outputs while a peer cannot manufacture an unbounded succession of
+   * identities across them. Twice the per-store ceiling leaves room for reconnect overlap and for
+   * concurrent shuffles without turning identity churn into permanent executor state.
+   */
+  val MAX_REGISTERED_CONSUMER_IDENTITIES: Int =
+    2 * MAX_REGISTERED_CONSUMERS_PER_STORE
+
+  /**
    * The largest number of retained spill records one consumer may accumulate across every
    * partition.
    *
@@ -3158,10 +3502,45 @@ private[spark] object MemorySpillManager extends Logging {
    * otherwise grow without limit. At the 2 MiB block cap it stands for 512 GiB of spilled payload,
    * so it constrains only a stream that has already stopped making progress.
    */
-  val MAX_RETAINED_SPILL_RECORDS_TOTAL: Int = 262144
+  val MAX_RETAINED_SPILL_RECORDS_TOTAL: Int = 65536
+
+  /** Most committed spill files the streaming subsystem may retain on one executor. */
+  val MAX_RETAINED_SPILL_FILES: Int = 4096
+
+  /** Most independently committed block segments written into one spill file. */
+  val MAX_SPILL_SEGMENTS_PER_FILE: Int = 64
+
+  /** Largest raw payload volume grouped into one spill file. */
+  val MAX_SPILL_FILE_PAYLOAD_BYTES: Long = 128L * 1024L * 1024L
+
+  /**
+   * Conservative expansion factor reserved before compression and encryption write a spill file.
+   */
+  val DISK_RESERVATION_MULTIPLIER: Long = 2L
+
+  /** Fixed per-file headroom included in every pre-write disk reservation. */
+  val DISK_RESERVATION_OVERHEAD_BYTES: Long = 64L * 1024L
+
+  /** Disk allowance as a multiple of the configured aggregate streaming heap allowance. */
+  val DISK_TO_MEMORY_QUOTA_MULTIPLIER: Long = 8L
+
+  /** Absolute ceiling on streaming-retained disk per executor. */
+  val MAX_EXECUTOR_DISK_QUOTA_BYTES: Long = 8L * 1024L * 1024L * 1024L
+
+  /** Share of currently usable local-disk space streaming may reserve. */
+  val LOCAL_DISK_QUOTA_PERCENT: Int = 10
+
+  /** Free space left untouched on a selected local directory before a spill write begins. */
+  val MIN_LOCAL_DISK_HEADROOM_BYTES: Long = 64L * 1024L * 1024L
+
+  /** Heap charged for one durable spill record and its collection slot. */
+  val SPILLED_RECORD_METADATA_BYTES: Long = 128L
 
   /** Name of the single daemon thread that drives the threshold cadence for the whole executor. */
   val POLLER_THREAD_NAME: String = "streaming-shuffle-spill-poller"
+
+  /** Name of the one executor-scoped worker that drains bounded reclamation batches. */
+  val RECLAIMER_THREAD_NAME: String = "streaming-shuffle-reclaimer"
 
   /**
    * The bound, in milliseconds, within which the executor's threshold ticker must be gone once
@@ -3180,10 +3559,20 @@ private[spark] object MemorySpillManager extends Logging {
    */
   val POLL_INTERVAL_MS: Long = 100L
 
+  /** Blocks one synchronous or asynchronous reclamation batch may retire under the store lock. */
+  val MAX_RECLAIMED_BLOCKS_PER_BATCH: Int = 256
+
+  /** Delay between executor-scoped reclamation dispatch rounds. */
+  val RECLAMATION_DISPATCH_INTERVAL_MS: Long = 1L
+
+  /** Managers one dispatch round services before yielding to the scheduler. */
+  val MAX_RECLAMATION_MANAGERS_PER_ROUND: Int = 64
+
   /**
    * The bound, in milliseconds, within which buffer reclamation must complete after a consumer
-   * acknowledgement. Exceeding it is logged rather than enforced, because failing a task over a
-   * reclamation that was merely slow would trade a latency problem for a correctness one.
+   * acknowledgement. Per-ack work is capped and any remaining prefix is dispatched to the bounded
+   * executor-scoped reclaimer, so the event-loop-facing call is never proportional to the retained
+   * window.
    */
   val RECLAMATION_DEADLINE_MS: Long = 100L
 
@@ -3390,6 +3779,31 @@ private[spark] object MemorySpillManager extends Logging {
     DataBlockMessage.FRAMING_OVERHEAD_BYTES.toLong + RETAINED_BLOCK_OVERHEAD_BYTES
 
   /**
+   * One kind of heap charged to the executor-wide streaming allowance.
+   *
+   * The category does not create a second ceiling. It is a diagnostic and ownership boundary inside
+   * the one ceiling, so a consumer cannot release producer bytes and a queue cannot release a
+   * decoder's payload. The sum of all four categories is always
+   * [[ExecutorBufferQuota.reservedBytes]].
+   */
+  private[streaming] sealed trait MemoryCharge
+
+  /** Retained producer payloads and the fixed framing scratch that creates them. */
+  private[streaming] case object ProducerMemory extends MemoryCharge
+
+  /** Decoded payloads retained by consumer hand-off queues and readers. */
+  private[streaming] case object ConsumerMemory extends MemoryCharge
+
+  /** Temporary frame copies held from encoding until a channel write completes. */
+  private[streaming] case object TransientMemory extends MemoryCharge
+
+  /** Queue nodes, credit windows, retained spill records and other bounded ledgers. */
+  private[streaming] case object MetadataMemory extends MemoryCharge
+
+  /** Quota owner of each committed spill file, including test-local quota instances. */
+  private val diskQuotaOwners = new ConcurrentHashMap[String, ExecutorDiskQuota]()
+
+  /**
    * Largest number of bytes one block can occupy on the wire, framing included, taken from the
    * protocol. Published here so that a producer sizing its framing against this manager's bound and
    * a limiter sizing its burst against the same bound read one value.
@@ -3402,93 +3816,153 @@ private[spark] object MemorySpillManager extends Logging {
   // the heap between them and the bound would be a per-task bound wearing an executor-wide name.
 
   /**
-   * The streaming buffer allowance every [[MemorySpillManager]] on one executor reserves from.
+   * The streaming buffer allowance every streaming shuffle participant on one executor reserves
+   * from, in '''both''' directions.
    *
-   * The allowance is derived once, on first use, from a single consistent observation of the
-   * on-heap unified memory region, and held immutably thereafter -- which is what makes
-   * "configuration changes require an executor restart" true by construction. Reservation is one
-   * atomic compare-and-set against that ceiling, so two producers on different tasks can never both
-   * observe room for the same bytes; refusal is the memory-pressure condition the fallback policy
-   * consumes.
+   * ==One allowance, not two==
    *
-   * @param bufferSizePercent percentage of the on-heap unified region the allowance occupies
+   * `spark.shuffle.streaming.bufferSizePercent` is a promise about one executor: no more than that
+   * percentage of its memory will be held in streaming shuffle buffers. Producer-side framing and
+   * buffered blocks and consumer-side received frames are all streaming shuffle buffers on the same
+   * heap, so they are all charged '''here''', against one ceiling, through one compare-and-set.
+   * Two independent allowances of the same percentage -- one per direction -- would have summed to
+   * twice the configured percentage on any executor doing both at once, which is every executor in
+   * a multi-stage job, and the promise would have been unenforceable in exactly the situation it
+   * exists for. The two directions are tallied separately for observability only; the '''bound'''
+   * is the single `reserved` cell below.
+   *
+   * ==The basis==
+   *
+   * The percentage is taken of the '''configured executor memory''' -- `spark.executor.memory` --
+   * which is the basis the property is documented and specified against, and the same basis on both
+   * sides of a shuffle. It is derived once, on first use, and held immutably thereafter, which is
+   * what makes "configuration changes require an executor restart" true by construction. It is also
+   * why this class needs nothing from a live `SparkEnv`: the figure is a configuration value, so
+   * the utilisation gauge can be read from the metrics thread at any time.
+   *
+   * Reservation is one atomic compare-and-set against the ceiling, so two participants on different
+   * tasks -- or on opposite sides of the same shuffle -- can never both observe room for the same
+   * bytes. Refusal on the producer side is the memory-pressure condition the fallback policy
+   * consumes; refusal on the consumer side is flow control the consumer repairs by asking for the
+   * position again.
+   *
+   * @param bufferSizePercent percentage of configured executor memory the allowance occupies
    * @param spillThresholdPercent percentage of the allowance at which eviction is triggered
-   * @param unifiedMemoryProvider supplies the size of the on-heap unified memory region; injected
-   *                              so the allowance is a function of this argument rather than of
-   *                              whatever heap the host JVM happens to have been given
+   * @param executorMemoryProvider supplies the configured executor memory in bytes; injected so the
+   *                               allowance is a function of this argument rather than of whatever
+   *                               heap the host JVM happens to have been given
    */
   class ExecutorBufferQuota(
       bufferSizePercent: Int,
       spillThresholdPercent: Int,
-      unifiedMemoryProvider: () => Long)
+      executorMemoryProvider: () => Long)
     extends StreamingShuffleBufferUtilizationContributor {
 
+    // The bound. Every byte held in a streaming shuffle buffer anywhere on this executor, in either
+    // direction, is counted here and nowhere else.
     private val reserved = new AtomicLong(0L)
 
     private val refusals = new AtomicLong(0L)
 
-    /**
-     * Size of the on-heap unified memory region, floored at one byte so the utilisation arithmetic
-     * can never divide by zero. Sampled exactly once, on first use.
-     */
-    lazy val unifiedMemoryBytes: Long = math.max(1L, unifiedMemoryProvider())
+    private val producerReserved = new AtomicLong(0L)
+
+    private val consumerReserved = new AtomicLong(0L)
+
+    private val transientReserved = new AtomicLong(0L)
+
+    private val metadataReserved = new AtomicLong(0L)
 
     /**
-     * The aggregate allowance in bytes: exactly `bufferSizePercent` of the on-heap unified region,
+     * Configured executor memory in bytes, floored at one byte so the utilisation arithmetic can
+     * never divide by zero. Sampled exactly once, on first use.
+     */
+    lazy val executorMemoryBytes: Long = math.max(1L, executorMemoryProvider())
+
+    /**
+     * The aggregate allowance in bytes: exactly `bufferSizePercent` of configured executor memory,
      * as the feature specifies it. [[MemorySpillManager.percentageOf]] computes the product before
-     * the division without ever forming a product that could overflow, so a heap size that is not a
-     * clean multiple of a hundred yields the allowance the operator configured rather than one
+     * the division without ever forming a product that could overflow, so a memory size that is not
+     * a clean multiple of a hundred yields the allowance the operator configured rather than one
      * systematically a few bytes short of it.
+     *
+     * There is no floor above that percentage, and deliberately so. Raising the allowance to the
+     * size of one legal frame would hand a very small executor more than the percentage it
+     * configured -- at the minimum percentage of a one-mebibyte executor, twice the executor's
+     * entire memory -- which is the same "allowances summing past the configured percent" defect
+     * this single aggregate quota exists to remove. An executor whose configured percentage cannot
+     * admit one frame refuses the reservation, and that refusal stands streaming down under
+     * [[StreamingShuffleFallbackReason.MemoryPressure]] to sort-based shuffle rather than quietly
+     * exceeding the ceiling the operator set. The one-byte floor below is only so the utilisation
+     * arithmetic cannot divide by zero; it is not a usable allowance.
      */
     lazy val totalBytes: Long =
-      math.max(1L, percentageOf(unifiedMemoryBytes, bufferSizePercent))
+      math.max(1L, percentageOf(executorMemoryBytes, bufferSizePercent))
 
     /** The utilisation level, in bytes, at which eviction is triggered. */
     lazy val spillTriggerBytes: Long =
       math.max(1L, percentageOf(totalBytes, spillThresholdPercent))
 
-    /** Bytes currently reserved across every instance drawing on this allowance. */
+    /** Bytes currently reserved across every participant drawing on this allowance. */
     def reservedBytes: Long = reserved.get()
+
+    /** Bytes not yet committed to any streaming allocation. */
+    def availableBytes: Long = math.max(0L, totalBytes - reservedBytes)
 
     /** Reservations refused because the allowance was exhausted. */
     def refusalCount: Long = refusals.get()
+
+    /** Bytes one ownership category currently holds inside the shared allowance. */
+    def reservedBytes(charge: MemoryCharge): Long = counterFor(charge).get()
 
     /**
      * Bytes this allowance is currently lending out, as reported to the executor-wide
      * `shuffle.streaming.bufferUtilizationPercent` gauge.
      *
-     * One relaxed atomic read, so the metrics reporting thread never waits on a buffer monitor, and
-     * the figure is the allowance's own -- the gauge sums the registered allowances rather than
-     * letting the last writer overwrite an executor-wide slot.
+     * Both directions, because both are charged against [[contributedBudgetBytes]]: reporting only
+     * one of them would put part of the numerator against the whole of the denominator and read low
+     * by exactly the share it omitted. One relaxed atomic read, so the metrics reporting thread
+     * never waits on a buffer monitor.
      */
     override def contributedBufferedBytes: Long = reservedBytes
 
     /**
      * The allowance this contribution is measured against. Answered from the memoised total, so
-     * reading the gauge never forces the lazy derivation and therefore never dereferences
-     * [[org.apache.spark.SparkEnv]] from the metrics thread once the allowance has been used at
-     * all.
+     * reading the gauge never forces the lazy derivation more than once.
      */
     override def contributedBudgetBytes: Long = totalBytes
 
     /**
-     * Reserves `bytes` against the allowance, atomically and without blocking.
+     * Reserves `bytes` of producer-side buffer against the allowance, atomically and without
+     * blocking.
      *
      * @param bytes the number of bytes to reserve; must be positive
      * @return true when the reservation was taken and the caller now owns those bytes; false when
      *         it would have exceeded the allowance, in which case nothing was reserved
      */
     def tryReserve(bytes: Long): Boolean = {
+      tryReserve(bytes, ProducerMemory)
+    }
+
+    /**
+     * Reserves `bytes` for one ownership category against the same aggregate allowance.
+     *
+     * The aggregate compare-and-set is performed first, so two categories racing can never both
+     * claim the last bytes. The category counter is advanced only after that claim succeeds; no
+     * caller can release the reservation before this method returns it.
+     */
+    def tryReserve(bytes: Long, charge: MemoryCharge): Boolean = {
       require(bytes > 0L, s"A quota reservation must be positive, but was $bytes")
+      require(charge != null, "A quota reservation category must not be null")
       val ceiling = totalBytes
       var granted = false
       var settled = false
       while (!settled) {
         val current = reserved.get()
-        if (current + bytes > ceiling) {
+        if (bytes > ceiling || current > ceiling - bytes) {
           refusals.incrementAndGet()
           settled = true
         } else if (reserved.compareAndSet(current, current + bytes)) {
+          counterFor(charge).addAndGet(bytes)
           granted = true
           settled = true
         }
@@ -3497,20 +3971,206 @@ private[spark] object MemorySpillManager extends Logging {
     }
 
     /**
-     * Returns `bytes` to the allowance. Floored at zero rather than allowed to go negative, so that
-     * a bookkeeping defect degrades to a conservatively smaller allowance instead of silently
-     * manufacturing headroom the executor does not have.
+     * Returns `bytes` of producer-side buffer to the allowance. Floored at zero rather than allowed
+     * to go negative, so that a bookkeeping defect degrades to a conservatively smaller allowance
+     * instead of silently manufacturing headroom the executor does not have.
      *
      * @param bytes the number of bytes to return; must not be negative
      */
     def release(bytes: Long): Unit = {
+      release(bytes, ProducerMemory)
+    }
+
+    /**
+     * Returns up to `bytes` owned by one category, never touching another category's
+     * reservation.
+     */
+    def release(bytes: Long, charge: MemoryCharge): Unit = {
       require(bytes >= 0L, s"A quota release must not be negative, but was $bytes")
-      var settled = bytes == 0L
+      require(charge != null, "A quota release category must not be null")
+      val category = counterFor(charge)
+      var released = 0L
+      var categorySettled = bytes == 0L
+      while (!categorySettled) {
+        val current = category.get()
+        released = math.min(current, bytes)
+        categorySettled = category.compareAndSet(current, current - released)
+      }
+      var settled = released == 0L
       while (!settled) {
         val current = reserved.get()
-        settled = reserved.compareAndSet(current, math.max(0L, current - bytes))
+        settled = reserved.compareAndSet(current, math.max(0L, current - released))
       }
     }
+
+    /** Counter belonging to one ownership category. */
+    private def counterFor(charge: MemoryCharge): AtomicLong = charge match {
+      case ProducerMemory => producerReserved
+      case ConsumerMemory => consumerReserved
+      case TransientMemory => transientReserved
+      case MetadataMemory => metadataReserved
+    }
+  }
+
+  /**
+   * Executor-wide disk byte and file allowance for retained streaming output.
+   *
+   * A reservation is taken before a temp file is allocated. It carries a conservative estimate
+   * while the writer is open, then is committed to the file's actual length or cancelled. Committed
+   * files remain charged until the component that really unlinks them calls [[release]], including
+   * files whose ownership moved from a task to the executor-scoped block resolver.
+   */
+  class ExecutorDiskQuota(
+      byteLimitProvider: () => Long,
+      val fileLimit: Int = MAX_RETAINED_SPILL_FILES) {
+
+    require(byteLimitProvider != null, "The disk-quota byte provider must not be null")
+    require(fileLimit > 0, s"The disk-quota file limit must be positive, but was $fileLimit")
+
+    private var bytesReserved = 0L
+    private var filesReserved = 0
+    private var refusals = 0L
+    private val committedFiles = new mutable.HashMap[String, Long]()
+
+    /** Maximum bytes retained by streaming output on this executor. */
+    lazy val totalBytes: Long = math.max(
+      DataBlockMessage.MAX_ENCODED_FRAME_BYTES.toLong, byteLimitProvider())
+
+    /** Bytes currently held by pending writes and committed files. */
+    def reservedBytes: Long = synchronized(bytesReserved)
+
+    /** Pending and committed spill files currently counted against the file ceiling. */
+    def reservedFileCount: Int = synchronized(filesReserved)
+
+    /** Reservations refused by either the byte or file ceiling. */
+    def refusalCount: Long = synchronized(refusals)
+
+    /**
+     * Takes room for one future file before any filesystem allocation occurs.
+     *
+     * @param estimatedBytes conservative upper bound for the write
+     * @return a reservation the caller must commit or cancel, or `None` when either ceiling binds
+     */
+    def tryReserve(estimatedBytes: Long): Option[DiskReservation] = synchronized {
+      require(estimatedBytes > 0L,
+        s"A disk reservation must be positive, but was $estimatedBytes")
+      val byteHeadroom = totalBytes - bytesReserved
+      if (filesReserved >= fileLimit || estimatedBytes > byteHeadroom) {
+        refusals += 1L
+        None
+      } else {
+        bytesReserved += estimatedBytes
+        filesReserved += 1
+        Some(new DiskReservation(estimatedBytes))
+      }
+    }
+
+    /**
+     * Whether the selected local directory can accept this write while preserving emergency
+     * headroom for Spark's other spill and shuffle paths.
+     *
+     * The directory check is separate from the free-space reading. `File.getUsableSpace` may report
+     * the containing filesystem's capacity even when the selected path has disappeared or become a
+     * regular file, and treating that as writable would open the spill writer only to fail after
+     * allocation. Refusing before that point is what routes device loss through MemoryPressure.
+     */
+    def hasUsableSpace(file: File, requestedBytes: Long): Boolean = {
+      require(file != null, "The spill file must not be null")
+      require(requestedBytes >= 0L,
+        s"Requested local-disk bytes must not be negative, but was $requestedBytes")
+      val parent = file.getAbsoluteFile.getParentFile
+      val usable = if (parent == null) 0L else parent.getUsableSpace
+      parent != null && parent.isDirectory && parent.canWrite &&
+        usable > MIN_LOCAL_DISK_HEADROOM_BYTES &&
+        requestedBytes <= usable - MIN_LOCAL_DISK_HEADROOM_BYTES
+    }
+
+    /** Releases a committed file after it has actually been removed. Idempotent by file path. */
+    def release(file: File): Long = synchronized {
+      if (file == null) {
+        0L
+      } else {
+        val key = fileKey(file)
+        committedFiles.remove(key) match {
+          case Some(bytes) =>
+            bytesReserved = math.max(0L, bytesReserved - bytes)
+            filesReserved = math.max(0, filesReserved - 1)
+            diskQuotaOwners.remove(key, this)
+            bytes
+          case None =>
+            0L
+        }
+      }
+    }
+
+    /** Whether this quota currently accounts for the given file. */
+    def contains(file: File): Boolean =
+      file != null && synchronized(committedFiles.contains(fileKey(file)))
+
+    /** Clears all process-scoped state for an isolated test. */
+    private[streaming] def resetForTesting(): Unit = synchronized {
+      bytesReserved = 0L
+      filesReserved = 0
+      refusals = 0L
+      committedFiles.keys.foreach(key => diskQuotaOwners.remove(key, this))
+      committedFiles.clear()
+    }
+
+    /** One pending file reservation. */
+    final class DiskReservation private[streaming] (val estimatedBytes: Long) {
+
+      private[streaming] var active = true
+
+      /** Reconciles the estimate to one committed file's actual length. */
+      def commit(file: File, actualBytes: Long): Boolean =
+        ExecutorDiskQuota.this.commit(this, file, actualBytes)
+
+      /** Returns a reservation whose file was never committed. */
+      def cancel(): Unit = ExecutorDiskQuota.this.cancel(this)
+    }
+
+    private def commit(
+        reservation: DiskReservation,
+        file: File,
+        actualBytes: Long): Boolean = synchronized {
+      require(reservation != null, "The disk reservation must not be null")
+      require(file != null, "The committed spill file must not be null")
+      require(actualBytes >= 0L,
+        s"Committed spill bytes must not be negative, but was $actualBytes")
+      if (!reservation.active) {
+        false
+      } else {
+        val delta = actualBytes - reservation.estimatedBytes
+        val key = fileKey(file)
+        if (committedFiles.contains(key) ||
+            (delta > 0L && delta > totalBytes - bytesReserved)) {
+          cancelLocked(reservation)
+          refusals += 1L
+          false
+        } else {
+          bytesReserved += delta
+          committedFiles.update(key, actualBytes)
+          diskQuotaOwners.put(key, this)
+          reservation.active = false
+          true
+        }
+      }
+    }
+
+    private def cancel(reservation: DiskReservation): Unit = synchronized {
+      require(reservation != null, "The disk reservation must not be null")
+      cancelLocked(reservation)
+    }
+
+    private def cancelLocked(reservation: DiskReservation): Unit = {
+      if (reservation.active) {
+        bytesReserved = math.max(0L, bytesReserved - reservation.estimatedBytes)
+        filesReserved = math.max(0, filesReserved - 1)
+        reservation.active = false
+      }
+    }
+
+    private def fileKey(file: File): String = file.getAbsoluteFile.toPath.normalize().toString
   }
 
   // The executor-scoped aggregators, one per recurring condition a spill manager reports. Each is
@@ -3526,6 +4186,9 @@ private[spark] object MemorySpillManager extends Logging {
   private[streaming] val spillFailureLogAggregator =
     new ExecutorLogAggregator(LOG_AGGREGATION_WINDOW_MS)
 
+  private[streaming] val diskPressureLogAggregator =
+    new ExecutorLogAggregator(LOG_AGGREGATION_WINDOW_MS)
+
   private[streaming] val reclamationLogAggregator =
     new ExecutorLogAggregator(LOG_AGGREGATION_WINDOW_MS)
 
@@ -3534,30 +4197,88 @@ private[spark] object MemorySpillManager extends Logging {
 
   /** Every aggregator above, for the bulk reset the test seam performs. */
   private val logAggregators: Seq[ExecutorLogAggregator] = Seq(spillLogAggregator,
-    durabilityFlushLogAggregator, spillFailureLogAggregator, reclamationLogAggregator,
-    spillFileDeletionLogAggregator)
+    durabilityFlushLogAggregator, spillFailureLogAggregator, diskPressureLogAggregator,
+    reclamationLogAggregator, spillFileDeletionLogAggregator)
 
   // Guarded by this object's monitor. Held as `var` rather than as a lazy val because they must be
   // discardable -- see [[resetExecutorState]] -- and because the configuration they are derived
   // from is only available once an instance is constructed.
   private var sharedQuota: ExecutorBufferQuota = null
 
+  private var sharedDiskQuota: ExecutorDiskQuota = null
+
   private var poller: ScheduledExecutorService = null
 
+  private var reclaimer: ScheduledExecutorService = null
+
   private val pollTargets = ConcurrentHashMap.newKeySet[MemorySpillManager]()
+
+  private val reclamationTargets = new ConcurrentLinkedQueue[MemorySpillManager]()
+
+  /** Reference count per stable logical consumer identity, guarded by this object's monitor. */
+  private val consumerIdentityRefCounts = new mutable.HashMap[String, Int]()
+
+  /**
+   * Claims one reference to a stable consumer identity against the executor-wide unique-id cap.
+   *
+   * Existing identities are always admitted and merely increment their reference count, which is
+   * what allows one reduce task to read every map output without consuming one unique-id slot per
+   * producer. A new identity is admitted only while the unique-id map remains below its cap.
+   */
+  private def acquireConsumerIdentity(consumerId: String): Boolean = synchronized {
+    consumerIdentityRefCounts.get(consumerId) match {
+      case Some(references) =>
+        consumerIdentityRefCounts.update(consumerId, references + 1)
+        true
+      case None if consumerIdentityRefCounts.size < MAX_REGISTERED_CONSUMER_IDENTITIES =>
+        consumerIdentityRefCounts.put(consumerId, 1)
+        true
+      case None =>
+        false
+    }
+  }
+
+  /** Releases one producer store's reference to a stable consumer identity. */
+  private def releaseConsumerIdentity(consumerId: String): Unit = synchronized {
+    consumerIdentityRefCounts.get(consumerId).foreach { references =>
+      if (references <= 1) {
+        consumerIdentityRefCounts.remove(consumerId)
+      } else {
+        consumerIdentityRefCounts.update(consumerId, references - 1)
+      }
+    }
+  }
+
+  /** Distinct consumer identities currently charged to the executor-wide cap. */
+  private[streaming] def registeredConsumerIdentityCount: Int = synchronized {
+    consumerIdentityRefCounts.size
+  }
 
   /**
    * The executor's shared buffer allowance, created on first use from the given configuration.
    *
-   * @param conf the configuration to read the buffer and threshold percentages from, exactly once
-   *             per executor; every later caller receives the allowance the first one created
+   * The one allowance every streaming shuffle participant on this executor draws on, producers and
+   * consumers alike, so that the configured percentage bounds the executor rather than bounding
+   * each direction separately and summing to twice itself. Every caller after the first receives
+   * the allowance the first one created.
+   *
+   * @param conf the configuration to read the buffer percentage, the spill threshold and the
+   *             executor memory from, exactly once per executor
    */
   def executorQuota(conf: SparkConf): ExecutorBufferQuota = synchronized {
     if (sharedQuota == null) {
       sharedQuota = new ExecutorBufferQuota(
         conf.get(SHUFFLE_STREAMING_BUFFER_SIZE_PERCENT),
         conf.get(SHUFFLE_STREAMING_SPILL_THRESHOLD),
-        () => onHeapUnifiedMemoryBytes())
+        // No floor above the configured percentage. An allowance raised to the size of one legal
+        // frame would grant a very small executor more than the percentage it configured -- on a
+        // one-mebibyte executor at the minimum percentage it would grant twice the executor's whole
+        // memory -- which is exactly the "two allowances summing past the configured percent"
+        // defect this single aggregate quota exists to remove. An executor too small to admit one
+        // frame therefore refuses the reservation, and that refusal takes the specified
+        // MemoryPressure fallback to sort-based shuffle, which is how every other unsatisfiable
+        // reservation already ends. Memory is bounded by configuration, without exception.
+        () => configuredExecutorMemoryBytes(conf))
       // Counted by the utilisation gauge for as long as the allowance exists. Registering the
       // allowance rather than each instance is what makes the gauge executor-wide without double
       // counting a shared budget: the numerator and the denominator both come from the one object
@@ -3565,6 +4286,44 @@ private[spark] object MemorySpillManager extends Logging {
       StreamingShuffleMetricsSource.registerBufferUtilizationContributor(sharedQuota)
     }
     sharedQuota
+  }
+
+  /**
+   * The executor's shared retained-output disk allowance.
+   *
+   * The byte ceiling is the smallest of three independent bounds: eight aggregate heap allowances,
+   * ten percent of the local directories' currently usable space, and eight gibibytes. The first
+   * keeps disk proportional to the configured streaming footprint, the second leaves ninety percent
+   * of local storage to Spark's ordinary shuffle and spill paths, and the third prevents a very
+   * large executor from turning this optional subsystem into an unbounded disk tenant.
+   */
+  def executorDiskQuota(
+      conf: SparkConf,
+      memoryQuota: ExecutorBufferQuota): ExecutorDiskQuota = synchronized {
+    require(conf != null, "The Spark configuration must not be null")
+    require(memoryQuota != null, "The executor memory quota must not be null")
+    if (sharedDiskQuota == null) {
+      sharedDiskQuota = new ExecutorDiskQuota(() => {
+        val memoryBound = math.min(
+          MAX_EXECUTOR_DISK_QUOTA_BYTES,
+          saturatingMultiply(memoryQuota.totalBytes, DISK_TO_MEMORY_QUOTA_MULTIPLIER))
+        val localBound = percentageOf(localDiskUsableBytes(), LOCAL_DISK_QUOTA_PERCENT)
+        val usableBound = if (localBound > 0L) localBound else memoryBound
+        math.min(memoryBound, usableBound)
+      })
+    }
+    sharedDiskQuota
+  }
+
+  /** Releases the quota ownership of a spill file after any component has actually unlinked it. */
+  private[streaming] def releaseDiskQuota(file: File): Long = {
+    if (file == null) {
+      0L
+    } else {
+      val key = file.getAbsoluteFile.toPath.normalize().toString
+      val owner = diskQuotaOwners.get(key)
+      if (owner == null) 0L else owner.release(file)
+    }
   }
 
   /**
@@ -3620,25 +4379,33 @@ private[spark] object MemorySpillManager extends Logging {
   }
 
   /**
-   * Size of the on-heap unified memory region, recovered from the callable public surface of the
-   * memory manager as `maxOnHeapStorageMemory + onHeapExecutionMemoryUsed`.
+   * The configured executor memory in bytes, which is the basis the buffer allowance is a
+   * percentage of.
    *
-   * Both accessors synchronize on the memory manager's own monitor, so both are read inside one
-   * `synchronized` block on that same monitor: the pair is then a single consistent observation
-   * rather than two independent ones a concurrent execution-memory acquisition can perturb between.
-   * Java monitors are reentrant, so nesting the accessors' own synchronisation inside ours is safe.
+   * Configuration rather than the live heap, deliberately. `spark.executor.memory` is the figure an
+   * operator sizes the allowance against and the figure the documented formula
+   * `(executorMemory * bufferSizePercent) / numPartitions` refers to, so reading it here makes the
+   * allowance a function of what was asked for rather than of whatever heap a particular JVM -- a
+   * test JVM, a driver running in local mode -- happens to have been given. It also means the
+   * figure needs no live `SparkEnv`, so the utilisation gauge can be read from the metrics thread.
+   *
+   * Saturating multiplication, because the entry is a size in mebibytes and an absurd configured
+   * value must degrade to an effectively unbounded basis rather than wrap negative and read as
+   * permanent memory pressure.
    */
-  private def onHeapUnifiedMemoryBytes(): Long = {
-    val manager = SparkEnv.get.memoryManager
-    val (executionUsed, storageHeadroom) = manager.synchronized {
-      (manager.onHeapExecutionMemoryUsed, manager.maxOnHeapStorageMemory)
+  private def configuredExecutorMemoryBytes(conf: SparkConf): Long = {
+    val megabytes = math.max(1L, conf.get(EXECUTOR_MEMORY))
+    if (megabytes > Long.MaxValue / (1024L * 1024L)) Long.MaxValue else megabytes * 1024L * 1024L
+  }
+
+  /** Usable bytes across the executor's configured local directories, with saturating addition. */
+  private def localDiskUsableBytes(): Long = {
+    val directories = SparkEnv.get.blockManager.diskBlockManager.localDirs
+    directories.foldLeft(0L) { (total, directory) =>
+      val usable = math.max(0L, directory.getUsableSpace)
+      val sum = total + usable
+      if (sum < 0L) Long.MaxValue else sum
     }
-    val sum = storageHeadroom + executionUsed
-    // Saturating addition. A production memory manager reports a real heap size, but a manager that
-    // reports an effectively unbounded headroom would otherwise wrap the sum negative and collapse
-    // the budget to one byte, which would look like permanent memory pressure rather than like the
-    // unbounded budget it actually is.
-    if (storageHeadroom > 0L && executionUsed > 0L && sum < 0L) Long.MaxValue else math.max(1L, sum)
   }
 
   /**
@@ -3665,8 +4432,42 @@ private[spark] object MemorySpillManager extends Logging {
   }
 
   /**
-   * Stops the executor's shared threshold ticker and waits, within a bounded deadline, for its
-   * thread to be gone.
+   * Queues one manager for a bounded reclamation batch and starts the shared worker on first use.
+   *
+   * Each manager guards its own queueing with an atomic flag, so this executor-wide queue contains
+   * at most one dispatch entry per manager however many acknowledgements arrive before it runs.
+   */
+  private def enqueueForReclamation(manager: MemorySpillManager): Unit = {
+    reclamationTargets.add(manager)
+    synchronized {
+      if (reclaimer == null) {
+        reclaimer = ThreadUtils.newDaemonSingleThreadScheduledExecutor(RECLAIMER_THREAD_NAME)
+        reclaimer.scheduleWithFixedDelay(new Runnable {
+          override def run(): Unit = dispatchReclamation()
+        }, 0L, RECLAMATION_DISPATCH_INTERVAL_MS, TimeUnit.MILLISECONDS)
+      }
+    }
+  }
+
+  /** Drains a bounded number of manager batches before yielding the shared worker thread. */
+  private def dispatchReclamation(): Unit = {
+    var dispatched = 0
+    var manager = reclamationTargets.poll()
+    while (manager != null && dispatched < MAX_RECLAMATION_MANAGERS_PER_ROUND) {
+      try {
+        manager.runScheduledReclamationBatch()
+      } catch {
+        case NonFatal(e) =>
+          logWarning(log"Streaming shuffle asynchronous reclamation failed for one producer", e)
+      }
+      dispatched += 1
+      manager = reclamationTargets.poll()
+    }
+  }
+
+  /**
+   * Stops the executor's shared threshold ticker and reclamation worker, then waits within a
+   * bounded deadline for both threads to be gone.
    *
    * <b>Why this exists and why it is the manager that calls it.</b> The ticker is created lazily by
    * the first instance that needs polling and is deliberately executor-scoped, because the budget
@@ -3689,33 +4490,40 @@ private[spark] object MemorySpillManager extends Logging {
    * Idempotent, and safe to call on an executor that never polled anything: with no ticker created
    * there is nothing to stop and nothing to wait for.
    *
-   * @return true when no ticker is running by the time this returns
+   * @return true when neither worker is running by the time this returns
    */
   def shutdownExecutorPoller(): Boolean = {
     val running = synchronized {
-      val current = poller
+      val currentPoller = poller
+      val currentReclaimer = reclaimer
       poller = null
-      current
+      reclaimer = null
+      Seq(
+        (currentPoller, POLLER_THREAD_NAME),
+        (currentReclaimer, RECLAIMER_THREAD_NAME))
     }
     pollTargets.clear()
-    running match {
-      case null => true
-      case executor =>
-        executor.shutdownNow()
-        val terminated = try {
-          executor.awaitTermination(POLLER_SHUTDOWN_TIMEOUT_MS, TimeUnit.MILLISECONDS)
-        } catch {
-          case _: InterruptedException =>
-            Thread.currentThread().interrupt()
-            executor.isTerminated
-        }
-        if (!terminated) {
-          logWarning(log"The streaming shuffle buffer threshold ticker " +
-            log"${MDC(THREAD_NAME, POLLER_THREAD_NAME)} did not terminate within " +
-            log"${MDC(TIMEOUT, POLLER_SHUTDOWN_TIMEOUT_MS)} ms of being asked to stop")
-        }
-        terminated
+    reclamationTargets.clear()
+    running.forall { case (executor, threadName) =>
+      executor == null || shutdownWorker(executor, threadName)
     }
+  }
+
+  /** Stops and awaits one executor-scoped daemon worker. */
+  private def shutdownWorker(executor: ScheduledExecutorService, threadName: String): Boolean = {
+    executor.shutdownNow()
+    val terminated = try {
+      executor.awaitTermination(POLLER_SHUTDOWN_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+    } catch {
+      case _: InterruptedException =>
+        Thread.currentThread().interrupt()
+        executor.isTerminated
+    }
+    if (!terminated) {
+      logWarning(log"The streaming shuffle worker ${MDC(THREAD_NAME, threadName)} did not " +
+        log"terminate within ${MDC(TIMEOUT, POLLER_SHUTDOWN_TIMEOUT_MS)} ms of being asked to stop")
+    }
+    terminated
   }
 
   /**
@@ -3761,11 +4569,18 @@ private[spark] object MemorySpillManager extends Logging {
       StreamingShuffleMetricsSource.unregisterBufferUtilizationContributor(sharedQuota)
     }
     sharedQuota = null
+    if (sharedDiskQuota != null) {
+      sharedDiskQuota.resetForTesting()
+    }
+    sharedDiskQuota = null
+    diskQuotaOwners.clear()
     pollTargets.clear()
+    reclamationTargets.clear()
+    consumerIdentityRefCounts.clear()
     logAggregators.foreach(aggregator => aggregator.reset())
     StreamingShuffleWriter.resetLogAggregationForTesting()
-    StreamingShuffleServerHandler.withdrawalLogAggregator.reset()
-    StreamingShuffleServerHandler.consumerExpiryLogGate.reset()
+    StreamingShuffleServerHandler.resetLogAggregationForTesting()
+    StreamingShuffleClientHandler.resetLogAggregationForTesting()
   }
 
   // Internal admission and eviction outcomes. Modelled as types rather than as booleans so that the

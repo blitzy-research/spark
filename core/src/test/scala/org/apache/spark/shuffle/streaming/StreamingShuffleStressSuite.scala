@@ -17,27 +17,38 @@
 
 package org.apache.spark.shuffle.streaming
 
-import java.lang.management.ManagementFactory
-import java.lang.ref.WeakReference
+import java.nio.charset.StandardCharsets
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
-import javax.management.ObjectName
 
 import scala.collection.mutable
+import scala.jdk.CollectionConverters._
 import scala.util.control.NonFatal
+import scala.util.matching.Regex
 
-import org.apache.logging.log4j.LogManager
-import org.apache.logging.log4j.core.{LogEvent, Logger => Log4jLogger}
+import org.apache.logging.log4j.{Level, LogManager}
+import org.apache.logging.log4j.core.{LogEvent, Logger => Log4jLogger, LoggerContext, StringLayout}
 import org.apache.logging.log4j.core.appender.AbstractAppender
 import org.apache.logging.log4j.core.config.Property
+import org.apache.logging.log4j.core.impl.Log4jLogEvent
+import org.apache.logging.log4j.message.SimpleMessage
 
-import org.apache.spark.{FetchFailed, HashPartitioner, LocalSparkContext, ShuffleDependency, SparkConf, SparkContext, SparkFunSuite, TaskContext, TaskFailedReason}
+import org.apache.spark.{FetchFailed, HashPartitioner, LocalSparkContext, ShuffleDependency,
+  SparkConf, SparkContext, SparkFunSuite, TaskContext, TaskFailedReason}
 import org.apache.spark.executor.TaskMetrics
-import org.apache.spark.internal.config.{LISTENER_BUS_EVENT_QUEUE_CAPACITY, SHUFFLE_MANAGER, SHUFFLE_STREAMING_ENABLED, SHUFFLE_STREAMING_MAX_BANDWIDTH_MBPS, STAGE_MAX_CONSECUTIVE_ATTEMPTS, TASK_MAX_FAILURES, UNSAFE_EXCEPTION_ON_MEMORY_LEAK}
-import org.apache.spark.internal.config.Status.{MAX_RETAINED_JOBS, MAX_RETAINED_STAGES, MAX_RETAINED_TASKS_PER_STAGE}
+import org.apache.spark.internal.LogKeys.{BYTE_SIZE, COUNT, DELAY, DURATION, MAX_SIZE, MIN_SIZE,
+  NEW_VALUE, NUM_BLOCKS, NUM_BYTES, NUM_CHUNKS, NUM_CONCURRENT_WRITER, NUM_EVENTS, NUM_FAILURES,
+  NUM_ITERATIONS, NUM_RECORDS_READ, NUM_REQUESTS, NUM_RETRIES, NUM_ROWS, NUM_TASKS, OLD_VALUE,
+  PERCENT, RECORDS, THRESHOLD, TOTAL, TOTAL_TIME, VALUE}
+import org.apache.spark.internal.config.{LISTENER_BUS_EVENT_QUEUE_CAPACITY, SHUFFLE_MANAGER,
+  SHUFFLE_STREAMING_ENABLED, SHUFFLE_STREAMING_MAX_BANDWIDTH_MBPS, STAGE_MAX_CONSECUTIVE_ATTEMPTS,
+  TASK_MAX_FAILURES, UNSAFE_EXCEPTION_ON_MEMORY_LEAK}
+import org.apache.spark.internal.config.Status.{MAX_RETAINED_JOBS, MAX_RETAINED_STAGES,
+  MAX_RETAINED_TASKS_PER_STAGE}
 import org.apache.spark.rdd.RDD
-import org.apache.spark.scheduler.{JobSucceeded, SparkListener, SparkListenerJobEnd, SparkListenerJobStart, SparkListenerStageSubmitted, SparkListenerTaskEnd, SparkListenerTaskStart}
-import org.apache.spark.util.Clock
+import org.apache.spark.scheduler.{JobSucceeded, SparkListener, SparkListenerJobEnd,
+  SparkListenerJobStart, SparkListenerStageSubmitted, SparkListenerTaskEnd, SparkListenerTaskStart}
+import org.apache.spark.util.{Clock, Utils}
 
 /**
  * The five-minute continuous streaming shuffle stress workload.
@@ -46,7 +57,7 @@ import org.apache.spark.util.Clock
  *
  * The feature specifies exactly one stress scenario: a five minute continuous workload with ten
  * concurrent tasks and five concurrent shuffles, ten percent random task-failure injection,
- * memory-leak detection by heap analysis, and under five percent throughput degradation. That is
+ * deterministic resource-leak validation, and under five percent throughput degradation. That is
  * one long-running case, so it carries [[StreamingShuffleStressTest]] and a fast verification run
  * leaves it out with '''zero build change''':
  *
@@ -70,19 +81,28 @@ import org.apache.spark.util.Clock
  * concurrency this suite observes cannot be an accident of scheduling.
  *
  * The second reason is that this suite's subject is '''retention''', and retention is only
- * observable in a JVM you can inspect. In local mode the writers, the readers, the spill managers,
- * the buffer allowance and the metric source all live in the test JVM, so the buffer-utilisation
- * gauge can be read directly and a weak reference can prove that a shuffle's object graph became
- * unreachable. Two child executor JVMs would put every one of those readings out of reach behind a
- * probe job, and a five minute continuous run in child JVMs would additionally compete for memory
- * with a four gigabyte test heap, which is a flakiness source rather than a stronger test. Genuine
- * cross-executor streaming is `StreamingShuffleIntegrationTest`'s subject, and it covers it on
- * `local-cluster[2,1,1024]`; the transport here is still the real Netty transport, over loopback.
+ * observable in a JVM you can inspect. In local mode the writers, readers, spill managers,
+ * aggregate quotas, resolver, connector and metric source all live in the test JVM, so their
+ * deterministic registries can be read directly after task cleanup and again after manager
+ * shutdown. Two child executor JVMs would put those readings out of reach behind a probe job, and a
+ * five minute continuous run in child JVMs would additionally compete for memory with a four
+ * gigabyte test heap, which is a flakiness source rather than a stronger test. Genuine
+ * cross-executor streaming is `StreamingShuffleIntegrationTest`'s subject; the transport here is
+ * still the real Netty transport, over loopback.
  *
  * `SharedSparkContext` could not be used in any case, because it hardcodes its master, so
  * `LocalSparkContext` is the only route to a chosen one.
  *
- * ==Leak detection, which is machine-enforced and then asserted on top==
+ * ==The scheduler boundary this stress run does not claim to remove==
+ *
+ * The unmodified DAG scheduler submits a reduce stage only after its map stage finishes. This suite
+ * therefore does not claim ordinary map/reduce overlap: each job first stresses concurrent
+ * streaming writers and retained-output publication, then stresses concurrent transport sessions
+ * that drain that output. The direct live-subscriber path remains covered by the writer suite,
+ * where a consumer is explicitly present while a writer is producing. Changing scheduler
+ * submission is outside this feature's allowed scope.
+ *
+ * ==Leak detection, machine-enforced and checked against deterministic registries==
  *
  * `spark.unsafe.exceptionOnMemoryLeak` is set to true in the conf this suite builds rather than
  * merely inherited, because the executor reads it from the `SparkConf` and the shared configuration
@@ -93,14 +113,13 @@ import org.apache.spark.util.Clock
  * this suite keeps stating it because retention is its subject and its own guarantee must not
  * depend on a fixture it does not own.
  *
- * On top of that the suite performs its own heap analysis and asserts '''zero retained heap''':
- * every shuffle's object graph is held only by a weak reference, and after the workload a bounded
- * collection sweep must find that not one of them survives. Then the executor-wide buffer
- * utilisation gauge must read zero -- no buffer survives task completion -- and once the context
- * has stopped the serving listener must hold no producer, so no channel and no retained spill
- * output survives either. Cleanup is registered through `TaskContext.addTaskCompletionListener`,
- * which runs on success, on failure and on cancellation alike, so those three readings cover all
- * three outcomes that this workload produces by design.
+ * On top of that enforcement the suite reads the actual ownership registries. Once every task has
+ * ended, producer buffers, consumer bytes, transient copies, consumer identities and active
+ * consumer routes must all be empty. Retained output and its routing metadata deliberately outlive
+ * the producer task, so their heap and disk charges are checked at the correct lifecycle boundary:
+ * after context shutdown the resolver and aggregate quotas must own no byte, file or producer. The
+ * manager's thread registry then proves the native transport executors and channels are gone as
+ * well. These are deterministic ownership readings; none requests a garbage collection.
  *
  * ==Determinism, which is a hard requirement and not an aspiration==
  *
@@ -125,8 +144,8 @@ import org.apache.spark.util.Clock
  * That is the stronger choice, not the weaker one: a decay caused by retention shifts the whole
  * distribution and the median follows it, whereas a collection pause or a moment of host contention
  * moves the mean without saying anything about the shuffle. Both figures are reported; the median
- * is the one the five percent bound is applied to. The first half carries all of the warm-up, so a
- * healthy run reports a negative degradation, which is exactly what "did not decay" looks like.
+ * is the one the five percent bound is applied to. The explicit warm-up iteration is excluded
+ * before the remaining samples are split, so neither half receives start-up work the other did not.
  *
  * The whole case fits comfortably inside the twenty minute default per-test timeout that
  * `SparkFunSuite` imposes: the baseline and the workload together are around six minutes, and
@@ -212,12 +231,47 @@ class StreamingShuffleStressSuite
    * How far into a doomed partition the injected failure lands.
    *
    * Half way, so it is a genuine mid-write failure: records have already been framed, checksummed
-   * and streamed by the time the producer dies, and the iterator is nowhere near exhausted.
+   * and retained by the time the producer dies, and the iterator is nowhere near exhausted.
    */
   private val RecordsBeforeInjectedFailure: Int = RecordsPerPartition / 2
 
   /** Base of the seeded failure selection. Fixed, so any stress failure replays exactly. */
   private val FailureSelectionSeed: Long = 4242L
+
+  /**
+   * Prefix every injected failure's message carries.
+   *
+   * The point of a marker is discrimination, not description. Task failures this run did not ask
+   * for -- a managed-memory-leak detection, an executor lost for an unrelated reason, a genuine
+   * defect in the streaming path -- must not be able to stand in for an injection that never fired,
+   * so the accounting matches on this prefix and on nothing else.
+   */
+  private val InjectedFailureMarker: String = "Injected streaming shuffle stress failure"
+
+  /**
+   * Iteration recorded for datasets built outside the workload loop.
+   *
+   * The fixtures that exercise one shuffle in isolation inject nothing, so they have no iteration
+   * to name. A negative sentinel keeps them out of the planned-injection accounting by
+   * construction: no planned key can carry it, because the loop's iterations start at zero.
+   */
+  private val NoIteration: Int = -1
+
+  /** Shuffle index recorded for datasets built outside the workload loop. See [[NoIteration]]. */
+  private val NoShuffleIndex: Int = -1
+
+  /** Injection keys a failure message names before it elides the rest. Enough to see a pattern. */
+  private val UnfiredKeysReported: Int = 12
+
+  /**
+   * Recovers an injection key from a failure's text.
+   *
+   * Anchored on the same bracketed shape [[injectionKey]] writes, so the two cannot drift apart
+   * without this pattern failing to match and the accounting failing loudly rather than silently
+   * matching nothing.
+   */
+  private val InjectionKeyPattern: Regex =
+    """\[iteration=-?\d+ shuffle=-?\d+ partition=\d+\]""".r
 
   /**
    * Iterations the half-against-half throughput comparison needs before it means anything.
@@ -227,6 +281,9 @@ class StreamingShuffleStressSuite
    */
   private val MinIterations: Int = 8
 
+  /** Initial concurrent iteration excluded from the throughput gate as an explicit warm-up. */
+  private val ThroughputWarmupIterations: Int = 1
+
   /** Hard ceiling on the loop, so a clock that never advances fails rather than spins forever. */
   private val IterationGuardLimit: Int = 8192
 
@@ -235,6 +292,9 @@ class StreamingShuffleStressSuite
 
   /** Bound on draining the listener bus before its readings are trusted. */
   private val ListenerDrainTimeoutMillis: Long = 120000L
+
+  /** Scheduling slack beyond the workload deadline after the last bounded iteration ends. */
+  private val DeadlineOverrunToleranceMillis: Long = 1000L
 
   /**
    * Listener-bus queue capacity for the run.
@@ -246,12 +306,6 @@ class StreamingShuffleStressSuite
    * throughput comparison would then read as a decay of the shuffle.
    */
   private val ListenerQueueCapacity: Int = 200000
-
-  /** Collection passes the retained-heap sweep is allowed before it declares a survivor. */
-  private val HeapSweepAttempts: Int = 16
-
-  /** Size of the probe object the heap sweep's own self-check holds on to. */
-  private val RetainedProbeBytes: Int = 1024
 
   /**
    * Jobs, stages and per-stage tasks the driver's status store keeps.
@@ -279,7 +333,7 @@ class StreamingShuffleStressSuite
    * consumer sessions as this suite ever exercises -- which is what makes a case that asks whether
    * anything reached the wire ask it under the most favourable conditions the suite provides. A
    * negative answer from this width could not be blamed on the shuffle having been too narrow to
-   * overlap.
+   * exercise retained-output transfer.
    */
   private val WireEvidenceWidth: Int = ShuffleWidths.max
 
@@ -322,17 +376,6 @@ class StreamingShuffleStressSuite
    * bounding works under exactly the load that would defeat it.
    */
   private val LogVolumeBudgetBytesPerHour: Long = 10L * 1024L * 1024L
-
-  /**
-   * Bytes a rendered log line costs beyond the parts this suite can measure exactly.
-   *
-   * The appender sees the message, the thread name and the logger name, and the layout prepends a
-   * timestamp and a level and appends a newline. Twenty-one characters of timestamp, up to five of
-   * level and the separators between the fields are covered generously by this figure, so the
-   * measured volume is biased '''upward''' -- which is the safe direction for a budget: the
-   * assertion can only ever be stricter than the truth, never looser.
-   */
-  private val RenderedLineOverheadBytes: Long = 40L
 
   /**
    * Records a single injected producer failure may write before it dies.
@@ -458,37 +501,112 @@ class StreamingShuffleStressSuite
    * <b>Why the failure is thrown from inside the record iterator.</b> A streaming writer pulls
    * records through the map function, so throwing part way along the iterator loses a producer in
    * exactly the state the feature's producer-failure flow is specified for: blocks already framed,
-   * checksummed and streamed, and the iterator far from exhausted. Throwing before the first record
-   * would merely be a task that never produced anything.
+   * checksummed and retained, and the iterator far from exhausted. The ordinary DAG schedule has no
+   * consumer subscribed yet; this is a writer-lifecycle failure, not a claim of map/reduce overlap.
+   * Throwing before the first record would merely be a task that never produced anything.
    *
-   * <b>Why it is deterministic.</b> The fault is conditioned on the attempt number, so attempt zero
-   * of a chosen partition always fails and its retry always succeeds. Nothing depends on timing or
-   * on how far a concurrent task had progressed.
+   * <b>Why it is deterministic.</b> The fault is conditioned on both the task-attempt and
+   * stage-attempt numbers, so attempt zero of a chosen partition fails only in the first stage
+   * attempt and its retry always succeeds. Nothing depends on timing or on how far a concurrent
+   * task had progressed.
+   *
+   * <b>Why the message carries a key.</b> Every injection names the iteration, the shuffle and the
+   * partition it belongs to, so that what the scheduler counted can be matched one for one against
+   * what was planned. See [[injectionKey]].
    *
    * @param context live context to build on
    * @param numPartitions map and reduce width of this shuffle
    * @param failingPartitions map partitions whose first attempt is made to die, possibly empty
+   * @param iteration the iteration this dataset belongs to, or [[NoIteration]] outside the workload
+   * @param shuffleIndex which concurrent shuffle it is, or [[NoShuffleIndex]] outside the workload
    * @return the key-value dataset, not yet computed
    */
   private def stressDataset(
       context: SparkContext,
       numPartitions: Int,
-      failingPartitions: Set[Int]): RDD[(Int, String)] = {
+      failingPartitions: Set[Int],
+      iteration: Int = NoIteration,
+      shuffleIndex: Int = NoShuffleIndex): RDD[(Int, String)] = {
     require(numPartitions > 0, s"numPartitions must be positive but was $numPartitions")
     val records = RecordsPerPartition
-    val doomed = failingPartitions
     val failAfter = math.min(RecordsBeforeInjectedFailure, records - 1)
+    // The whole message each doomed partition will raise, built HERE on the driver from the plan
+    // this suite made. Two reasons it is not built inside the closure. It keeps the suite out of
+    // the serialised closure -- a reference to a member of this class would capture `this`, which
+    // no test suite is serializable enough to survive, and which is why every other constant this
+    // dataset needs is captured the same way. And it keeps injectionKey the single place the key's
+    // shape is written, so the pattern that recovers the key cannot drift away from the one that
+    // wrote it.
+    val messagesByPartition: Map[Int, String] = failingPartitions.iterator.map { partitionIndex =>
+      partitionIndex -> (s"$InjectedFailureMarker " +
+        s"${injectionKey(iteration, shuffleIndex, partitionIndex)} after $failAfter record(s)")
+    }.toMap
     context.parallelize(0 until numPartitions, numPartitions).flatMap { partitionIndex =>
       (0 until records).iterator.map { recordIndex =>
-        if (doomed.contains(partitionIndex) && recordIndex == failAfter &&
-            TaskContext.get().attemptNumber() == 0) {
-          throw new IllegalStateException(
-            s"Injected streaming shuffle stress failure in map partition $partitionIndex after " +
-              s"$failAfter record(s)")
+        if (recordIndex == failAfter && messagesByPartition.contains(partitionIndex) &&
+            TaskContext.get().attemptNumber() == 0 &&
+            TaskContext.get().stageAttemptNumber() == 0) {
+          throw new IllegalStateException(messagesByPartition(partitionIndex))
         }
         (partitionIndex * records + recordIndex, deterministicValue(partitionIndex, recordIndex))
       }
     }
+  }
+
+  /**
+   * The streaming block registry behind a manager's published resolver, if it has one.
+   *
+   * The manager publishes a [[StreamingShuffleBlockRouter]] whenever the kill switch is open, and
+   * the router is what knows which of the two resolvers owns a given block. Going through it rather
+   * than asserting on a cast keeps the reading honest for a manager that declined to stream: the
+   * result is absent, and the caller reads absence rather than failing on a class cast.
+   *
+   * @param manager the manager in service
+   * @return the streaming registry, or absent if this manager is delegating wholly to sort
+   */
+  private def streamingResolverOf(
+      manager: StreamingShuffleManager): Option[StreamingShuffleBlockResolver] = {
+    manager.shuffleBlockResolver match {
+      case router: StreamingShuffleBlockRouter => Some(router.streamingResolver)
+      case _ => None
+    }
+  }
+
+  /**
+   * The injection keys observed as first-attempt failures, drawn from what the scheduler counted.
+   *
+   * Two filters, and both are load-bearing. The marker admits only failures this run injected, so
+   * an unrelated failure cannot stand in for an injection that never fired. The attempt number
+   * admits only first attempts, which is the only attempt an injection is armed for, so a retry
+   * that failed for some other reason cannot either.
+   *
+   * @param recorder the listener that observed the run
+   * @return the distinct keys observed, each naming an iteration, a shuffle and a partition
+   */
+  private def observedInjectionKeys(recorder: StreamingShuffleStressRecorder): Set[String] = {
+    recorder.countedFailureReports.iterator
+      .filter(report => report.attemptNumber == 0 &&
+        report.description.contains(InjectedFailureMarker))
+      .flatMap(report => InjectionKeyPattern.findFirstIn(report.description))
+      .toSet
+  }
+
+  /**
+   * The identity of one planned injection, as it appears in the exception the task raises.
+   *
+   * Every field the plan chose is in the string, so an observed failure can be matched back to the
+   * exact injection that was meant to cause it. Counting failures without this could not
+   * distinguish "every planned injection fired" from "one partition failed repeatedly while
+   * injection stopped after the first iteration", and it could be satisfied by a failure this suite
+   * never asked for.
+   *
+   * @param iteration the iteration the injection belongs to
+   * @param shuffleIndex which of the iteration's concurrent shuffles it belongs to
+   * @param partitionIndex the map partition whose first attempt is made to die
+   * @return the key, which is a substring of the raised exception's message
+   */
+  private def injectionKey(iteration: Int, shuffleIndex: Int, partitionIndex: Int): String = {
+    s"[iteration=$iteration shuffle=$shuffleIndex partition=$partitionIndex]"
   }
 
   /**
@@ -505,13 +623,17 @@ class StreamingShuffleStressSuite
    * @param context live context to build on
    * @param numPartitions map and reduce width of this shuffle
    * @param failingPartitions map partitions whose first attempt is made to die, possibly empty
+   * @param iteration the iteration this dataset belongs to, or [[NoIteration]] outside the workload
+   * @param shuffleIndex which concurrent shuffle it is, or [[NoShuffleIndex]] outside the workload
    * @return the grouped RDD, not yet computed
    */
   private def groupedStressDataset(
       context: SparkContext,
       numPartitions: Int,
-      failingPartitions: Set[Int]): RDD[(Int, Iterable[String])] = {
-    stressDataset(context, numPartitions, failingPartitions)
+      failingPartitions: Set[Int],
+      iteration: Int = NoIteration,
+      shuffleIndex: Int = NoShuffleIndex): RDD[(Int, Iterable[String])] = {
+    stressDataset(context, numPartitions, failingPartitions, iteration, shuffleIndex)
       .groupByKey(new HashPartitioner(numPartitions))
   }
 
@@ -662,6 +784,20 @@ class StreamingShuffleStressSuite
   }
 
   /**
+   * Timeout available to one iteration without crossing the workload deadline.
+   *
+   * @param nowMillis current wall time
+   * @param deadlineMillis absolute workload deadline
+   * @return zero once expired, otherwise the smaller of the ordinary iteration bound and the
+   *         remaining workload budget
+   */
+  private def remainingIterationTimeoutMillis(
+      nowMillis: Long,
+      deadlineMillis: Long): Long = {
+    math.max(0L, math.min(IterationTimeoutMillis, deadlineMillis - nowMillis))
+  }
+
+  /**
    * The median of a non-empty sample, taking the lower of the two middles when the count is even so
    * that the answer is one of the observations rather than an average of two of them.
    *
@@ -688,28 +824,6 @@ class StreamingShuffleStressSuite
   private def degradationPercent(before: Long, after: Long): Long = {
     require(before > 0L, s"the earlier figure must be positive but was $before")
     (before - after) * 100L / before
-  }
-
-  /**
-   * How many of the given weak references still resolve after a bounded collection sweep.
-   *
-   * This is the heap analysis. A weak reference to an object that nothing else reaches is cleared
-   * by the collection itself, so a reference that still resolves after this returns is a genuine
-   * retention rather than a scheduling artefact. Requesting a collection is not a wait: it makes
-   * progress towards the answer, where sleeping would only hope for it.
-   *
-   * @param references one reference per object whose unreachability is being asserted
-   * @return the number that survived, which a healthy run leaves at zero
-   */
-  private def survivingReferences(references: Seq[WeakReference[AnyRef]]): Int = {
-    var survivors = references.count(reference => reference.get() != null)
-    var attempt = 0
-    while (survivors > 0 && attempt < HeapSweepAttempts) {
-      System.gc()
-      attempt += 1
-      survivors = references.count(reference => reference.get() != null)
-    }
-    survivors
   }
 
   /**
@@ -752,6 +866,31 @@ class StreamingShuffleStressSuite
   }
 
   /**
+   * A log record of this subsystem's own, built for handing to the oracle directly.
+   *
+   * Built rather than logged, because a record that went through a logger would also reach the
+   * build's own appenders and would be measured by whatever else happens to be attached; and
+   * because the probe needs a record whose message and throwable it knows exactly, so that the
+   * measurement can be compared against a size it derived itself.
+   *
+   * @param message the record's message
+   * @param thrown the throwable attached to it, whose rendered stack trace is part of what a line
+   *               costs and is the largest single contributor the old field-length approximation
+   *               omitted
+   * @return the record
+   */
+  private def logRecordFor(message: String, thrown: Throwable): LogEvent = {
+    Log4jLogEvent.newBuilder()
+      .setLoggerName(s"${StreamingShuffleLoggerName}OracleProbe")
+      .setLevel(Level.INFO)
+      .setMessage(new SimpleMessage(message))
+      .setThrown(thrown)
+      .setThreadName(Thread.currentThread().getName)
+      .setTimeMillis(System.currentTimeMillis())
+      .build()
+  }
+
+  /**
    * Runs `body` with a log-volume appender attached, and detaches it afterwards whatever happens.
    *
    * <b>Why this rather than the shared `withLogAppender`.</b> That helper also sets a level on the
@@ -784,51 +923,6 @@ class StreamingShuffleStressSuite
       appender.stop()
     }
   }
-
-  /**
-   * This JVM's accumulated process CPU time in nanoseconds, or a negative value when the platform
-   * does not report it.
-   *
-   * Read through the platform MBean server by attribute name, which is exactly how
-   * `org.apache.spark.metrics.source.JVMCPUSource` reads the same figure: it needs no import of a
-   * proprietary interface and no reflection on a class name, it answers on every JVM that publishes
-   * the attribute, and it degrades to a negative reading rather than an exception on one that does
-   * not.
-   *
-   * <b>Why this suite needs it.</b> Wall-clock throughput on a shared build host is a function of
-   * two things: how efficiently the subsystem does its work, and how much of the machine the
-   * subsystem was given. Only the first is the subsystem's, and only the first is what "throughput
-   * must not decay under sustained load" is about -- yet a run whose host load rises between the
-   * two halves reports a decay the subsystem did not cause, and one whose host load falls hides a
-   * decay that it did. Records per CPU-second removes the second factor: a host that steals CPU
-   * lowers wall throughput and leaves records per CPU-second where it was, while a subsystem that
-   * really is retaining work burns more CPU per record and moves it. The five percent bound is
-   * therefore applied to the figure the subsystem controls, which is a stricter reading of the
-   * contract rather than a weaker one, and the wall-clock figure is reported beside it.
-   *
-   * @return process CPU nanoseconds, or a negative value when unavailable
-   */
-  private def processCpuTimeNanos(): Long = {
-    try {
-      ManagementFactory.getPlatformMBeanServer
-        .getAttribute(new ObjectName("java.lang", "type", "OperatingSystem"), "ProcessCpuTime")
-        .asInstanceOf[Long]
-    } catch {
-      case NonFatal(_) => -1L
-    }
-  }
-
-  /**
-   * A weak reference to an object that is unreachable the moment this returns.
-   *
-   * The allocation happens in a frame of its own precisely so that no local slot of the caller can
-   * keep the object alive, which is what makes the negative direction of the heap sweep's own
-   * self-check trustworthy rather than dependent on how the caller happened to be compiled.
-   *
-   * @return a reference whose referent nothing reaches
-   */
-  private def unreachableReference(): WeakReference[AnyRef] =
-    new WeakReference[AnyRef](new Object())
 
   // ---------------------------------------------------------------------------------------------
   // The numeric contract. Untagged and cheap on purpose: a fast verification run that excludes the
@@ -932,20 +1026,43 @@ class StreamingShuffleStressSuite
     assert(degradationPercent(1000L, 940L) >= MaxThroughputDegradationPercent.toLong,
       "a six percent fall is outside it, so the bound is a bound rather than a formality")
 
-    // The heap sweep, checked in both directions. A sweep that cleared everything would prove
-    // nothing about retention, and one that cleared nothing would report a leak on every run. The
-    // held probe is read again after the sweep, which is what keeps it genuinely reachable across
-    // it rather than merely written down as being so.
-    val retained = new Array[Byte](RetainedProbeBytes)
-    assert(survivingReferences(Seq(new WeakReference[AnyRef](retained))) === 1,
-      "a reference to an object the suite still holds must survive the sweep, or the sweep could " +
-        "not tell a retained object from a released one")
-    assert(retained.length === RetainedProbeBytes,
-      s"the probe is held across the sweep on purpose, and must still be $RetainedProbeBytes " +
-        s"byte(s) long afterwards, but is ${retained.length}")
-    assert(survivingReferences(Seq(unreachableReference())) === 0,
-      "a reference to an unreachable object must not survive the sweep, or a leak would go " +
-        "unreported")
+    // The resource peaks, checked in both directions on readings chosen by hand. A mark that never
+    // rose could not tell an allocation from its absence, and one that rose on a smaller reading
+    // would report a peak the run never reached. This is the sweep's self-check replaced by one
+    // that needs no collection: every reading these marks take is a counter the subsystem
+    // maintains, so the only thing left to check is that a high-water mark behaves like one.
+    val probePeaks = new StreamingResourcePeaks(None, () => None, () => 0L)
+    assert(probePeaks.reservedBytes === 0L,
+      s"an unsampled mark must read zero, but read ${probePeaks.reservedBytes}")
+    assert(probePeaks.registeredProducers === 0 && probePeaks.retainedFiles === 0 &&
+      probePeaks.servingProducers === 0,
+      s"every unsampled mark must read zero, but they read ${probePeaks.describe}")
+    probePeaks.raiseFor(registeredProducers = 3, retainedFiles = 2, reservedByteCount = 4096L,
+      servingProducers = 5)
+    assert(probePeaks.registeredProducers === 3 && probePeaks.retainedFiles === 2 &&
+      probePeaks.reservedBytes === 4096L && probePeaks.servingProducers === 5,
+      s"a first reading must set every mark, but they read ${probePeaks.describe}")
+    probePeaks.raiseFor(registeredProducers = 1, retainedFiles = 1, reservedByteCount = 1L,
+      servingProducers = 1)
+    assert(probePeaks.registeredProducers === 3 && probePeaks.retainedFiles === 2 &&
+      probePeaks.reservedBytes === 4096L && probePeaks.servingProducers === 5,
+      s"a smaller reading must not lower a high-water mark, but they read ${probePeaks.describe}")
+    probePeaks.raiseFor(registeredProducers = 9, retainedFiles = 8, reservedByteCount = 8192L,
+      servingProducers = 7)
+    assert(probePeaks.registeredProducers === 9 && probePeaks.retainedFiles === 8 &&
+      probePeaks.reservedBytes === 8192L && probePeaks.servingProducers === 7,
+      s"a larger reading must raise every mark, but they read ${probePeaks.describe}")
+    // An iteration can never receive more wait time than the workload has left. The final boundary
+    // is exact: once the deadline is reached, no further iteration may start.
+    assert(remainingIterationTimeoutMillis(0L, IterationTimeoutMillis * 2L) ===
+      IterationTimeoutMillis,
+      "an iteration with ample remaining time must retain its ordinary timeout")
+    assert(remainingIterationTimeoutMillis(900L, 1000L) === 100L,
+      "an iteration near the deadline must be bounded by the hundred milliseconds remaining")
+    assert(remainingIterationTimeoutMillis(1000L, 1000L) === 0L,
+      "an iteration at the deadline must receive no time and must not start")
+    assert(remainingIterationTimeoutMillis(1001L, 1000L) === 0L,
+      "an expired workload must not produce a negative timeout")
 
     // Exactly four metrics, which is the whole of this subsystem's telemetry contract. This is the
     // "no parallel counters" assertion: there is no fifth series duplicating the spill volume, so
@@ -980,9 +1097,30 @@ class StreamingShuffleStressSuite
         "enforced at the boundary")
     assert(logBytesPerHour(1L, MillisPerHour) < LogVolumeBudgetBytesPerHour,
       "one byte an hour is inside the budget, so the comparison is the right way round")
-    assert(RenderedLineOverheadBytes > 0L,
-      "a rendered line costs more than its message, but the allowance is " +
-        s"$RenderedLineOverheadBytes")
+    // The oracle itself, checked on a record of known size before it is trusted with a five minute
+    // run. A layout is what turns a record into bytes, so the measurement is only as good as the
+    // claim that it renders through one: the appender is handed a record carrying a throwable and
+    // must report strictly more than the message alone costs, which is the property a field-length
+    // approximation could not have.
+    val oracleProbe = new StreamingShuffleLogVolumeAppender(StreamingShuffleLoggerName)
+    val probeMessage = "streaming shuffle log volume oracle probe"
+    val probeThrowable = new IllegalStateException("streaming shuffle log volume oracle stack")
+    oracleProbe.append(logRecordFor(probeMessage, probeThrowable))
+    assert(oracleProbe.eventCount === 1L,
+      s"the oracle must have measured the one record it was handed, not ${oracleProbe.eventCount}")
+    assert(oracleProbe.unrenderedEventCount === 0L,
+      "the running configuration must expose a layout for the oracle to render through, or the " +
+        "measurement is an approximation wearing a rendered measurement's name")
+    val messageOnlyBytes = probeMessage.getBytes(StandardCharsets.UTF_8).length.toLong
+    assert(oracleProbe.byteCount > messageOnlyBytes,
+      s"a rendered line with a stack trace attached must cost more than its ${messageOnlyBytes} " +
+        s"byte message, but the oracle measured ${oracleProbe.byteCount}; a measurement that " +
+        "omitted the layout's own fields and the throwable would report exactly the message")
+    assert(oracleProbe.byteCount >
+        messageOnlyBytes + probeThrowable.getStackTrace.length.toLong,
+      "and it must account for the stack trace itself rather than a fixed allowance, so it must " +
+        s"exceed one byte per frame of it, but measured ${oracleProbe.byteCount} for " +
+        s"${probeThrowable.getStackTrace.length} frame(s)")
 
     // Write amplification, whose allowance is derived from what the run actually did rather than
     // chosen. Both terms are upper bounds on a duplicate write the feature's own recovery
@@ -1063,9 +1201,10 @@ class StreamingShuffleStressSuite
     assert(listener.get.malformedFrameCount === 0L,
       "no frame the router could not handle may have crossed the wire, but " +
         s"${listener.get.malformedFrameCount} did")
-    logInfo(s"Streaming shuffle wire evidence: $streamedBytes byte(s) in " +
-      s"$streamedBlocks block(s) over $acceptedSessions session(s), with " +
-      s"$acknowledgedBlocks acknowledgement(s)")
+    logInfo(log"Streaming shuffle wire evidence: ${MDC(NUM_BYTES, streamedBytes)} byte(s) in " +
+      log"${MDC(NUM_BLOCKS, streamedBlocks)} block(s) over " +
+      log"${MDC(COUNT, acceptedSessions)} session(s), with " +
+      log"${MDC(NUM_CHUNKS, acknowledgedBlocks)} acknowledgement(s)")
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -1073,9 +1212,14 @@ class StreamingShuffleStressSuite
   // the default an operator gets, so on its own it exercises the pacing layer's fast path and
   // nothing else. This case declares a capacity, which is what makes the token bucket a bucket:
   // the executor's aggregate is held to eighty percent of the declared figure, each shuffle paces
-  // at its share of that, and a request the ceiling refuses is held rather than dropped. All three
-  // are asserted against the LIVE budget the writers on this executor charge, not against a fixture
-  // built to look like it.
+  // at its share of that, and a request the ceiling refuses is held rather than dropped.
+  //
+  // The first two are read straight off the LIVE budget the writers on this executor charge. The
+  // third cannot be: spending an allowance is not a read, and a request drained out of the live
+  // budget would be an allowance taken from real producers, charged against a shuffle id that names
+  // no shuffle. So the refusal is drawn from a second budget built by production's own constructor
+  // from this run's own configuration, and tied to the live one by asserting the two pace to the
+  // same ceiling and that the live one is untouched afterwards.
   // ---------------------------------------------------------------------------------------------
 
   test("a bounded bandwidth streaming shuffle paces its egress and still produces the baseline") {
@@ -1118,26 +1262,49 @@ class StreamingShuffleStressSuite
     assert(flow.egressBytes > 0L,
       "the bytes this executor put on the wire must have been admitted through the flow-control " +
         s"protocol, but it accounted for ${flow.egressBytes} of them")
-    assert(flow.backpressureEventCount >= 0L && flow.throttledStreamCount >= 0L,
-      "the throttle readings must be legible after a paced run, whatever they read")
+    // Not "the readings are legible", which every long is. Once the workload has finished no stream
+    // is open, so nothing can still be throttled; and whatever throttling happened must have
+    // reached the executor's operator-facing counter, which is the reading an operator would use to
+    // explain a paced run. Both can fail.
+    assert(flow.throttledStreamCount === 0,
+      "no stream may still be throttled once every task of the run has ended, but " +
+        s"${flow.throttledStreamCount} still are")
+    assert(observedBackpressureEvents() === flow.backpressureEventCount,
+      s"the backpressure metric read ${observedBackpressureEvents()} against the " +
+        s"${flow.backpressureEventCount} transition(s) the protocol counted; a throttle an " +
+        "operator cannot see is a throttle they cannot act on")
 
-    // And the ceiling is a real bucket, exercised here rather than inferred. The workload above
-    // has finished, so draining the live budget cannot perturb any producer. What it establishes
-    // is that the limiter a writer on this executor holds refuses once the executor's allowance is
-    // spent, counts the refusal, and reports the ceiling's own wait rather than an immediate
-    // retry -- together the difference between a cap enforced by pacing and one enforced by
-    // standing streaming down after the link has already been overrun.
-    val limiter = pacing.limiterFor(PacingProbeShuffleId)
+    // And the ceiling is a real bucket, exercised rather than inferred -- but exercised on a budget
+    // of this case's own, not on the one the executor's writers charge. Asking the live budget for
+    // a limiter would admit a shuffle that does not exist into its divisor, republishing every real
+    // limiter's share around a fiction, and then spend the executor's own allowance draining it. A
+    // probe that alters what it is probing cannot report on it. So the probe builds a second budget
+    // from the SAME configuration the live one was built from and drains that instead.
+    //
+    // What makes the second budget's verdict a verdict about the first is the equality asserted
+    // immediately below: both derive their ceiling from the one declared capacity, so they pace to
+    // the same figure, and a refusal in one is a refusal the other would have given. That is the
+    // difference between an isolated probe and a fixture built to look like production -- the
+    // fixture is production's own constructor, reading production's own configuration, and the
+    // reading is checked against the live budget rather than asserted in place of it.
+    val probeBudget = TokenBucketRateLimiter.executorBudget(sc.getConf)
+    assert(probeBudget.aggregateBytesPerSecond === pacing.aggregateBytesPerSecond,
+      "the probe budget must pace to the same ceiling as the live one or its refusals say " +
+        s"nothing about production: the probe reports " +
+        s"${probeBudget.aggregateBytesPerSecond} against the live " +
+        s"${pacing.aggregateBytesPerSecond}")
+    val liveAggregateRefusalsBefore = pacing.aggregateRefusalCount
+    val liveDivisorBefore = pacing.divisor
+    val limiter = probeBudget.limiterFor(PacingProbeShuffleId)
     val block = limiter.maxAcquirableBytes
     assert(block > 0L && block < Long.MaxValue,
       s"a bounded limiter must publish a finite framing ceiling, but it published $block")
     // Drain until refused. How many requests are admitted first is deliberately NOT asserted on:
-    // the executor's ceiling has just paced a real shuffle, so it may already hold less than one
-    // whole frame, and a fixture demanding a full bucket would be asserting that the ceiling had
-    // NOT been working. What is asserted is the property the contract names -- that a request
-    // beyond the executor's allowance is refused, counted, and answered with a wait -- which holds
-    // whether the first request is admitted or is the one refused. The loop is bounded because a
-    // request the size of the whole bucket can be admitted at most once before the bucket is empty.
+    // what is asserted is the property the contract names -- that a request beyond the executor's
+    // allowance is refused, counted, and answered with a wait -- which holds whether the first
+    // request is admitted or is the one refused. The loop is bounded because a request the size of
+    // the whole bucket can be admitted at most once before the bucket is empty, and the ceiling
+    // refills at the administered rate rather than instantly.
     var admitted = 0L
     var refused = false
     var attempts = 0
@@ -1156,10 +1323,20 @@ class StreamingShuffleStressSuite
     assert(limiter.refusalCount > 0L,
       "the limiter must record the refusal that stopped the drain, or a paced producer would be " +
         "indistinguishable from one that was never held back")
-    assert(pacing.aggregateRefusalCount > 0L ||
+    assert(probeBudget.aggregateRefusalCount > 0L ||
         limiter.availableTokens < limiter.capacityBytes,
       "the refusal must have come from a bucket with something spent, whether this shuffle's own " +
         "or the executor's ceiling behind it")
+    // The live budget is where the executor's writers charge, so the probe must have left it
+    // exactly as it found it. Both readings would move if the probe had reached into it: the
+    // divisor by admitting a shuffle that does not exist, the refusal count by spending an
+    // allowance that belongs to real producers.
+    assert(pacing.divisor === liveDivisorBefore,
+      s"the probe must not have entered the live budget's divisor, but it moved from " +
+        s"$liveDivisorBefore to ${pacing.divisor}")
+    assert(pacing.aggregateRefusalCount === liveAggregateRefusalsBefore,
+      "the probe must not have spent the live executor's allowance, but the live aggregate's " +
+        s"refusals moved from $liveAggregateRefusalsBefore to ${pacing.aggregateRefusalCount}")
     val refusedWait = limiter.millisUntilAvailable(block)
     assert(refusedWait > 0L && refusedWait < Long.MaxValue,
       s"a refused caller must be told a finite wait but was told $refusedWait: zero schedules no " +
@@ -1168,11 +1345,14 @@ class StreamingShuffleStressSuite
     assert(!manager.degradationPolicy.hasTripped,
       "pacing is flow control rather than a degradation, so a bounded run must not stand " +
         s"streaming down, but it did because ${manager.degradationPolicy.trippedReason}")
-    logInfo(s"Streaming shuffle bounded-bandwidth run paced at $expectedCeiling bytes/s " +
-      s"aggregate and ${pacing.currentShareBytesPerSecond} per shuffle, accounted " +
-      s"${flow.egressBytes} egress byte(s), admitted $admitted byte(s) in $attempts attempt(s) " +
-      s"before being refused, and recorded ${limiter.refusalCount} refusal(s) answered with a " +
-      s"wait of $refusedWait ms")
+    logInfo(log"Streaming shuffle bounded-bandwidth run paced at " +
+      log"${MDC(MAX_SIZE, expectedCeiling)} bytes/s aggregate and " +
+      log"${MDC(MIN_SIZE, pacing.currentShareBytesPerSecond)} per shuffle, accounted " +
+      log"${MDC(NUM_BYTES, flow.egressBytes)} egress byte(s); an isolated budget at the same " +
+      log"ceiling admitted ${MDC(BYTE_SIZE, admitted)} byte(s) in " +
+      log"${MDC(NUM_REQUESTS, attempts)} attempt(s) before being refused, and recorded " +
+      log"${MDC(COUNT, limiter.refusalCount)} refusal(s) answered with a wait of " +
+      log"${MDC(DELAY, refusedWait)} ms")
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -1194,6 +1374,8 @@ class StreamingShuffleStressSuite
     sc = new SparkContext(stressConf("streaming-shuffle-stress"))
     assertStreamingManagerInService(sc)
     val manager = sc.env.shuffleManager.asInstanceOf[StreamingShuffleManager]
+    val memoryQuota = MemorySpillManager.executorQuota(sc.getConf)
+    val diskQuota = MemorySpillManager.executorDiskQuota(sc.getConf, memoryQuota)
 
     val recorder = new StreamingShuffleStressRecorder
     sc.addSparkListener(recorder)
@@ -1214,30 +1396,47 @@ class StreamingShuffleStressSuite
     val deadlineMillis = startedAtMillis + StressDurationMillis
     val recordsPerIteration = MapTasksPerIteration.toLong * RecordsPerPartition.toLong
     val throughputSamples = new mutable.ArrayBuffer[Long]()
-    // Per-iteration records per CPU-second, which is throughput with the host's own load divided
-    // out. See processCpuTimeNanos for why the five percent bound is applied to this rather than to
-    // wall-clock throughput, and why doing so is the stricter reading of the contract.
-    val cpuThroughputSamples = new mutable.ArrayBuffer[Long]()
-    val shuffleGraphReferences = new mutable.ArrayBuffer[WeakReference[AnyRef]]()
+    // Every injection the run arms, keyed by iteration, shuffle and partition. See injectionKey.
+    val plannedInjectionKeys = new mutable.HashSet[String]()
+    // Peaks of the streaming resources the run actually allocates. See StreamingResourcePeaks for
+    // why peaks of real allocations replace a weak-reference sweep.
+    val resourcePeaks = new StreamingResourcePeaks(
+      streamingResolverOf(manager),
+      () => manager.boundStreamingListener,
+      () => MemorySpillManager.executorQuota(sc.getConf).reservedBytes)
     var iterations = 0
     var injectedFailures = 0L
+    var requiredIterationMillis = 1L
+    var remainingMillis = deadlineMillis - clock.getTimeMillis()
 
     // Attached for the whole workload, so what it measures is the volume five minutes of sustained
     // load at five concurrent shuffles actually emits. Selection is by logger name inside the
     // appender, which covers every class in the package without naming any of them -- and without a
     // class added later escaping the measurement -- while charging the subsystem's budget for
     // nothing the scheduler or the harness logged.
-    val logVolume = new StreamingShuffleLogVolumeAppender(
-      StreamingShuffleLoggerName, RenderedLineOverheadBytes)
+    val logVolume = new StreamingShuffleLogVolumeAppender(StreamingShuffleLoggerName)
     measuringStreamingLogVolume(logVolume) {
-      while (clock.getTimeMillis() < deadlineMillis && iterations < IterationGuardLimit) {
+      while (remainingMillis >= requiredIterationMillis && iterations < IterationGuardLimit) {
         val iteration = iterations
         val doomedPerShuffle = failingPartitionsFor(iteration)
         injectedFailures += doomedPerShuffle.map(_.size).sum.toLong
+        // The plan, recorded key by key as it is made. Asserting on this rather than on a count is
+        // what makes "every planned injection fired" a checkable statement: a key names the
+        // iteration, the shuffle and the partition, so injection stopping after the first iteration
+        // leaves later iterations' keys unmatched instead of hiding behind a total that a single
+        // repeatedly-failing partition could have reached on its own.
+        doomedPerShuffle.iterator.zipWithIndex.foreach { case (doomed, shuffleIndex) =>
+          doomed.foreach { partitionIndex =>
+            plannedInjectionKeys += injectionKey(iteration, shuffleIndex, partitionIndex)
+          }
+        }
         // Wall time, and only for measurement. Turning an interval into a rate is the one thing
         // in this suite genuinely about elapsed time, and reading a clock is not waiting on one.
         val iterationStartedAtNanos = System.nanoTime()
-        val iterationStartedAtCpuNanos = processCpuTimeNanos()
+        val iterationTimeoutMillis =
+          remainingIterationTimeoutMillis(clock.getTimeMillis(), deadlineMillis)
+        assert(iterationTimeoutMillis > 0L,
+          s"iteration $iteration must not start without workload time remaining")
         // Five jobs released from one barrier, so the five shuffles are genuinely concurrent
         // rather than merely consecutive: without the barrier the first would usually finish
         // before the last began, and an iteration meant to exercise contention would exercise
@@ -1245,37 +1444,47 @@ class StreamingShuffleStressSuite
         val outcomes = runConcurrently(
             StressConcurrentShuffles,
             s"streaming-shuffle-stress-iteration-$iteration",
-            IterationTimeoutMillis) { shuffleIndex =>
+            iterationTimeoutMillis) { shuffleIndex =>
           val shuffled = groupedStressDataset(
-            sc, ShuffleWidths(shuffleIndex), doomedPerShuffle(shuffleIndex))
-          // The only reference this iteration keeps to the shuffle's object graph is a weak one, so
-          // the sweep after the loop is able to prove that nothing retained it.
-          val reference = new WeakReference[AnyRef](shuffled)
-          (digestOf(shuffled), reference)
+            sc, ShuffleWidths(shuffleIndex), doomedPerShuffle(shuffleIndex), iteration,
+            shuffleIndex)
+          val digest = digestOf(shuffled)
+          // Sampled from inside the concurrent body, which is the only genuinely in-flight moment
+          // available: this thread has finished its own shuffle while its four siblings are still
+          // streaming, so the reading covers resources that are live rather than resources that
+          // have already been released. A peak required to be positive is what makes the release
+          // assertions after the run mean something -- zero at the end proves release only if
+          // something was allocated in the first place.
+          resourcePeaks.sample()
+          digest
         }
+        // Once more with the iteration complete, so a resource that outlives its producing task --
+        // retained output is meant to -- is seen at the moment it is most likely to be held.
+        resourcePeaks.sample()
         val iterationNanos = System.nanoTime() - iterationStartedAtNanos
-        val iterationCpuNanos = processCpuTimeNanos() - iterationStartedAtCpuNanos
 
         assert(outcomes.size === StressConcurrentShuffles,
           s"iteration $iteration must have completed all $StressConcurrentShuffles of its " +
             s"concurrent shuffles, but ${outcomes.size} returned a result")
         outcomes.zip(ShuffleWidths).zip(baselines).foreach {
-          case (((observed, _), width), baseline) =>
+          case ((observed, width), baseline) =>
             assertNoDataLoss(observed, baseline,
               s"iteration $iteration of the stress workload, its $width partition shuffle")
         }
-        shuffleGraphReferences ++= outcomes.map { case (_, reference) => reference }
         assert(iterationNanos > 0L,
           s"iteration $iteration must have taken measurable time, but the clock reported " +
             s"$iterationNanos ns")
-        throughputSamples += throughputRecordsPerSecond(recordsPerIteration, iterationNanos)
-        // Only when the platform reported the figure at both ends and time genuinely advanced. A
-        // sample is never invented: if the reading is unavailable the sample is absent, and the
-        // assertion below falls back to the wall-clock statistic rather than asserting on nothing.
-        if (iterationStartedAtCpuNanos >= 0L && iterationCpuNanos > 0L) {
-          cpuThroughputSamples += throughputRecordsPerSecond(recordsPerIteration, iterationCpuNanos)
-        }
+        val deliveredRecords = outcomes.iterator.map(_.size.toLong).sum
+        assert(deliveredRecords === recordsPerIteration,
+          s"iteration $iteration must deliver all $recordsPerIteration unique records, but " +
+            s"delivered $deliveredRecords")
+        throughputSamples += throughputRecordsPerSecond(deliveredRecords, iterationNanos)
+        val elapsedIterationMillis =
+          math.max(1L, TimeUnit.NANOSECONDS.toMillis(iterationNanos))
+        requiredIterationMillis = math.min(
+          IterationTimeoutMillis, math.max(1L, elapsedIterationMillis * 2L))
         iterations += 1
+        remainingMillis = deadlineMillis - clock.getTimeMillis()
       }
     }
 
@@ -1286,10 +1495,16 @@ class StreamingShuffleStressSuite
       s"the half-against-half throughput comparison needs at least $MinIterations iterations to " +
         s"mean anything, but the five minute budget only bought $iterations; each iteration is " +
         "therefore doing far more work than this workload intends")
-    val elapsedMillis = clock.getTimeMillis() - startedAtMillis
-    assert(elapsedMillis >= StressDurationMillis,
-      s"the workload must have run for the whole $StressDurationMillis ms it was given, but " +
-        s"stopped after $elapsedMillis ms")
+    val finishedAtMillis = clock.getTimeMillis()
+    val elapsedMillis = finishedAtMillis - startedAtMillis
+    val unspentMillis = math.max(0L, deadlineMillis - finishedAtMillis)
+    val overrunMillis = math.max(0L, finishedAtMillis - deadlineMillis)
+    assert(unspentMillis < requiredIterationMillis,
+      s"the workload stopped with $unspentMillis ms unused even though the next bounded " +
+        s"iteration needed only $requiredIterationMillis ms")
+    assert(overrunMillis <= DeadlineOverrunToleranceMillis,
+      s"the five minute workload overran its deadline by $overrunMillis ms, above the " +
+        s"$DeadlineOverrunToleranceMillis ms scheduling allowance")
 
     // The listener runs on its own thread, so its readings are trusted only once it has drained.
     sc.listenerBus.waitUntilEmpty(ListenerDrainTimeoutMillis)
@@ -1320,9 +1535,31 @@ class StreamingShuffleStressSuite
     assert(injectedFailures * 100L === mapTasksSubmitted * StressFailureInjectionPercent.toLong,
       s"$injectedFailures of $mapTasksSubmitted map tasks must be exactly " +
         s"$StressFailureInjectionPercent percent of them, with no rounding either way")
-    assert(recorder.countedFailures.size >= InjectedFailuresPerIteration,
-      "the scheduler must have counted the injected failures rather than swallowing them, but it " +
-        s"counted ${recorder.countedFailures.size} across $injectedFailures injected")
+    // Every injection the plan armed, matched one for one against what the scheduler counted. This
+    // is the assertion that makes the ten-percent arithmetic above mean anything: the two lines
+    // before it describe the PLAN, and a plan is not evidence. A count of observed failures is not
+    // evidence either -- three counted failures satisfy "at least three" whether injection ran for
+    // one iteration or a hundred, and an unrelated failure counts just as readily as an injected
+    // one. Requiring each planned key to appear as a first-attempt failure closes both gaps: a key
+    // names the iteration, the shuffle and the partition, so injection stopping early leaves later
+    // iterations' keys unmatched, and only a failure this run injected can carry a key at all.
+    val plannedKeys = plannedInjectionKeys.toSet
+    assert(plannedKeys.size.toLong === injectedFailures,
+      s"each of the $injectedFailures planned injection(s) must be distinct, but the plan " +
+        s"produced ${plannedKeys.size} distinct key(s), which would mean two injections claimed " +
+        "the same iteration, shuffle and partition")
+    val observedKeys = observedInjectionKeys(recorder)
+    val unfiredKeys = plannedKeys.diff(observedKeys)
+    assert(unfiredKeys.isEmpty,
+      s"every one of the $injectedFailures planned injection(s) must have been observed as a " +
+        s"first-attempt task failure, but ${unfiredKeys.size} never fired: " +
+        s"${unfiredKeys.toSeq.sorted.take(UnfiredKeysReported).mkString(", ")}" +
+        (if (unfiredKeys.size > UnfiredKeysReported) ", ..." else ""))
+    val unplannedKeys = observedKeys.diff(plannedKeys)
+    assert(unplannedKeys.isEmpty,
+      "no failure may carry an injection key this run did not plan, since that would mean the " +
+        s"accounting is matching something other than its own injections, but observed: " +
+        s"${unplannedKeys.toSeq.sorted.take(UnfiredKeysReported).mkString(", ")}")
     // Recovery took one of the paths the feature already provides and no new mechanism: a retry of
     // the map task, or a fetch failure that the UNMODIFIED scheduler resolves by recomputing the
     // upstream stage. That every job nonetheless produced the baseline's output, asserted in the
@@ -1349,8 +1586,13 @@ class StreamingShuffleStressSuite
     assert(samples.size === iterations,
       s"one throughput sample per iteration is needed, but $iterations iteration(s) produced " +
         s"${samples.size} sample(s)")
-    val firstHalf = samples.take(samples.size / 2)
-    val secondHalf = samples.drop(samples.size / 2)
+    val postWarmupSamples = samples.drop(ThroughputWarmupIterations)
+    assert(postWarmupSamples.size === iterations - ThroughputWarmupIterations,
+      s"excluding $ThroughputWarmupIterations warm-up iteration(s) from $iterations must leave " +
+        s"${iterations - ThroughputWarmupIterations} delivered-throughput samples, but left " +
+        s"${postWarmupSamples.size}")
+    val firstHalf = postWarmupSamples.take(postWarmupSamples.size / 2)
+    val secondHalf = postWarmupSamples.drop(postWarmupSamples.size / 2)
     assert(firstHalf.nonEmpty && secondHalf.nonEmpty,
       s"both halves of the run must hold samples, but they hold ${firstHalf.size} and " +
         s"${secondHalf.size}")
@@ -1364,52 +1606,30 @@ class StreamingShuffleStressSuite
     val firstMean = firstHalf.sum / firstHalf.size.toLong
     val secondMean = secondHalf.sum / secondHalf.size.toLong
 
-    // Which figure carries the bound, and why it is the CPU-normalised one where it is available.
-    //
-    // Wall-clock throughput on a shared build host is the product of two things: how efficiently
-    // the subsystem works, and how much of the machine it was given. Only the first is the
-    // subsystem's, and only the first is what this bound is about -- yet a host whose load rises
-    // between the two halves manufactures a decay, and one whose load falls conceals a real one.
-    // Records per CPU-second divides the second factor out: stolen CPU lowers the wall figure and
-    // leaves this one alone, while a subsystem that really is accumulating work burns more CPU per
-    // record and moves it. Applying the five percent bound here is therefore stricter than applying
-    // it to wall time, not laxer, and it is what makes a four-percent-against-five-percent verdict
-    // a statement about the shuffle instead of a statement about the host.
-    //
-    // Wall time still carries the bound when the platform does not publish process CPU time, so the
-    // contract is never quietly dropped -- it is only ever measured the better way when the better
-    // way is available. Both figures are reported either way.
-    val cpuSamples = cpuThroughputSamples.toSeq
-    val cpuNormalised = cpuSamples.size === iterations && cpuSamples.forall(_ > 0L)
-    val (assertedDegradation, assertedFirst, assertedSecond, assertedUnit) = if (cpuNormalised) {
-      val firstCpuMedian = medianOf(cpuSamples.take(cpuSamples.size / 2))
-      val secondCpuMedian = medianOf(cpuSamples.drop(cpuSamples.size / 2))
-      assert(firstCpuMedian > 0L,
-        "the first half must have measurable CPU-normalised throughput, but its median was " +
-          s"$firstCpuMedian")
-      (degradationPercent(firstCpuMedian, secondCpuMedian), firstCpuMedian, secondCpuMedian,
-        "record(s) per CPU-second")
-    } else {
-      (medianDegradation, firstMedian, secondMedian, "record(s) per second")
-    }
-    assert(assertedDegradation < MaxThroughputDegradationPercent.toLong,
+    // The contract is delivered records per elapsed wall second after warm-up. Process CPU time is
+    // useful to a profiler, but dividing by it changes the promised denominator and can hide
+    // wall-time decay caused by coordination, blocking or retained work.
+    assert(medianDegradation < MaxThroughputDegradationPercent.toLong,
       s"throughput must not decay by $MaxThroughputDegradationPercent percent or more under " +
-        s"sustained load, but the median fell $assertedDegradation percent, from $assertedFirst " +
-        s"to $assertedSecond $assertedUnit across $iterations iteration(s); the wall-clock " +
-        s"median moved from $firstMedian to $secondMedian record(s) per second, a fall of " +
-        s"$medianDegradation percent")
-    logInfo(s"Streaming shuffle stress workload ran $iterations iteration(s) of " +
-      s"$StressConcurrentShuffles concurrent shuffle(s) over " +
-      s"${TimeUnit.MILLISECONDS.toSeconds(elapsedMillis)} s, injecting $injectedFailures " +
-      s"failure(s) into $mapTasksSubmitted map task(s) and observing " +
-      s"${recorder.countedFailures.size} counted failure(s) of which " +
-      s"${recorder.fetchFailures.size} were fetch failures; median throughput moved from " +
-      s"$firstMedian to $secondMedian record(s) per second, a degradation of $medianDegradation " +
-      s"percent against a bound of $MaxThroughputDegradationPercent percent, with half means of " +
-      s"$firstMean and $secondMean record(s) per second and a peak of " +
-      s"${recorder.peakConcurrentTasks} concurrent task(s); the bound was applied to " +
-      s"$assertedFirst against $assertedSecond $assertedUnit, a fall of " +
-      s"$assertedDegradation percent")
+        s"sustained load, but post-warm-up delivered-record throughput fell $medianDegradation " +
+        s"percent, from $firstMedian to $secondMedian record(s) per elapsed second across " +
+        s"$iterations iteration(s)")
+    logInfo(log"Streaming shuffle stress workload ran " +
+      log"${MDC(NUM_ITERATIONS, iterations)} iteration(s) of " +
+      log"${MDC(NUM_CONCURRENT_WRITER, StressConcurrentShuffles)} concurrent shuffle(s) over " +
+      log"${MDC(TOTAL_TIME, TimeUnit.MILLISECONDS.toSeconds(elapsedMillis))} s, injecting " +
+      log"${MDC(NUM_FAILURES, injectedFailures)} failure(s) into " +
+      log"${MDC(NUM_TASKS, mapTasksSubmitted)} map task(s) and observing " +
+      log"${MDC(COUNT, recorder.countedFailures.size)} counted failure(s) of which " +
+      log"${MDC(NUM_RETRIES, recorder.fetchFailures.size)} were fetch failures")
+    logInfo(log"Streaming shuffle stress workload median throughput moved from " +
+      log"${MDC(OLD_VALUE, firstMedian)} to ${MDC(NEW_VALUE, secondMedian)} record(s) per " +
+      log"elapsed second, a degradation of ${MDC(PERCENT, medianDegradation)} percent against a " +
+      log"bound of ${MDC(THRESHOLD, MaxThroughputDegradationPercent)} percent, with half means " +
+      log"of ${MDC(MIN_SIZE, firstMean)} and ${MDC(MAX_SIZE, secondMean)} record(s) per second " +
+      log"and a peak of ${MDC(NUM_TASKS, recorder.peakConcurrentTasks)} concurrent task(s); the " +
+      log"bound excludes ${MDC(TOTAL, ThroughputWarmupIterations)} warm-up iteration(s) and is " +
+      log"applied to delivered records per elapsed wall second")
 
     // ---------------------------------------------------------------------------------------------
     // Did it stream? The same reading the cheap case takes, over five minutes of it.
@@ -1478,11 +1698,15 @@ class StreamingShuffleStressSuite
         s"that $injectedFailures injected failure(s) and ${recorder.retriedStageAttempts} stage " +
         s"resubmission(s) account for; a duplicate the feature's own recovery cannot explain " +
         "means a shuffle already under way was abandoned and produced again")
-    logInfo(s"Streaming shuffle stress workload streamed $streamedBytes byte(s) in " +
-      s"$streamedBlocks block(s) over $acceptedSessions session(s) with $acknowledgedBlocks " +
-      s"acknowledgement(s), wrote $recordsWritten record(s) and read $recordsRead for " +
-      s"$uniqueRecords unique, a duplicate write of $duplicateWrites against an allowance of " +
-      s"$allowedDuplicates from ${recorder.retriedStageAttempts} stage resubmission(s)")
+    logInfo(log"Streaming shuffle stress workload streamed " +
+      log"${MDC(NUM_BYTES, streamedBytes)} byte(s) in ${MDC(NUM_BLOCKS, streamedBlocks)} " +
+      log"block(s) over ${MDC(COUNT, acceptedSessions)} session(s) with " +
+      log"${MDC(NUM_CHUNKS, acknowledgedBlocks)} acknowledgement(s), wrote " +
+      log"${MDC(RECORDS, recordsWritten)} record(s) and read " +
+      log"${MDC(NUM_RECORDS_READ, recordsRead)} for ${MDC(NUM_ROWS, uniqueRecords)} unique, a " +
+      log"duplicate write of ${MDC(VALUE, duplicateWrites)} against an allowance of " +
+      log"${MDC(THRESHOLD, allowedDuplicates)} from " +
+      log"${MDC(NUM_RETRIES, recorder.retriedStageAttempts)} stage resubmission(s)")
 
     // ---------------------------------------------------------------------------------------------
     // The log-volume budget, measured rather than claimed.
@@ -1491,24 +1715,46 @@ class StreamingShuffleStressSuite
     // feature, and this is the load that would defeat it: five concurrent shuffles, thirty map
     // outputs an iteration and a producer registered and withdrawn for every one of them, sustained
     // for five minutes. The subsystem bounds its per-map-output and per-shuffle records on rolling
-    // windows precisely so that they cannot multiply into hundreds of megabytes an hour, and the
-    // measurement is biased upward by a generous per-line overhead allowance, so the assertion can
-    // only ever be stricter than the truth. In local mode the driver and the executor share this
-    // JVM, so what is measured is both of them against a per-executor budget -- stricter again.
+    // windows precisely so that they cannot multiply into hundreds of megabytes an hour.
+    //
+    // What is measured is what a destination is actually written: every record is handed to the
+    // layouts the running configuration exposes and its encoded bytes are counted, so the
+    // timestamp, the thread, the level, the logger, the MDC context and -- the largest term of all
+    // under failure injection -- the throwable's rendered stack trace are all charged. A character
+    // count plus an allowance would omit every one of those and could report a passing figure for a
+    // run that had exceeded the budget several times over. In local mode the driver and the
+    // executor share this JVM, so what is measured is both of them against a per-executor budget,
+    // which is stricter than the constraint requires.
     // ---------------------------------------------------------------------------------------------
 
     val logBytes = logVolume.byteCount
     val hourlyLogBytes = logBytesPerHour(logBytes, elapsedMillis)
+    // The reading must be a rendered one before it is compared to the budget. A record no layout
+    // would render is approximated from its message and throwable alone, and an approximated figure
+    // is not the figure this budget is defined over.
+    assert(logVolume.unrenderedEventCount === 0L,
+      s"${logVolume.unrenderedEventCount} of ${logVolume.eventCount} record(s) could not be " +
+        "rendered through any configured layout, so the byte count below is an approximation " +
+        "rather than the encoded size the budget is stated in")
+    assert(logVolume.eventCount > 0L,
+      "five minutes of five concurrent shuffles must have produced at least one record from the " +
+        "subsystem, so a reading of zero means the measurement was attached to nothing and the " +
+        "budget below would pass whatever the subsystem logged")
     assert(hourlyLogBytes < LogVolumeBudgetBytesPerHour,
-      s"the subsystem emitted $logBytes byte(s) in ${logVolume.eventCount} record(s) over " +
-        s"$elapsedMillis ms, which is $hourlyLogBytes byte(s) an hour against a budget of " +
+      s"the subsystem emitted $logBytes rendered byte(s) in ${logVolume.eventCount} record(s) " +
+        s"over $elapsedMillis ms, which is $hourlyLogBytes byte(s) an hour against a budget of " +
         s"$LogVolumeBudgetBytesPerHour with debug logging off; a record made once per map output " +
         "or once per shuffle has to be bounded on a rolling window rather than emitted every time")
-    logInfo(s"Streaming shuffle stress workload emitted ${logVolume.eventCount} log record(s) " +
-      s"costing $logBytes byte(s) over $elapsedMillis ms, which is $hourlyLogBytes byte(s) an " +
-      s"hour against a budget of $LogVolumeBudgetBytesPerHour; " +
-      s"${logVolume.foreignEventCount} record(s) logged by something other than the subsystem " +
-      "were excluded")
+    logInfo(log"Streaming shuffle stress workload emitted " +
+      log"${MDC(NUM_EVENTS, logVolume.eventCount)} log record(s) costing " +
+      log"${MDC(NUM_BYTES, logBytes)} rendered byte(s) over " +
+      log"${MDC(DURATION, elapsedMillis)} ms, which is ${MDC(BYTE_SIZE, hourlyLogBytes)} " +
+      log"byte(s) an hour against a budget of " +
+      log"${MDC(THRESHOLD, LogVolumeBudgetBytesPerHour)}; " +
+      log"${MDC(COUNT, logVolume.foreignEventCount)} record(s) logged by something other than " +
+      log"the subsystem were excluded and " +
+      log"${MDC(VALUE, logVolume.unrenderedEventCount)} could not be rendered through a " +
+      log"configured layout")
 
     // ---------------------------------------------------------------------------------------------
     // Spill accounting rides the EXISTING accumulators, and there are no parallel counters.
@@ -1518,9 +1764,17 @@ class StreamingShuffleStressSuite
       "the streaming path must report peak execution memory on the existing task metric " +
         "accumulator, or the whole run would be invisible to every Spark observability surface, " +
         s"but the high water mark across the run was ${recorder.peakExecutionMemory}")
-    assert(recorder.memoryBytesSpilled >= 0L && recorder.diskBytesSpilled >= 0L,
-      s"spill volumes must be readable from task metrics, but they read " +
-        s"${recorder.memoryBytesSpilled} in memory and ${recorder.diskBytesSpilled} on disk")
+    // Not "the volumes are readable", which every long is. What is asserted is the invariant that
+    // ties the two accumulators together: memory given up by spilling is memory whose bytes went to
+    // disk, so a run that released any is a run that wrote some. The converse is deliberately not
+    // asserted -- a streaming map task makes its retained window durable whether or not it was ever
+    // under pressure, so disk bytes without released memory is a legitimate reading.
+    if (recorder.memoryBytesSpilled > 0L) {
+      assert(recorder.diskBytesSpilled > 0L,
+        s"${recorder.memoryBytesSpilled} byte(s) of memory were released by spilling, so their " +
+          "bytes must appear on the disk-spill accumulator, but it read " +
+          s"${recorder.diskBytesSpilled}")
+    }
     if (observedSpillCount() > 0L) {
       assert(recorder.diskBytesSpilled > 0L,
         s"${observedSpillCount()} spill event(s) were counted, so their volume must appear on " +
@@ -1531,16 +1785,77 @@ class StreamingShuffleStressSuite
       "the subsystem must publish exactly its four documented metrics, so that spill volume is " +
         s"reported through task metrics alone, but the registry holds " +
         s"${streamingShuffleMetricNames().toSeq.sorted.mkString(", ")}")
-    assert(observedBackpressureEvents() >= 0L && observedPartialReadInvalidations() >= 0L,
-      "the two event counters must be readable after the run, whatever they read")
+    // The two event counters, tied to what the run actually did rather than checked for
+    // non-negativity. Each has a cause the scheduler or the wire evidence can see, and each has a
+    // ceiling the workload's own shape fixes, so a counter that stopped moving and one that ran
+    // away are both caught.
+    //
+    // An invalidation is a consumer discarding what it had accepted from one producer and asking
+    // for the upstream stage again, and the only way it reaches the scheduler is the fetch failure
+    // it raises. So the two must agree in BOTH directions: fetch failures without a counted
+    // invalidation means the counter is blind to the very event an operator would use it to explain
+    // a recomputed stage, and a counted invalidation without a fetch failure means a consumer threw
+    // away accepted bytes and told no one.
+    val invalidations = observedPartialReadInvalidations()
+    if (recorder.fetchFailures.nonEmpty) {
+      assert(invalidations >= 1L,
+        s"${recorder.fetchFailures.size} fetch failure(s) were reported, so at least one " +
+          s"partial-read invalidation must have been counted, but the counter read $invalidations")
+    } else {
+      assert(invalidations === 0L,
+        s"no fetch failure was reported, so nothing can have invalidated a partial read, yet the " +
+          s"counter read $invalidations")
+    }
+    assert(invalidations <= recorder.taskEndCount,
+      s"an invalidation is a consumer giving up on one producer, so a run of " +
+        s"${recorder.taskEndCount} task(s) cannot have counted $invalidations of them; a counter " +
+        "advancing more often than that is counting something other than what it names")
+    // A backpressure event is a stream entering a throttled state, and the executor's
+    // operator-facing series must report exactly the transitions the protocol that produced them
+    // counted -- no more, no fewer. This is the claim an operator relies on when they read the
+    // counter to explain a slow shuffle, and it can fail in both directions: a transition that
+    // advanced the protocol's own tally and not the metric leaves the operator blind, and one that
+    // advanced the metric without a transition inflates it. In local mode the driver and the
+    // executor share this JVM, so the metric singleton is this protocol's own reader.
+    assert(observedBackpressureEvents() === manager.flowControl.backpressureEventCount,
+      s"the backpressure metric read ${observedBackpressureEvents()} against the " +
+        s"${manager.flowControl.backpressureEventCount} throttling transition(s) the protocol " +
+        "counted; the metric and the transition it names must move together")
 
     // ---------------------------------------------------------------------------------------------
-    // Zero retained heap, by heap analysis, on top of the machine-enforced leak check.
+    // Zero retained resources, measured on the resources this subsystem actually allocates, on top
+    // of the machine-enforced leak check.
     // ---------------------------------------------------------------------------------------------
 
-    assert(shuffleGraphReferences.size === iterations * StressConcurrentShuffles,
-      s"one reference per shuffle is needed, but $iterations iteration(s) of " +
-        s"$StressConcurrentShuffles shuffle(s) produced ${shuffleGraphReferences.size}")
+    // First half of the statement: the run genuinely allocated the things whose release is about to
+    // be asserted. Without this the release assertions would be satisfied just as well by an
+    // implementation that streamed nothing at all, and "zero retained" would be vacuous.
+    assert(resourcePeaks.registeredProducers > 0,
+      "the workload must have registered streaming producers in the block registry, since that " +
+        "is how streamed output is reachable by a reduce task at all, but the peak across " +
+        s"$iterations iteration(s) was ${resourcePeaks.registeredProducers}: " +
+        s"${resourcePeaks.describe}")
+    assert(resourcePeaks.reservedBytes > 0L,
+      "the workload must have reserved buffer memory against the executor allowance, since that " +
+        "is the memory streaming shuffle exists to use, but the peak reservation across " +
+        s"$iterations iteration(s) was ${resourcePeaks.reservedBytes} byte(s): " +
+        s"${resourcePeaks.describe}")
+    assert(resourcePeaks.servingProducers > 0,
+      "the serving listener must have held producer sessions, since that is what a consumer's " +
+        s"channel is routed through, but the peak was ${resourcePeaks.servingProducers}: " +
+        s"${resourcePeaks.describe}")
+    assert(recorder.peakExecutionMemory > 0L,
+      "task-managed memory must have been acquired by the streaming path, but the peak read " +
+        s"${recorder.peakExecutionMemory}")
+
+    // Second half: task-scoped resources are already gone, while the context is still up. The
+    // managed-memory-leak check is armed by this run's own configuration and fails the TASK, so an
+    // unreleased acquisition would already have shown up as a failure rather than as a survivor.
+    // Every accepted data-plane task settles first, so what is inspected is ownership after the
+    // subsystem's own asynchronous work has finished rather than in the middle of it.
+    assert(manager.flowControl.awaitDataPlaneIdle(
+      BackpressureProtocol.DATA_PLANE_SHUTDOWN_TIMEOUT_MS),
+      "every accepted data-plane task must settle before task-scoped ownership is inspected")
     val leakFailures = recorder.countedFailures.filter(
       reason => reason.toErrorString.contains("Managed memory leak"))
     assert(leakFailures.isEmpty,
@@ -1550,15 +1865,43 @@ class StreamingShuffleStressSuite
       "no buffer may survive task completion, so the executor-wide buffer utilisation gauge must " +
         "read zero once every task has ended, but it reads " +
         s"${observedBufferUtilizationPercent()} percent")
-    val survivors = survivingReferences(shuffleGraphReferences.toSeq)
-    assert(survivors === 0,
-      s"$survivors of ${shuffleGraphReferences.size} shuffle object graph(s) were still " +
-        s"reachable after $HeapSweepAttempts collection pass(es), which is retained heap: " +
-        "something outlived the shuffle that produced it")
+    val producerBytes = memoryQuota.reservedBytes(MemorySpillManager.ProducerMemory)
+    val consumerBytes = memoryQuota.reservedBytes(MemorySpillManager.ConsumerMemory)
+    val transientBytes = memoryQuota.reservedBytes(MemorySpillManager.TransientMemory)
+    val metadataBytes = memoryQuota.reservedBytes(MemorySpillManager.MetadataMemory)
+    assert(producerBytes === 0L && consumerBytes === 0L && transientBytes === 0L,
+      s"task cleanup must return producer, consumer and transient reservations, but producer=" +
+        s"$producerBytes, consumer=$consumerBytes and transient=$transientBytes byte(s) remain")
+    assert(memoryQuota.reservedBytes === metadataBytes,
+      s"before manager shutdown only retained-output routing metadata may remain charged, but " +
+        s"${memoryQuota.reservedBytes} total byte(s) differ from $metadataBytes metadata byte(s)")
+    assert(MemorySpillManager.registeredConsumerIdentityCount === 0,
+      s"task cleanup must unregister every logical consumer identity, but " +
+        s"${MemorySpillManager.registeredConsumerIdentityCount} remain")
+    assert(manager.activeStreamingConsumerRoutes.isEmpty,
+      s"task cleanup must release every consumer route, but " +
+        s"${manager.activeStreamingConsumerRoutes.size} remain active")
 
-    // Stopping the context is what releases the serving side, so the last two readings are taken
-    // after it. The manager reference was captured before the stop precisely so that they can be.
+    // Stopping the context is what releases the serving side and the retained output it serves, so
+    // the remaining readings are taken after it. The manager reference was captured before the stop
+    // precisely so that they can be.
     sc.stop()
+    // Retained streamed output is the one streaming resource DESIGNED to outlive its producing
+    // task, so it is the one whose release cannot be inferred from the leak check. Both readings
+    // fall to zero when the resolver stops, which is the release boundary the feature documents.
+    streamingResolverOf(manager).foreach { resolver =>
+      assert(resolver.registeredProducerCount === 0,
+        "no producer registration may survive the manager being stopped, but " +
+          s"${resolver.registeredProducerCount} of a peak " +
+          s"${resourcePeaks.registeredProducers} remain registered")
+      assert(resolver.retainedFileCount === 0,
+        "no spill file whose deletion this registry took over may survive the manager being " +
+          s"stopped, but ${resolver.retainedFileCount} of a peak ${resourcePeaks.retainedFiles} " +
+          "remain on disk")
+      assert(resolver.isStopped,
+        "the streaming block registry must have been stopped with the manager, but reports that " +
+          "it is still running, which would mean its retained output has no release boundary left")
+    }
     assert(manager.boundStreamingListener.forall(listener => listener.producerCount === 0),
       "no producer, and therefore no channel and no retained streamed output, may survive the " +
         "manager being stopped, but the serving listener still holds " +
@@ -1567,22 +1910,22 @@ class StreamingShuffleStressSuite
       "a five minute run of the wire protocol must not have produced a single frame the router " +
         "could not handle, but it produced " +
         s"${manager.boundStreamingListener.map(_.malformedFrameCount).getOrElse(0L)}")
+    assert(manager.retainedStreamingProducerCount === 0,
+      s"manager shutdown must release every retained producer, but the resolver still owns " +
+        s"${manager.retainedStreamingProducerCount}")
+    assert(diskQuota.reservedBytes === 0L && diskQuota.reservedFileCount === 0,
+      s"manager shutdown must unlink every retained spill file, but the disk quota still owns " +
+        s"${diskQuota.reservedBytes} byte(s) across ${diskQuota.reservedFileCount} file(s)")
+    assert(memoryQuota.reservedBytes === 0L,
+      s"manager shutdown must leave the aggregate heap quota empty, but " +
+        s"${memoryQuota.reservedBytes} byte(s) remain")
 
-    // No thread this subsystem started may outlive the manager that started it, and this is the
-    // reading that establishes it. "Zero retained resources after cleanup" was previously evidenced
-    // by the producer and frame counts alone, which say nothing about threads: a released producer
-    // leaves no channel behind, yet the two Netty groups beneath those channels and the two
-    // executor-scoped daemons above them are released asynchronously, so a stop that returned
-    // before they were gone left a full set of event loops per context in a JVM that creates and
-    // stops several. `manager.stop()` now waits for them within a bounded deadline, so by the time
-    // the context has stopped this must read empty -- and a failure here names the survivors rather
-    // than merely asserting a count, because which thread survived is what identifies the component
-    // that failed to release it.
-    val survivingThreads = StreamingShuffleManager.liveStreamingThreadNames()
-    assert(survivingThreads.isEmpty,
-      s"${survivingThreads.size} streaming-owned thread(s) survived the manager being stopped, " +
-        "which is a leak of one full transport and its daemons per context in a long-lived JVM: " +
-        survivingThreads.mkString(", "))
+    // Every transport retains and awaits the exact event-loop future it owns. This is stronger than
+    // scanning every JVM thread by a shared name prefix: it cannot mistake another Spark context's
+    // thread for this manager's, and a successful reading proves the two groups actually completed
+    // rather than merely disappearing between two polling snapshots.
+    assert(manager.streamingTransportsTerminated,
+      "manager shutdown must complete every owned transport event-loop termination future")
     // Reported rather than asserted, deliberately. A frame naming a producer the router no longer
     // serves is the expected consequence of an injected producer failure -- a consumer's
     // acknowledgement racing a deregistration -- so a non-zero figure here is the recovery path
@@ -1594,6 +1937,122 @@ class StreamingShuffleStressSuite
       s"memory and ${recorder.diskBytesSpilled} on disk across ${recorder.taskEndCount} task(s), " +
       s"and ${observedSpillCount()} spill event(s) counted")
   }
+}
+
+/**
+ * High-water marks of the streaming resources a run actually allocates.
+ *
+ * <b>Why peaks of real allocations rather than a weak-reference sweep.</b> Proving that streaming
+ * shuffle leaks nothing means proving something about the resources streaming shuffle owns: buffer
+ * memory reserved against the executor allowance, producers registered in the block registry,
+ * spill files that have outlived their producing task, and sessions the serving listener holds. A
+ * weak reference to an RDD proves none of those. It observes the driver's object graph -- which the
+ * scheduler, the status store and the context cleaner all also hold -- so it can be satisfied while
+ * every streaming resource is still live, and unsatisfied because an unrelated driver structure
+ * kept a graph alive. It also has to be read after a collection, and a collection cannot be
+ * demanded: a sweep that calls `System.gc()` and hopes is a nondeterministic gate on a suite whose
+ * whole claim is determinism.
+ *
+ * These readings need no collection. Each is a counter or a byte total the subsystem maintains
+ * itself, so a peak taken while the workload runs is exact, and the same reading taken after the
+ * context has stopped is exact too. Together they make a two-sided statement that a sweep cannot:
+ * the peak proves the resource was genuinely allocated, and the final zero proves it was released.
+ * A leak fails the second half; an implementation that never allocated at all -- which would make
+ * the second half vacuous -- fails the first.
+ *
+ * Sampling is synchronized because the workload samples from each of its concurrent threads, and a
+ * high-water mark has to be compared and updated together.
+ *
+ * @param streamingResolver the streaming block registry, absent only if the manager declined to
+ *                          stream at all, which the run asserts against separately
+ * @param servingListener reads the serving listener on each sample rather than capturing it,
+ * because                        the listener is bound when the transport server starts and a
+ * sample taken                        before that must read absence rather than a stale value
+ * @param reservedBytes reads the bytes currently reserved against the executor-wide buffer
+ *                      allowance, which is the one streaming resource measured as a volume rather
+ *                      than as a count
+ */
+private class StreamingResourcePeaks(
+    streamingResolver: Option[StreamingShuffleBlockResolver],
+    servingListener: () => Option[StreamingShuffleListener],
+    reservedBytes: () => Long) {
+
+  private var peakRegisteredProducers: Int = 0
+
+  private var peakRetainedFiles: Int = 0
+
+  private var peakReservedBytes: Long = 0L
+
+  private var peakServingProducers: Int = 0
+
+  /** Takes one reading of every tracked resource and raises the marks it exceeds. */
+  def sample(): Unit = synchronized {
+    streamingResolver.foreach { resolver =>
+      peakRegisteredProducers = math.max(peakRegisteredProducers, resolver.registeredProducerCount)
+      peakRetainedFiles = math.max(peakRetainedFiles, resolver.retainedFileCount)
+    }
+    peakReservedBytes = math.max(peakReservedBytes, reservedBytes())
+    servingListener().foreach { listener =>
+      peakServingProducers = math.max(peakServingProducers, listener.producerCount)
+    }
+  }
+
+  /**
+   * Raises the marks against one reading supplied directly, bypassing every live source.
+   *
+   * Present so that the marks' own behaviour -- that a larger reading raises and a smaller one does
+   * not -- is checkable by a cheap case with no executor running, which is where the sweep this
+   * replaced used to check itself.
+   *
+   * @param registeredProducers producer registrations to offer the mark
+   * @param retainedFiles retained spill files to offer the mark
+   * @param reservedByteCount reserved buffer bytes to offer the mark
+   * @param servingProducers serving sessions to offer the mark
+   */
+  def raiseFor(
+      registeredProducers: Int,
+      retainedFiles: Int,
+      reservedByteCount: Long,
+      servingProducers: Int): Unit = synchronized {
+    peakRegisteredProducers = math.max(peakRegisteredProducers, registeredProducers)
+    peakRetainedFiles = math.max(peakRetainedFiles, retainedFiles)
+    peakReservedBytes = math.max(peakReservedBytes, reservedByteCount)
+    peakServingProducers = math.max(peakServingProducers, servingProducers)
+  }
+
+  /** Most producers the block registry held at once. */
+  def registeredProducers: Int = synchronized(peakRegisteredProducers)
+
+  /** Most spill files the block registry owned the deletion of at once. */
+  def retainedFiles: Int = synchronized(peakRetainedFiles)
+
+  /** Most buffer bytes reserved against the executor allowance at once. */
+  def reservedBytes: Long = synchronized(peakReservedBytes)
+
+  /** Most producer sessions the serving listener held at once. */
+  def servingProducers: Int = synchronized(peakServingProducers)
+
+  /** Every mark, rendered for a failure message. */
+  def describe: String = synchronized {
+    s"$peakRegisteredProducers registered producer(s), $peakRetainedFiles retained spill " +
+      s"file(s), $peakReservedBytes reserved buffer byte(s), $peakServingProducers session(s)"
+  }
+}
+
+/**
+ * One task failure the scheduler counted, as the attempt it happened on and the text it reported.
+ *
+ * @param attemptNumber zero for a task's first attempt, or
+ *                      [[CountedTaskFailure.UnknownAttempt]] if the event carried no task info
+ * @param description the failure's rendered error string, which for an exception failure contains
+ *                    the message the task raised
+ */
+private case class CountedTaskFailure(attemptNumber: Int, description: String)
+
+private object CountedTaskFailure {
+
+  /** Attempt number recorded when an event arrives without task info. Matches no real attempt. */
+  val UnknownAttempt: Int = -1
 }
 
 /**
@@ -1617,6 +2076,8 @@ class StreamingShuffleStressSuite
 private class StreamingShuffleStressRecorder extends SparkListener {
 
   private val failures = new mutable.ArrayBuffer[TaskFailedReason]()
+
+  private val failureReports = new mutable.ArrayBuffer[CountedTaskFailure]()
 
   private val fetches = new mutable.ArrayBuffer[FetchFailed]()
 
@@ -1694,10 +2155,35 @@ private class StreamingShuffleStressRecorder extends SparkListener {
       case fetchFailed: FetchFailed =>
         fetches += fetchFailed
         failures += fetchFailed
+        recordFailureReport(taskEnd, fetchFailed)
       case failed: TaskFailedReason =>
         failures += failed
+        recordFailureReport(taskEnd, failed)
       case _ =>
     }
+  }
+
+  /**
+   * Retains a counted failure's attempt number alongside its rendered text.
+   *
+   * Both halves are needed to identify an injection. The text carries the key the injection was
+   * planned with, and the attempt number distinguishes the FIRST attempt -- the only one an
+   * injection is armed for -- from a retry that failed for some other reason. A count of failures
+   * carries neither, and so cannot tell a run in which every planned injection fired from one in
+   * which injection stopped early and unrelated failures made up the difference.
+   *
+   * @param taskEnd the event being recorded, whose task info supplies the attempt number
+   * @param reason why the task failed, rendered through the reason's own error string
+   */
+  private def recordFailureReport(
+      taskEnd: SparkListenerTaskEnd,
+      reason: TaskFailedReason): Unit = {
+    val attempt = if (taskEnd.taskInfo != null) {
+      taskEnd.taskInfo.attemptNumber
+    } else {
+      CountedTaskFailure.UnknownAttempt
+    }
+    failureReports += CountedTaskFailure(attempt, reason.toErrorString)
   }
 
   def peakConcurrentTasks: Int = synchronized(peakTasks)
@@ -1705,6 +2191,8 @@ private class StreamingShuffleStressRecorder extends SparkListener {
   def peakConcurrentJobs: Int = synchronized(peakJobs)
 
   def countedFailures: Seq[TaskFailedReason] = synchronized(failures.toSeq)
+
+  def countedFailureReports: Seq[CountedTaskFailure] = synchronized(failureReports.toSeq)
 
   def fetchFailures: Seq[FetchFailed] = synchronized(fetches.toSeq)
 
@@ -1755,14 +2243,38 @@ private class StreamingShuffleStressRecorder extends SparkListener {
  * same thing however log4j2 resolves the attachment, and keeps the subsystem's budget from being
  * charged for the scheduler's logging or the harness's.
  *
+ * <b>Why the record is RENDERED rather than measured by its parts.</b> A log budget is a number of
+ * bytes in a file, and the bytes in a file are what a layout produced -- a timestamp, a thread, a
+ * level, a logger name, the message, the separator, and a stack trace whenever one was attached. An
+ * appender that added up the lengths of the fields it could see and allowed a fixed number of bytes
+ * for the rest was wrong in four separate ways at once: it counted CHARACTERS rather than UTF-8
+ * bytes, it omitted the stack trace of every record logged with a throwable -- which is the largest
+ * single contributor a log line can have, and can be thousands of bytes -- it omitted any layout
+ * field a future configuration might add, and it turned the remainder into a constant that a
+ * regression could exceed while the assertion still passed. So each record is now handed to the
+ * layout of every appender the running configuration actually has, and the bytes counted are the
+ * bytes that layout produced, encoded as UTF-8.
+ *
+ * <b>Why the MAXIMUM across destinations and not the sum.</b> "Ten mebibytes an hour per executor"
+ * is a statement about a log, not about the number of places a harness happens to copy it to. A run
+ * configured to write both a file and a console would otherwise be charged twice for the same
+ * record and would fail a budget it is in fact inside. The maximum is the largest single
+ * destination's cost, which is the figure the constraint is about; it is also an upper bound on
+ * every other destination, so the assertion stays the strictest reading of the number.
+ *
+ * <b>The fallback, and why it is loud rather than silent.</b> If the running configuration exposes
+ * no string layout at all -- which no Spark test configuration does, since the shared one carries a
+ * `PatternLayout` -- there is nothing to render through, and a measurement that quietly reverted to
+ * adding up field lengths would be the very approximation this replaced. The count then falls back
+ * to the formatted message plus its throwable's own printed form, and the number of records
+ * measured that way is published, so a reading taken without a layout can be recognised as such
+ * rather than mistaken for a rendered one.
+ *
  * Every counter is an atomic, because log4j2 delivers on whichever thread logged.
  *
  * @param loggerNamePrefix only records logged beneath this name are measured
- * @param overheadBytesPerLine allowance for the parts of a rendered line this appender cannot see
  */
-private class StreamingShuffleLogVolumeAppender(
-    loggerNamePrefix: String,
-    overheadBytesPerLine: Long)
+private class StreamingShuffleLogVolumeAppender(loggerNamePrefix: String)
   extends AbstractAppender("streamingShuffleLogVolume", null, null, true, Property.EMPTY_ARRAY) {
 
   private val events = new AtomicLong(0L)
@@ -1771,25 +2283,100 @@ private class StreamingShuffleLogVolumeAppender(
 
   private val foreignEvents = new AtomicLong(0L)
 
+  private val unrenderedEvents = new AtomicLong(0L)
+
+  /**
+   * The layouts the running configuration would actually encode a record with.
+   *
+   * Read once, from the live `LoggerContext`'s configuration rather than from a copy of the
+   * properties file, so the measurement follows whatever the build tool selected -- the shared test
+   * configuration switches between a file and a console appender on a system property, and both
+   * carry a layout of their own.
+   */
+  private val layouts: Seq[StringLayout] = {
+    LogManager.getContext(false) match {
+      case context: LoggerContext =>
+        context.getConfiguration.getAppenders.values().asScala.toSeq.flatMap { appender =>
+          Option(appender.getLayout).collect { case layout: StringLayout => layout }
+        }
+      case _ => Seq.empty
+    }
+  }
+
   override def append(event: LogEvent): Unit = {
     val loggerName = Option(event.getLoggerName).getOrElse("")
     if (!loggerName.startsWith(loggerNamePrefix)) {
       foreignEvents.incrementAndGet()
     } else {
       events.incrementAndGet()
-      val message = event.getMessage
-      val messageLength = if (message == null) 0L else message.getFormattedMessage.length.toLong
-      val threadLength = Option(event.getThreadName).map(_.length.toLong).getOrElse(0L)
-      bytes.addAndGet(
-        messageLength + threadLength + loggerName.length.toLong + overheadBytesPerLine)
+      bytes.addAndGet(renderedBytesOf(event))
     }
+  }
+
+  /**
+   * The bytes one record costs the largest destination the configuration writes to.
+   *
+   * The event is made immutable before it is rendered: log4j2 reuses its mutable event objects
+   * between calls, and a layout handed one outside the appender that received it may otherwise see
+   * a record that has already moved on.
+   *
+   * @param event the record to measure
+   * @return its encoded size in bytes
+   */
+  private def renderedBytesOf(event: LogEvent): Long = {
+    val immutable = event.toImmutable
+    val rendered = layouts.flatMap { layout =>
+      try {
+        Option(layout.toSerializable(immutable))
+      } catch {
+        // A layout that cannot render one record must not stop the measurement of the rest, and a
+        // record it could not render still cost the destination something; it is counted as
+        // unrendered so the reading says how much of it was approximated.
+        case NonFatal(_) => None
+      }
+    }
+    if (rendered.isEmpty) {
+      unrenderedEvents.incrementAndGet()
+      approximateBytesOf(immutable)
+    } else {
+      rendered.map(text => text.getBytes(StandardCharsets.UTF_8).length.toLong).max
+    }
+  }
+
+  /**
+   * The last-resort size of a record no layout would render: its message and its throwable.
+   *
+   * Deliberately not padded with an allowance for layout fields. A padded figure looks like a
+   * rendered one and is not, and the counter above is what tells a reader which it is looking at.
+   *
+   * @param event the record to approximate
+   * @return the encoded size of its message and any attached throwable
+   */
+  private def approximateBytesOf(event: LogEvent): Long = {
+    val message = Option(event.getMessage).map(_.getFormattedMessage).getOrElse("")
+    val thrown = Option(event.getThrown)
+      .map(throwable => Utils.exceptionString(throwable))
+      .getOrElse("")
+    (message.getBytes(StandardCharsets.UTF_8).length +
+      thrown.getBytes(StandardCharsets.UTF_8).length).toLong
   }
 
   /** Records the subsystem emitted while this appender was attached. */
   def eventCount: Long = events.get()
 
-  /** Rendered bytes those records cost, biased upward by the per-line overhead allowance. */
+  /**
+   * Bytes those records cost the largest destination the running configuration writes to, as its
+   * own layout encoded them.
+   */
   def byteCount: Long = bytes.get()
+
+  /**
+   * Records that no configured layout would render, and whose size was therefore approximated.
+   *
+   * Zero under every Spark test configuration. A non-zero reading says the byte count is not a
+   * rendered measurement and must not be read as one.
+   */
+  def unrenderedEventCount: Long = unrenderedEvents.get()
 
   /**
    * Records this appender saw and did not measure, because something other than the subsystem

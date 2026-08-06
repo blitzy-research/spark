@@ -18,17 +18,23 @@
 package org.apache.spark.network.shuffle.protocol.streaming;
 
 import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 import java.util.zip.CRC32C;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 import org.apache.spark.annotation.Private;
+import org.apache.spark.network.buffer.ManagedBuffer;
+import org.apache.spark.network.buffer.NettyManagedBuffer;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -69,6 +75,13 @@ public class StreamingShuffleMessageSuite {
   private static final long SEQUENCE_NUMBER = 42L;
 
   /**
+   * A consumer session token. Distinct from every other constant here and far outside the range of
+   * any of them, so a heartbeat that encoded its sequence number where its token belongs -- or the
+   * reverse -- shows up as a mismatch rather than coinciding with a neighbour's value.
+   */
+  private static final long CONSUMER_TOKEN = 0x51A5_1D3E_7C0F_0042L;
+
+  /**
    * A fixed timestamp literal. The heartbeat's timestamp is caller-supplied precisely so that this
    * suite never has to read a clock, which is what keeps it deterministic.
    */
@@ -80,18 +93,75 @@ public class StreamingShuffleMessageSuite {
   /** A message type id no constant uses, used to exercise unknown-discriminator handling. */
   private static final byte UNKNOWN_TYPE_ID = (byte) 9;
 
+  /**
+   * Every buffer this suite allocated, in allocation order, so that each is released exactly once.
+   *
+   * A {@link ByteBuf} is reference counted, and an unreleased one is a leak whether it is heap
+   * backed or not: the JVM reclaims the array, but Netty's leak detector and any pooled allocator
+   * this suite is later run against do not agree that nothing was lost. Tracking them here rather
+   * than releasing at each site is deliberate -- a release written at the end of a test is a
+   * release that a test throwing half way through skips, and these tests provoke exceptions on
+   * purpose.
+   */
+  private final List<ByteBuf> ownedBuffers = new ArrayList<>();
+
+  /**
+   * Releases every buffer the test allocated, and asserts that this suite owned each of them alone.
+   *
+   * The reference count is checked on both sides of the release. A count other than one before it
+   * means something retained the buffer or released it already -- either way the ownership contract
+   * this message family is built on has been broken, and a decoder that retained a frame's buffer
+   * is exactly the defect that copying the payload out at decode time exists to prevent. A count of
+   * zero after it is the release itself, observed rather than assumed.
+   */
+  @AfterEach
+  public void releaseOwnedBuffers() {
+    try {
+      for (ByteBuf buf : ownedBuffers) {
+        assertEquals(1, buf.refCnt(),
+            "this suite owns every buffer it allocates, so nothing may have retained or released "
+                + "it before teardown");
+        assertTrue(buf.release(), "the last reference must be the one released here");
+        assertEquals(0, buf.refCnt(), "a released buffer holds no reference");
+      }
+    } finally {
+      ownedBuffers.clear();
+    }
+  }
+
+  /** An empty buffer whose release this suite owns. */
+  private ByteBuf buffer() {
+    return track(Unpooled.buffer());
+  }
+
+  /** A buffer of an exact capacity whose release this suite owns. */
+  private ByteBuf buffer(int capacity) {
+    return track(Unpooled.buffer(capacity));
+  }
+
+  /** A buffer wrapping bytes this suite holds, whose release this suite owns. */
+  private ByteBuf wrapped(byte[] bytes) {
+    return track(Unpooled.wrappedBuffer(bytes));
+  }
+
+  private ByteBuf track(ByteBuf buf) {
+    ownedBuffers.add(buf);
+    return buf;
+  }
+
   // Group 1: round-trip encode/decode for every message type, with exact-literal lengths.
 
   @Test
   public void testDataBlockMessageEncodeDecode() {
-    // 29 + payload.length for a data block: 17 header + 8 checksum + 4 length prefix + payload.
+    // EMPTY_DATA_BLOCK_BYTES + payload.length for a data block: 17 header + 8 producer id
+    // + 8 checksum + 4 length prefix + payload.
     for (int payloadLength : new int[] {0, 1, 1024, 8192}) {
       byte[] payload = payload(payloadLength);
       DataBlockMessage message = DataBlockMessage.withComputedChecksum(
           SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, payload);
       int len = message.encodedLength();
-      assertEquals(37 + payloadLength, len);
-      ByteBuf buf = Unpooled.buffer(len);
+      assertEquals(EMPTY_DATA_BLOCK_BYTES + payloadLength, len);
+      ByteBuf buf = buffer(len);
       message.encode(buf);
       // Encodable requires encode to write exactly encodedLength() bytes; with an exact-size buffer
       // that is precisely what no writable bytes remaining means.
@@ -114,7 +184,7 @@ public class StreamingShuffleMessageSuite {
     assertEquals(25, len);
     // The position acknowledged travels as the next position expected, one above it.
     assertEquals(41L, message.sequenceNumber());
-    ByteBuf buf = Unpooled.buffer(len);
+    ByteBuf buf = buffer(len);
     message.encode(buf);
     assertEquals(0, buf.writableBytes());
 
@@ -126,14 +196,16 @@ public class StreamingShuffleMessageSuite {
 
   @Test
   public void testHeartbeatMessageEncodeDecode() {
-    HeartbeatMessage message =
-        new HeartbeatMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER);
+    HeartbeatMessage message = new HeartbeatMessage(
+        SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, CONSUMER_TOKEN);
     int len = message.encodedLength();
-    // Seventeen header bytes and eight of producer id: one fixed size, with no variable-length
-    // field anywhere in the streaming control protocol for a peer to choose.
-    assertEquals(CONTROL_MESSAGE_BYTES, len);
-    assertEquals(25, len);
-    ByteBuf buf = Unpooled.buffer(len);
+    // Seventeen header bytes, eight of producer id and eight of consumer session token: one fixed
+    // size, with no variable-length field anywhere in the streaming control protocol for a peer to
+    // choose. The token is a number precisely so that this stays true -- the identity it stands for
+    // is a string whose length the consumer would otherwise decide.
+    assertEquals(HEARTBEAT_BYTES, len);
+    assertEquals(33, len);
+    ByteBuf buf = buffer(len);
     message.encode(buf);
     assertEquals(0, buf.writableBytes());
 
@@ -141,21 +213,84 @@ public class StreamingShuffleMessageSuite {
     assertEquals(message, decoded);
     assertEquals(SEQUENCE_NUMBER, decoded.sequenceNumber());
     assertEquals(MAP_ID, decoded.mapId());
+    assertEquals(CONSUMER_TOKEN, decoded.consumerToken());
+  }
+
+  @Test
+  public void testHeartbeatMessageWithoutATokenRoundTripsAtTheSameWidth() {
+    // A heartbeat that declares nothing -- a producer's own, or a peer of an earlier revision --
+    // occupies exactly the same bytes and reports the one reserved value. The width may not depend
+    // on whether an identity was declared, or a producer's framing budget would depend on what its
+    // peers chose to say.
+    HeartbeatMessage message = heartbeatWithoutToken();
+    assertEquals(HEARTBEAT_BYTES, message.encodedLength());
+    assertEquals(HeartbeatMessage.NO_CONSUMER_TOKEN, message.consumerToken());
+    assertEquals(0L, HeartbeatMessage.NO_CONSUMER_TOKEN);
+
+    HeartbeatMessage decoded = (HeartbeatMessage) roundTrip(message);
+    assertEquals(message, decoded);
+    assertEquals(HeartbeatMessage.NO_CONSUMER_TOKEN, decoded.consumerToken());
+    // Declaring an identity and declaring none are different heartbeats, so the token takes part in
+    // equality: a producer that treated them as equal could adopt an identity never sent.
+    assertNotEquals(heartbeat(), message);
+    assertNotEquals(heartbeat().hashCode(), message.hashCode());
+  }
+
+  @Test
+  public void testHeartbeatConsumerTokenDomainIsEnforcedOnBothRoutes() {
+    // The domain is the non-negative longs, and it is the same domain in both directions: a locally
+    // built heartbeat and a decoded one are refused on identical terms, so the codec cannot encode
+    // a value it would then refuse to read back.
+    assertThrows(IllegalArgumentException.class,
+        () -> new HeartbeatMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, -1L));
+    assertThrows(IllegalArgumentException.class,
+        () -> new HeartbeatMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER,
+            Long.MIN_VALUE));
+    assertThrows(IllegalArgumentException.class,
+        () -> new HeartbeatMessage(header(), MAP_ID, -1L));
+    assertThrows(IllegalArgumentException.class, () -> decodeHeartbeatWithToken(-1L));
+    assertThrows(IllegalArgumentException.class,
+        () -> decodeHeartbeatWithToken(Long.MIN_VALUE));
+    // The reserved value and the largest legal one are both accepted, on both routes.
+    assertDoesNotThrow(() -> decodeHeartbeatWithToken(HeartbeatMessage.NO_CONSUMER_TOKEN));
+    assertDoesNotThrow(() -> decodeHeartbeatWithToken(Long.MAX_VALUE));
+    assertEquals(Long.MAX_VALUE, new HeartbeatMessage(
+        SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, Long.MAX_VALUE).consumerToken());
   }
 
   @Test
   public void testEveryControlMessageIsFixedAtTheSpecifiedSize() {
-    // The four control messages have one size between them, and it is the specified one. Asserted
-    // against literals rather than against the production constants, so that a change to the wire
-    // layout has to be a deliberate change to this contract as well.
+    // Every control message has a size this build fixes, and none has a size a peer chooses.
+    // Asserted against literals rather than against the production constants, so that a change to
+    // the wire layout has to be a deliberate change to this contract as well.
     for (StreamingShuffleMessage message : fixedSizeMessages()) {
-      assertEquals(25, message.encodedLength(), message.getClass().getSimpleName());
-      assertEquals(26, message.toByteBuffer().remaining(), message.getClass().getSimpleName());
+      assertEquals(CONTROL_MESSAGE_BYTES, message.encodedLength(),
+          message.getClass().getSimpleName());
+      assertEquals(CONTROL_MESSAGE_BYTES + FRAME_TYPE_PREFIX_BYTES,
+          message.toByteBuffer().remaining(), message.getClass().getSimpleName());
     }
+    // A heartbeat is wider by exactly the eight bytes of the consumer session token, and is that
+    // width whether it declares one or not.
+    assertEquals(33, heartbeat().encodedLength());
+    assertEquals(33, heartbeatWithoutToken().encodedLength());
+    assertEquals(34, heartbeat().toByteBuffer().remaining());
+    assertEquals(34, heartbeatWithoutToken().toByteBuffer().remaining());
+    // A retransmission request is wider by exactly the eight bytes of the inclusive upper bound
+    // that lets one frame name a whole repair window. It is still a fixed width, and it is fixed
+    // whatever window the request names.
+    RetransmitRequestMessage single =
+        new RetransmitRequestMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER);
+    RetransmitRequestMessage run =
+        new RetransmitRequestMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER,
+            SEQUENCE_NUMBER + 100L);
+    assertEquals(33, single.encodedLength());
+    assertEquals(33, run.encodedLength());
+    assertEquals(34, single.toByteBuffer().remaining());
+    assertEquals(34, run.toByteBuffer().remaining());
     // And a data block is the header, the producer id, the checksum, the length prefix and the
     // payload -- thirty-seven bytes before a single payload byte.
-    assertEquals(37, dataBlock(0).encodedLength());
-    assertEquals(37 + 1024, dataBlock(1024).encodedLength());
+    assertEquals(EMPTY_DATA_BLOCK_BYTES, dataBlock(0).encodedLength());
+    assertEquals(EMPTY_DATA_BLOCK_BYTES + 1024, dataBlock(1024).encodedLength());
   }
 
   @Test
@@ -163,24 +298,52 @@ public class StreamingShuffleMessageSuite {
     RetransmitRequestMessage message =
         new RetransmitRequestMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER);
     int len = message.encodedLength();
-    assertEquals(CONTROL_MESSAGE_BYTES, len);
-    assertEquals(25, len);
-    ByteBuf buf = Unpooled.buffer(len);
+    assertEquals(RETRANSMIT_REQUEST_BYTES, len);
+    assertEquals(33, len);
+    ByteBuf buf = buffer(len);
     message.encode(buf);
     assertEquals(0, buf.writableBytes());
 
     RetransmitRequestMessage decoded = RetransmitRequestMessage.decode(buf);
     assertEquals(message, decoded);
-    // A request names exactly one position, so both ends of the interval a producer services are
-    // the header's own sequence number and the count is one.
+    // A request built from one position states it as the inclusive single-element window it is, so
+    // both ends coincide and the count is one.
     assertEquals(SEQUENCE_NUMBER, decoded.firstSequenceNumber());
     assertEquals(SEQUENCE_NUMBER, decoded.lastSequenceNumber());
     assertEquals(1L, decoded.blockCount());
-    assertEquals(1L, RetransmitRequestMessage.REQUESTED_BLOCKS);
     assertTrue(decoded.contains(SEQUENCE_NUMBER));
     assertFalse(decoded.contains(SEQUENCE_NUMBER - 1L));
     assertFalse(decoded.contains(SEQUENCE_NUMBER + 1L));
     assertEquals(MAP_ID, decoded.mapId());
+  }
+
+  @Test
+  public void testRetransmitRequestMessageCarriesAMultiBlockWindowThroughARoundTrip() {
+    // The whole point of the field: one frame names a run of positions, so a multi-block gap is one
+    // repair the producer charges one attempt and one backoff for. A frame per position would have
+    // the producer defer every sibling behind the first one's pause, spend the five-attempt budget
+    // re-asking for the first position and escalate to a stage recomputation while still holding
+    // every byte that was asked for.
+    RetransmitRequestMessage window =
+        new RetransmitRequestMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, 7L, 11L);
+    assertEquals(RETRANSMIT_REQUEST_BYTES, window.encodedLength());
+    RetransmitRequestMessage decoded = (RetransmitRequestMessage) roundTrip(window);
+    assertEquals(window, decoded);
+    assertEquals(7L, decoded.firstSequenceNumber());
+    assertEquals(11L, decoded.lastSequenceNumber());
+    assertEquals(5L, decoded.blockCount());
+    for (long position = 7L; position <= 11L; position++) {
+      assertTrue(decoded.contains(position), "position " + position + " must be covered");
+    }
+    assertFalse(decoded.contains(6L));
+    assertFalse(decoded.contains(12L));
+    // Two windows that share a lower bound are different requests, so the upper bound has to
+    // participate in identity as well as in the encoding.
+    RetransmitRequestMessage narrower =
+        new RetransmitRequestMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, 7L, 10L);
+    assertNotEquals(window, narrower);
+    assertNotEquals(window.hashCode(), narrower.hashCode());
+    assertTrue(window.toString().contains("lastSequenceNumber=11"));
   }
 
   @Test
@@ -190,7 +353,7 @@ public class StreamingShuffleMessageSuite {
     int len = message.encodedLength();
     assertEquals(CONTROL_MESSAGE_BYTES, len);
     assertEquals(25, len);
-    ByteBuf buf = Unpooled.buffer(len);
+    ByteBuf buf = buffer(len);
     message.encode(buf);
     assertEquals(0, buf.writableBytes());
 
@@ -211,11 +374,18 @@ public class StreamingShuffleMessageSuite {
     assertEquals(HEADER_BYTES, StreamingShuffleMessage.HEADER_ENCODED_LENGTH);
     assertEquals(17, StreamingShuffleMessage.HEADER_ENCODED_LENGTH);
     assertEquals(1 + 4 + 4 + 8, StreamingShuffleMessage.HEADER_ENCODED_LENGTH);
-    // The producer id is the first body field of every message, and a control message is the header
-    // plus that field: twenty-five bytes, twenty-six once framed.
+    // The producer id is the first body field of every message, and a control message that carries
+    // no field of its own is the header plus that field: twenty-five bytes, twenty-six once framed.
+    // A retransmission request adds the eight bytes of its window's upper bound, which is a width
+    // this build fixes rather than one a peer chooses.
     assertEquals(8, StreamingShuffleMessage.PRODUCER_ID_ENCODED_LENGTH);
     assertEquals(CONTROL_MESSAGE_BYTES, StreamingShuffleMessage.CONTROL_MESSAGE_ENCODED_LENGTH);
     assertEquals(25, StreamingShuffleMessage.CONTROL_MESSAGE_ENCODED_LENGTH);
+    assertEquals(RETRANSMIT_REQUEST_BYTES,
+        new RetransmitRequestMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, 4L, 6L).encodedLength());
+    // A heartbeat adds the eight bytes of the consumer session token, likewise a fixed width.
+    assertEquals(HEARTBEAT_BYTES, heartbeat().encodedLength());
+    assertEquals(33, heartbeat().encodedLength());
     assertEquals(1, StreamingShuffleMessage.FRAME_TYPE_PREFIX_LENGTH);
     assertEquals(1, StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION);
   }
@@ -320,6 +490,42 @@ public class StreamingShuffleMessageSuite {
   }
 
   @Test
+  public void testOwnedChecksumFactoryAdoptsRetainedPayloadAndSeedsChecksum() throws Exception {
+    byte[] retainedPayload = payload(1024);
+    DataBlockMessage block = DataBlockMessage.withComputedChecksumAndOwnedPayload(
+      SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, retainedPayload);
+
+    Field payloadField = DataBlockMessage.class.getDeclaredField("payload");
+    payloadField.setAccessible(true);
+    assertSame(retainedPayload, payloadField.get(block),
+      "The producer-owned factory must adopt the retained array instead of cloning it.");
+    assertEquals(block.checksum(), block.computedChecksum(),
+      "The checksum computed before enqueue must be cached for consumer diagnostics.");
+    assertTrue(block.verifyChecksum());
+  }
+
+  @Test
+  public void testManagedDataBlockFrameGathersHeaderAndPayloadWithoutCopy() throws Exception {
+    DataBlockMessage block = DataBlockMessage.withComputedChecksumAndOwnedPayload(
+      SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, payload(1024));
+    ManagedBuffer managed = block.toManagedBuffer();
+    try {
+      assertInstanceOf(NettyManagedBuffer.class, managed);
+      Field bufferField = NettyManagedBuffer.class.getDeclaredField("buf");
+      bufferField.setAccessible(true);
+      ByteBuf encoded = (ByteBuf) bufferField.get(managed);
+      assertEquals(2, encoded.nioBufferCount(),
+        "A data block must gather its fixed header and retained payload as two buffers.");
+      assertEquals(block.toByteBuffer().remaining(), managed.size());
+      assertArrayEquals(toByteArray(block.toByteBuffer()), toByteArray(managed.nioByteBuffer()));
+      assertEquals(block,
+        StreamingShuffleMessage.Decoder.fromByteBuffer(managed.nioByteBuffer()));
+    } finally {
+      managed.release();
+    }
+  }
+
+  @Test
   public void testFramingTypeByteMatchesDiscriminator() {
     assertFramingTypeByte(StreamingShuffleMessageType.DATA_BLOCK, dataBlock(16));
     assertFramingTypeByte(StreamingShuffleMessageType.ACK, ack(40L));
@@ -352,7 +558,8 @@ public class StreamingShuffleMessageSuite {
     DataBlockMessage block = DataBlockMessage.withComputedChecksum(
         SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, payload);
     assertEquals(DataBlockMessage.MAX_BLOCK_SIZE_BYTES, block.payloadLength());
-    assertEquals(37 + DataBlockMessage.MAX_BLOCK_SIZE_BYTES, block.encodedLength());
+    assertEquals(EMPTY_DATA_BLOCK_BYTES + DataBlockMessage.MAX_BLOCK_SIZE_BYTES,
+        block.encodedLength());
     assertEquals(block, roundTrip(block));
     assertTrue(block.verifyChecksum());
   }
@@ -403,6 +610,69 @@ public class StreamingShuffleMessageSuite {
     // be allowed to ride along past the message boundary.
     ByteBuf buf = dataBlockBodyWithPayloadPrefix(4, 10);
     assertThrows(IllegalArgumentException.class, () -> DataBlockMessage.decode(buf));
+  }
+
+  @Test
+  public void testPayloadReservationIsConsultedBeforeDecodeAllocates() {
+    int payloadBytes = 1024;
+    RecordingPayloadReservation reservation = new RecordingPayloadReservation(false);
+    StreamingShuffleMessage.PayloadReservationRejectedException failure =
+        assertThrows(StreamingShuffleMessage.PayloadReservationRejectedException.class,
+            () -> StreamingShuffleMessage.Decoder.fromByteBuffer(
+                dataBlock(payloadBytes).toByteBuffer(), reservation));
+
+    assertEquals(1, reservation.attempts);
+    assertEquals(0, reservation.releases);
+    assertEquals(SHUFFLE_ID, reservation.shuffleId);
+    assertEquals(MAP_ID, reservation.mapId);
+    assertEquals(PARTITION_ID, reservation.partitionId);
+    assertEquals(SEQUENCE_NUMBER, reservation.sequenceNumber);
+    assertEquals(payloadBytes, reservation.payloadBytes);
+    assertEquals(SHUFFLE_ID, failure.shuffleId());
+    assertEquals(MAP_ID, failure.mapId());
+    assertEquals(PARTITION_ID, failure.partitionId());
+    assertEquals(SEQUENCE_NUMBER, failure.sequenceNumber());
+    assertEquals(payloadBytes, failure.payloadBytes());
+  }
+
+  @Test
+  public void testDecodedBlockReturnsItsReservationExactlyOnce() {
+    int payloadBytes = 512;
+    RecordingPayloadReservation reservation = new RecordingPayloadReservation(true);
+    DataBlockMessage decoded = (DataBlockMessage) StreamingShuffleMessage.Decoder.fromByteBuffer(
+        dataBlock(payloadBytes).toByteBuffer(), reservation);
+
+    assertTrue(decoded.hasPayloadReservation());
+    assertEquals(payloadBytes, reservation.reservedBytes);
+    assertTrue(decoded.releasePayloadReservation());
+    assertFalse(decoded.hasPayloadReservation());
+    assertFalse(decoded.releasePayloadReservation());
+    assertEquals(1, reservation.releases);
+    assertEquals(0, reservation.reservedBytes);
+  }
+
+  @Test
+  public void testTransferredReservationIsNotReleasedByTheMessage() {
+    int payloadBytes = 256;
+    RecordingPayloadReservation reservation = new RecordingPayloadReservation(true);
+    DataBlockMessage decoded = (DataBlockMessage) StreamingShuffleMessage.Decoder.fromByteBuffer(
+        dataBlock(payloadBytes).toByteBuffer(), reservation);
+
+    assertTrue(decoded.transferPayloadReservation());
+    assertFalse(decoded.hasPayloadReservation());
+    assertFalse(decoded.transferPayloadReservation());
+    assertFalse(decoded.releasePayloadReservation());
+    assertEquals(0, reservation.releases);
+    assertEquals(payloadBytes, reservation.reservedBytes);
+  }
+
+  @Test
+  public void testControlMessagesDoNotConsultPayloadReservation() {
+    RecordingPayloadReservation reservation = new RecordingPayloadReservation(false);
+    assertEquals(ack(40L), StreamingShuffleMessage.Decoder.fromByteBuffer(
+        ack(40L).toByteBuffer(), reservation));
+    assertEquals(0, reservation.attempts);
+    assertEquals(0, reservation.releases);
   }
 
   // Group 5: checksum behaviour.
@@ -636,6 +906,11 @@ public class StreamingShuffleMessageSuite {
     assertNotEquals(base, new AckMessage(SHUFFLE_ID, MAP_ID + 1, PARTITION_ID, 40L));
     assertNotEquals(base, ack(41L));
 
+    HeartbeatMessage beat = heartbeat();
+    assertNotEquals(beat, new HeartbeatMessage(
+        SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, CONSUMER_TOKEN + 1L));
+    assertNotEquals(beat, heartbeatWithoutToken());
+
     DataBlockMessage block = dataBlock(64);
     assertNotEquals(block, DataBlockMessage.withComputedChecksum(
         SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, payload(65)));
@@ -650,18 +925,19 @@ public class StreamingShuffleMessageSuite {
 
   @Test
   public void testTheFourControlMessagesAreNeverEqualToEachOther() {
-    // All four encode to exactly twenty-five bytes over identical header and producer-id values, so
-    // neither length nor content can tell them apart on the wire. Given that, they must still be
-    // distinct in memory, which is what confirms each equals implementation checks the concrete
-    // type before it compares a field.
+    // Built over identical header and producer-id values, the control messages agree on every field
+    // they share, so content alone cannot tell them apart. Given that, they must still be distinct
+    // in memory, which is what confirms each equals implementation checks the concrete type before
+    // it compares a field.
     StreamingShuffleMessage[] identical = {
         new AckMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER - 1L),
-        new HeartbeatMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER),
+        new HeartbeatMessage(
+            SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, CONSUMER_TOKEN),
         new RetransmitRequestMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER),
         new StreamTerminationMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER),
     };
     for (int i = 0; i < identical.length; i++) {
-      assertEquals(25, identical[i].encodedLength());
+      assertTrue(identical[i].encodedLength() >= 25);
       for (int j = i + 1; j < identical.length; j++) {
         assertNotEquals(identical[i], identical[j]);
         assertNotEquals(identical[j], identical[i]);
@@ -732,12 +1008,13 @@ public class StreamingShuffleMessageSuite {
   }
 
   @Test
-  public void testEachFixedSizeDecoderRequiresAnExactBody() {
-    // Directly against each concrete decoder, one byte short and one byte long.
+  public void testEachControlDecoderRequiresAnExactBody() {
+    // Directly against each concrete decoder, one byte short and one byte long. The heartbeat's
+    // body is variable across identities but exact after its length prefix has been read.
     for (StreamingShuffleMessage message : exactBodyMessages()) {
       byte[] body = encodedBody(message);
-      ByteBuf shortBody = Unpooled.wrappedBuffer(Arrays.copyOf(body, body.length - 1));
-      ByteBuf longBody = Unpooled.wrappedBuffer(Arrays.copyOf(body, body.length + 1));
+      ByteBuf shortBody = wrapped(Arrays.copyOf(body, body.length - 1));
+      ByteBuf longBody = wrapped(Arrays.copyOf(body, body.length + 1));
       assertThrows(IllegalArgumentException.class, () -> decodeAs(message, shortBody));
       assertThrows(IllegalArgumentException.class, () -> decodeAs(message, longBody));
     }
@@ -835,7 +1112,7 @@ public class StreamingShuffleMessageSuite {
     // The wire carries the next expected position in the header, so a negative one is refused by
     // the header's own domain check -- on the single path every decoder takes.
     for (long invalid : new long[] {-1L, -2L, Long.MIN_VALUE}) {
-      ByteBuf buf = Unpooled.buffer();
+      ByteBuf buf = buffer();
       buf.writeByte(StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION);
       buf.writeInt(SHUFFLE_ID);
       buf.writeInt(PARTITION_ID);
@@ -846,9 +1123,9 @@ public class StreamingShuffleMessageSuite {
   }
 
   @Test
-  public void testRetransmissionRequestNamesExactlyOneBlock() {
-    // A request names one position, which is what makes it a fixed-size control message and what
-    // denies a peer the ability to name a range for a producer to walk.
+  public void testRetransmissionRequestWindowIsClosedAndBounded() {
+    // A request names a closed interval. A single block is the interval whose ends coincide, which
+    // is the ordinary shape a corrupt block calls for.
     RetransmitRequestMessage single =
         new RetransmitRequestMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, 5L);
     assertEquals(1L, single.blockCount());
@@ -858,17 +1135,50 @@ public class StreamingShuffleMessageSuite {
     assertFalse(single.contains(4L));
     assertFalse(single.contains(6L));
     assertEquals(single, roundTrip(single));
-    assertEquals(25, single.encodedLength());
+    assertEquals(RETRANSMIT_REQUEST_BYTES, single.encodedLength());
     // Position zero is legal, since block numbering starts there.
     assertDoesNotThrow(() -> new RetransmitRequestMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, 0L));
-    // The extreme is legal too: there is no arithmetic on the position, so nothing can overflow.
+    // The extreme is legal for a single position: the width is zero, so nothing overflows.
     assertDoesNotThrow(
         () -> new RetransmitRequestMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, Long.MAX_VALUE));
+    // An inverted window is refused, so the two ends can never be transposed.
+    assertThrows(IllegalArgumentException.class,
+        () -> new RetransmitRequestMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, 5L, 4L));
+    // The widest legal window includes both of its ends, so its span is one below the ceiling.
+    long widest = RetransmitRequestMessage.MAX_REQUESTED_BLOCKS - 1L;
+    RetransmitRequestMessage atTheCeiling =
+        new RetransmitRequestMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, 0L, widest);
+    assertEquals(RetransmitRequestMessage.MAX_REQUESTED_BLOCKS, atTheCeiling.blockCount());
+    assertEquals(atTheCeiling, roundTrip(atTheCeiling));
+    // One block wider is refused, which stops a peer naming a window for a producer to walk.
+    assertThrows(IllegalArgumentException.class, () -> new RetransmitRequestMessage(
+        SHUFFLE_ID, MAP_ID, PARTITION_ID, 0L, RetransmitRequestMessage.MAX_REQUESTED_BLOCKS));
+    // Including the window a Long.MAX_VALUE upper bound would express, whose count would otherwise
+    // wrap negative and slip past a naive comparison.
+    assertThrows(IllegalArgumentException.class,
+        () -> new RetransmitRequestMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, 0L, Long.MAX_VALUE));
+  }
+
+  @Test
+  public void testRetransmissionRequestWindowDomainIsEnforcedOnDecode() {
+    // A peer cannot smuggle an inverted or over-wide window past the codec: the same constructor
+    // validates a decoded request and a locally built one.
+    ByteBuf inverted = Unpooled.buffer();
+    writeHeader(inverted, SHUFFLE_ID, PARTITION_ID, 9L);
+    inverted.writeLong(8L);
+    assertThrows(IllegalArgumentException.class,
+        () -> RetransmitRequestMessage.decode(inverted));
+
+    ByteBuf overWide = Unpooled.buffer();
+    writeHeader(overWide, SHUFFLE_ID, PARTITION_ID, 0L);
+    overWide.writeLong(RetransmitRequestMessage.MAX_REQUESTED_BLOCKS);
+    assertThrows(IllegalArgumentException.class,
+        () -> RetransmitRequestMessage.decode(overWide));
   }
 
   @Test
   public void testRetransmissionRequestDomainIsEnforcedOnDecode() {
-    ByteBuf negative = Unpooled.buffer();
+    ByteBuf negative = buffer();
     negative.writeByte(StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION);
     negative.writeInt(SHUFFLE_ID);
     negative.writeInt(PARTITION_ID);
@@ -877,11 +1187,17 @@ public class StreamingShuffleMessageSuite {
     assertThrows(IllegalArgumentException.class,
         () -> RetransmitRequestMessage.decode(negative));
 
-    // A body of any size other than the producer id is a framing error rather than something to
-    // tolerate, in either direction.
-    ByteBuf surplus = Unpooled.buffer();
+    // A body of any size other than the producer id followed by the upper bound is a framing error
+    // rather than something to tolerate, in either direction.
+    ByteBuf truncated = buffer();
+    writeHeader(truncated, SHUFFLE_ID, PARTITION_ID, 5L);
+    assertThrows(IllegalArgumentException.class,
+        () -> RetransmitRequestMessage.decode(truncated));
+
+    ByteBuf surplus = buffer();
     writeHeader(surplus, SHUFFLE_ID, PARTITION_ID, 5L);
-    surplus.writeLong(0L);
+    surplus.writeLong(5L);
+    surplus.writeByte(0);
     assertThrows(IllegalArgumentException.class, () -> RetransmitRequestMessage.decode(surplus));
   }
 
@@ -912,7 +1228,7 @@ public class StreamingShuffleMessageSuite {
   public void testStreamTerminationBlockCountRelationIsEnforcedOnDecode() {
     // A peer cannot state a total that disagrees with the position, because there is one field for
     // both; what it can state is a negative one, and that is refused where it enters.
-    ByteBuf negative = Unpooled.buffer();
+    ByteBuf negative = buffer();
     negative.writeByte(StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION);
     negative.writeInt(SHUFFLE_ID);
     negative.writeInt(PARTITION_ID);
@@ -921,7 +1237,7 @@ public class StreamingShuffleMessageSuite {
     assertThrows(IllegalArgumentException.class,
         () -> StreamTerminationMessage.decode(negative));
 
-    ByteBuf surplus = Unpooled.buffer();
+    ByteBuf surplus = buffer();
     writeHeader(surplus, SHUFFLE_ID, PARTITION_ID, 10L);
     surplus.writeLong(10L);
     assertThrows(IllegalArgumentException.class,
@@ -1140,8 +1456,8 @@ public class StreamingShuffleMessageSuite {
           message.getClass().getSimpleName());
       assertEquals(MAP_ID, ByteBuffer.wrap(body).getLong(17));
     }
-    // And the four control messages are exactly the header plus that id: twenty-five bytes,
-    // twenty-six framed.
+    // And a control message that carries no field of its own is exactly the header plus that id:
+    // twenty-five bytes, twenty-six framed.
     for (StreamingShuffleMessage message : fixedSizeMessages()) {
       assertEquals(25, message.encodedLength(), message.getClass().getSimpleName());
       assertEquals(26, message.toByteBuffer().remaining());
@@ -1283,6 +1599,23 @@ public class StreamingShuffleMessageSuite {
   }
 
   @Test
+  public void testHeartbeatBodyIsProducerIdThenConsumerToken() {
+    HeartbeatMessage message = heartbeat();
+    ByteBuffer framed = ByteBuffer.wrap(toByteArray(message.toByteBuffer()));
+
+    assertEquals(StreamingShuffleMessageType.HEARTBEAT.id(), framed.get());
+    assertEquals(StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION, framed.get());
+    assertEquals(SHUFFLE_ID, framed.getInt());
+    assertEquals(PARTITION_ID, framed.getInt());
+    assertEquals(SEQUENCE_NUMBER, framed.getLong());
+    assertEquals(MAP_ID, framed.getLong());
+    assertEquals(CONSUMER_TOKEN, framed.getLong());
+    // Nothing follows the token, so the frame has exactly one size and a peer cannot choose it.
+    assertFalse(framed.hasRemaining());
+    assertEquals(34, toByteArray(message.toByteBuffer()).length);
+  }
+
+  @Test
   public void testShuffleIdAndPartitionIdAreNeverTransposed() {
     // Two adjacent int fields in one header are a transposition hazard, so assert they survive a
     // real round trip rather than trusting encoder and decoder to agree with each other.
@@ -1312,8 +1645,10 @@ public class StreamingShuffleMessageSuite {
     assertEquals(new AckMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER - 1L),
         fromHeader);
     // The same header drives every control message, so each must read it identically.
-    assertEquals(heartbeat(), new HeartbeatMessage(header, MAP_ID));
-    assertEquals(retransmit(SEQUENCE_NUMBER), new RetransmitRequestMessage(header, MAP_ID));
+    assertEquals(heartbeat(), new HeartbeatMessage(header, MAP_ID, CONSUMER_TOKEN));
+    assertEquals(heartbeatWithoutToken(), new HeartbeatMessage(header, MAP_ID));
+    assertEquals(retransmit(SEQUENCE_NUMBER),
+        new RetransmitRequestMessage(header, MAP_ID, SEQUENCE_NUMBER));
     assertEquals(termination(SEQUENCE_NUMBER), new StreamTerminationMessage(header, MAP_ID));
   }
 
@@ -1373,7 +1708,7 @@ public class StreamingShuffleMessageSuite {
     // An unknown type from an incompatible peer is still a version problem, because that is the
     // condition the fallback policy acts on. Blaming the type byte would send it down the wrong
     // path entirely.
-    ByteBuf frame = Unpooled.buffer();
+    ByteBuf frame = buffer();
     frame.writeByte(UNKNOWN_TYPE_ID);
     frame.writeByte(UNSUPPORTED_VERSION);
     frame.writeInt(SHUFFLE_ID);
@@ -1410,7 +1745,10 @@ public class StreamingShuffleMessageSuite {
   public void testNullHeaderIsRejectedByEveryConstructionRoute() {
     assertThrows(NullPointerException.class, () -> new AckMessage(null, MAP_ID));
     assertThrows(NullPointerException.class, () -> new HeartbeatMessage(null, MAP_ID));
-    assertThrows(NullPointerException.class, () -> new RetransmitRequestMessage(null, MAP_ID));
+    assertThrows(NullPointerException.class,
+        () -> new HeartbeatMessage(null, MAP_ID, CONSUMER_TOKEN));
+    assertThrows(NullPointerException.class,
+        () -> new RetransmitRequestMessage(null, MAP_ID, 0L));
     assertThrows(NullPointerException.class, () -> new StreamTerminationMessage(null, MAP_ID));
     assertThrows(NullPointerException.class,
         () -> new DataBlockMessage(null, MAP_ID, 0L, payload(4)));
@@ -1438,7 +1776,7 @@ public class StreamingShuffleMessageSuite {
   public void testDataBlockDecodeRejectsATruncatedChecksum() {
     // A well-formed header followed by four bytes: not enough for the eight-byte checksum, so the
     // checksum must never be read at all.
-    ByteBuf buf = Unpooled.buffer();
+    ByteBuf buf = buffer();
     writeHeader(buf, SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER);
     buf.writeBytes(new byte[] {1, 2, 3, 4});
     IllegalArgumentException error =
@@ -1453,7 +1791,7 @@ public class StreamingShuffleMessageSuite {
     // as one quantity ahead of any read, so the checksum is never consumed off a body that cannot
     // also carry the prefix behind it, and the diagnostic names the shortfall in body bytes.
     for (int bodyBytesAfterHeader : new int[] {0, 8, 16, 17, 19}) {
-      ByteBuf buf = Unpooled.buffer();
+      ByteBuf buf = buffer();
       buf.writeByte(StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION);
       buf.writeInt(SHUFFLE_ID);
       buf.writeInt(PARTITION_ID);
@@ -1465,7 +1803,7 @@ public class StreamingShuffleMessageSuite {
     }
     // Exactly the minimum body is a zero-length payload, which is legal, so the bound is not
     // off by one in the refusing direction.
-    ByteBuf minimal = Unpooled.buffer();
+    ByteBuf minimal = buffer();
     writeHeader(minimal, SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER);
     minimal.writeLong(StreamingShuffleChecksum.computeBlock(
         SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, new byte[0]));
@@ -1534,9 +1872,11 @@ public class StreamingShuffleMessageSuite {
     assertEquals(Long.MAX_VALUE, decoded.sequenceNumber());
     assertEquals(AckMessage.MAX_CONSUMER_POSITION, decoded.consumerPosition());
 
-    HeartbeatMessage beat = new HeartbeatMessage(0, Long.MAX_VALUE, 0, Long.MAX_VALUE);
+    HeartbeatMessage beat =
+        new HeartbeatMessage(0, Long.MAX_VALUE, 0, Long.MAX_VALUE, Long.MAX_VALUE);
     assertEquals(beat, roundTrip(beat));
     assertEquals(Long.MAX_VALUE, roundTrip(beat).sequenceNumber());
+    assertEquals(Long.MAX_VALUE, ((HeartbeatMessage) roundTrip(beat)).consumerToken());
   }
 
   // Rendering: every message names its own body field and stays bounded.
@@ -1545,6 +1885,8 @@ public class StreamingShuffleMessageSuite {
   public void testControlMessagesRenderTheirOwnBodyFieldAndStayBounded() {
     assertTrue(ack(40L).toString().contains("consumerPosition=40"), ack(40L).toString());
     assertTrue(heartbeat().toString().contains("sequenceNumber=" + SEQUENCE_NUMBER),
+        heartbeat().toString());
+    assertTrue(heartbeat().toString().contains("consumerToken=" + CONSUMER_TOKEN),
         heartbeat().toString());
     assertTrue(retransmit(44L).toString().contains("sequenceNumber=44"),
         retransmit(44L).toString());
@@ -1633,16 +1975,13 @@ public class StreamingShuffleMessageSuite {
 
   @Test
   public void testOnlyTheFramingByteDistinguishesTheFixedSizeMessagesOnTheWire() {
-    // Three control messages encode to byte-identical bodies when their single body field happens
-    // to match, so the framing byte is the only thing that tells the decoder which one it is
-    // holding. If routing ever fell back on anything else it would silently mis-decode here.
-    // Every control message is the header plus the producer id, so four messages built over one
-    // identity encode to byte-for-byte identical bodies. Only the framing discriminator tells them
-    // apart on the wire, and the decoder must therefore rely on it alone.
+    // The control messages that carry no field of their own are the header plus the producer id, so
+    // messages built over one identity encode to byte-for-byte identical bodies. Only the framing
+    // discriminator tells them apart on the wire, and the decoder must therefore rely on it alone,
+    // never on a length and never on a body byte. A heartbeat is excluded because it carries a
+    // field of its own, not because it is any less strict about the discriminator.
     StreamingShuffleMessage[] messages = {
         ack(SEQUENCE_NUMBER - 1L),
-        heartbeat(),
-        new RetransmitRequestMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER),
         termination(SEQUENCE_NUMBER),
     };
     byte[] reference = encodedBody(messages[0]);
@@ -1689,7 +2028,7 @@ public class StreamingShuffleMessageSuite {
     assertThrows(IllegalArgumentException.class,
         () -> StreamingShuffleMessage.Decoder.fromByteBuffer(framed));
     // And the concrete decoder refuses it too, so the check does not live only in the dispatcher.
-    ByteBuf body = Unpooled.buffer();
+    ByteBuf body = buffer();
     body.writeByte(UNSUPPORTED_VERSION);
     body.writeInt(SHUFFLE_ID);
     body.writeInt(PARTITION_ID);
@@ -1750,18 +2089,25 @@ public class StreamingShuffleMessageSuite {
     };
   }
 
-  /** The four control messages, every one of which encodes to exactly twenty-five bytes. */
+  /**
+   * The control messages that carry no field of their own, every one of which encodes to exactly
+   * twenty-five bytes: the header and the producer id and nothing else. A heartbeat is not among
+   * them -- it carries a consumer session token -- and neither is a retransmission request, which
+   * carries the upper bound of its repair window. Both are still of a width this build fixes.
+   */
   private StreamingShuffleMessage[] fixedSizeMessages() {
     return new StreamingShuffleMessage[] {
-        ack(40L), heartbeat(), retransmit(44L), termination(SEQUENCE_NUMBER)};
+        ack(40L), termination(SEQUENCE_NUMBER)};
   }
 
   /**
-   * Every message whose decoder demands an exact body, which is all four control messages: each of
-   * them carries the header and the producer id and nothing else, so its body has one legal size.
+   * Every message whose decoder demands an exact body, which is all four control messages: each has
+   * a body of one legal size, whether that is the shared twenty-five bytes or the wider fixed size
+   * a retransmission request occupies.
    */
   private StreamingShuffleMessage[] exactBodyMessages() {
-    return fixedSizeMessages();
+    return new StreamingShuffleMessage[] {
+        ack(40L), heartbeat(), retransmit(44L), termination(SEQUENCE_NUMBER)};
   }
 
   private DataBlockMessage dataBlock(int payloadLength) {
@@ -1780,6 +2126,14 @@ public class StreamingShuffleMessageSuite {
   }
 
   private HeartbeatMessage heartbeat() {
+    return new HeartbeatMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER, CONSUMER_TOKEN);
+  }
+
+  /**
+   * A heartbeat that declares no consumer session token, which is what a producer's own heartbeat
+   * is and what a peer speaking an earlier revision of this protocol sends.
+   */
+  private HeartbeatMessage heartbeatWithoutToken() {
     return new HeartbeatMessage(SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER);
   }
 
@@ -1805,6 +2159,50 @@ public class StreamingShuffleMessageSuite {
     return bytes;
   }
 
+  /** Records the allocation gate's call order and ownership transitions without allocating. */
+  private static final class RecordingPayloadReservation
+      implements StreamingShuffleMessage.PayloadReservation {
+
+    private final boolean grant;
+    private int attempts;
+    private int releases;
+    private int shuffleId = -1;
+    private long mapId = -1L;
+    private int partitionId = -1;
+    private long sequenceNumber = -1L;
+    private int payloadBytes = -1;
+    private int reservedBytes;
+
+    private RecordingPayloadReservation(boolean grant) {
+      this.grant = grant;
+    }
+
+    @Override
+    public boolean tryReserve(
+        int observedShuffleId,
+        long observedMapId,
+        int observedPartitionId,
+        long observedSequenceNumber,
+        int observedPayloadBytes) {
+      attempts++;
+      shuffleId = observedShuffleId;
+      mapId = observedMapId;
+      partitionId = observedPartitionId;
+      sequenceNumber = observedSequenceNumber;
+      payloadBytes = observedPayloadBytes;
+      if (grant) {
+        reservedBytes += observedPayloadBytes;
+      }
+      return grant;
+    }
+
+    @Override
+    public void release(int releasedPayloadBytes) {
+      releases++;
+      reservedBytes -= releasedPayloadBytes;
+    }
+  }
+
   private static byte[] toByteArray(ByteBuffer buffer) {
     byte[] bytes = new byte[buffer.remaining()];
     buffer.duplicate().get(bytes);
@@ -1813,11 +2211,17 @@ public class StreamingShuffleMessageSuite {
 
   /** The encoded body of a message, that is, its framed form without the leading type byte. */
   private static byte[] encodedBody(StreamingShuffleMessage message) {
+    // Released here rather than tracked, because the buffer does not escape this method: the bytes
+    // the caller receives are a copy of it.
     ByteBuf buf = Unpooled.buffer(message.encodedLength());
-    message.encode(buf);
-    byte[] body = new byte[buf.readableBytes()];
-    buf.readBytes(body);
-    return body;
+    try {
+      message.encode(buf);
+      byte[] body = new byte[buf.readableBytes()];
+      buf.readBytes(body);
+      return body;
+    } finally {
+      buf.release();
+    }
   }
 
   private static void writeHeader(ByteBuf buf, int shuffleId, int partitionId, long sequence) {
@@ -1845,8 +2249,10 @@ public class StreamingShuffleMessageSuite {
    * number of actual payload bytes, so that a hostile prefix can be presented without the frame
    * ever growing to the size that prefix claims.
    */
-  private static ByteBuf dataBlockBodyWithPayloadPrefix(int declaredLength, int actualBytes) {
-    ByteBuf buf = Unpooled.buffer();
+  private ByteBuf dataBlockBodyWithPayloadPrefix(int declaredLength, int actualBytes) {
+    // Tracked rather than released here, because this buffer is handed back to the caller: its
+    // release belongs to the teardown that owns every buffer this suite allocates.
+    ByteBuf buf = buffer();
     writeHeader(buf, SHUFFLE_ID, PARTITION_ID, SEQUENCE_NUMBER);
     buf.writeLong(0L);
     buf.writeInt(declaredLength);
@@ -1854,14 +2260,29 @@ public class StreamingShuffleMessageSuite {
     return buf;
   }
 
-  /** The specified encoded size of every control message: the header plus the producer id. */
+  /** The specified encoded size of each fixed control message: header plus producer id. */
   private static final int CONTROL_MESSAGE_BYTES = 25;
+
+  /**
+   * Encoded length of a retransmission request: a control message plus the eight bytes of the
+   * inclusive upper bound that lets one frame name a whole repair window.
+   */
+  private static final int RETRANSMIT_REQUEST_BYTES = CONTROL_MESSAGE_BYTES + 8;
+
+  /**
+   * Encoded length of a heartbeat: a control message plus the eight bytes of the consumer session
+   * token that lets a producer recognise a reconnection as the consumer it already knows.
+   */
+  private static final int HEARTBEAT_BYTES = CONTROL_MESSAGE_BYTES + 8;
 
   /** The specified encoded size of the shared header. */
   private static final int HEADER_BYTES = 17;
 
   /** The specified encoded size of a data block with an empty payload. */
   private static final int EMPTY_DATA_BLOCK_BYTES = 37;
+
+  /** The one byte of type prefix a framed message carries ahead of its encoded body. */
+  private static final int FRAME_TYPE_PREFIX_BYTES = 1;
 
   private static void decodeAckWithHeader(int shuffleId, int partitionId, long sequence) {
     decodeAckWithHeader(shuffleId, MAP_ID, partitionId, sequence);
@@ -1870,9 +2291,27 @@ public class StreamingShuffleMessageSuite {
   /** As {@link #decodeAckWithHeader(int, int, long)}, but with the map id chosen as well. */
   private static void decodeAckWithHeader(
       int shuffleId, long mapId, int partitionId, long sequence) {
+    // The decode below is expected to raise, so the release belongs in a finally: a buffer freed
+    // only on the success path is a buffer leaked by every case this helper exists to exercise.
     ByteBuf buf = Unpooled.buffer();
-    writeHeader(buf, shuffleId, mapId, partitionId, sequence);
-    AckMessage.decode(buf);
+    try {
+      writeHeader(buf, shuffleId, mapId, partitionId, sequence);
+      AckMessage.decode(buf);
+    } finally {
+      buf.release();
+    }
+  }
+
+  /**
+   * Decodes a heartbeat body carrying the given consumer session token, hand-written so that a
+   * value the constructors refuse can still be presented to the decoder -- which is the point: the
+   * domain rule has to hold on the route a remote peer actually uses.
+   */
+  private static HeartbeatMessage decodeHeartbeatWithToken(long consumerToken) {
+    ByteBuf buf = Unpooled.buffer();
+    writeHeader(buf, SHUFFLE_ID, MAP_ID, PARTITION_ID, SEQUENCE_NUMBER);
+    buf.writeLong(consumerToken);
+    return HeartbeatMessage.decode(buf);
   }
 
   /** Routes a buffer to the concrete decoder matching the given message's type. */

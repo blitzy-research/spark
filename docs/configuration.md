@@ -1429,8 +1429,14 @@ Apart from these, the following properties are also available, and may be useful
     service-provider call to the sort-based shuffle manager, so behavior is indistinguishable from
     the default sort-based shuffle; it is therefore a kill switch that restores sort behavior
     without changing the shuffle manager. Every <code>spark.shuffle.streaming.*</code> property,
-    including this one, is read once when the streaming shuffle manager is constructed and then held
-    immutably, so changing any of them requires an executor restart to take effect. See the
+    including this one, is read once when the component that uses it is constructed -- the manager,
+    the buffer allowance, the flow-control protocol, the rate limiter and the fallback policy each
+    take their own snapshot -- and is then held immutably, so changing any of them requires an
+    executor restart to take effect. Streaming is also excluded outright while
+    <code>spark.shuffle.service.enabled</code> is true, because streamed and spilled blocks are
+    served by the producing executor's own process rather than by an external shuffle service; every
+    shuffle is then served by the sort-based shuffle manager, exactly as it is when this property is
+    false. See the
     <a href="streaming-shuffle.html">Streaming Shuffle</a> guide for how to size the buffers, what
     each fallback condition means in practice, and the operational limits.
   </td>
@@ -1440,19 +1446,18 @@ Apart from these, the following properties are also available, and may be useful
   <td><code>spark.shuffle.streaming.bufferSizePercent</code></td>
   <td>20</td>
   <td>
-    Percentage of the executor's on-heap unified memory region reserved across all streaming
-    shuffle buffers. The basis is the region Spark shares between execution and storage, that is
-    <code>(heap space - 300MB) * spark.memory.fraction</code> as described in
-    <a href="tuning.html#memory-management-overview">Memory Management Overview</a>, and not the
-    total configured executor heap: at the default <code>spark.memory.fraction</code> of 0.6 a value
-    of 20 reserves 12% of the heap remaining after Spark's 300MB reservation, not 20% of the heap.
-    The aggregate budget is <code>(unifiedMemoryRegion * bufferSizePercent) / 100</code> and the
-    per-partition allowance is that budget divided by the number of partitions. The budget is
-    executor-wide rather than per task, so every concurrently streaming task on the executor draws
-    on the same allowance and a reservation that would exceed it is refused rather than granted.
-    Must be in the range 1 to 50; values outside that range are rejected when the configuration is
-    read. Only takes effect when streaming shuffle is enabled, and changing it requires an executor
-    restart.
+    Percentage of the configured executor memory reserved across all streaming shuffle buffers. The
+    basis is <code>spark.executor.memory</code> itself: the aggregate budget is
+    <code>(executorMemory * bufferSizePercent) / 100</code> and the per-partition allowance is that
+    budget divided by the number of partitions, so at the default of 20 a 4g executor reserves
+    819MiB across its streaming buffers. One basis serves both directions of a shuffle: producer
+    framing and buffered blocks and consumer received frames are all charged against this one
+    budget, so the percentage bounds the executor rather than bounding each direction separately.
+    The budget is executor-wide rather than per task, so every concurrently streaming task on the
+    executor draws on the same allowance and a reservation that would exceed it is refused rather
+    than granted. Must be in the range 1 to 50; values outside that range are rejected when the
+    configuration is read. Only takes effect when streaming shuffle is enabled, and changing it
+    requires an executor restart.
   </td>
   <td>4.2.0</td>
 </tr>

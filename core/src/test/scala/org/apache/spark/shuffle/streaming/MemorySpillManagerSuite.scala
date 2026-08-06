@@ -27,13 +27,16 @@ import scala.collection.mutable
 
 import org.scalatest.matchers.should.Matchers
 
-import org.apache.spark.{SharedSparkContext, SparkConf, SparkEnv, SparkFunSuite, SparkIllegalArgumentException, TaskContext, TaskContextImpl}
+import org.apache.spark.{SharedSparkContext, SparkConf, SparkEnv, SparkFunSuite,
+  SparkIllegalArgumentException, TaskContext, TaskContextImpl}
 import org.apache.spark.executor.{ShuffleWriteMetrics, TaskMetrics}
-import org.apache.spark.internal.config.{CPUS_PER_TASK, EXECUTOR_CORES, SHUFFLE_STREAMING_BUFFER_SIZE_PERCENT, SHUFFLE_STREAMING_SPILL_THRESHOLD}
+import org.apache.spark.internal.config.{CPUS_PER_TASK, EXECUTOR_CORES,
+  SHUFFLE_STREAMING_BUFFER_SIZE_PERCENT, SHUFFLE_STREAMING_SPILL_THRESHOLD}
 import org.apache.spark.memory.{MemoryConsumer, MemoryMode, TaskMemoryManager}
 import org.apache.spark.serializer.{SerializerInstance, SerializerManager}
 import org.apache.spark.shuffle.ShuffleWriteMetricsReporter
-import org.apache.spark.storage.{BlockId, DiskBlockObjectWriter, TempShuffleBlockId, UnrecognizedBlockId}
+import org.apache.spark.storage.{BlockId, DiskBlockObjectWriter, TempShuffleBlockId,
+  UnrecognizedBlockId}
 import org.apache.spark.util.{Clock, Utils}
 
 /**
@@ -195,9 +198,11 @@ class MemorySpillManagerSuite
       context: TaskContextImpl,
       clock: Clock,
       quota: MemorySpillManager.ExecutorBufferQuota,
-      conf: SparkConf = streamingConfWithOverrides()): MemorySpillManager = {
+      conf: SparkConf = streamingConfWithOverrides(),
+      diskQuota: Option[MemorySpillManager.ExecutorDiskQuota] = None): MemorySpillManager = {
     val manager = new MemorySpillManager(
-      memoryManagerOf(context), conf, clock, Some(quota), autoPoll = false)
+      memoryManagerOf(context), conf, clock, Some(quota), autoPoll = false,
+      diskQuotaOverride = diskQuota)
     manager.registerPartitionCount(reducePartitions)
     manager.registerCleanup(context)
     openManagers += manager
@@ -209,9 +214,10 @@ class MemorySpillManagerSuite
    *
    * Every other fixture in this suite injects an allowance, so that each arithmetic assertion is
    * exact on any machine. This one deliberately does not: withholding the override is what makes
-   * the lazy derivation run [[MemorySpillManager.executorQuota]], which reads the live memory
-   * manager and registers the resulting allowance with the metrics source. That is the wiring
-   * an operator's gauge depends on, and it is only exercised on this path.
+   * the lazy derivation run [[MemorySpillManager.executorQuota]], which takes the configured
+   * percentage of the configured executor memory and registers the resulting allowance with the
+   * metrics source. That is the wiring an operator's gauge depends on, and it is only exercised on
+   * this path.
    *
    * The threshold ticker is still withheld, for the same reason as everywhere else in this suite.
    *
@@ -552,8 +558,11 @@ class MemorySpillManagerSuite
         s"the drained partitions were $drained")
 
     bufferBlocks(manager, drained.head, 1)
-    assert(manager.executorReservedBytes === manager.spillThresholdBytes,
-      "The refill must put the reservation back on the trigger")
+    assert(manager.bufferedBytes === manager.spillThresholdBytes,
+      "The refill must put producer payload and retained-block overhead back on the trigger")
+    assert(manager.executorReservedBytes ===
+      manager.spillThresholdBytes + MemorySpillManager.SPILLED_RECORD_METADATA_BYTES,
+      "The one durable record from the first eviction must stay charged above producer bytes")
 
     assert(!manager.pollOnce(), "A poll taken with no time elapsed must be suppressed")
     assert(manager.spillCount === 1L, "A suppressed poll must not evict")
@@ -709,9 +718,11 @@ class MemorySpillManagerSuite
 
   test("a block the allowance cannot hold is admitted straight to disk instead") {
     // The specified answer to a full buffer is to spill, not to fail, so a producer that cannot
-    // reserve for a block writes it through: the map output stays complete and the shuffle keeps
-    // the streaming path it is already committed to. `admitDurably` is that write-through, and it
-    // is reached from the writer's admission recovery loop once the loop has exhausted its rounds.
+    // reserve for a block writes it through and the map output stays complete rather than losing
+    // the record. `admitDurably` is that write-through, and it is reached from the writer's
+    // admission recovery loop once the loop has exhausted its rounds -- which is also the point at
+    // which the writer reports the refusal as memory pressure, a decision that belongs to the
+    // writer and the fallback policy and is asserted where they are.
     val context = newTrackedTaskContext()
     val manager = newManager(context, newManualClock(), newQuota(roomyMemoryBytes))
     assert(manager.durableAdmissionCount === 0L, "Nothing may have bypassed the buffer yet")
@@ -972,6 +983,107 @@ class MemorySpillManagerSuite
     assert(manager.acknowledge(slowConsumerId, 0, 1L) === 2L * blockCharge,
       "The last consumer to confirm receipt is the one whose acknowledgement releases the memory")
     assert(manager.bufferedBytes === 0L, "The confirmed prefix must be released in full")
+  }
+
+  test("unregistering a stale consumer immediately releases the prefix a live peer confirmed") {
+    val manager = newManager(newTrackedTaskContext(), newManualClock(), newQuota(roomyMemoryBytes))
+    val liveConsumer = "attempt-41-partitions-0-0"
+    val staleConsumer = "attempt-42-partitions-0-0"
+    assert(manager.registerConsumer(liveConsumer), "The live consumer must be admitted")
+    assert(manager.registerConsumer(staleConsumer), "The stale consumer must initially be admitted")
+    bufferBlocks(manager, 0, 3)
+
+    assert(manager.acknowledge(liveConsumer, 0, 2L) === 0L,
+      "The stale cursor must pin the prefix until that consumer is finally unregistered")
+    assert(manager.retainedBlockCount(0) === 3,
+      "All three blocks must remain while the stale cursor is registered")
+    assert(manager.unregisterConsumer(staleConsumer) === 3L * blockCharge,
+      "Removing the stale cursor must reclaim the live consumer's confirmed prefix immediately")
+    assert(manager.retainedBlockCount(0) === 0,
+      "No block may remain pinned by an identity that has been unregistered")
+    assert(manager.registeredConsumers === Set(liveConsumer),
+      "Final unregistration must remove exactly the stale identity")
+    assert(MemorySpillManager.registeredConsumerIdentityCount === 1,
+      "The executor-wide identity ledger must release the stale identity too")
+  }
+
+  test("consumer cursor registration is capped per store and across the executor") {
+    val first = newManager(newTrackedTaskContext(), newManualClock(), newQuota(roomyMemoryBytes))
+    val second = newManager(newTrackedTaskContext(), newManualClock(), newQuota(roomyMemoryBytes))
+    val third = newManager(newTrackedTaskContext(), newManualClock(), newQuota(roomyMemoryBytes))
+    val perStoreCap = MemorySpillManager.MAX_REGISTERED_CONSUMERS_PER_STORE
+    val executorCap = MemorySpillManager.MAX_REGISTERED_CONSUMER_IDENTITIES
+
+    (0 until perStoreCap).foreach { index =>
+      assert(first.registerConsumer(s"attempt-$index-partitions-0-0"),
+        s"The first store must admit identity $index through its exact cap")
+    }
+    assert(first.registeredConsumers.size === perStoreCap)
+    assert(!first.registerConsumer(s"attempt-$perStoreCap-partitions-0-0"),
+      "A store must refuse the first identity beyond its cursor cap")
+    assert(first.rejectedConsumerRegistrationCount === 1L)
+    assert(MemorySpillManager.registeredConsumerIdentityCount === perStoreCap)
+
+    (perStoreCap until executorCap).foreach { index =>
+      assert(second.registerConsumer(s"attempt-$index-partitions-0-0"),
+        s"The second store must admit identity $index through the executor-wide cap")
+    }
+    assert(MemorySpillManager.registeredConsumerIdentityCount === executorCap)
+    assert(!third.registerConsumer(s"attempt-$executorCap-partitions-0-0"),
+      "A new identity must be refused once the executor-wide unique-id cap is full")
+    assert(third.rejectedConsumerRegistrationCount === 1L)
+
+    val existingIdentity = "attempt-0-partitions-0-0"
+    assert(third.registerConsumer(existingIdentity),
+      "An already charged identity must remain usable by another producer at the unique-id cap")
+    assert(MemorySpillManager.registeredConsumerIdentityCount === executorCap,
+      "Reference counting an existing identity must not consume another unique-id slot")
+    assert(third.unregisterConsumer(existingIdentity) === 0L,
+      "Unregistering a cursor with no retained partition releases no bytes")
+    assert(MemorySpillManager.registeredConsumerIdentityCount === executorCap,
+      "The original producer's reference must keep the shared identity charged")
+
+    assert(first.releaseRetainedConsumerState() === perStoreCap,
+      "The resolver-side final release must drop every cursor owned by the first store")
+    assert(MemorySpillManager.registeredConsumerIdentityCount === executorCap - perStoreCap,
+      "Only the second store's identities may remain after the first store is released")
+    assert(second.releaseRetainedConsumerState() === perStoreCap,
+      "The second store must release the remaining executor identities")
+    assert(MemorySpillManager.registeredConsumerIdentityCount === 0,
+      "The executor-wide identity ledger must return to zero after final release")
+  }
+
+  test("a large acknowledged prefix is reclaimed in bounded batches") {
+    val manager = newManager(
+      newTrackedTaskContext(), newManualClock(), newQuota(64L * 1024L * 1024L))
+    val batchSize = MemorySpillManager.MAX_RECLAIMED_BLOCKS_PER_BATCH
+    val blockCount = 2 * batchSize + 17
+    assert(manager.registerConsumer(consumerId), "The consumer must be admitted")
+    bufferBlocks(manager, 0, blockCount)
+    assert(manager.retainedBlockCount(0) === blockCount)
+
+    val firstBatch = manager.acknowledge(consumerId, 0, blockCount - 1L)
+    assert(firstBatch === batchSize.toLong * blockCharge,
+      "The acknowledgement-facing call must retire exactly one bounded batch")
+    assert(manager.retainedBlockCount(0) === blockCount - batchSize,
+      "The remainder must stay charged until the bounded worker batches run")
+    assert(manager.pendingReclamationCount === 1,
+      "One coalesced partition request must represent the remaining prefix")
+    assert(manager.reclamationBatchCount === 1L,
+      "The acknowledgement-facing call must run one reclamation batch")
+
+    val remainder = manager.drainPendingReclamationForTesting()
+    assert(remainder === (blockCount - batchSize).toLong * blockCharge,
+      "The deterministic worker seam must release the whole queued remainder")
+    assert(manager.retainedBlockCount(0) === 0 && manager.bufferedBytes === 0L,
+      "All acknowledged blocks and their memory charge must be gone after the worker drains")
+    assert(manager.pendingReclamationCount === 0,
+      "The partition must leave no queued reclamation after its final batch")
+    assert(manager.reclamationBatchCount === 3L,
+      "Two full batches and one final partial batch must service the acknowledged prefix")
+    assert(manager.lastReclamationDurationMs === 0L,
+      "The end-to-end duration must use the held test clock and stay inside the 100 ms bound")
+    assert(manager.reclamationDeadlineBreaches === 0L)
   }
 
   // -----------------------------------------------------------------------------------------------
@@ -1489,6 +1601,63 @@ class MemorySpillManagerSuite
       "No memory volume may be manufactured by a write that never occupied memory")
   }
 
+  test("spill files contain a bounded number of segments and remain charged until deletion") {
+    val diskQuota = new MemorySpillManager.ExecutorDiskQuota(
+      () => 64L * 1024L * 1024L, fileLimit = 2)
+    val manager = newManager(
+      newTrackedTaskContext(),
+      newManualClock(),
+      newQuota(roomyMemoryBytes),
+      diskQuota = Some(diskQuota))
+    val blockCount = MemorySpillManager.MAX_SPILL_SEGMENTS_PER_FILE + 1
+    bufferBlocks(manager, 0, blockCount)
+
+    assert(manager.spillAllRetained() === blockCount.toLong * blockCharge)
+    val records = manager.spilledBlocks(0)
+    val files = records.groupBy(_.file)
+    assert(files.size === 2,
+      "One block beyond the segment ceiling must be written to a second spill file")
+    assert(files.values.forall(_.size <= MemorySpillManager.MAX_SPILL_SEGMENTS_PER_FILE),
+      "No spill file may contain more than the bounded segment count")
+    assert(manager.reservedDiskFiles === 2 && diskQuota.reservedFileCount === 2,
+      "Both committed files must remain charged while their retained output is live")
+    assert(manager.reservedDiskBytes === files.keys.map(_.length()).sum,
+      "The disk quota must reconcile conservative reservations to committed file lengths")
+
+    manager.close()
+    assert(diskQuota.reservedFileCount === 0 && diskQuota.reservedBytes === 0L,
+      "Deleting task-owned spill files must return both disk quota dimensions")
+    assert(files.keys.forall(file => !file.exists()),
+      "Closing a store that retained ownership must unlink every bounded spill file")
+  }
+
+  test("disk quota refusal rolls back partial batches and signals MemoryPressure") {
+    val diskQuota = new MemorySpillManager.ExecutorDiskQuota(
+      () => 64L * 1024L * 1024L, fileLimit = 1)
+    val manager = newManager(
+      newTrackedTaskContext(),
+      newManualClock(),
+      newQuota(roomyMemoryBytes),
+      diskQuota = Some(diskQuota))
+    val blockCount = MemorySpillManager.MAX_SPILL_SEGMENTS_PER_FILE + 1
+    bufferBlocks(manager, 0, blockCount)
+    val retainedBefore = manager.bufferedBytes
+
+    assert(manager.spillAllRetained() === 0L,
+      "A file-ceiling refusal must not publish a partially durable retained window")
+    assert(manager.diskPressureDetected,
+      "The refusal must expose the executor-wide disk-pressure diagnostic")
+    assert(manager.memoryPressureDetected,
+      "Disk exhaustion is the documented MemoryPressure fallback condition, not a fifth reason")
+    assert(manager.memoryPressureEvents > 0L)
+    assert(manager.allSpilledBlocks.isEmpty,
+      "Every earlier batch must be rolled back when a later bounded file is refused")
+    assert(manager.retainedBlockCount(0) === blockCount && manager.bufferedBytes === retainedBefore,
+      "Every detached block must return to memory so no output is lost")
+    assert(diskQuota.reservedFileCount === 0 && diskQuota.reservedBytes === 0L,
+      "Rollback must return the failed batch and every already committed file reservation")
+  }
+
   test("recurring-condition log records are bounded per executor, not per manager instance") {
     // Two managers, which is what an executor running two streaming map tasks has. The log-volume
     // budget this subsystem is held to -- under 10 MB an hour per executor with debug off -- is
@@ -1616,8 +1785,8 @@ class MemorySpillManagerSuite
       "With no contributor registered the gauge must read zero rather than throw or guess")
 
     // Withholding the quota override is what makes the lazy derivation run the production
-    // `executorQuota` path: the budget comes from the live memory manager and the allowance
-    // registers itself with the metrics source.
+    // `executorQuota` path: the budget is the configured percentage of the configured executor
+    // memory, and the allowance registers itself with the metrics source.
     val conf = streamingConfWithOverrides()
     val manager = newProductionManager(newTrackedTaskContext(), conf)
     bufferBlocks(manager, 0, 1)
@@ -2082,8 +2251,10 @@ class MemorySpillManagerSuite
     assert(sc.env.blockManager.diskBlockManager.localDirs.forall(_.isDirectory),
       "Local storage must be intact again before anything else runs")
 
-    assert(manager.spillFailureCount === 1L,
-      s"The failure must be counted, but ${manager.spillFailureCount} were")
+    assert(manager.spillFailureCount === 0L,
+      "The disk guard must refuse before a spill writer is opened, so no write failure is counted")
+    assert(manager.diskPressureDetected && manager.memoryPressureDetected,
+      "An unusable local directory must route through the documented MemoryPressure condition")
     assert(manager.durableAdmissionCount === 0L,
       "A failed write is not a durable admission and must not be counted as one")
     assert(manager.diskBytesSpilled === diskBefore,

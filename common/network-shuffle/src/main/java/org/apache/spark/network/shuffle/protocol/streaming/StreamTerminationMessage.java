@@ -83,11 +83,12 @@ import org.apache.spark.annotation.Private;
  *   |&lt;--------------- inherited header ------------------&gt;|&lt;- body -&gt;|
  * </pre>
  *
- * All four control messages encode to the same {@value
- * StreamingShuffleMessage#CONTROL_MESSAGE_ENCODED_LENGTH} bytes, so length can never be used to
- * tell them apart. The one-byte discriminator that precedes the body does that on the wire, and
- * {@link #equals(Object)} does it in memory by requiring the concrete type to match before it looks
- * at a single field.
+ * The three fixed control messages encode to the same {@value
+ * StreamingShuffleMessage#CONTROL_MESSAGE_ENCODED_LENGTH} bytes, so length can never distinguish
+ * this terminator from an acknowledgement or retransmission request. A heartbeat additionally
+ * carries a bounded logical-consumer identity. The one-byte discriminator that precedes the body
+ * identifies every type on the wire, and {@link #equals(Object)} requires the concrete type to
+ * match in memory.
  *
  * The inherited {@code shuffleId}, {@code partitionId} and {@code sequenceNumber}, and the producer
  * id that opens the body, are all required to be non-negative, and {@link StreamingShuffleMessage}

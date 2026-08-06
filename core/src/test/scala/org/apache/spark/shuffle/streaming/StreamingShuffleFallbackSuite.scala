@@ -26,8 +26,11 @@ import org.apache.logging.log4j.Level
 import org.apache.logging.log4j.core.LogEvent
 import org.mockito.Mockito.mock
 
-import org.apache.spark.{FetchFailed, LocalSparkContext, ShuffleDependency, SparkConf, SparkContext, SparkEnv, SparkFunSuite, SparkThrowableHelper, TaskFailedReason}
-import org.apache.spark.internal.config.{SHUFFLE_MANAGER, SHUFFLE_STREAMING_BUFFER_SIZE_PERCENT, SHUFFLE_STREAMING_ENABLED, SHUFFLE_STREAMING_MAX_BANDWIDTH_MBPS, SHUFFLE_STREAMING_SPILL_THRESHOLD, STAGE_MAX_CONSECUTIVE_ATTEMPTS, TASK_MAX_FAILURES}
+import org.apache.spark.{FetchFailed, LocalSparkContext, ShuffleDependency, SparkConf, SparkContext,
+  SparkEnv, SparkFunSuite, SparkThrowableHelper, TaskFailedReason}
+import org.apache.spark.internal.config.{SHUFFLE_MANAGER, SHUFFLE_STREAMING_BUFFER_SIZE_PERCENT,
+  SHUFFLE_STREAMING_ENABLED, SHUFFLE_STREAMING_MAX_BANDWIDTH_MBPS,
+  SHUFFLE_STREAMING_SPILL_THRESHOLD, STAGE_MAX_CONSECUTIVE_ATTEMPTS, TASK_MAX_FAILURES}
 import org.apache.spark.network.shuffle.protocol.streaming.StreamingShuffleMessage
 import org.apache.spark.rpc.RpcEnv
 import org.apache.spark.scheduler.{SparkListener, SparkListenerStageSubmitted, SparkListenerTaskEnd}
@@ -136,6 +139,15 @@ class StreamingShuffleFallbackSuite
   private val LinkCapacityBytesPerSecond: Double = 100.0d
 
   private val EgressAtSaturationThreshold: Double = LinkSaturationTripPercent.toDouble
+
+  /**
+   * Samples a case records when it is establishing that a reading does '''not''' trip.
+   *
+   * Deliberately more than the one sample the condition trips on, so "exactly ninety per cent is
+   * tolerated" is asserted for a link that stays at the threshold rather than only for its first
+   * reading of it.
+   */
+  private val SaturationSampleRepetitions: Long = 4L
 
   private val RequestedBufferBytes: Long = 1024L
 
@@ -508,76 +520,39 @@ class StreamingShuffleFallbackSuite
   }
 
   // -----------------------------------------------------------------------------------------------
-  // Trip 1, observed rather than measured: producer-liveness invalidations that keep repeating.
+  // NOT a trip condition: producer-liveness invalidations, however many of them there are.
   //
-  // The rate-based form of this condition needs sixty seconds of evidence, and the connection
-  // timeout fires at five, so a producer is invalidated and its reduce attempt gone long before the
-  // window can be evaluated. Each invalidation costs one recomputation, nothing about recomputing
-  // changes what caused the timeout, and the scheduler abandons a stage after
-  // `spark.stage.maxConsecutiveAttempts` -- so without a bound the streaming path can spend a job's
-  // whole attempt budget and have it aborted, which is the one outcome graceful degradation exists
-  // to make impossible. The driver is the only participant that sees every consumer's invalidations
-  // across every attempt, so the bound lives on the coordinator, and both of its forms are asserted
-  // here: the specific one (the same map output lost twice) and the safety net (losses spread one
-  // per map output, which satisfies no per-output bound while spending an attempt each).
+  // The four fallback conditions are a closed set and a lost producer is not among them. The
+  // specified producer-failure flow answers a producer that has gone silent for the connection
+  // timeout by invalidating every partial read taken from it and raising a fetch failure, which the
+  // unmodified scheduler answers by recomputing the upstream stage. That flow stands nothing down,
+  // and it must not: standing a shuffle down would abandon the fast path for exactly the fault the
+  // feature is designed to absorb, and it would report a condition -- sustained consumer slowness
+  // -- that nothing on this path ever measured, sending an operator to tune consumer throughput
+  // for a producer that died.
+  //
+  // The tallies below therefore exist purely as diagnostics. These cases assert that they count
+  // what they claim to count, that only an authorized liveness timeout advances them, and above
+  // all that no number of them stands the shuffle down.
   // -----------------------------------------------------------------------------------------------
 
-  test("the producer-liveness tolerances follow the scheduler's consecutive-attempt allowance") {
-    // Stated as pure arithmetic first, because the whole point of deriving the bounds is that an
-    // operator who raises their own tolerance for recomputation raises streaming's with it.
-    Seq(
-      (4, 2, 3), // the shipped default: two per map output, three per shuffle
-      (5, 3, 4),
-      (12, 10, 11)).foreach { case (allowance, expectedPerMap, expectedPerShuffle) =>
-      assert(StreamingShuffleCoordinator.perMapProducerTimeoutTolerance(allowance) ===
-          expectedPerMap,
-        s"an allowance of $allowance must tolerate $expectedPerMap loss(es) of one map output")
-      assert(StreamingShuffleCoordinator.shuffleProducerTimeoutTolerance(allowance) ===
-          expectedPerShuffle,
-        s"an allowance of $allowance must tolerate $expectedPerShuffle loss(es) per shuffle")
-      assert(StreamingShuffleCoordinator.shuffleProducerTimeoutTolerance(allowance) >=
-          StreamingShuffleCoordinator.perMapProducerTimeoutTolerance(allowance),
-        "the shuffle-wide bound may never sit below the per-map-output one, or the safety net " +
-          "would fire before the signal it exists to back up")
-    }
-
-    // And floored, so an installation that has tightened the allowance cannot reduce the tolerance
-    // to a value that stands a shuffle down on its first ordinary producer failure -- which is the
-    // fault the specified producer-failure flow exists to absorb rather than to degrade for.
-    Seq(0, 1, 2, 3).foreach { tight =>
-      assert(StreamingShuffleCoordinator.perMapProducerTimeoutTolerance(tight) >=
-          StreamingShuffleCoordinator.MIN_PRODUCER_TIMEOUT_TOLERANCE,
-        s"an allowance of $tight must still tolerate at least " +
-          s"${StreamingShuffleCoordinator.MIN_PRODUCER_TIMEOUT_TOLERANCE} loss(es) of one output")
-    }
-
-    // The live endpoint reports what its configuration derives, read once at construction.
-    withCoordinator(streamingConf().set(STAGE_MAX_CONSECUTIVE_ATTEMPTS, 12)) { coordinator =>
-      assert(coordinator.producerTimeoutTolerancePerMap === 10,
-        s"the endpoint must derive 10 from an allowance of 12 but derived " +
-          s"${coordinator.producerTimeoutTolerancePerMap}")
-      assert(coordinator.producerTimeoutToleranceForShuffle === 11,
-        s"the endpoint must derive 11 from an allowance of 12 but derived " +
-          s"${coordinator.producerTimeoutToleranceForShuffle}")
-    }
-  }
-
-  test("losing the same map output twice to a liveness timeout stands the whole shuffle down") {
+  test("losing the same map output repeatedly is recovered by recomputation, never by standing " +
+      "the shuffle down") {
     withCoordinator(streamingConf()) { coordinator =>
       val shuffleId = 7101
       val token = registerShuffleFor(coordinator, shuffleId)
-      assert(coordinator.producerTimeoutTolerancePerMap === 2,
-        "this case is written against the shipped tolerance of two losses per map output")
 
       // The original attempt of map output zero is lost to the connection timeout. That is the
-      // ordinary producer-failure flow and must NOT cost the shuffle its fast path.
+      // ordinary producer-failure flow: the generation is withdrawn, the epoch advances so a
+      // consumer can tell that what it holds predates the loss, and the reduce attempt fails with a
+      // fetch failure the scheduler recovers from.
       val original = timeOutProducer(coordinator, shuffleId, token, mapIndex = 0, attemptId = 100L)
       assert(original !== StreamingShuffleCoordinator.NO_EPOCH,
         "the invalidation must have withdrawn the registration and advanced the epoch")
       assert(coordinator.producerTimeoutCount(shuffleId, 0) === 1,
         s"one loss must be recorded but ${coordinator.producerTimeoutCount(shuffleId, 0)} were")
       assert(!coordinator.fallbackStateFor(shuffleId, token).fallenBack,
-        "a single producer loss is recovered by recomputation, never by standing the shuffle down")
+        "a producer loss is recovered by recomputation, never by standing the shuffle down")
 
       // A consumer that retries the very same invalidation must not be able to inflate the tally:
       // the generation it names has already been withdrawn, so nothing is withdrawn again.
@@ -585,113 +560,139 @@ class StreamingShuffleFallbackSuite
         register = false)
       assert(coordinator.producerTimeoutCount(shuffleId, 0) === 1,
         "re-invalidating a generation already gone must not be counted a second time")
-      assert(!coordinator.fallbackStateFor(shuffleId, token).fallenBack,
-        "and it must not be able to stand the shuffle down either")
 
-      // The recomputed attempt of the same map output is lost the same way. Recomputation is
-      // therefore not converging, and this is the point at which streaming must yield.
-      timeOutProducer(coordinator, shuffleId, token, mapIndex = 0, attemptId = 101L)
-      assert(coordinator.producerTimeoutCount(shuffleId, 0) === 2,
-        s"two losses must be recorded but ${coordinator.producerTimeoutCount(shuffleId, 0)} were")
-
-      val declared = coordinator.fallbackStateFor(shuffleId, token)
-      assert(declared.fallenBack,
-        "the shuffle must have stood streaming down once the same map output was lost twice")
-      assert(declared.reason.contains(StreamingShuffleFallbackReason.ConsumerTooSlow),
-        s"the condition recorded must be the pacing one but was ${declared.reason}")
-      assert(declared.detail.contains("map index 0") && declared.detail.contains("tolerance"),
-        s"the record must name the observation that was made, but reads ${declared.detail}")
-      assert(declared.detail.contains(STAGE_MAX_CONSECUTIVE_ATTEMPTS.key),
-        s"and it must name the allowance the bound is derived from, but reads ${declared.detail}")
+      // And now the point of the case. The recomputed attempt of the same map output is lost the
+      // same way, and so is the one after that, and the one after that. Every one of them is
+      // recovered by the specified flow and NOT ONE of them stands the shuffle down, because
+      // repeated producer loss is not one of the four conditions and this build does not invent a
+      // fifth from it.
+      (101L to 108L).foreach { attemptId =>
+        timeOutProducer(coordinator, shuffleId, token, mapIndex = 0, attemptId)
+        val declared = coordinator.fallbackStateFor(shuffleId, token)
+        assert(!declared.fallenBack,
+          s"attempt $attemptId was lost to the connection timeout, which must be recovered by " +
+            s"recomputing the upstream stage; instead the shuffle stood streaming down as " +
+            s"'${declared.condition}'")
+      }
+      assert(coordinator.producerTimeoutCount(shuffleId, 0) === 9,
+        s"every distinct generation lost must be tallied, but " +
+          s"${coordinator.producerTimeoutCount(shuffleId, 0)} of 9 were")
+      assert(coordinator.producerTimeoutTotal(shuffleId) === 9,
+        s"and the shuffle-wide tally must agree, but reads " +
+          s"${coordinator.producerTimeoutTotal(shuffleId)}")
+      assert(coordinator.fallbackStateFor(shuffleId, token).reason.isEmpty,
+        "no fallback condition may be reported for a shuffle that only ever lost producers")
     }
   }
 
-  test("liveness timeouts spread across map outputs stand the shuffle down at the wider bound") {
+  test("liveness timeouts spread across map outputs leave the shuffle streaming too") {
     withCoordinator(streamingConf()) { coordinator =>
       val shuffleId = 7102
       val token = registerShuffleFor(coordinator, shuffleId)
-      val tolerance = coordinator.producerTimeoutToleranceForShuffle
-      assert(tolerance === 3, "this case is written against the shipped shuffle-wide tolerance")
 
-      // One loss per map output satisfies no per-output bound, so only the shuffle-wide count can
-      // terminate this pattern -- and it must, because each loss still spends a stage attempt.
-      (0 until tolerance - 1).foreach { mapIndex =>
+      // One loss per map output, across every map output the shuffle declared and then some. The
+      // shape matters because a count-based bound would fire here even though each loss belongs to
+      // a different output and each is independently recovered by recomputation.
+      (0 until ProducerCount).foreach { mapIndex =>
         timeOutProducer(coordinator, shuffleId, token, mapIndex, attemptId = 200L + mapIndex)
         assert(coordinator.producerTimeoutCount(shuffleId, mapIndex) === 1,
           s"map output $mapIndex must have been lost exactly once")
         assert(!coordinator.fallbackStateFor(shuffleId, token).fallenBack,
-          s"${mapIndex + 1} loss(es) spread across map outputs must stay inside the tolerance of " +
-            s"$tolerance")
+          s"${mapIndex + 1} loss(es) spread across map outputs must leave the shuffle streaming")
       }
-
-      timeOutProducer(coordinator, shuffleId, token, mapIndex = tolerance - 1,
-        attemptId = 200L + tolerance - 1)
-      assert(coordinator.producerTimeoutTotal(shuffleId) === tolerance,
-        s"the shuffle-wide tally must read $tolerance but read " +
+      assert(coordinator.producerTimeoutTotal(shuffleId) === ProducerCount,
+        s"the shuffle-wide tally must read $ProducerCount but read " +
           s"${coordinator.producerTimeoutTotal(shuffleId)}")
       val declared = coordinator.fallbackStateFor(shuffleId, token)
-      assert(declared.fallenBack,
-        s"$tolerance losses spread one per map output must stand the shuffle down, because each " +
-          "one spends a stage attempt the scheduler will not give back")
-      assert(declared.reason.contains(StreamingShuffleFallbackReason.ConsumerTooSlow),
-        s"the condition recorded must be the pacing one but was ${declared.reason}")
+      assert(!declared.fallenBack,
+        s"losing every map output's producer once must still not stand the shuffle down, but it " +
+          s"stood down as '${declared.condition}'")
     }
   }
 
-  test("only a liveness timeout counts towards the stand down, and only an authorized one") {
+  test("only an authorized liveness timeout advances the diagnostic tallies") {
     withCoordinator(streamingConf()) { coordinator =>
       val shuffleId = 7103
       val token = registerShuffleFor(coordinator, shuffleId)
       val foreign = registerShuffleFor(coordinator, shuffleId + 1)
       assert(foreign !== token, "the two shuffles must not share a token")
 
+      // Far more losses of one map output, and of the shuffle as a whole, than any tolerance this
+      // subsystem could reasonably have chosen -- and the shuffle must still be streaming after
+      // every one of them. This is the assertion that would have caught the unplanned fifth
+      // trigger: it fails the moment producer loss is given a stand-down of its own.
+      val repeats = 8
+      (0 until repeats).foreach { attempt =>
+        timeOutProducer(coordinator, shuffleId, token, mapIndex = 0, attemptId = 100L + attempt)
+        val counted = coordinator.producerTimeoutCount(shuffleId, 0)
+        assert(counted === attempt + 1,
+          s"the loss must be counted, but the tally read $counted")
+        assert(!coordinator.fallbackStateFor(shuffleId, token).fallenBack,
+          s"${attempt + 1} loss(es) of one map output must leave the shuffle streaming: the " +
+            "answer to a lost producer is the specified producer-failure flow, bounded by the " +
+            "scheduler's own consecutive-attempt allowance, and not a fallback of this " +
+            "subsystem's")
+      }
+      (1 to repeats).foreach { mapIndex =>
+        timeOutProducer(coordinator, shuffleId, token, mapIndex, attemptId = 200L + mapIndex)
+        assert(!coordinator.fallbackStateFor(shuffleId, token).fallenBack,
+          s"losses spread across ${mapIndex + 1} map outputs must likewise leave it streaming")
+      }
+      assert(coordinator.producerTimeoutTotal(shuffleId) === repeats * 2,
+        s"every loss must be counted for diagnosis, but the shuffle-wide tally read " +
+          s"${coordinator.producerTimeoutTotal(shuffleId)}")
+
       // A producer withdrawing its own generation after its map task failed reports an incomplete
-      // stream, and so does a consumer that saw the stream close early. Both are ordinary task
-      // failure, which the unmodified scheduler retries; counting them would stand a shuffle down
-      // for injected faults and user-code failures that have nothing to do with pacing.
+      // stream, and so does a consumer that saw the stream close early. Neither is a liveness
+      // timeout, so neither belongs in a tally of liveness timeouts.
       val uncounted = Seq(
         StreamingShuffleInvalidationReason.IncompleteStream,
         StreamingShuffleInvalidationReason.ChecksumMismatch,
         StreamingShuffleInvalidationReason.StaleEpoch,
         StreamingShuffleInvalidationReason.Unknown)
+      val otherShuffle = shuffleId + 2
+      val otherToken = registerShuffleFor(coordinator, otherShuffle)
       uncounted.zipWithIndex.foreach { case (reason, index) =>
         val attemptId = 300L + index
-        registerProducerFor(coordinator, shuffleId, token, mapIndex = 0, attemptId)
-        coordinator.invalidateProducer(shuffleId, token,
+        registerProducerFor(coordinator, otherShuffle, otherToken, mapIndex = 0, attemptId)
+        coordinator.invalidateProducer(otherShuffle, otherToken,
           StreamingShuffleProducerGeneration(mapIndex = 0, mapId = attemptId, attemptId),
           reason, s"an invalidation reported as $reason")
-        assert(coordinator.producerTimeoutCount(shuffleId, 0) === 0,
+        assert(coordinator.producerTimeoutCount(otherShuffle, 0) === 0,
           s"$reason must not be counted as a producer-liveness loss")
       }
-      assert(coordinator.producerTimeoutTotal(shuffleId) === 0,
+      assert(coordinator.producerTimeoutTotal(otherShuffle) === 0,
         "no shuffle-wide loss may be recorded for reasons that are not liveness timeouts")
-      assert(!coordinator.fallbackStateFor(shuffleId, token).fallenBack,
+      assert(!coordinator.fallbackStateFor(otherShuffle, otherToken).fallenBack,
         "and the shuffle must still be streaming, however many of them arrive")
 
       // An unauthorized invalidation is refused before anything is recorded, so a stranger cannot
-      // drive a shuffle onto the sort-based path by repeating one.
-      registerProducerFor(coordinator, shuffleId, token, mapIndex = 1, attemptId = 400L)
-      (1 to coordinator.producerTimeoutToleranceForShuffle + 1).foreach { _ =>
-        assert(coordinator.invalidateProducer(shuffleId, foreign,
+      // drive a shuffle's recovery machinery by repeating one.
+      registerProducerFor(coordinator, otherShuffle, otherToken, mapIndex = 1, attemptId = 400L)
+      (1 to 4).foreach { _ =>
+        assert(coordinator.invalidateProducer(otherShuffle, foreign,
             StreamingShuffleProducerGeneration(mapIndex = 1, mapId = 400L, taskAttemptId = 400L),
             StreamingShuffleInvalidationReason.ConnectionTimeout, "unauthorized") ===
             StreamingShuffleCoordinator.NO_EPOCH,
           "an unauthorized invalidation must be refused without disclosing the epoch")
       }
-      assert(coordinator.producerTimeoutCount(shuffleId, 1) === 0,
+      assert(coordinator.producerTimeoutCount(otherShuffle, 1) === 0,
         "an unauthorized invalidation must not be counted")
-      assert(!coordinator.fallbackStateFor(shuffleId, token).fallenBack,
-        "and it must not be able to stand the shuffle down")
+      assert(!coordinator.fallbackStateFor(otherShuffle, otherToken).fallenBack,
+        "and it must leave the shuffle streaming")
 
       // The authorized timeout of the same generation is counted, which is what makes every
       // assertion above a statement about the guard rather than about an inert code path.
-      timeOutProducer(coordinator, shuffleId, token, mapIndex = 1, attemptId = 400L,
-        register = false)
-      assert(coordinator.producerTimeoutCount(shuffleId, 1) === 1,
+      timeOutProducer(coordinator, otherShuffle, token = otherToken, mapIndex = 1,
+        attemptId = 400L, register = false)
+      assert(coordinator.producerTimeoutCount(otherShuffle, 1) === 1,
         "the authorized timeout of a registered generation must be counted")
+      assert(!coordinator.fallbackStateFor(otherShuffle, otherToken).fallenBack,
+        "and counting it must still not stand the shuffle down")
     }
   }
 
+  // -----------------------------------------------------------------------------------------------
   // Trip 2: memory pressure prevented a buffer allocation, so streaming risks exhausting memory.
   // The signal is a PARTIAL GRANT, which is Spark's own idiom rather than anything invented here:
   // MemoryConsumer.acquireMemory answers with the amount it could grant, which may be less than the
@@ -763,14 +764,12 @@ class StreamingShuffleFallbackSuite
   test("link utilisation exactly at the saturation threshold does not trip") {
     val policy = activePolicy(newManualClock())
 
-    // Repeated as many times as a sustained run would need, so that "exactly ninety does not trip"
-    // is established against the sustained rule rather than merely against the first sample of it.
-    (0L until StreamingShuffleFallbackPolicy.SATURATION_SUSTAINED_SAMPLES + 1L).foreach { _ =>
+    // Repeated, so that "exactly ninety does not trip" is established over a run of readings and
+    // not merely for the first one: the trip is immediate on any reading strictly above the share,
+    // so a reading AT the share must be inert however many of them arrive.
+    (0L until 4L).foreach { _ =>
       policy.recordLinkUtilization(EgressAtSaturationThreshold, LinkCapacityBytesPerSecond)
     }
-    assert(policy.consecutiveSaturatedSampleCount == 0L,
-      "a sample at exactly the threshold is not over capacity, so no run may be counted, but the " +
-        s"run reads ${policy.consecutiveSaturatedSampleCount}")
 
     assert(!policy.hasTripped,
       "utilisation of exactly ninety per cent must not trip; the comparison is strictly greater")
@@ -782,34 +781,25 @@ class StreamingShuffleFallbackSuite
       "utilisation at the threshold must leave the streaming path in service")
   }
 
-  test("link utilisation strictly above the saturation threshold trips") {
+  test("the first link utilisation reading strictly above the saturation threshold trips") {
     val clock = newManualClock()
     val policy = activePolicy(clock)
 
-    // Sustained, not instantaneous, and the reason is the pacing bucket rather than caution. A
-    // bucket must be able to admit one maximum-sized block or it would refuse every block forever,
-    // so its burst allowance is at least one frame however small its paced share is -- and a bucket
-    // that starts full legitimately delivers that burst inside one sampling interval, which across
-    // several concurrent shuffles sums to a multiple of the administered capacity for exactly that
-    // interval. Tripping on the first sample turned that legal burst into a stand-down: egress read
-    // at nearly twice the administered capacity with not one stream throttled, every live producer
-    // invalidated, and over a quarter of the shuffle's records written again by the recomputation.
-    // A burst clears on the next sample; a saturated link does not, and still trips within a few
-    // seconds.
-    var sample = 1L
-    while (sample < StreamingShuffleFallbackPolicy.SATURATION_SUSTAINED_SAMPLES) {
-      policy.recordLinkUtilization(EgressAtSaturationThreshold + 1.0d, LinkCapacityBytesPerSecond)
-      assert(!policy.hasTripped,
-        s"sample $sample is over capacity but short of a sustained run, so it must not trip")
-      assert(policy.consecutiveSaturatedSampleCount == sample,
-        s"the run must stand at $sample but reads ${policy.consecutiveSaturatedSampleCount}")
-      assert(policy.streamingActive, s"streaming must remain active through sample $sample")
-      sample += 1L
-    }
+    // ONE reading, and the trip is immediate. The specification names network saturation above
+    // ninety percent of the link capacity as a fallback condition and attaches no sustaining
+    // requirement to it, so requiring a run of readings would leave a genuinely saturated link
+    // streaming for as long as the run took to accumulate -- which is the interval during which
+    // streaming is starving every other tenant of that link. What keeps a single reading honest is
+    // the reading itself: an egress rate is derived from a whole measurement window rather than
+    // from one transfer, and a sample whose capacity is unknown is refused outright rather than
+    // evaluated, which the case below this one pins.
+    assert(!policy.hasTripped, "the policy must start untripped, or this case proves nothing")
 
-    policy.recordLinkUtilization(EgressAtSaturationThreshold + 1.0d, LinkCapacityBytesPerSecond)
+    policy.recordLinkUtilization(
+      EgressAtSaturationThreshold + 1.0d, LinkCapacityBytesPerSecond, clock.getTimeMillis())
 
-    assert(policy.hasTripped, "utilisation past the tolerated share must trip")
+    assert(policy.hasTripped,
+      "the very first reading past the tolerated share must trip, with no run to accumulate")
     assert(policy.trippedReason.contains(NetworkSaturation),
       s"the reported reason must be NetworkSaturation but was ${policy.trippedReason}")
     assert(policy.trippedAtTimeMillis.contains(clock.getTimeMillis()),
@@ -869,11 +859,8 @@ class StreamingShuffleFallbackSuite
     assert(!policy.hasTripped,
       "the administered capacity must tolerate utilisation at the threshold")
 
-    // A run of samples, because a single one is a pacing bucket's legal burst: see
-    // StreamingShuffleFallbackPolicy.SATURATION_SUSTAINED_SAMPLES.
-    (1L to StreamingShuffleFallbackPolicy.SATURATION_SUSTAINED_SAMPLES).foreach { _ =>
-      policy.recordLinkUtilization(capacity)
-    }
+    // One reading, because one reading strictly above the share is the whole of the condition.
+    policy.recordLinkUtilization(capacity)
     assert(policy.hasTripped, "a fully saturated administered link must trip")
     assert(policy.trippedReason.contains(NetworkSaturation),
       s"the reported reason must be NetworkSaturation but was ${policy.trippedReason}")
@@ -1261,10 +1248,8 @@ class StreamingShuffleFallbackSuite
     val clock = newManualClock()
     val policy = activePolicy(clock)
 
-    // A run of samples, since one is a pacing bucket's legal burst rather than a saturated link.
-    (1L to StreamingShuffleFallbackPolicy.SATURATION_SUSTAINED_SAMPLES).foreach { _ =>
-      policy.recordLinkUtilization(LinkCapacityBytesPerSecond, LinkCapacityBytesPerSecond)
-    }
+    // One reading at the full administered capacity, which is strictly above the tolerated share.
+    policy.recordLinkUtilization(LinkCapacityBytesPerSecond, LinkCapacityBytesPerSecond)
     assert(policy.trippedReason.contains(NetworkSaturation), "the first condition must be recorded")
     val firstTrippedAt = policy.trippedAtTimeMillis
     assert(firstTrippedAt.contains(clock.getTimeMillis()), "the first trip must be stamped")
@@ -1293,11 +1278,24 @@ class StreamingShuffleFallbackSuite
     driveSustainedConsumerSlowness(policy, clock)
     policy.recordProducerThroughput(OtherShuffleId, ProducerBytesPerSecond, clock.getTimeMillis())
     policy.recordAllocationGrant(0L, 0L)
+    // A saturating reading is part of that sampling state, and it is taken here so that reset is
+    // exercised against a policy that has taken one. A reading left standing across a reset
+    // described a link the next workload never used, and an operator reading it after a later trip
+    // would be told about capacity this workload never consumed.
+    policy.recordLinkUtilization(EgressAtSaturationThreshold + 1.0d, LinkCapacityBytesPerSecond)
     assert(policy.hasTripped, "the fixture must have tripped before reset is exercised")
     assert(policy.trackedShuffleCount == 2, "two shuffles must have been sampled")
     assert(policy.unevaluableSampleCount == 1L, "one un-evaluable sample must have been counted")
 
     policy.reset()
+
+    // And the cleared sampling state must behave as cleared: a reused policy tolerates the
+    // threshold again rather than carrying the previous workload's readings into this one.
+    (0L until SaturationSampleRepetitions).foreach { _ =>
+      policy.recordLinkUtilization(EgressAtSaturationThreshold, LinkCapacityBytesPerSecond)
+    }
+    assert(!policy.hasTripped,
+      "a reset policy must tolerate utilisation at the threshold exactly as a fresh one does")
 
     assert(!policy.hasTripped, "reset must restore the untripped state")
     assert(policy.trippedReason.isEmpty, "reset must discard the latched reason")
@@ -1383,11 +1381,8 @@ class StreamingShuffleFallbackSuite
       ConsumerTooSlow -> ((policy, clock) => driveSustainedConsumerSlowness(policy, clock)),
       MemoryPressure -> ((policy, _) => policy.recordAllocationGrant(RequestedBufferBytes, 0L)),
       NetworkSaturation -> ((policy, _) =>
-        // A run of samples: one over-capacity sample is a pacing bucket's legal burst, so the
-        // policy requires the run before it calls the link saturated.
-        (1L to StreamingShuffleFallbackPolicy.SATURATION_SUSTAINED_SAMPLES).foreach { _ =>
-          policy.recordLinkUtilization(LinkCapacityBytesPerSecond, LinkCapacityBytesPerSecond)
-        }),
+        // One reading at the full administered capacity, strictly above the tolerated share.
+        policy.recordLinkUtilization(LinkCapacityBytesPerSecond, LinkCapacityBytesPerSecond)),
       ProtocolVersionMismatch -> ((policy, _) =>
         assert(!policy.checkProtocolVersion(IncompatibleProtocolVersion),
           "the fixture must actually drive the protocol mismatch it claims to drive")))
@@ -1599,6 +1594,85 @@ class StreamingShuffleFallbackSuite
       "every condition must carry an operator-facing wording")
     assert(all.map(_.description).distinct.size == all.size,
       "every condition must be distinguishable from the others in the log")
+
+    // And the correspondence runs the other way too: each member's wording states its OWN
+    // predicate and no other, so an operator who reads a name is told what was measured. The
+    // consumer-slowness member is asserted specifically because it had been widened to cover
+    // producer
+    // loss, which is a different condition recovered by a different flow.
+    assert(ConsumerTooSlow.description.contains("2x slower") &&
+        ConsumerTooSlow.description.contains("60 seconds"),
+      s"consumer slowness must render as the measured rate predicate: '${
+        ConsumerTooSlow.description}'")
+    assert(!ConsumerTooSlow.description.contains("timeout") &&
+        !ConsumerTooSlow.description.contains("producer(s)"),
+      s"and must claim nothing about producer loss: '${ConsumerTooSlow.description}'")
+    assert(MemoryPressure.description.contains("memory"),
+      s"memory pressure must render as a memory condition: '${MemoryPressure.description}'")
+    assert(NetworkSaturation.description.contains("90%"),
+      s"network saturation must render with its threshold: '${NetworkSaturation.description}'")
+    assert(ProtocolVersionMismatch.description.contains("version"),
+      s"a version mismatch must render as one: '${ProtocolVersionMismatch.description}'")
+  }
+
+  test("a capability stand-down is not a fallback condition and never borrows one of their names") {
+    // The four conditions above are a closed set of MEASUREMENTS. Two situations stand a shuffle
+    // down without measuring any of them -- a read shape the protocol cannot serve, and producers
+    // that could not be reached -- and they are named separately precisely so that the four keep
+    // meaning four things. This case asserts the separation both ways.
+    val causes = StreamingShuffleStandDownCause.structuralDeclines
+    assert(causes === Seq(
+        StreamingShuffleStandDownCause.UnsupportedReadShape,
+        StreamingShuffleStandDownCause.ProducerUnavailable),
+      s"the build must hold exactly these two capability causes but held $causes")
+
+    val conditionNames = StreamingShuffleFallbackReason.all.map(_.toString).toSet
+    assert(causes.forall(cause => !conditionNames.contains(cause.toString)),
+      s"no cause may borrow a condition's name, yet ${causes.map(_.toString)} overlaps " +
+        s"$conditionNames")
+    assert(causes.forall(cause => StreamingShuffleFallbackReason.fromName(cause.toString).isEmpty),
+      "and no cause may resolve onto the four conditions")
+    assert(causes.forall(cause =>
+        StreamingShuffleStandDownCause.fromName(cause.toString).exists(resolved =>
+          !resolved.isInstanceOf[StreamingShuffleFallbackReason])),
+      "a cause resolved through the shared entry point must report no measured condition")
+    // The four conditions ARE causes -- `StreamingShuffleFallbackReason` extends the cause
+    // supertype -- so the shared entry point resolves a condition's name, which is what lets a
+    // stand-down of any kind cross the RPC boundary as one name. What it may never do is answer a
+    // condition's name with a capability cause, because that is the aliasing this separation
+    // exists to forbid: it must answer with that same condition and nothing else.
+    assert(StreamingShuffleFallbackReason.all.forall(reason =>
+        StreamingShuffleStandDownCause.fromName(reason.toString).exists {
+          case _: StreamingShuffleStandDownCause.StructuralDecline => false
+          case resolved => resolved == reason
+        }),
+      "and no condition may resolve onto the causes")
+    assert(causes.forall(_.description.nonEmpty) &&
+        causes.map(_.description).distinct.size == causes.size,
+      s"every cause must carry a distinct operator-facing wording but held " +
+        s"${causes.map(_.description)}")
+    assert(StreamingShuffleStandDownCause.fromName("NotACauseName").isEmpty &&
+        StreamingShuffleStandDownCause.fromName(null).isEmpty,
+      "an unknown or null name must resolve to nothing, so no peer can introduce a cause")
+
+    // A cause never trips the executor-local policy either: the policy's four conditions are the
+    // only things it measures, so a capability limit reaches the coordinator directly and leaves
+    // the policy's own verdict empty.
+    val policy = activePolicy(newManualClock())
+    assert(policy.trippedReason.isEmpty && !policy.hasTripped,
+      "the policy must start untripped, or the assertion below proves nothing")
+    policy.observeShuffleFallback(4242, StreamingShuffleFallbackState(
+      StreamingShuffleStandDownCause.ProducerUnavailable.toString, declaredAtEpoch = 3L))
+    assert(policy.shuffleHasFallenBack(4242),
+      "the shuffle-wide verdict must be cached whatever kind of stand-down it carries")
+    assert(policy.trippedReason.isEmpty,
+      s"but no condition may be latched locally by it, yet ${policy.trippedReason} was")
+    assert(policy.knownShuffleFallback(4242).flatMap(_.reason).isEmpty,
+      "and the cached verdict must report no measured condition")
+    assert(policy.knownShuffleFallback(4242).map(_.condition) ===
+        Some(StreamingShuffleStandDownCause.ProducerUnavailable.description),
+      s"while still rendering the cause an operator reads, but rendered " +
+        s"${policy.knownShuffleFallback(4242).map(_.condition)}")
   }
 
   test("fallback publishes no fifth metric and raises no error condition") {

@@ -22,7 +22,7 @@ import java.lang.reflect.Modifier
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import java.util.Locale
-import java.util.concurrent.{Callable, CountDownLatch, TimeUnit}
+import java.util.concurrent.{Callable, CountDownLatch, CyclicBarrier, TimeUnit}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicReference}
 
 import scala.collection.mutable
@@ -33,17 +33,23 @@ import scala.reflect.ClassTag
 import _root_.io.netty.channel.{ChannelFuture, ChannelFutureListener, DefaultChannelId}
 import _root_.io.netty.channel.embedded.EmbeddedChannel
 
-import org.apache.spark.{FetchFailed, LocalSparkContext, ShuffleDependency, SparkConf, SparkContext, SparkException, SparkFunSuite, SparkThrowable, TaskContext, TaskContextImpl}
+import org.apache.spark.{FetchFailed, LocalSparkContext, ShuffleDependency, SparkConf, SparkContext,
+  SparkException, SparkFunSuite, SparkThrowable, TaskContext, TaskContextImpl}
 import org.apache.spark.internal.config.{SHUFFLE_COMPRESS, SHUFFLE_STREAMING_ENABLED}
 import org.apache.spark.network.buffer.NioManagedBuffer
-import org.apache.spark.network.client.{RpcResponseCallback, TransportClient, TransportResponseHandler}
+import org.apache.spark.network.client.{RpcResponseCallback, TransportClient,
+  TransportResponseHandler}
 import org.apache.spark.network.protocol.OneWayMessage
 import org.apache.spark.network.server.TransportRequestHandler
-import org.apache.spark.network.shuffle.protocol.streaming.{AckMessage, DataBlockMessage, HeartbeatMessage, RetransmitRequestMessage, StreamingShuffleChecksum, StreamingShuffleMessage, StreamingShuffleMessageType, StreamTerminationMessage}
+import org.apache.spark.network.shuffle.protocol.streaming.{AckMessage, DataBlockMessage,
+  HeartbeatMessage, RetransmitRequestMessage, StreamingShuffleChecksum, StreamingShuffleMessage,
+  StreamingShuffleMessageType, StreamTerminationMessage}
 import org.apache.spark.rpc.{RpcAddress, RpcEndpointRef, RpcTimeout}
-import org.apache.spark.shuffle.{FetchFailedException, ShuffleManager, ShuffleReader, ShuffleReadMetricsReporter}
+import org.apache.spark.shuffle.{FetchFailedException, ShuffleManager, ShuffleReader,
+  ShuffleReadMetricsReporter}
 import org.apache.spark.storage.{BlockManagerId, ShuffleBlockId}
-import org.apache.spark.util.{Clock, ManualClock, SystemClock, TaskCompletionListenerException, ThreadUtils}
+import org.apache.spark.util.{Clock, ManualClock, SystemClock, TaskCompletionListenerException,
+  ThreadUtils}
 
 /**
  * One consumer channel a test has opened to a streaming shuffle producer.
@@ -73,6 +79,13 @@ private[streaming] class StreamingShuffleTestProducerStream(
   private val deliveredBuffers = mutable.ArrayBuffer.empty[RecordingStreamingManagedBuffer]
 
   private val crashed = new AtomicBoolean(false)
+
+  def awaitDataPlane(operation: String): Unit = {
+    if (!handler.awaitDataPlaneIdle(10000L)) {
+      throw new IllegalStateException(
+        s"The consumer data plane did not settle after $operation")
+    }
+  }
 
   /**
    * The transport's own dispatcher for an inbound frame, which is what owns the frame's buffer.
@@ -129,6 +142,7 @@ private[streaming] class StreamingShuffleTestProducerStream(
       deliveredBuffers += buffer
     }
     transportDispatcher.handle(new OneWayMessage(buffer))
+    awaitDataPlane("frame delivery")
     assert(buffer.callsToRetain == 0,
       s"The consumer took ${buffer.callsToRetain} reference(s) on a transport buffer it must " +
         s"copy out of instead, so a frame's bytes could outlive the call that delivered it")
@@ -158,6 +172,7 @@ private[streaming] class StreamingShuffleTestProducerStream(
       deliveredBuffers += buffer
     }
     handler.receive(client, buffer.nioByteBuffer())
+    awaitDataPlane("raw frame delivery")
     buffer
   }
 
@@ -183,10 +198,12 @@ private[streaming] class StreamingShuffleTestProducerStream(
     val foreignChannel = new EmbeddedChannel(DefaultChannelId.newInstance())
     val foreignClient = new TransportClient(foreignChannel, new TransportResponseHandler(
       foreignChannel))
+    foreignClient.setClientId("streaming-shuffle-reader-suite")
     val framed = message.toByteBuffer()
     val bytes = new Array[Byte](framed.remaining())
     framed.duplicate().get(bytes)
     handler.receive(foreignClient, ByteBuffer.wrap(bytes))
+    awaitDataPlane("foreign-channel frame delivery")
     foreignChannel.finishAndReleaseAll()
     foreignClient
   }
@@ -204,6 +221,7 @@ private[streaming] class StreamingShuffleTestProducerStream(
    * @return the frames, oldest first
    */
   def drainOutboundMessages(): Seq[StreamingShuffleMessage] = {
+    awaitDataPlane("outbound control production")
     val decoded = mutable.ArrayBuffer.empty[StreamingShuffleMessage]
     var written = channel.readOutbound[AnyRef]()
     while (written != null) {
@@ -229,6 +247,7 @@ private[streaming] class StreamingShuffleTestProducerStream(
    * @return the encoded frames, oldest first
    */
   def encodedOutboundFrames: Seq[Array[Byte]] = {
+    awaitDataPlane("encoded outbound control production")
     val frames = mutable.ArrayBuffer.empty[Array[Byte]]
     var written = channel.readOutbound[AnyRef]()
     while (written != null) {
@@ -312,6 +331,7 @@ private[streaming] class StreamingShuffleTestProducerConnector(refusalsBeforeSuc
     } else {
       val channel = new EmbeddedChannel()
       val client = new TransportClient(channel, new TransportResponseHandler(channel))
+      client.setClientId("streaming-shuffle-reader-suite")
       val stream = new StreamingShuffleTestProducerStream(location, handler, channel, client)
       synchronized {
         opened += stream
@@ -320,6 +340,10 @@ private[streaming] class StreamingShuffleTestProducerConnector(refusalsBeforeSuc
       // the in-progress block request -- is written from it. Raising it here is what makes the
       // fixture behave like the production connector rather than merely resemble it.
       handler.channelActive(client)
+      if (!handler.awaitDataPlaneIdle(10000L)) {
+        throw new IllegalStateException(
+          "The consumer data plane did not settle after producer channel activation")
+      }
       firstConnection.countDown()
       Some(client)
     }
@@ -373,6 +397,27 @@ private[streaming] class BarrieredStreamingShuffleProducerConnector(conf: SparkC
    */
   def duringCreation(action: () => Unit): Unit = insideCreation.set(action)
 
+  private val insideReservation = new AtomicReference[() => Unit](() => ())
+
+  /**
+   * Installs an action to run while a place on a shared channel is reserved and before the joining
+   * handler is published into it.
+   *
+   * This is the second ownership interval the production connector has, and the one a departing
+   * participant races: the joiner holds a reference the participant set does not yet reflect, so a
+   * release that decided "last" from the set alone would close the socket underneath it. Standing
+   * inside the interval is the only way to run the other side of that race deterministically.
+   *
+   * @param action what to run inside the reservation interval
+   */
+  def duringShareReservation(action: () => Unit): Unit = insideReservation.set(action)
+
+  override protected def reserveShare(share: ChannelShare): Boolean = {
+    val reserved = super.reserveShare(share)
+    insideReservation.get()()
+    reserved
+  }
+
   /** Every channel this connector created, in creation order. */
   def createdClients: Seq[TransportClient] = created.asScala.toSeq
 
@@ -383,6 +428,7 @@ private[streaming] class BarrieredStreamingShuffleProducerConnector(conf: SparkC
     // asserting against a registry that had merged them.
     val channel = new EmbeddedChannel(DefaultChannelId.newInstance())
     val client = new TransportClient(channel, new TransportResponseHandler(channel))
+    client.setClientId("streaming-shuffle-reader-suite")
     created.add(client)
     insideCreation.get()()
     client
@@ -688,6 +734,16 @@ class StreamingShuffleReaderSuite
    */
   private val TwoProducers = 2
 
+  /**
+   * Map tasks a case declares when it asserts how a map range is selected.
+   *
+   * Four, because a narrowed range has to be distinguishable from every neighbour it could be
+   * confused with: a range that omits the first index, one that omits the last, one that omits both
+   * ends, and one that lies wholly beyond the declared cardinality. Three would leave the
+   * "omits both ends" selection indistinguishable from a single index.
+   */
+  private val FourProducers = 4
+
   private val ProducerMapId = 0L
 
   private val ProducerAttemptId = 200L
@@ -713,6 +769,24 @@ class StreamingShuffleReaderSuite
 
   private val BlocksPastHighWaterMark = StreamingShuffleClientHandler.INBOUND_QUEUE_HIGH_WATER_MARK
 
+  /**
+   * Bound on the two-thread barrier the channel-share race is driven through.
+   *
+   * Generous rather than tight: it is not a timing assertion, it is the point at which a hung
+   * interleaving is reported as a failure instead of stalling the suite. The work either side of
+   * the barrier is a handful of lock-free operations.
+   */
+  private val RaceBarrierTimeoutSeconds = 30L
+
+  /**
+   * Receive window the completion cases register their one stream with.
+   *
+   * Several maximum-size frames, so nothing in those cases is throttled by credit: they are about
+   * what happens when a stream ends, and a stream held up by its window would never get there.
+   */
+  private val LedgeredConsumerCreditBytes =
+    DataBlockMessage.MAX_ENCODED_FRAME_BYTES.toLong * 8L
+
   private val LookupWaitMillis = 7L
 
   private val FullRangeStart = 0
@@ -731,6 +805,31 @@ class StreamingShuffleReaderSuite
     // The metrics source is a JVM singleton, so its counters survive from one test into the next.
     // Resetting is what makes an assertion on partialReadInvalidations a statement about this test.
     resetStreamingShuffleMetrics()
+    // The executor-wide streaming buffer allowance a consumer charges its received bytes to is
+    // likewise process-scoped and memoised, so bytes a case deliberately abandoned -- a reader
+    // whose task never completed, a frame refused mid-flight -- would still be charged when the
+    // next case asserted that a task which succeeded returned everything it held.
+    MemorySpillManager.resetSharedStateForTesting()
+  }
+
+  /**
+   * Returns the process-scoped state to zero AFTER the case has finished, as well as before it.
+   *
+   * Resetting only on the way in is not enough, and the reason is ordering rather than tidiness: a
+   * case's own teardown is still running code. `LocalSparkContext` stops the context here, and a
+   * stopping context reports its last task ends, drains its metrics system and withdraws whatever
+   * the streaming manager still held -- all of which can advance a counter after the body returned.
+   * Left in place, that advance becomes the starting point of whichever case runs next in this JVM.
+   * So the reset follows the shutdown, and the one in `beforeEach` remains as the guard against a
+   * suite that never ran a teardown at all.
+   */
+  override def afterEach(): Unit = {
+    try {
+      super.afterEach()
+    } finally {
+      resetStreamingShuffleMetrics()
+      MemorySpillManager.resetSharedStateForTesting()
+    }
   }
 
   /**
@@ -1139,6 +1238,7 @@ class StreamingShuffleReaderSuite
           stream.handler.exceptionCaught(failure, stream.client)
         }
       }))
+      stream.awaitDataPlane("injected I/O failure")
     } finally {
       pool.shutdownNow()
     }
@@ -1689,6 +1789,7 @@ class StreamingShuffleReaderSuite
     // complete, so this is a read of retained output -- the same state as the single-producer
     // invalidation case above -- and the only difference under test is the producer count.
     val fixture = new ReaderFixture(numMaps = TwoProducers, completedMaps = Set(0, 1))
+    val receiveQuotaBaseline = fixture.backpressure.reservedReceiveQuotaBytes
     val lostProducer = fixture.producers.head
     val survivingProducer = fixture.producers.last
     assert(lostProducer.mapIndex == 0 && survivingProducer.mapIndex == 1,
@@ -1851,6 +1952,17 @@ class StreamingShuffleReaderSuite
     assert(fixture.connector.closeCallCount == 0,
       s"A reader must close only the channels it opened and never the executor-scoped connector, " +
         s"but the connector was closed ${fixture.connector.closeCallCount} time(s)")
+
+    // The fetch failure ends the reduce task in production. Complete that lifecycle only after
+    // proving the peer survived the per-producer invalidation, so its still-live handler returns
+    // the executor-wide receive quota it intentionally retained during the observation above.
+    fixture.context.markTaskFailed(failure)
+    fixture.context.markTaskCompleted(Some(failure))
+    assert(survivingStream.handler.isClosed,
+      "Task completion must release the peer after the per-producer invalidation assertion")
+    assert(fixture.backpressure.reservedReceiveQuotaBytes == receiveQuotaBaseline,
+      s"Task completion must return the receive quota to $receiveQuotaBaseline byte(s), but " +
+        s"${fixture.backpressure.reservedReceiveQuotaBytes} byte(s) remained")
   }
 
   test("several producers lost together are one fetch failure counted exactly once") {
@@ -1860,6 +1972,7 @@ class StreamingShuffleReaderSuite
     // output, so there are two partial reads outstanding and only one of them can be reported --
     // the reader reaches producers in map-index order and the first loss it meets ends the read.
     val fixture = new ReaderFixture(numMaps = TwoProducers, completedMaps = Set(0, 1))
+    val receiveQuotaBaseline = fixture.backpressure.reservedReceiveQuotaBytes
     val injector = newFaultInjector(fixture.clock)
     val firstProducer = fixture.producers.head
     val secondProducer = fixture.producers.last
@@ -1944,6 +2057,17 @@ class StreamingShuffleReaderSuite
     assert(fixture.streamOf(firstProducer.mapIndex).handler.isClosed,
       "The reported producer's channel must be shut, or a block arriving after the discard could " +
         "be mixed into the recomputed input")
+
+    // Only the first loss is reported, so the second handler remains live until the failed task's
+    // completion listener runs. Exercise that real lifecycle rather than leaving its accepted
+    // blocks charged to the executor-wide quota for every later case in this suite.
+    fixture.context.markTaskFailed(failure)
+    fixture.context.markTaskCompleted(Some(failure))
+    assert(fixture.connector.streams.forall(_.handler.isClosed),
+      "Task completion must release every producer handler after the one reported fetch failure")
+    assert(fixture.backpressure.reservedReceiveQuotaBytes == receiveQuotaBaseline,
+      s"Task completion must return the receive quota to $receiveQuotaBaseline byte(s), but " +
+        s"${fixture.backpressure.reservedReceiveQuotaBytes} byte(s) remained")
   }
 
 
@@ -2016,6 +2140,238 @@ class StreamingShuffleReaderSuite
         s"${observedPartialReadInvalidations()} was recorded")
     assert(fixture.coordinatorRef.invalidationsSent.isEmpty,
       "Corruption repaired inside the retained window must not invalidate a producer")
+  }
+
+  test("a held end-of-stream terminates the flow-control ledger as well as the stream") {
+    startContext()
+    val fixture = new ReaderFixture()
+    val payload = fixture.encodePartition(StreamedRecords)
+    // Two blocks, so that a repair can be outstanding while a terminator naming the full total
+    // arrives. That is the one ordering that reaches the deferred acceptance path: the terminator
+    // is ahead of the position this consumer has reached, but only because a block it already
+    // committed to is being replayed.
+    val blocks = fixture.dataBlocksOf(payload, blocks = 2)
+    val corrupt = corruptedDataBlock(fixture.shuffleId, ProducerMapId, fixture.partitionId,
+      blocks(1).sequenceNumber(), blocks(1).copyPayload())
+
+    val records = fixture.reader.read()
+    val stream = fixture.connector.onlyStream
+    val ledgerKey = fixture.consumerLedgerKey
+    assert(ledgerKey.isDefined, "The reader must have registered a credit ledger for its partition")
+    stream.deliver(blocks.head)
+    stream.deliver(corrupt)
+    assert(stream.handler.quarantinedPositionCount(fixture.partitionId) == 1,
+      s"The corrupt position must be quarantined for a replay, but " +
+        s"${stream.handler.quarantinedPositionCount(fixture.partitionId)} position(s) were")
+    assert(stream.handler.expectedSequenceNumber(fixture.partitionId) == 1L,
+      s"The consumer must still be waiting for position 1, but expects " +
+        s"${stream.handler.expectedSequenceNumber(fixture.partitionId)}")
+
+    // The terminator names both blocks while the second is still being repaired. Held, not refused:
+    // refusing it would report a producer that has done nothing wrong as lost.
+    stream.deliver(fixture.terminator(blocks.size.toLong))
+    assert(stream.handler.deferredTerminationCount(fixture.partitionId) == 1L,
+      s"The end-of-stream must be held while the repair is outstanding, but " +
+        s"${stream.handler.deferredTerminationCount(fixture.partitionId)} was held")
+    assert(stream.handler.rejectedTerminationCount(fixture.partitionId) == 0L,
+      "A terminator held for a repair must not also be counted as refused")
+    assert(!stream.handler.isStreamComplete(fixture.partitionId),
+      "A held end-of-stream must leave the stream unfinished")
+    assert(!fixture.backpressure.isStreamTerminated(ledgerKey.get),
+      "A held end-of-stream must leave the flow-control ledger unfinished too, so the producer " +
+        "liveness timer stays armed for the replay that is still owed")
+
+    // The replay closes the gap, which is the only event that can apply a held terminator.
+    stream.deliver(blocks(1))
+    assert(stream.handler.isStreamComplete(fixture.partitionId),
+      "Applying the held end-of-stream must finish the stream")
+    assert(stream.handler.announcedBlockCount(fixture.partitionId).contains(blocks.size.toLong),
+      s"The applied terminator must publish the total it named, but published " +
+        s"${stream.handler.announcedBlockCount(fixture.partitionId)}")
+    // The regression this case exists for. The deferred path used to set this handler's own
+    // completion state and enqueue the marker without telling the flow-control protocol, so a
+    // stream that ended after a repair stayed un-terminated in the protocol's ledger: it went on
+    // arming the producer-liveness timer for a producer that had finished and had nothing more to
+    // send, and the ledger's own terminated reading -- which is what distinguishes silence that
+    // means completion from silence that means failure -- disagreed with the handler's.
+    assert(fixture.backpressure.isStreamTerminated(ledgerKey.get),
+      "A deferred end-of-stream must reach the flow-control ledger exactly as an immediate one " +
+        "does, or a finished producer goes on being measured for liveness")
+    assert(readRecords(records) == expectedRecords,
+      "A partition whose end-of-stream was held for a repair must still read complete")
+    assert(fixture.coordinatorRef.invalidationsSent.isEmpty,
+      "A repair that completed must invalidate no producer")
+  }
+
+  // -----------------------------------------------------------------------------------------------
+  // Log volume: which records reach an operator, and how many of them.
+  //
+  // The budget is under 10 MiB per hour per executor with the streaming debug key off, and it is a
+  // per-EXECUTOR budget. That is what the two cases below are about, because a consumer handler
+  // exists per producer channel and a reduce task opens one channel per map output it reads: a
+  // bound that admits one record per handler, or one record per loss per handler, produces a volume
+  // set by the product of reduce tasks and map outputs rather than by time.
+  // -----------------------------------------------------------------------------------------------
+
+  test("a consumer's recurring records are bounded by the executor, not by the channel") {
+    startContext()
+    // Two producers, so there are two consumer handlers in this JVM -- which is the whole point. A
+    // per-handler window is indistinguishable from a per-executor one when only one handler exists.
+    val fixture = new ReaderFixture(numMaps = TwoProducers, completedMaps = Set(0, 1))
+    fixture.reader.read()
+    val first = fixture.streamOf(0)
+    val second = fixture.streamOf(1)
+    // The executor-scoped window outlives a test the way it outlives a task, so it is returned to
+    // its initial state here rather than inherited from whatever ran before this case.
+    MemorySpillManager.resetSharedStateForTesting()
+    val aggregator = StreamingShuffleClientHandler.misaddressedFrameLogAggregator
+    assert(aggregator.occurrenceCount == 0L && aggregator.unreportedCount == 0L,
+      s"The shared reset must leave the executor's window open and its tally at zero, but the " +
+        s"tally read ${aggregator.occurrenceCount} with " +
+        s"${aggregator.unreportedCount} unreported")
+
+    // A block naming a partition neither handler serves, delivered to each of them in turn. Dropped
+    // rather than escalated, so the read is unaffected and the only thing under test is the record.
+    val foreignPartition = fixture.partitionId + 41
+    val stray = fixture.encodePartition(StreamedRecords)
+    val (_, captured) = capturingStreamingLogs {
+      first.deliver(dataBlock(fixture.shuffleId, first.location.mapId, foreignPartition, 0L, stray))
+      second.deliver(
+        dataBlock(fixture.shuffleId, second.location.mapId, foreignPartition, 0L, stray))
+    }
+
+    // Both channels counted their own frame: a per-channel tally is real information and is what a
+    // suite and an operator use to tell one bad producer from a bad executor.
+    assert(first.handler.misaddressedFrameCount == 1L &&
+        second.handler.misaddressedFrameCount == 1L,
+      s"Each channel must count the frame it dropped, but they counted " +
+        s"${first.handler.misaddressedFrameCount} and ${second.handler.misaddressedFrameCount}")
+    // One record between them, and it is the executor's window that says so.
+    assert(aggregator.occurrenceCount == 2L,
+      s"The executor's tally must have both occurrences, but it read ${aggregator.occurrenceCount}")
+    assert(aggregator.unreportedCount == 1L,
+      s"The second occurrence must have been accounted rather than reported, so exactly one must " +
+        s"be unreported, but ${aggregator.unreportedCount} were")
+    val dropped = captured.filter(record =>
+      record.isDefaultLevel && record.message.contains("dropped"))
+    assert(dropped.size == 1,
+      s"Two channels dropping a frame must produce one default-level record, not one each, but " +
+        s"produced ${dropped.size}: ${dropped.map(_.message).mkString(" | ")}")
+    assert(dropped.head.message.contains("on this executor"),
+      s"The admitted record must state the executor-wide figure, because that is what a reader " +
+        s"needs to tell one bad producer from a bad executor, but it read: ${dropped.head.message}")
+
+    // Left clean, because the window outlives this test the way it outlives a task.
+    MemorySpillManager.resetSharedStateForTesting()
+  }
+
+  test("one lost producer is reported once at default level, by the reader") {
+    startContext()
+    val fixture = new ReaderFixture()
+    val payload = fixture.encodePartition(StreamedRecords)
+    val blocks = fixture.dataBlocksOf(payload, BlockCount)
+
+    val records = fixture.reader.read()
+    val stream = fixture.connector.onlyStream
+    stream.deliver(blocks.head)
+
+    val (failure, captured) = capturingStreamingLogs {
+      // The peer takes its socket away with blocks still owing, which is what a producer executor
+      // being lost looks like from the consumer's side. Both records were emitted on this path:
+      // the handler's, on the Netty thread that saw the channel go, and the reader's, on the task
+      // thread that converted it into the fetch failure that actually recovers the read.
+      stream.closeChannel()
+      stream.handler.channelInactive(stream.client)
+      // The lifecycle transition is applied off the event loop like every other frame, so the loss
+      // it records exists only once that work has run.
+      stream.awaitDataPlane("channel-inactive processing")
+      assert(stream.handler.isProducerLost,
+        "The handler must have observed the loss, or there is no duplicate record to rule out")
+      intercept[FetchFailedException] {
+        withTaskContext(fixture.context) {
+          readRecords(records)
+        }
+      }
+    }
+    assert(fetchFailedReasonOf(failure).reduceId == fixture.partitionId,
+      "The fetch failure must name the partition whose producer was lost")
+
+    // One loss, one default-level record, and it belongs to the reader: it is the only component
+    // that can state what the loss cost and what happens next -- the bytes discarded, the
+    // invalidation sent to the driver, and that the upstream stage will be recomputed. The consumer
+    // handler saw the same loss on a Netty thread and keeps its account under the debug key: a
+    // record per loss per channel on a stage whose every reduce task opens a channel per map output
+    // is exactly the volume this feature may not produce.
+    assertSingleDefaultLevelOwner(
+      captured.filter(record => record.message.contains("invalidated partial") ||
+        record.message.contains("consumer failed") ||
+        record.message.contains("closed the connection")),
+      owner = "StreamingShuffleReader",
+      silent = Seq("StreamingShuffleClientHandler"),
+      what = "one lost producer")
+  }
+
+  test("a gap of several positions is repaired by one request naming the whole window") {
+    startContext()
+    val fixture = new ReaderFixture()
+    val payload = fixture.encodePartition(StreamedRecords)
+    // A gap of more than one position, because that is where the defect lived: a repair of a run
+    // used to be emitted as one frame per position, and the producer -- whose replay budget and
+    // backoff are charged per request -- armed its pause on the first frame and deferred every
+    // sibling behind it. The run then spent the whole five-attempt budget re-asking for its first
+    // position and escalated to a stage recomputation while the producer still held every byte it
+    // had been asked for.
+    val blocks = fixture.dataBlocksOf(payload, BlockCount)
+    assert(blocks.size >= 4,
+      s"this case needs a gap of at least two positions inside a longer partition, but the " +
+        s"fixture framed ${blocks.size} block(s)")
+    val outOfOrder = blocks(3)
+    val missing = Seq(blocks(1), blocks(2))
+
+    val records = fixture.reader.read()
+    val stream = fixture.connector.onlyStream
+    stream.drainOutboundMessages()
+    stream.deliver(blocks.head)
+    stream.deliver(outOfOrder)
+
+    // The out-of-order block is not spliced in ahead of the positions that should have preceded it,
+    // and the window asked for spans the missing run together with that block, inclusively.
+    val requests = stream.drainOutboundMessages().collect {
+      case request: RetransmitRequestMessage => request
+    }
+    assert(requests.size == 1,
+      s"a gap must be repaired by exactly ONE request naming the whole run, but " +
+        s"${requests.size} frame(s) were written: " +
+        requests.map(request =>
+          s"[${request.firstSequenceNumber()}, ${request.lastSequenceNumber()}]").mkString(", "))
+    val request = requests.head
+    assert(request.firstSequenceNumber() == missing.head.sequenceNumber() &&
+        request.lastSequenceNumber() == outOfOrder.sequenceNumber(),
+      s"the window must span the missing positions and the block that revealed them, but it was " +
+        s"[${request.firstSequenceNumber()}, ${request.lastSequenceNumber()}]")
+    assert(request.blockCount() == 3L,
+      s"the request must name three positions but named ${request.blockCount()}")
+    (missing.map(_.sequenceNumber()) :+ outOfOrder.sequenceNumber()).foreach { position =>
+      assert(request.contains(position),
+        s"position $position must be covered by the one repair request")
+    }
+    assert(request.partitionId() == fixture.partitionId,
+      "a retransmission request must name the partition whose sequence gapped")
+
+    // Every quarantined position is admitted when the producer replays it, including the one whose
+    // arrival revealed the gap, and the reduce input is complete afterwards.
+    missing.foreach(stream.deliver)
+    blocks.drop(3).foreach(stream.deliver)
+    stream.deliver(fixture.terminator(blocks.size.toLong))
+    assert(stream.handler.acceptedBlockCount(fixture.partitionId) == blocks.size.toLong,
+      s"every position must be admitted once the run has been replayed, but " +
+        s"${stream.handler.acceptedBlockCount(fixture.partitionId)} of ${blocks.size} were")
+    assert(readRecords(records) == expectedRecords,
+      "a gap repaired by one ranged retransmission must leave the reduce input complete and " +
+        "equal to what the producer sent")
+    assert(observedPartialReadInvalidations() == 0L,
+      s"a repair inside the retained window must not invalidate a partial read, but " +
+        s"${observedPartialReadInvalidations()} was recorded")
   }
 
   test("a corrupt block that can no longer be replayed escalates to a fetch failure") {
@@ -2727,6 +3083,24 @@ class StreamingShuffleReaderSuite
         s"${fixture.coordinatorRef.invalidationsSent.size} were")
     assert(fixture.context.fetchFailed.isEmpty,
       "and no fetch failure may be reported, because the producer was never lost")
+
+    // A deferred completion and an immediate one must be indistinguishable to every observer, and
+    // the credit ledger is an observer: it is what `isStreamTerminated` and `announcedBlockCount`
+    // answer from, and what the liveness timers consult to decide whether a silent producer is a
+    // finished one or a lost one. The deferred path used to skip that transition, so a stream that
+    // ended through a repair read as never terminated and its producer went on being expected.
+    val ledgerKey = fixture.consumerLedgerKey
+    assert(ledgerKey.isDefined,
+      "The reader must hold a credit ledger for the partition it read, or nothing below is " +
+        "asserted at all")
+    ledgerKey.foreach { key =>
+      assert(fixture.backpressure.isStreamTerminated(key),
+        "A stream completed through a held end-of-stream must be recorded as terminated in the " +
+          "credit ledger, exactly as one completed immediately is")
+      assert(fixture.backpressure.announcedBlockCount(key).contains(blocks.size.toLong),
+        s"and the ledger must carry the total the terminator announced, ${blocks.size}, but " +
+          s"carries ${fixture.backpressure.announcedBlockCount(key)}")
+    }
   }
 
   test("a producer failure whose hand-off marker never arrived still escalates to a fetch " +
@@ -2941,6 +3315,7 @@ class StreamingShuffleReaderSuite
     val foreignChannel = new EmbeddedChannel(DefaultChannelId.newInstance())
     val foreignClient =
       new TransportClient(foreignChannel, new TransportResponseHandler(foreignChannel))
+    foreignClient.setClientId("streaming-shuffle-reader-suite")
     assert(foreignChannel.id().asLongText() != stream.channel.id().asLongText(),
       "The foreign channel must have an identity of its own, or the handler could not tell it " +
         "apart from the one it is bound to")
@@ -2949,6 +3324,7 @@ class StreamingShuffleReaderSuite
       // shuffle, the right producer, the right partition, the next sequence number and a correct
       // CRC32C. Nothing about the frame can be the reason it is refused.
       stream.handler.receive(foreignClient, blocks(1).toByteBuffer())
+      stream.awaitDataPlane("foreign-channel block callback")
       assert(stream.handler.foreignChannelCallbackCount == 1L,
         s"A frame from an unbound channel must be counted as a refused callback, but " +
           s"${stream.handler.foreignChannelCallbackCount} were")
@@ -2970,6 +3346,7 @@ class StreamingShuffleReaderSuite
       // harmless: a decoder that had been reached would raise, the failure would be latched on the
       // notifier, and the read below would fail with it.
       stream.handler.receive(foreignClient, ByteBuffer.wrap(Array[Byte](-1, -2, -3, -4)))
+      stream.awaitDataPlane("foreign-channel malformed callback")
       assert(stream.handler.foreignChannelCallbackCount == 2L,
         s"Every callback from an unbound channel must be counted, but only " +
           s"${stream.handler.foreignChannelCallbackCount} were")
@@ -2977,6 +3354,7 @@ class StreamingShuffleReaderSuite
       // Nor may a stranger provoke a subscription, which is the message that carries this
       // consumer's identity and its position.
       stream.handler.channelActive(foreignClient)
+      stream.awaitDataPlane("foreign-channel activation callback")
       assert(stream.handler.foreignChannelCallbackCount == 3L,
         "An activation callback from an unbound channel must be refused and counted")
       assert(foreignChannel.readOutbound[AnyRef]() == null,
@@ -2987,6 +3365,7 @@ class StreamingShuffleReaderSuite
       // this task's notifier would fail a reduce task over a socket it never read from.
       stream.handler.exceptionCaught(
         new SparkException("a transport failure on somebody else's channel"), foreignClient)
+      stream.awaitDataPlane("foreign-channel exception callback")
       assert(stream.handler.foreignChannelCallbackCount == 4L,
         "An exception callback from an unbound channel must be refused and counted")
       assert(!foreignClient.isActive(),
@@ -3004,6 +3383,46 @@ class StreamingShuffleReaderSuite
           "own producer sent")
     } finally {
       foreignChannel.close().syncUninterruptibly()
+    }
+  }
+
+  test("an unauthenticated producer frame is refused before payload deserialization") {
+    startContext()
+    val fixture = new ReaderFixture()
+    val payload = fixture.encodePartition(StreamedRecords)
+    val block = fixture.dataBlocksOf(payload, BlockCount).head
+    val records = fixture.reader.read()
+    val stream = fixture.connector.onlyStream
+    val handler = stream.handler
+    val quotaBefore = fixture.backpressure.reservedReceiveQuotaBytes
+    val queuedBytesBefore = handler.queuedByteCount
+
+    val unauthenticatedChannel = new EmbeddedChannel(DefaultChannelId.newInstance())
+    val unauthenticatedClient = new TransportClient(
+      unauthenticatedChannel, new TransportResponseHandler(unauthenticatedChannel))
+    try {
+      handler.receive(unauthenticatedClient, block.toByteBuffer())
+      assert(handler.awaitDataPlaneIdle(10000L),
+        "The consumer data plane must settle after an unauthenticated frame")
+
+      assert(handler.unauthenticatedCallbackCount === 1L,
+        "The consumer must count the callback it refused for lacking a transport principal")
+      assert(!unauthenticatedClient.isActive(),
+        "The consumer must close a channel that attempts to deliver unauthenticated payload bytes")
+      assert(handler.acceptedBlockCount(fixture.partitionId) === 0L,
+        "An unauthenticated block must never be admitted to the reader's payload queue")
+      assert(handler.queuedByteCount === queuedBytesBefore,
+        "Refusal before decode may enqueue only the failure marker, never payload bytes")
+      assert(fixture.backpressure.reservedReceiveQuotaBytes === quotaBefore,
+        "Refusal before decode must charge no shared receive quota")
+      val failure = intercept[FetchFailedException](records.hasNext)
+      val detail = Seq(
+        Option(failure.getMessage),
+        Option(failure.getCause).map(_.getMessage)).flatten.mkString(" ")
+      assert(detail.contains("requires an authenticated transport channel"),
+        s"The fetch failure must retain the authentication refusal, but reported $detail")
+    } finally {
+      unauthenticatedChannel.finishAndReleaseAll()
     }
   }
 
@@ -3257,6 +3676,7 @@ class StreamingShuffleReaderSuite
       val strangerChannel = new EmbeddedChannel(DefaultChannelId.newInstance())
       val stranger = new TransportClient(strangerChannel, new TransportResponseHandler(
         strangerChannel))
+      stranger.setClientId("streaming-shuffle-reader-suite")
       assert(connector.unboundFrameCount === 0L,
         "a connector that has been handed nothing must report no unbound frame")
 
@@ -3367,7 +3787,7 @@ class StreamingShuffleReaderSuite
         "timeout in the same number, or one of them will be stale")
   }
 
-  test("a streaming reader may only be constructed for a whole map range with streaming enabled") {
+  test("a streaming reader is constructed for any well formed map range with streaming enabled") {
     startContext()
     val fixture = new ReaderFixture()
 
@@ -3377,18 +3797,41 @@ class StreamingShuffleReaderSuite
     assert(gatedOff.getMessage.contains(SHUFFLE_STREAMING_ENABLED.key),
       s"The refusal must name the gate that is closed, but it read: ${gatedOff.getMessage}")
 
-    // A live producer location names a map id and a task attempt id but no map index, so a narrowed
-    // range cannot be honoured and the manager must delegate it to the sort-based reader.
-    val narrowed = intercept[IllegalArgumentException] {
-      fixture.newReader(fixture.conf, FullRangeStart + 1, FullRangeEnd)
+    // A narrowed map range is an ordinary request -- adaptive execution issues one whenever it
+    // coalesces or splits a stage -- and it is answerable, because a producer registration carries
+    // the map INDEX beside the map id. So the range is honoured by selecting registrations, and the
+    // reader is constructed for it and serves exactly that selection. Refusing it used to stand the
+    // whole shuffle down and record the refusal as a protocol-version mismatch that had not
+    // happened.
+    val ranged = new ReaderFixture(numMaps = FourProducers, completedMaps = Set(0, 1, 2, 3))
+    val everyProducer = ranged.locationsReply((0 until FourProducers).map(ranged.producerLocation))
+    Seq((FullRangeStart, FullRangeEnd, Seq(0, 1, 2, 3)), (FullRangeStart + 1, FullRangeStart + 3,
+      Seq(1, 2)), (FullRangeStart + 3, FullRangeStart + 4, Seq(3)),
+      (FourProducers, FourProducers + 5, Seq.empty[Int])).foreach { case (start, end, expected) =>
+      val narrowed = ranged.newReader(ranged.conf, start, end)
+      assert(narrowed.servedMapIndexesOf(everyProducer) === expected,
+        s"The map range [$start, $end) must select map indexes ${expected.mkString(", ")} but " +
+          s"selected ${narrowed.servedMapIndexesOf(everyProducer).mkString(", ")}")
+      assert(StreamingShuffleReader.servesFullMapRange(start, end) === (expected.size ==
+          FourProducers),
+        s"[$start, $end) must be recognised as the whole map range only when it selects every " +
+          s"declared map index, or the two diagnoses of an unresolved rendezvous are the wrong " +
+          s"way round")
     }
-    assert(narrowed.getMessage.contains("whole map range"),
-      s"The refusal must explain that streaming serves whole map ranges only, but it read: " +
-        s"${narrowed.getMessage}")
-    assert(!StreamingShuffleReader.servesFullMapRange(FullRangeStart + 1, FullRangeEnd),
-      "A range that does not start at the first map index is not the whole map range")
-    assert(StreamingShuffleReader.servesFullMapRange(FullRangeStart, FullRangeEnd),
-      "The whole map range is the only range a streaming read serves")
+
+    // A malformed range is still refused, and named as malformed rather than as anything else: an
+    // end before its start selects nothing and describes no set of map indexes at all.
+    val inverted = intercept[IllegalArgumentException] {
+      fixture.newReader(fixture.conf, FullRangeStart + 3, FullRangeStart + 1)
+    }
+    assert(inverted.getMessage.contains("Invalid map index range"),
+      s"The refusal must name the range as invalid, but it read: ${inverted.getMessage}")
+    val negative = intercept[IllegalArgumentException] {
+      fixture.newReader(fixture.conf, -1, FullRangeEnd)
+    }
+    assert(negative.getMessage.contains("Invalid map index range"),
+      s"A negative first map index must be refused the same way, but it read: " +
+        s"${negative.getMessage}")
   }
 
   // -----------------------------------------------------------------------------------------------
@@ -3735,17 +4178,70 @@ class StreamingShuffleReaderSuite
    *
    * @param conf configuration the handler reads its own entries from
    * @param clock the time source the handler reads
+   * @param mapId the producer generation this handler consumes, which is what distinguishes two
+   *              handlers multiplexed onto one channel
+   * @param consumerId the consuming attempt's identity, which is what confines a shared channel to
+   *                   the handlers of one reduce task attempt: two handlers share a channel only if
+   *                   they agree on it
    * @return the handler
    */
   private def newConnectorHandler(
       conf: SparkConf,
-      clock: ManualClock): StreamingShuffleClientHandler = {
+      clock: ManualClock,
+      mapId: Long = ProducerMapId,
+      consumerId: String = "streaming-shuffle-connector-consumer"
+  ): StreamingShuffleClientHandler = {
     val budget = TokenBucketRateLimiter.executorBudget(conf, clock)
     val protocol = new BackpressureProtocol(conf, null, budget, clock)
-    new StreamingShuffleClientHandler(conf, shuffleId = 0, mapId = ProducerMapId,
-      taskAttemptId = ProducerAttemptId, consumerId = "streaming-shuffle-connector-consumer",
+    new StreamingShuffleClientHandler(conf, shuffleId = 0, mapId = mapId,
+      taskAttemptId = ProducerAttemptId, consumerId = consumerId,
       startPartition = ReducePartition, endPartition = ReducePartition + 1, backpressure = protocol,
       errorNotifier = new StreamingShuffleErrorNotifier(0, conf), clock = clock)
+  }
+
+  /** The producer endpoint the connector cases connect to. One endpoint, so shares are joinable. */
+  private def connectorLocation(mapId: Long = ProducerMapId): StreamingShuffleProducerLocation =
+    StreamingShuffleProducerLocation("producer-executor-0", "producer-host", 7078,
+      mapId, mapId.toInt, ProducerAttemptId,
+      BlockManagerId("producer-executor-0", "block-manager-host", 7079))
+
+  /**
+   * Drives one handler past its hand-off queue's high-water mark, which is what throttles it.
+   *
+   * The blocks are correctly checksummed and addressed to that handler's own generation, so what
+   * stops the handler reading is the queue depth the backpressure layer exists to bound and not a
+   * repair or a misaddressed frame.
+   *
+   * @param handler the handler to throttle
+   * @param client the channel to deliver over
+   * @return how many blocks were delivered
+   */
+  private def throttleHandler(
+      handler: StreamingShuffleClientHandler,
+      client: TransportClient): Int = {
+    val payload = payloadOfLength(handler.mapId, 64)
+    val blocks = BlocksPastHighWaterMark + 1
+    (0 until blocks).foreach { index =>
+      val block = dataBlock(
+        handler.shuffleId, handler.mapId, ReducePartition, index.toLong, payload)
+      handler.receive(client, block.toByteBuffer())
+    }
+    // The blocks are applied off the event loop, so the queue depth that closes the window exists
+    // only once that work has run.
+    assert(handler.awaitDataPlaneIdle(10000L),
+      "the consumer data plane must settle before the receive window is read")
+    assert(!handler.isAutoReadEnabled,
+      s"a handler holding ${handler.queuedEventCount} event(s) must have stopped reading once it " +
+        s"passed the high-water mark of $BlocksPastHighWaterMark [accepted " +
+        s"${handler.acceptedBlockCount(ReducePartition)}, duplicates " +
+        s"${handler.duplicateBlockCount(ReducePartition)}, quota refusals " +
+        s"${handler.quotaRefusalCount(ReducePartition)}, corrupt " +
+        s"${handler.corruptBlockCount(ReducePartition)}, misaddressed " +
+        s"${handler.misaddressedFrameCount}, replays " +
+        s"${handler.replayRequestCount(ReducePartition)}, expecting " +
+        s"${handler.expectedSequenceNumber(ReducePartition)}, cause " +
+        s"${handler.currentThrottleCause}]")
+    blocks
   }
 
   test("a channel created while the connector closes is closed rather than published") {
@@ -3817,6 +4313,8 @@ class StreamingShuffleReaderSuite
           s"${connector.earlyTerminalCallbackCount} replay(s) were counted")
       assert(connector.boundChannelCount == 0,
         "A channel that is already dead must leave no registration behind")
+      assert(handler.awaitDataPlaneIdle(10000L),
+        "The consumer data plane must settle after replaying the early terminal callback")
       assert(handler.isProducerLost,
         "The handler must have been told its producer is gone, which is what stops the reduce " +
           "task from waiting out its whole five-second connection timeout")
@@ -3851,6 +4349,8 @@ class StreamingShuffleReaderSuite
       assert(connector.unreleasedChannels == 0,
         s"A clean release must report no straggling channel, but reported " +
           s"${connector.unreleasedChannels}")
+      assert(connector.transportResourcesTerminated,
+        "Closing must await the event-loop group retained when the channel was created")
 
       // And a connect after the closure is refused outright, before any socket is created.
       val createdBefore = connector.createdClients.size
@@ -3866,4 +4366,702 @@ class StreamingShuffleReaderSuite
     }
   }
 
+  // -----------------------------------------------------------------------------------------------
+  // The multiplexed consumer channel.
+  //
+  // One physical channel now carries every producer a single reduce task reads from one executor,
+  // because a socket per producer is a socket per map output and therefore a connect storm at any
+  // realistic shuffle width. Three properties have to hold for that to be safe, and none of them
+  // holds by accident: the channel's lifetime must be decided by ONE atomic transition, so a joiner
+  // can never be handed a channel a releaser is closing; the receive window must be channel-scoped,
+  // so one participant cannot reopen a socket another still needs shut; and a producer-local
+  // teardown on the serving side must not close a channel other producers are still using. The
+  // cases below drive each of the three directly.
+  // -----------------------------------------------------------------------------------------------
+
+  test("two producers of one consumer share a channel and only its last participant closes it") {
+    val conf = streamingConf()
+    val clock = newManualClock()
+    val connector = new BarrieredStreamingShuffleProducerConnector(conf)
+    val first = newConnectorHandler(conf, clock, mapId = ProducerMapId)
+    val second = newConnectorHandler(conf, clock, mapId = ProducerMapId + 1L)
+    try {
+      val firstClient = connector.connect(connectorLocation(first.mapId), first)
+      assert(firstClient.isDefined, "the first producer must open a channel")
+      assert(connector.createdClients.size == 1, "the first producer opens exactly one socket")
+      assert(connector.sharedJoinCount == 0L,
+        "the channel that was opened is not a join, so no join may be counted yet")
+
+      val secondClient = connector.connect(connectorLocation(second.mapId), second)
+      assert(secondClient.isDefined, "the second producer must be given a channel")
+      assert(secondClient.get eq firstClient.get,
+        "a second producer of the same consumer on the same executor must JOIN the channel this " +
+          "consumer already holds rather than open a socket of its own")
+      assert(connector.createdClients.size == 1,
+        s"joining must open no further socket, but ${connector.createdClients.size} were created")
+      assert(connector.sharedJoinCount == 1L,
+        s"the join must be counted so that sharing is observable, but the count read " +
+          s"${connector.sharedJoinCount}")
+      assert(connector.channelClaimCount(firstClient.get) == 2,
+        s"both participants must hold a claim, but the channel reported " +
+          s"${connector.channelClaimCount(firstClient.get)}")
+      assert(connector.boundChannelCount == 1,
+        "two participants of one channel are one registration, not two")
+
+      // The first participant leaving must not cost the second its channel. This is the whole point
+      // of the share: an orderly end of one map stream is not the loss of the socket.
+      connector.release(first, firstClient.get)
+      assert(firstClient.get.getChannel().isOpen(),
+        "the channel must stay open while a producer the reduce task has not finished with is " +
+          "still reading from it")
+      assert(connector.channelClaimCount(firstClient.get) == 1,
+        s"one claim must remain after the first release, but " +
+          s"${connector.channelClaimCount(firstClient.get)} did")
+      assert(connector.isShareJoinable(firstClient.get),
+        "a channel with a live participant must still be joinable by a further producer")
+      assert(first.isClosed, "the departing handler itself must be released")
+      assert(!second.isClosed, "the remaining handler must be untouched by its peer's departure")
+
+      // The last participant leaving is the one release that closes the socket.
+      connector.release(second, firstClient.get)
+      assert(!firstClient.get.getChannel().isOpen(),
+        "the last participant's departure must release the socket")
+      assert(connector.channelClaimCount(firstClient.get) == 0,
+        "no claim may remain once the last participant has left")
+      assert(!connector.isShareJoinable(firstClient.get),
+        "a released channel must be permanently unjoinable, or a joiner could be handed a socket " +
+          "that has already been closed")
+      assert(connector.boundChannelCount == 0,
+        "the registration must be withdrawn with the channel it named")
+      assert(second.isClosed, "the last handler must be released too")
+
+      // Withdrawal is permanent, so a further producer opens a fresh channel rather than reviving a
+      // dead one. This is the assertion that makes the seal load-bearing.
+      val third = newConnectorHandler(conf, clock, mapId = ProducerMapId + 2L)
+      try {
+        val thirdClient = connector.connect(connectorLocation(third.mapId), third)
+        assert(thirdClient.isDefined, "a producer arriving after the release must still connect")
+        assert(!(thirdClient.get eq firstClient.get),
+          "a producer arriving after the last release must NOT be handed the closed channel")
+        assert(thirdClient.get.getChannel().isOpen(),
+          "the channel a late producer is given must be one it can actually use")
+        assert(connector.createdClients.size == 2,
+          "the late producer must have caused exactly one further socket to be opened")
+      } finally {
+        third.close()
+      }
+    } finally {
+      connector.close()
+      first.close()
+      second.close()
+    }
+  }
+
+  test("a join racing the last release is never handed a channel that is being closed") {
+    val conf = streamingConf()
+    val clock = newManualClock()
+    // Both orderings of the race are exercised, and the assertion does not depend on which one
+    // happened: whatever a joiner is handed must be a channel it can use. That is the invariant the
+    // claim-count transition exists to guarantee, and the invariant the previous participant-set
+    // test could not guarantee -- becoming empty and being withdrawn were two steps, and a joiner
+    // arriving between them was handed the socket the releaser then closed.
+    val rounds = 200
+    val handedClosedChannel = new AtomicInteger(0)
+    val joinedLive = new AtomicInteger(0)
+    val openedFresh = new AtomicInteger(0)
+    val executor = ThreadUtils.newDaemonFixedThreadPool(2, "streaming-shuffle-share-race")
+    try {
+      (0 until rounds).foreach { round =>
+        val connector = new BarrieredStreamingShuffleProducerConnector(conf)
+        val resident = newConnectorHandler(conf, clock, mapId = ProducerMapId)
+        val joiner = newConnectorHandler(conf, clock, mapId = ProducerMapId + 1L)
+        try {
+          val client = connector.connect(connectorLocation(resident.mapId), resident).getOrElse(
+            fail(s"round $round must have opened a channel to race against"))
+          val barrier = new CyclicBarrier(2)
+          val releaseTask: Runnable = () => {
+            barrier.await(RaceBarrierTimeoutSeconds, TimeUnit.SECONDS)
+            connector.release(resident, client)
+          }
+          val joinTask: Runnable = () => {
+            barrier.await(RaceBarrierTimeoutSeconds, TimeUnit.SECONDS)
+            connector.connect(connectorLocation(joiner.mapId), joiner) match {
+              case Some(given) =>
+                if (!given.getChannel().isOpen()) {
+                  handedClosedChannel.incrementAndGet()
+                } else if (given eq client) {
+                  joinedLive.incrementAndGet()
+                } else {
+                  openedFresh.incrementAndGet()
+                }
+              case None =>
+                // A refusal is a legal outcome only while the connector is open, and it never is
+                // here, so it is counted as a failure of the invariant.
+                handedClosedChannel.incrementAndGet()
+            }
+          }
+          val release = executor.submit(releaseTask)
+          val join = executor.submit(joinTask)
+          release.get(RaceBarrierTimeoutSeconds, TimeUnit.SECONDS)
+          join.get(RaceBarrierTimeoutSeconds, TimeUnit.SECONDS)
+        } finally {
+          connector.close()
+          resident.close()
+          joiner.close()
+        }
+      }
+    } finally {
+      executor.shutdownNow()
+    }
+
+    assert(handedClosedChannel.get() == 0,
+      s"no joiner may ever be handed a channel that is closed or be refused outright, but " +
+        s"${handedClosedChannel.get()} of $rounds round(s) were")
+    assert(joinedLive.get() + openedFresh.get() == rounds,
+      s"every round must have ended in one of the two legal outcomes, but " +
+        s"${joinedLive.get()} join(s) and ${openedFresh.get()} fresh channel(s) account for only " +
+        s"${joinedLive.get() + openedFresh.get()} of $rounds")
+    // Both orderings must actually have occurred, or the race was never run and the case above
+    // proves nothing. The counts are not asserted individually -- a schedule is not a contract --
+    // but neither may be zero across two hundred rounds of a two-thread barrier.
+    assert(joinedLive.get() > 0,
+      "the joiner must sometimes have won the race and joined the live channel, or the " +
+        "barrier is not producing the interleaving this case exists to exercise")
+    assert(openedFresh.get() > 0,
+      "the releaser must sometimes have won the race, leaving the joiner to open a fresh channel")
+  }
+
+  test("the receive window of a shared channel obeys every participant, not the last to speak") {
+    val conf = streamingConf()
+    val clock = newManualClock()
+    val connector = new BarrieredStreamingShuffleProducerConnector(conf)
+    val first = newConnectorHandler(conf, clock, mapId = ProducerMapId)
+    val second = newConnectorHandler(conf, clock, mapId = ProducerMapId + 1L)
+    try {
+      val client = connector.connect(connectorLocation(first.mapId), first).getOrElse(
+        fail("the first producer must open a channel"))
+      assert(connector.connect(connectorLocation(second.mapId), second).contains(client),
+        "the second producer must join the same channel for this case to be about sharing")
+      val channel = client.getChannel()
+
+      // The wiring: one socket, one window. Two windows over one socket is the defect itself.
+      assert(first.currentReadGate eq second.currentReadGate,
+        "handlers multiplexed onto one channel must share one receive window, or each will " +
+          "believe it owns the socket")
+      assert(channel.config().isAutoRead,
+        "a freshly opened channel must be reading from its socket")
+      assert(first.isChannelReadEnabled && second.isChannelReadEnabled,
+        "both participants must see the socket as reading before anything is throttled")
+
+      // One participant throttles: the socket closes for everyone, which is the point.
+      throttleHandler(first, client)
+      assert(!channel.config().isAutoRead,
+        "a participant that has stopped reading must close the socket")
+      assert(!first.isChannelReadEnabled && !second.isChannelReadEnabled,
+        "the socket's state is one state, so every participant must report it")
+      assert(second.isAutoReadEnabled,
+        "the throttle belongs to the participant that raised it: the other's own intent is " +
+          "unchanged, which is exactly why it must not be the one deciding the socket")
+      assert(first.throttlingParticipantCount == 1,
+        s"exactly one participant may be throttling, but " +
+          s"${first.throttlingParticipantCount} were")
+
+      // The second participant throttles too, and then leaves. Its departure withdraws its own
+      // throttle and NOTHING else: the socket must stay shut because the first is still throttled.
+      // This is the exact regression -- one participant's resume used to reopen the socket while
+      // another remained throttled and could no longer reapply the close.
+      throttleHandler(second, client)
+      assert(first.throttlingParticipantCount == 2,
+        s"both participants must be throttling, but ${first.throttlingParticipantCount} were")
+      connector.release(second, client)
+      assert(!channel.config().isAutoRead,
+        "a participant leaving must not reopen a socket another participant still needs shut")
+      assert(!first.isChannelReadEnabled,
+        "the remaining participant must still see its window closed")
+      assert(first.throttlingParticipantCount == 1,
+        s"the departing participant's throttle must be withdrawn with it, leaving one, but " +
+          s"${first.throttlingParticipantCount} remain")
+      assert(channel.isOpen(),
+        "releasing one of two participants must not close the channel itself")
+
+      // And the last participant leaving withdraws the last throttle, so no closed window outlives
+      // the handlers that asked for it.
+      connector.release(first, client)
+      assert(first.throttlingParticipantCount == 0,
+        s"no throttle may outlive its participant, but ${first.throttlingParticipantCount} did")
+      assert(!channel.isOpen(),
+        "the last participant's departure releases the channel")
+    } finally {
+      connector.close()
+      first.close()
+      second.close()
+    }
+  }
+
+  test("a departing throttled participant never wedges a shared channel shut") {
+    val conf = streamingConf()
+    val clock = newManualClock()
+    val connector = new BarrieredStreamingShuffleProducerConnector(conf)
+    val leaving = newConnectorHandler(conf, clock, mapId = ProducerMapId)
+    val staying = newConnectorHandler(conf, clock, mapId = ProducerMapId + 1L)
+    try {
+      val client = connector.connect(connectorLocation(leaving.mapId), leaving).getOrElse(
+        fail("the first producer must open a channel"))
+      assert(connector.connect(connectorLocation(staying.mapId), staying).contains(client),
+        "the second producer must join the same channel")
+      val channel = client.getChannel()
+
+      throttleHandler(leaving, client)
+      assert(!channel.config().isAutoRead, "the throttling participant must close the socket")
+
+      // The departing participant is the ONLY one throttled, so its departure must reopen the
+      // window for the participant that outlives it. A throttle left behind by a closed handler is
+      // a window no living participant could ever clear, which would stall the remaining stream
+      // until its own five-second producer timeout fired.
+      connector.release(leaving, client)
+      assert(channel.isOpen(),
+        "one of two participants leaving must not close the channel")
+      assert(channel.config().isAutoRead,
+        "the last throttle leaving with its participant must reopen the socket for the " +
+          "participant that remains")
+      assert(staying.isChannelReadEnabled,
+        "the remaining participant must be able to receive again")
+      assert(staying.throttlingParticipantCount == 0,
+        s"no participant may still be throttling, but ${staying.throttlingParticipantCount} was")
+    } finally {
+      connector.close()
+      leaving.close()
+      staying.close()
+    }
+  }
+
+  test("a channel read gate is disabled by any participant and enabled only by all of them") {
+    // The rule stated directly, on the class that owns it, with participants that are nothing but
+    // identities. Everything above drives this through real handlers; this is the rule itself, so
+    // that a future change to the handler cannot quietly weaken it without a failure that names it.
+    val channel = new EmbeddedChannel(DefaultChannelId.newInstance())
+    val gate = new StreamingShuffleChannelReadGate
+    val alpha = new Object
+    val beta = new Object
+    try {
+      gate.attach(channel)
+      assert(gate.isReadEnabled && channel.config().isAutoRead,
+        "a gate with no throttling participant must leave the socket reading")
+
+      assert(gate.throttle(alpha, "alpha is out of credit"),
+        "the first throttle must report that it closed the window")
+      assert(!gate.isReadEnabled && !channel.config().isAutoRead,
+        "one participant is enough to close the window")
+      assert(!gate.throttle(beta, "beta's queue is full"),
+        "a second throttle changes nothing about the socket, so it must report no transition")
+      assert(gate.throttlingParticipantCount == 2,
+        s"both participants must be recorded, but ${gate.throttlingParticipantCount} were")
+
+      assert(!gate.resume(beta),
+        "a participant resuming while another is throttled must NOT reopen the window, and must " +
+          "report that it changed nothing")
+      assert(!gate.isReadEnabled && !channel.config().isAutoRead,
+        "the window must stay closed while any participant is throttled")
+
+      assert(gate.resume(alpha), "the last participant to resume reopens the window")
+      assert(gate.isReadEnabled && channel.config().isAutoRead,
+        "with no participant throttling, the socket must read again")
+      assert(gate.throttlingParticipantCount == 0,
+        "a resumed participant must leave no record behind")
+
+      // Idempotence in both directions, because both are reached once per frame and once per poll.
+      assert(!gate.resume(alpha), "resuming a participant that is not throttled changes nothing")
+      gate.throttle(alpha, "alpha is out of credit again")
+      assert(!gate.throttle(alpha, "alpha is out of credit again"),
+        "restating a throttle changes nothing")
+      assert(!gate.isReadEnabled, "the restated throttle must still hold the window closed")
+
+      // Withdrawal, which is what a closing handler performs.
+      gate.withdraw(alpha)
+      assert(gate.isReadEnabled && channel.config().isAutoRead,
+        "withdrawing the last throttling participant must reopen the socket")
+
+      // A gate that adopts a channel while a participant is throttled must push the standing state
+      // onto it, or a handler that throttled before its socket was known would read on regardless.
+      val late = new EmbeddedChannel(DefaultChannelId.newInstance())
+      try {
+        val lateGate = new StreamingShuffleChannelReadGate
+        lateGate.throttle(alpha, "alpha throttled before the socket existed")
+        assert(late.config().isAutoRead, "a fresh channel reads until something stops it")
+        lateGate.attach(late)
+        assert(!late.config().isAutoRead,
+          "attaching a channel to a gate with a throttling participant must close it at once")
+      } finally {
+        late.close()
+      }
+    } finally {
+      channel.close()
+    }
+  }
+
+  test("a producer-local session teardown leaves the other producers of a shared channel alive") {
+    // The serving side of the same channel. A consumer channel reaches several producers, so a
+    // producer that closed the socket when ITS OWN session ended -- superseded, expired, or refused
+    // for want of a slot -- cut off every other map stream multiplexed onto it: each of those
+    // consumers saw its producer vanish, raised a fetch failure, and had its upstream stage
+    // recomputed over an event that concerned exactly one of them. Producer-local state is released
+    // producer-locally; the physical channel belongs to the router.
+    val conf = streamingConf()
+    val clock = newManualClock()
+    val listener = new StreamingShuffleListener(conf, clock)
+    val channel = new EmbeddedChannel(DefaultChannelId.newInstance())
+    val consumer = new TransportClient(channel, new TransportResponseHandler(channel))
+    // The routing surface refuses a frame that carries no authenticated transport principal, so a
+    // consumer that has not completed the platform handshake reaches no producer at all. This
+    // fixture is about which producers a frame reaches, not about that refusal.
+    consumer.setClientId("streaming-shuffle-reader-suite")
+    val firstProducer = newServerHandler(conf, clock, listener, mapId = ProducerMapId)
+    val secondProducer = newServerHandler(conf, clock, listener, mapId = ProducerMapId + 1L)
+    try {
+      listener.register(0, firstProducer.mapId, firstProducer)
+      listener.register(0, secondProducer.mapId, secondProducer)
+
+      // Participation is recorded by routing a frame, exactly as it is in production: the router
+      // records which producer a channel has reached before it hands the frame on.
+      listener.receive(consumer, heartbeat(0, firstProducer.mapId, ReducePartition, 0L)
+        .toByteBuffer())
+      listener.receive(consumer, heartbeat(0, secondProducer.mapId, ReducePartition, 0L)
+        .toByteBuffer())
+      assert(listener.channelParticipantCount(channel) == 2,
+        s"the channel must have reached both producers, but reached " +
+          s"${listener.channelParticipantCount(channel)}")
+      assert(channel.isOpen(), "the consumer's channel must be open before anything is released")
+
+      // One producer gives up its participation. The socket must survive, because the other
+      // producer is still serving this consumer over it.
+      val closedOnFirst = listener.releaseChannelParticipation(
+        channel, firstProducer, closeWhenLast = true)
+      assert(!closedOnFirst,
+        "releasing one of two participating producers must not close the consumer's channel")
+      assert(channel.isOpen(),
+        "the channel must stay open for the producer that is still serving this consumer")
+      assert(listener.channelParticipantCount(channel) == 1,
+        s"exactly one producer must remain, but ${listener.channelParticipantCount(channel)} did")
+      assert(listener.faultedChannelCloseCount == 0L,
+        "a producer-local release is not a channel-global fault and must not be counted as one")
+
+      // The last producer leaving is what reclaims an abandoned socket, so a half-open connection
+      // does not outlive every producer that was talking over it.
+      val closedOnLast = listener.releaseChannelParticipation(
+        channel, secondProducer, closeWhenLast = true)
+      assert(closedOnLast,
+        "the last participating producer leaving must reclaim the channel")
+      assert(!channel.isOpen(), "an unreferenced consumer channel must be closed")
+      assert(listener.channelParticipantCount(channel) == 0,
+        "the participation set must be withdrawn with the channel")
+    } finally {
+      firstProducer.releaseAll()
+      secondProducer.releaseAll()
+      listener.releaseAll()
+      channel.close()
+    }
+  }
+
+  test("a channel-global fault closes the channel and is counted apart from a local release") {
+    val conf = streamingConf()
+    val clock = newManualClock()
+    val listener = new StreamingShuffleListener(conf, clock)
+    val channel = new EmbeddedChannel(DefaultChannelId.newInstance())
+    val consumer = new TransportClient(channel, new TransportResponseHandler(channel))
+    // Authenticated for the same reason: an unauthenticated frame is refused before it is routed,
+    // and this fixture needs the frame to reach the producer it names.
+    consumer.setClientId("streaming-shuffle-reader-suite")
+    val producer = newServerHandler(conf, clock, listener, mapId = ProducerMapId)
+    try {
+      listener.register(0, producer.mapId, producer)
+      listener.receive(consumer, heartbeat(0, producer.mapId, ReducePartition, 0L).toByteBuffer())
+      assert(listener.channelParticipantCount(channel) == 1,
+        "the channel must have reached the producer before the fault is raised")
+
+      // A fault that impugns the CONNECTION -- a frame a producer may never be sent, a forged
+      // acknowledgement, a wire revision this build cannot read -- is a property of the socket and
+      // not of the producer that happened to be addressed, so the socket goes. Every producer the
+      // channel had reached learns of it through the channel's own inactivity callback, which is
+      // why the participation set is deliberately left in place here.
+      listener.closeFaultedChannel(
+        channel, producer, "it sent a frame a producer may never be sent")
+      assert(!channel.isOpen(), "a channel-global fault must close the channel")
+      assert(listener.faultedChannelCloseCount == 1L,
+        s"the teardown must be counted so it can be told apart from a producer-local " +
+          s"release, but the count read ${listener.faultedChannelCloseCount}")
+    } finally {
+      producer.releaseAll()
+      listener.releaseAll()
+      channel.close()
+    }
+  }
+
+  test("a held end-of-stream retires the flow-control ledger exactly as an immediate one does") {
+    // A stream can end in two ways, and they must leave the same state behind. The immediate path
+    // told the flow-control ledger; the deferred path -- a terminator held while a repair was
+    // outstanding and applied once the repair closed the gap -- published the total and queued the
+    // completion marker but left the ledger believing the stream was still live. A live ledger is
+    // not inert: it keeps arming the five-second producer timer and the ten-second consumer timer,
+    // so a partition that had finished perfectly well went on to be reported as a silent producer
+    // for as long as the reader held the handler. This case is the deferred path measured against
+    // the ledger rather than against the handler alone.
+    val conf = streamingConf()
+    val clock = newManualClock()
+    val (handler, protocol, key) = newLedgeredConsumer(conf, clock, "deferred-completion-consumer")
+    val connector = new BarrieredStreamingShuffleProducerConnector(conf)
+    try {
+      val client = connector.connect(connectorLocation(handler.mapId), handler).getOrElse(
+        fail("the producer must open a channel"))
+      val payload = payloadOfLength(handler.mapId, 64)
+      def block(sequenceNumber: Long): DataBlockMessage =
+        dataBlock(handler.shuffleId, handler.mapId, ReducePartition, sequenceNumber, payload)
+
+      // Position 0 arrives, position 1 is withheld and position 2 arrives out of order: the gap is
+      // quarantined for a replay, so the stream has a repair outstanding.
+      feed(handler, client, block(0L))
+      feed(handler, client, block(2L))
+      assert(handler.quarantinedPositionCount(ReducePartition) > 0,
+        "the withheld position must be quarantined for a replay, or nothing is being deferred")
+
+      // The producer announces the end of a stream it did send in full. Its total is ahead of the
+      // position this consumer has reached, which is the truth arriving before the blocks that make
+      // it true, so it is held rather than refused.
+      feed(handler, client,
+        streamTermination(handler.shuffleId, handler.mapId, ReducePartition, 3L))
+      assert(handler.announcedBlockCount(ReducePartition).isEmpty,
+        "a held terminator must not publish its total, because the stream has not ended yet")
+      assert(!protocol.isStreamTerminated(key),
+        "and it must not retire the ledger either, for the same reason")
+      assert(handler.rejectedTerminationCount(ReducePartition) == 0L,
+        s"a terminator held for an outstanding repair is not a contradiction and must not be " +
+          s"refused, but ${handler.rejectedTerminationCount(ReducePartition)} was")
+
+      // The replay lands and closes the gap, which is the only event that can apply a held
+      // terminator.
+      feed(handler, client, block(1L))
+      feed(handler, client, block(2L))
+
+      assert(handler.announcedBlockCount(ReducePartition).contains(3L),
+        s"the held total must be published once the repair completed the stream, but the handler " +
+          s"reports ${handler.announcedBlockCount(ReducePartition)}")
+      assert(protocol.isStreamTerminated(key),
+        "and the ledger must be retired by the same transition: a deferred completion that " +
+          "leaves the ledger live is the regression this case exists for")
+      assert(protocol.announcedBlockCount(key).contains(3L),
+        s"the ledger must hold the same total the handler published, but it holds " +
+          s"${protocol.announcedBlockCount(key)}")
+
+      // What a retired ledger buys: the liveness timers stop arming. Silence after an orderly end
+      // of stream means completion, so no amount of it may be read as a lost producer or as a
+      // consumer that has stopped acknowledging.
+      clock.advance(ProducerConnectionTimeoutMillis + ConsumerLivenessTimeoutMillis)
+      assert(!protocol.isProducerTimedOut(key),
+        "a completed stream's silence is completion, not a producer that died")
+      assert(!protocol.isConsumerTimedOut(key),
+        "and a completed stream has nothing left for its consumer to acknowledge late")
+      assert(protocol.timedOutProducerStreams.isEmpty && protocol.timedOutConsumerStreams.isEmpty,
+        s"nor may the whole-set scans report it, but they reported " +
+          s"${protocol.timedOutProducerStreams} and ${protocol.timedOutConsumerStreams}")
+      assert(!protocol.shouldSendHeartbeat(key),
+        "and a terminated stream is never due a heartbeat")
+
+      // Exactly one completion marker, however the completion was reached.
+      val completions = drainCompletions(handler).collect {
+        case completed: StreamingShuffleClientHandler.StreamCompleted => completed
+      }
+      assert(completions.map(_.totalBlocks) == Seq(3L),
+        s"exactly one completion marker carrying the announced total must be queued, but the " +
+          s"markers were ${completions.map(_.totalBlocks)}")
+      assert(!handler.isProducerLost,
+        "and a stream that completed may not be reported as a lost producer")
+    } finally {
+      connector.close()
+      handler.close()
+    }
+  }
+
+  test("a replacement asked for after the end of stream repairs the read instead of failing it") {
+    // The reader verifies every block a second time on the task thread, and the task thread runs
+    // behind the channel: a block can therefore be found corrupt, and its replacement requested,
+    // after the producer has already announced the end of the stream. That announcement was
+    // legitimate -- it was reconciled against the position the consumer had reached, and asking for
+    // a position again does not change that position -- so the replacement must be accepted. It
+    // used to be refused as a block past the end of stream, which meant the consumer asked for a
+    // block and then declared the producer lost for sending it: in-window retransmission could not
+    // complete at all in this ordering.
+    val conf = streamingConf()
+    val clock = newManualClock()
+    val (handler, protocol, key) = newLedgeredConsumer(conf, clock, "post-termination-consumer")
+    val connector = new BarrieredStreamingShuffleProducerConnector(conf)
+    try {
+      val client = connector.connect(connectorLocation(handler.mapId), handler).getOrElse(
+        fail("the producer must open a channel"))
+      val payload = payloadOfLength(handler.mapId, 64)
+      val only = dataBlock(handler.shuffleId, handler.mapId, ReducePartition, 0L, payload)
+
+      feed(handler, client, only)
+      feed(handler, client,
+        streamTermination(handler.shuffleId, handler.mapId, ReducePartition, 1L))
+      assert(handler.announcedBlockCount(ReducePartition).contains(1L),
+        "the stream must have ended for this case to be about what follows a terminator")
+      assert(protocol.isStreamTerminated(key),
+        "and its ledger must be retired, which is the state the repair has to work through")
+
+      // Exactly what the reader's task thread does when its own verification of an admitted block
+      // fails: it asks for that one position again. The position is still retained, because nothing
+      // has been acknowledged, so the request is accepted and the position is quarantined.
+      assert(handler.requestRetransmission(ReducePartition, 0L, 0L),
+        "a position the consumer has not acknowledged is still retained, so the replay request " +
+          "must be accepted even though the stream has ended")
+      assert(handler.quarantinedPositionCount(ReducePartition) == 1,
+        s"the requested position must be quarantined, but " +
+          s"${handler.quarantinedPositionCount(ReducePartition)} position(s) were")
+
+      val cursorBeforeRepair = handler.expectedSequenceNumber(ReducePartition)
+      feed(handler, client, only)
+
+      assert(handler.repairsAfterTerminationCount(ReducePartition) == 1L,
+        s"the replacement must be admitted as the repair it is, but " +
+          s"${handler.repairsAfterTerminationCount(ReducePartition)} were")
+      assert(handler.blocksAfterTerminationCount(ReducePartition) == 0L,
+        s"and it may not be counted as a block past the end of stream, but " +
+          s"${handler.blocksAfterTerminationCount(ReducePartition)} was")
+      assert(!handler.isProducerLost,
+        "a producer answering a request this consumer made is not a lost producer")
+      assert(handler.expectedSequenceNumber(ReducePartition) == cursorBeforeRepair,
+        s"a repair below the frontier must move no cursor, but it moved from $cursorBeforeRepair " +
+          s"to ${handler.expectedSequenceNumber(ReducePartition)}")
+      assert(handler.announcedBlockCount(ReducePartition).contains(1L),
+        "and it may not disturb the total the terminator fixed")
+      assert(handler.quarantinedPositionCount(ReducePartition) == 0,
+        "the quarantine must be released by the admission, or the reader would ask again")
+
+      // The replacement reached the hand-off queue, which is what makes the repair complete: the
+      // reader takes it by sequence number and reads its records in place of the corrupt copy.
+      val delivered = drainCompletions(handler).collect {
+        case StreamingShuffleClientHandler.BlockReceived(block) => block.sequenceNumber()
+      }
+      assert(delivered.count(_ == 0L) == 2,
+        s"both the original and its replacement must have been handed to the task, but the " +
+          s"positions delivered were ${delivered.mkString("[", ", ", "]")}")
+
+      // The boundary the acceptance is drawn at, on the same handler: a position at the frontier
+      // the terminator fixed is the contradiction that still escalates, because admitting it would
+      // put the stream past the total the reader completes against.
+      feed(handler, client,
+        dataBlock(handler.shuffleId, handler.mapId, ReducePartition, 1L, payload))
+      assert(handler.blocksAfterTerminationCount(ReducePartition) == 1L,
+        s"a block at the announced frontier must still be refused, but " +
+          s"${handler.blocksAfterTerminationCount(ReducePartition)} was")
+      assert(handler.repairsAfterTerminationCount(ReducePartition) == 1L,
+        "and it may not be mistaken for a repair, which was never asked for at that position")
+      assert(handler.isProducerLost,
+        "a producer sending past its own end of stream is lost, exactly as it was before")
+    } finally {
+      connector.close()
+      handler.close()
+    }
+  }
+
+  /**
+   * A consumer handler and the flow-control ledger behind it, for the completion cases.
+   *
+   * The protocol is handed back rather than kept private, because the completion cases are exactly
+   * the ones that assert on what the handler told the protocol: a stream can be completed on the
+   * handler and left live in the ledger, and only the ledger can report that.
+   *
+   * The ledger is registered here, since [[BackpressureProtocol]] records nothing for a stream it
+   * has never been told about -- an unregistered stream would make every assertion below pass
+   * vacuously.
+   *
+   * @param conf configuration both components read their own entries from
+   * @param clock the time source both components read
+   * @param consumerId the consuming attempt's identity, which is part of the ledger's key
+   * @return the handler, its protocol and the key its one stream is registered under
+   */
+  private def newLedgeredConsumer(
+      conf: SparkConf,
+      clock: ManualClock,
+      consumerId: String
+  ): (StreamingShuffleClientHandler, BackpressureProtocol, BackpressureStreamKey) = {
+    val budget = TokenBucketRateLimiter.executorBudget(conf, clock)
+    val protocol = new BackpressureProtocol(conf, null, budget, clock)
+    protocol.registerShuffle(0, NumPartitions)
+    val key = BackpressureStreamKey.forConsumer(
+      0, ProducerMapId, ProducerAttemptId, ReducePartition, consumerId)
+    assert(protocol.registerStream(key, LedgeredConsumerCreditBytes),
+      "the stream must be registered for the ledger to record anything about it")
+    val handler = new StreamingShuffleClientHandler(conf, shuffleId = 0, mapId = ProducerMapId,
+      taskAttemptId = ProducerAttemptId, consumerId = consumerId,
+      startPartition = ReducePartition, endPartition = ReducePartition + 1,
+      backpressure = protocol,
+      errorNotifier = new StreamingShuffleErrorNotifier(0, conf), clock = clock)
+    (handler, protocol, key)
+  }
+
+  /**
+   * Feeds one frame to a consumer handler exactly as the transport would hand it over.
+   *
+   * @param handler the handler to deliver to
+   * @param client the channel the frame arrives on
+   * @param message the frame
+   */
+  private def feed(
+      handler: StreamingShuffleClientHandler,
+      client: TransportClient,
+      message: StreamingShuffleMessage): Unit = {
+    handler.receive(client, message.toByteBuffer())
+    // A frame is decoded and applied off the event loop, so `receive` returns before the frame has
+    // had any effect. Every assertion about what a frame did therefore has to wait for the work it
+    // submitted, or it reads a state the frame has not reached yet -- which is a race the fixture
+    // would lose intermittently rather than a property of the handler.
+    assert(handler.awaitDataPlaneIdle(10000L),
+      s"the consumer data plane must settle after a ${message.getClass.getSimpleName} frame")
+  }
+
+  /** Every completion marker a handler has queued, which must never be more than one per stream. */
+  private def drainCompletions(
+      handler: StreamingShuffleClientHandler): Seq[StreamingShuffleClientHandler.Inbound] = {
+    val drained = mutable.ArrayBuffer.empty[StreamingShuffleClientHandler.Inbound]
+    var event = handler.poll()
+    while (event.isDefined) {
+      drained += event.get
+      event = handler.poll()
+    }
+    drained.toSeq
+  }
+
+  /**
+   * A producer-side handler of the shape the manager builds, for the channel-ownership cases.
+   *
+   * Built by hand for the same reason the consumer handler above is: these cases are about which
+   * party owns a physical channel's lifetime, not about what travels over it.
+   *
+   * @param conf configuration the handler reads its own entries from
+   * @param clock the time source the handler reads
+   * @param routes the routing table this producer publishes itself in
+   * @param mapId the map output this producer serves
+   * @return the handler
+   */
+  private def newServerHandler(
+      conf: SparkConf,
+      clock: ManualClock,
+      routes: StreamingShuffleRouteRegistry,
+      mapId: Long): StreamingShuffleServerHandler = {
+    val budget = TokenBucketRateLimiter.executorBudget(conf, clock)
+    val protocol = new BackpressureProtocol(conf, null, budget, clock)
+    new StreamingShuffleServerHandler(
+      conf,
+      shuffleId = 0,
+      mapId = mapId,
+      taskAttemptId = ProducerAttemptId + mapId,
+      numPartitions = NumPartitions,
+      blockResolver = new StreamingShuffleBlockResolver(conf),
+      routes = routes,
+      backpressure = protocol,
+      rateLimiter = budget.limiterFor(0),
+      errorNotifier = new StreamingShuffleErrorNotifier(0, conf),
+      fallbackPolicy = new StreamingShuffleFallbackPolicy(conf, clock),
+      clock = clock)
+  }
 }

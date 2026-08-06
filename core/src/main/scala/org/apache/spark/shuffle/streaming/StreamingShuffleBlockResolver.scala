@@ -315,6 +315,7 @@ private[spark] class StreamingShuffleBlockResolver(
     val key = ProducerKey(shuffleId, mapId)
     var dropped = false
     var orphanedFiles: Seq[File] = Seq.empty
+    var orphanedProducer: MemorySpillManager = null
     lifecycle.synchronized {
       // compute() removes the mapping when the remapping function returns null, so the generation
       // comparison and the removal are one indivisible step against the current entry. A
@@ -324,11 +325,15 @@ private[spark] class StreamingShuffleBlockResolver(
         if (existing != null && existing.taskAttemptId == taskAttemptId) {
           dropped = true
           orphanedFiles = existing.retainedFiles
+          orphanedProducer = existing.producer
           null
         } else {
           existing
         }
       })
+    }
+    if (orphanedProducer != null) {
+      orphanedProducer.releaseRetainedConsumerState()
     }
     // Outside the monitor: unlinking a file performs I/O, and this registry's monitor is contended
     // by every registration and every lookup in the JVM. Nothing can reach these files any longer
@@ -359,17 +364,20 @@ private[spark] class StreamingShuffleBlockResolver(
   def removeShuffle(shuffleId: Int): Int = {
     var dropped = 0
     val orphanedFiles = new mutable.ArrayBuffer[File]()
+    val orphanedProducers = new mutable.ArrayBuffer[MemorySpillManager]()
     lifecycle.synchronized {
       val iterator = producers.entrySet().iterator()
       while (iterator.hasNext) {
         val entry = iterator.next()
         if (entry.getKey.shuffleId == shuffleId) {
           orphanedFiles ++= entry.getValue.retainedFiles
+          orphanedProducers += entry.getValue.producer
           iterator.remove()
           dropped += 1
         }
       }
     }
+    orphanedProducers.distinct.foreach(_.releaseRetainedConsumerState())
     // Every retained file of every generation of this shuffle goes, which is one of the three
     // boundaries at which retained output is specified to be released. A consumer that has not read
     // by now cannot: the shuffle itself is being unregistered.
@@ -454,6 +462,8 @@ private[spark] class StreamingShuffleBlockResolver(
         if (file.exists() && !file.delete()) {
           logWarning(log"Could not delete retained streaming shuffle spill file " +
             log"${MDC(FILE_NAME, file.getName)}")
+        } else {
+          MemorySpillManager.releaseDiskQuota(file)
         }
       } catch {
         case NonFatal(e) =>
@@ -506,6 +516,41 @@ private[spark] class StreamingShuffleBlockResolver(
 
   /** How many producers are currently registered. Intended for diagnostics and tests. */
   def registeredProducerCount: Int = lifecycle.synchronized(producers.size())
+
+  /**
+   * How many spill files this registry currently owns the deletion of, across all producers.
+   *
+   * This is the count of files that have outlived their producing task, having been handed across
+   * by [[retainProducerOutput]]. It is therefore the honest measure of on-disk output this
+   * component is holding: it excludes files a running task still owns, which that task's own
+   * cleanup unlinks, and it falls to zero exactly when every generation has been superseded,
+   * unregistered or stopped.
+   *
+   * Intended for diagnostics and tests. A test proving that streaming shuffle releases what it
+   * allocates needs a reading that is positive while output is retained and zero afterwards, and no
+   * other accessor reports one.
+   */
+  def retainedFileCount: Int = lifecycle.synchronized {
+    producers.values().asScala.map(_.retainedFiles.size).sum
+  }
+
+  /**
+   * The spill files this registry currently owns the deletion of for one shuffle.
+   *
+   * Intended for diagnostics and tests. These are the files a consumer's request is served from
+   * once the producing task has gone, so they are the only place a test can reach the bytes this
+   * component will actually hand out -- which is what makes a genuine on-disk fault, rather than a
+   * simulated one, possible against the production read path.
+   *
+   * @param shuffleId shuffle to read
+   * @return the files, in no particular order
+   */
+  def retainedFilesOf(shuffleId: Int): Seq[File] = lifecycle.synchronized {
+    producers.entrySet().asScala.iterator
+      .filter(_.getKey.shuffleId == shuffleId)
+      .flatMap(_.getValue.retainedFiles)
+      .toSeq
+  }
 
   /** Whether [[stop]] has already run. */
   def isStopped: Boolean = lifecycle.synchronized(stopped)
@@ -966,17 +1011,22 @@ private[spark] class StreamingShuffleBlockResolver(
   override def stop(): Unit = {
     Utils.tryLogNonFatalError {
       val orphanedFiles = new mutable.ArrayBuffer[File]()
+      val orphanedProducers = new mutable.ArrayBuffer[MemorySpillManager]()
       val dropped = lifecycle.synchronized {
         if (stopped) {
           -1
         } else {
           stopped = true
           val registered = producers.size()
-          producers.values().asScala.foreach(orphanedFiles ++= _.retainedFiles)
+          producers.values().asScala.foreach { registered =>
+            orphanedFiles ++= registered.retainedFiles
+            orphanedProducers += registered.producer
+          }
           producers.clear()
           registered
         }
       }
+      orphanedProducers.distinct.foreach(_.releaseRetainedConsumerState())
       deleteRetainedFiles(orphanedFiles.toSeq)
       if (dropped > 0 && debugEnabled) {
         logDebug(log"Streaming shuffle block resolver stopped, dropping " +

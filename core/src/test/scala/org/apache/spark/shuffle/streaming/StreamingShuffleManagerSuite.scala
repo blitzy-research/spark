@@ -21,6 +21,7 @@ import java.lang.reflect.Modifier
 import java.nio.ByteBuffer
 import java.util.Locale
 
+import scala.collection.immutable.SortedMap
 import scala.jdk.CollectionConverters._
 
 import _root_.io.netty.channel.DefaultChannelId
@@ -31,17 +32,24 @@ import org.mockito.stubbing.Answer
 import org.scalatest.concurrent.Eventually._
 import org.scalatest.time.SpanSugar._
 
-import org.apache.spark.{Aggregator, HashPartitioner, LocalSparkContext, Partitioner, SecurityManager, ShuffleDependency, SparkConf, SparkContext, SparkEnv, SparkFunSuite, SparkIllegalArgumentException, TaskContext}
-import org.apache.spark.internal.config.{AUTH_SECRET, NETWORK_AUTH_ENABLED, SHUFFLE_MANAGER, SHUFFLE_STREAMING_BUFFER_SIZE_PERCENT, SHUFFLE_STREAMING_DEBUG, SHUFFLE_STREAMING_ENABLED, SHUFFLE_STREAMING_MAX_BANDWIDTH_MBPS, SHUFFLE_STREAMING_SPILL_THRESHOLD}
+import org.apache.spark.{Aggregator, HashPartitioner, LocalSparkContext, Partitioner,
+  SecurityManager, ShuffleDependency, SparkConf, SparkContext, SparkEnv, SparkException,
+  SparkFunSuite, SparkIllegalArgumentException, TaskContext}
+import org.apache.spark.internal.config.{AUTH_SECRET, NETWORK_AUTH_ENABLED, SHUFFLE_MANAGER,
+  SHUFFLE_SERVICE_ENABLED, SHUFFLE_STREAMING_BUFFER_SIZE_PERCENT, SHUFFLE_STREAMING_DEBUG,
+  SHUFFLE_STREAMING_ENABLED, SHUFFLE_STREAMING_MAX_BANDWIDTH_MBPS,
+  SHUFFLE_STREAMING_SPILL_THRESHOLD}
 import org.apache.spark.metrics.source.StaticSources
 import org.apache.spark.network.TransportContext
-import org.apache.spark.network.client.{TransportClient, TransportClientFactory, TransportResponseHandler}
+import org.apache.spark.network.client.{TransportClient, TransportClientBootstrap,
+  TransportClientFactory, TransportResponseHandler}
 import org.apache.spark.network.crypto.{AuthClientBootstrap, AuthServerBootstrap}
-import org.apache.spark.network.server.TransportServer
-import org.apache.spark.network.shuffle.protocol.streaming.HeartbeatMessage
+import org.apache.spark.network.shuffle.protocol.streaming.{HeartbeatMessage,
+  StreamingShuffleMessage}
 import org.apache.spark.rpc.RpcEnv
 import org.apache.spark.serializer.{JavaSerializer, Serializer}
-import org.apache.spark.shuffle.{BaseShuffleHandle, IndexShuffleBlockResolver, MigratableResolver, ShuffleHandle, ShuffleManager, ShuffleReader, ShuffleReadMetricsReporter}
+import org.apache.spark.shuffle.{BaseShuffleHandle, IndexShuffleBlockResolver, MigratableResolver,
+  ShuffleHandle, ShuffleManager, ShuffleReader, ShuffleReadMetricsReporter}
 import org.apache.spark.shuffle.sort.SortShuffleManager
 import org.apache.spark.storage.{BlockManagerId, ShuffleMergedBlockId}
 import org.apache.spark.util.{RpcUtils, Utils}
@@ -99,8 +107,8 @@ class StreamingShuffleManagerSuite extends SparkFunSuite
    * Buffer share a live budget is derived from before the immutability case mutates it, and the
    * share it is mutated to. Both are inside the documented one-to-fifty range, and the second is a
    * multiple of the first so that the expected allowance after a restart is exact arithmetic rather
-   * than an approximation: an allowance is the integer quotient of the unified memory region by a
-   * hundred, multiplied by the share, so the shares' ratio carries through without rounding.
+   * than an approximation: an allowance is the integer quotient of the configured executor memory
+   * by a hundred, multiplied by the share, so the shares' ratio carries through without rounding.
    */
   private val initialBufferSizePercent: Int = 10
 
@@ -119,6 +127,16 @@ class StreamingShuffleManagerSuite extends SparkFunSuite
    * comparisons afterwards use so that no two writers of one case share an output file.
    */
   private val PreTripMapId = 90L
+
+  /**
+   * The consumer identity the transport-security cases put on the wire.
+   *
+   * Consumer identity crosses the wire as a fixed-width token rather than as text, so the cases
+   * that assert on routing and on refusal carry a token rather than a name. Any non-sentinel value
+   * serves; what matters is that it is not [[StreamingShuffleTestHelper.NoConsumerToken]], because
+   * a frame that declares no consumer at all takes a different path through the listener.
+   */
+  private val DirectConsumerToken: Long = 4711001L
 
   /**
    * A shuffle id the coordinator has never been told about.
@@ -660,12 +678,9 @@ class StreamingShuffleManagerSuite extends SparkFunSuite
       (StreamingShuffleFallbackReason.MemoryPressure,
         policy => policy.recordAllocationGrant(requestedBytes = 1024L, grantedBytes = 512L)),
       (StreamingShuffleFallbackReason.NetworkSaturation,
-        // A run of over-capacity samples rather than one: a single one is a pacing bucket's legal
-        // burst, and the policy requires the run before it calls the link saturated.
-        policy => (1L to StreamingShuffleFallbackPolicy.SATURATION_SUSTAINED_SAMPLES).foreach { _ =>
-          policy.recordLinkUtilization(
-            usedBytesPerSecond = 990.0d, capacityBytesPerSecond = 1000.0d)
-        }),
+        // One reading strictly above the ninety percent share, which is the whole condition.
+        policy => policy.recordLinkUtilization(
+          usedBytesPerSecond = 990.0d, capacityBytesPerSecond = 1000.0d)),
       (StreamingShuffleFallbackReason.ProtocolVersionMismatch,
         policy => policy.checkProtocolVersion((ProtocolVersion + 1).toByte)),
       (StreamingShuffleFallbackReason.ConsumerTooSlow, policy => {
@@ -842,12 +857,9 @@ class StreamingShuffleManagerSuite extends SparkFunSuite
 
     // The condition is applied to the very policy the service-provider methods consult, which is
     // what a writer or a reader on this executor would have done on observing it.
-    // A run of over-capacity samples, because one is a pacing bucket's legal burst rather than a
-    // saturated link: see StreamingShuffleFallbackPolicy.SATURATION_SUSTAINED_SAMPLES.
-    (1L to StreamingShuffleFallbackPolicy.SATURATION_SUSTAINED_SAMPLES).foreach { _ =>
-      manager.degradationPolicy.recordLinkUtilization(
-        usedBytesPerSecond = 990.0d, capacityBytesPerSecond = 1000.0d)
-    }
+    // One reading strictly above the ninety percent share, which is the whole condition.
+    manager.degradationPolicy.recordLinkUtilization(
+      usedBytesPerSecond = 990.0d, capacityBytesPerSecond = 1000.0d)
     assert(manager.degradationPolicy.hasTripped &&
         manager.degradationPolicy.trippedReason
           .contains(StreamingShuffleFallbackReason.NetworkSaturation),
@@ -906,19 +918,20 @@ class StreamingShuffleManagerSuite extends SparkFunSuite
     assertNoDataLoss(observed, baseline, "a shuffle run after the manager stood streaming down")
   }
 
-  test("a fallback verdict reports the declarer's own account before the member's prose") {
-    // The set of conditions is closed at four, so a declaration whose true condition is narrower
-    // than any member has to pick the member it belongs under -- and the member's prose would then
-    // be the only thing an operator ever read, stating a measurement nobody took. The declarer's
-    // sentence therefore travels with the verdict and is what a rendering prefers, while the name
-    // stays the stable machine identifier.
+  test("a fallback verdict reports the declarer's own account, and names a condition only if one " +
+      "was observed") {
+    // Two properties of one record. The declarer's own sentence travels with the verdict and is
+    // what every operator-facing rendering prefers, so a record never reports a measurement nobody
+    // took; and the machine identifier -- the thing an operator filters and alerts on -- names one
+    // of the four conditions only when one of the four was actually observed.
     val withDetail = StreamingShuffleFallbackState(
-      StreamingShuffleFallbackReason.ProtocolVersionMismatch.toString,
+      StreamingShuffleFallbackReason.NetworkSaturation.toString,
       declaredAtEpoch = 7L,
-      detail = "a consumer requested the narrowed map range [1, 3)")
-    assert(withDetail.condition === "a consumer requested the narrowed map range [1, 3)",
+      detail = "egress held 94% of the administered link for the whole sampling run")
+    assert(withDetail.condition ===
+        "egress held 94% of the administered link for the whole sampling run",
       s"a verdict carrying a detail must report it, but reported ${withDetail.condition}")
-    assert(withDetail.reason.contains(StreamingShuffleFallbackReason.ProtocolVersionMismatch),
+    assert(withDetail.reason.contains(StreamingShuffleFallbackReason.NetworkSaturation),
       "and the name must still resolve onto this build's closed set")
 
     val withoutDetail = StreamingShuffleFallbackState(
@@ -926,11 +939,59 @@ class StreamingShuffleManagerSuite extends SparkFunSuite
     assert(withoutDetail.condition === StreamingShuffleFallbackReason.ConsumerTooSlow.description,
       s"a verdict with no detail must fall back to this build's prose for the member, but " +
         s"reported ${withoutDetail.condition}")
+    assert(withoutDetail.condition.contains("2x") && withoutDetail.condition.contains("60 seconds"),
+      s"and that prose must state the measurement the member IS, narrowly, so a record naming it " +
+        s"cannot be read as anything else, but read '${withoutDetail.condition}'")
+
+    // The record that names no condition. It stands a shuffle down exactly as the four do -- a
+    // consumer that can resolve no producer, a producer whose address could not be published -- but
+    // it claims no measurement, because none was taken. It is deliberately NOT a member of the
+    // closed set, so it resolves to no condition while still reading as fallen back.
+    val unavailable = StreamingShuffleFallbackState(
+      StreamingShuffleFallbackReason.UNAVAILABLE_NAME, declaredAtEpoch = 9L)
+    assert(unavailable.fallenBack,
+      "the unavailable marker must stand the shuffle down, or a retry would stream again")
+    assert(unavailable.reason.isEmpty,
+      s"it must resolve to no condition, because it names none, but resolved ${unavailable.reason}")
+    assert(StreamingShuffleFallbackReason.fromName(
+        StreamingShuffleFallbackReason.UNAVAILABLE_NAME).isEmpty,
+      "and it must stay outside the closed set of four")
+    assert(StreamingShuffleFallbackReason.all.size === 4,
+      s"which must still hold exactly four members, but holds " +
+        s"${StreamingShuffleFallbackReason.all.size}")
+    assert(StreamingShuffleFallbackReason.isDeclarable(
+        StreamingShuffleFallbackReason.UNAVAILABLE_NAME),
+      "while still being a record this build is willing to latch")
+    assert(!StreamingShuffleFallbackReason.isDeclarable("SomethingThisBuildCannotResolve"),
+      "unlike a name it has never heard of, which is refused at the boundary")
+    assert(unavailable.condition === StreamingShuffleFallbackReason.UNAVAILABLE_DESCRIPTION,
+      s"and its rendering must say that streaming was unavailable rather than naming a resource " +
+        s"to tune, but read '${unavailable.condition}'")
+    assert(!unavailable.condition.contains("2x") && !unavailable.condition.contains("memory") &&
+        !unavailable.condition.contains("link"),
+      s"naming no resource at all, but read '${unavailable.condition}'")
+
+    // A capability stand-down resolves too, and resolves as itself: `cause` names it while
+    // `reason` stays empty, because none of the four conditions was measured.
+    val capability = StreamingShuffleFallbackState(
+      StreamingShuffleStandDownCause.UnsupportedReadShape.toString, declaredAtEpoch = 8L)
+    assert(capability.fallenBack, "a capability stand-down must read as fallen back")
+    assert(capability.reason.isEmpty,
+      s"but it must NOT resolve onto the four conditions, because none was measured: " +
+        s"${capability.reason}")
+    assert(capability.cause.map(_.toString) ===
+        Some(StreamingShuffleStandDownCause.UnsupportedReadShape.toString),
+      s"and it must resolve as the cause it is, but resolved to ${capability.cause}")
+    assert(capability.condition ===
+        StreamingShuffleStandDownCause.UnsupportedReadShape.description,
+      s"with prose of its own rather than a member's, but read '${capability.condition}'")
 
     val unresolvable = StreamingShuffleFallbackState("SomethingThisBuildCannotResolve", 7L)
     assert(unresolvable.condition === "SomethingThisBuildCannotResolve",
       s"and a name this build cannot resolve must be reported verbatim rather than as prose it " +
         s"cannot produce, but reported ${unresolvable.condition}")
+    assert(unresolvable.cause.isEmpty && unresolvable.reason.isEmpty,
+      "a name in neither set must resolve to nothing at all")
 
     val stillStreaming = StreamingShuffleFallbackState()
     assert(!stillStreaming.fallenBack,
@@ -940,16 +1001,15 @@ class StreamingShuffleManagerSuite extends SparkFunSuite
         s"described '${stillStreaming.condition}'")
   }
 
-  test("a narrowed map range is declined as a compatibility failure and never as consumer " +
-      "slowness") {
-    // A live producer location names a map id and a task attempt id but no map index, so "map
-    // indexes 1 to 3" cannot be served from producers that are still running and the read must be
-    // declined. What is asserted here is the ATTRIBUTION of that decline. It used to be declared as
-    // a consumer held at 2x behind the producer for more than a minute -- a measurement nothing on
-    // this path takes -- which told an operator reading the driver log to go and tune consumer
-    // throughput for a condition that was purely structural. The decline is a compatibility failure
-    // between what a consumer asked for and what the protocol can serve, which is the same member a
-    // partition-count disagreement is declared under, and the detail carries the specifics.
+  test("a narrowed map range is served by the streaming reader and filtered exactly") {
+    // The seven-argument form of getReader is part of the service-provider contract, and adaptive
+    // execution narrows a map range routinely when it coalesces or splits a stage. A producer
+    // registration carries the map INDEX beside the map id -- the identity every attempt of a map
+    // task shares -- so the range is answerable by selecting registrations, with no mapping to
+    // invent. What this case pins is that the request is SERVED rather than declined: declining it
+    // stood the whole shuffle down for an ordinary read and recorded the decline as a
+    // protocol-version mismatch that had not happened, so an adaptive plan lost the fast path and
+    // its operator was pointed at the wrong cause.
     val baseline = sortBaselineGroupedOutput(numPartitions = 4)
     sc = new SparkContext(
       withLocalMaster(streamingConf(), "streaming-shuffle-manager-narrowed-range", "local[2]"))
@@ -960,47 +1020,98 @@ class StreamingShuffleManagerSuite extends SparkFunSuite
 
     val dependency = shuffleDependencyFor(sc, sc.conf, numPartitions = 4, numRecords = 20)
     val handle = dependency.shuffleHandle.asInstanceOf[StreamingShuffleHandle[Int, Int, Int]]
-    // The full range still streams, so the decline below is attributable to the narrowing alone.
     assert(manager.getReader[Int, Int](handle, 0, Int.MaxValue, 0, 1, context,
         context.taskMetrics().createTempShuffleReadMetrics())
         .isInstanceOf[StreamingShuffleReader[_, _]],
-      "the whole map range must still be served by the streaming reader, or the narrowed case " +
-        "below proves nothing")
+      "the whole map range must be served by the streaming reader")
 
-    val narrowedReader = manager.getReader[Int, Int](handle, 1, 3, 0, 1, context,
-      context.taskMetrics().createTempShuffleReadMetrics())
-    withSortManager(sc.conf) { sort =>
-      val sortReader = sort.getReader[Int, Int](handle, 1, 3, 0, 1, context,
+    Seq((1, 3), (0, 1), (2, 7)).foreach { case (startMapIndex, endMapIndex) =>
+      val reader = manager.getReader[Int, Int](handle, startMapIndex, endMapIndex, 0, 1, context,
         context.taskMetrics().createTempShuffleReadMetrics())
-      assert(narrowedReader.getClass === sortReader.getClass,
-        s"a narrowed map range must be served by the sort delegate's own reader, but was served " +
-          s"by ${narrowedReader.getClass.getName} against ${sortReader.getClass.getName}")
+      assert(reader.isInstanceOf[StreamingShuffleReader[_, _]],
+        s"the narrowed map range [$startMapIndex, $endMapIndex) must be served by the streaming " +
+          s"reader too, but was served by ${reader.getClass.getName}")
+      assert(!StreamingShuffleReader.servesFullMapRange(startMapIndex, endMapIndex),
+        s"[$startMapIndex, $endMapIndex) must be a narrowed range, or this case proves nothing")
     }
 
+    // Nothing about a narrowed read may stand the shuffle down, and in particular nothing may claim
+    // a compatibility failure: a valid request is not a version mismatch.
     val declared = coordinatorRef.askSync[StreamingShuffleFallbackState](
       GetStreamingShuffleFallbackState(handle.shuffleId, handle.capabilityToken))
-    assert(declared.fallenBack,
-      "the decline must stand the shuffle down for every participant, or the recomputation would " +
-        "land on producers that cannot serve the narrowed range either")
-    assert(declared.reasonName !== StreamingShuffleFallbackReason.ConsumerTooSlow.toString,
-      "a structural decline must not be attributed to sustained consumer slowness, which is a " +
-        "measurement this path never takes")
-    assert(declared.reason.contains(StreamingShuffleFallbackReason.ProtocolVersionMismatch),
-      s"it must be declared as the compatibility failure it is, but was declared as " +
+    assert(!declared.fallenBack,
+      s"a valid narrowed read must leave the shuffle streaming, but it stood down for " +
         s"${declared.reasonName}")
-    assert(declared.detail.contains("narrowed map range [1, 3)"),
-      s"the declaration must carry the requested range, but carried '${declared.detail}'")
-    assert(declared.condition === declared.detail,
-      s"and an operator must read that account rather than the member's prose, but would read " +
-        s"'${declared.condition}'")
-    assert(!declared.condition.contains("slower") && !declared.condition.contains("60 seconds"),
-      s"nothing an operator reads may claim a throughput condition, but the rendering was " +
-        s"'${declared.condition}'")
+    assert(declared.reasonName === StreamingShuffleCoordinator.NO_FALLBACK_REASON,
+      s"and no condition may be recorded at all, but '${declared.reasonName}' was")
 
-    // The definitive statement: the workload still completes, on the sort-based path, with the
-    // baseline's output.
+    // The filtering itself, asserted where it is decided: only the registrations of the requested
+    // range are selected, and a range beyond the declared cardinality selects nothing.
+    val locations = (0 until 4).map { mapIndex =>
+      StreamingShuffleProducerLocation(executorId = s"exec-$mapIndex", host = "producer-host",
+        port = 7337 + mapIndex, mapId = 100L + mapIndex, mapIndex = mapIndex,
+        taskAttemptId = 100L + mapIndex,
+        blockManagerId = BlockManagerId(s"exec-$mapIndex", "producer-host", 7337 + mapIndex))
+    }
+    val reply = StreamingShuffleProducerLocations(shuffleId = handle.shuffleId,
+      locations = locations, numPartitions = 4, numMaps = 4, completedMapIndexes = Set.empty,
+      protocolVersion = StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION, coordinatorEpoch = 3L,
+      fallback = StreamingShuffleFallbackState())
+    Seq((0, Int.MaxValue, Seq(0, 1, 2, 3)), (1, 3, Seq(1, 2)), (3, 4, Seq(3)),
+      (4, 9, Seq.empty[Int])).foreach { case (startMapIndex, endMapIndex, expected) =>
+      val reader = manager.getReader[Int, Int](handle, startMapIndex, endMapIndex, 0, 1, context,
+        context.taskMetrics().createTempShuffleReadMetrics())
+        .asInstanceOf[StreamingShuffleReader[Int, Int]]
+      assert(reader.servedMapIndexesOf(reply) === expected,
+        s"[$startMapIndex, $endMapIndex) must select map indexes ${expected.mkString(", ")} but " +
+          s"selected ${reader.servedMapIndexesOf(reply).mkString(", ")}")
+    }
+
+    // And the workload still completes with the baseline's output, which is the statement that
+    // matters most: serving narrowed ranges did not cost correctness.
     val observed = groupedOutputAsSet(sc, numPartitions = 4)
-    assertNoDataLoss(observed, baseline, "a shuffle whose narrowed read stood streaming down")
+    assertNoDataLoss(observed, baseline, "a shuffle read through the streaming reader")
+  }
+
+  test("an enabled external shuffle service declines streaming for the whole application") {
+    // The service serves a block by reading the index and data files an executor left on disk,
+    // from a process that outlives that executor. Streaming has neither: its resolver answers from
+    // a live producer's retained window and spill segments, which the service cannot see, and the
+    // producer address a consumer resolves belongs to the very executor the service exists to make
+    // dispensable. The exclusion is therefore STRUCTURAL rather than a per-shuffle refusal: this
+    // JVM builds no streaming state at all, so no streaming handle is created, the delegate's own
+    // index resolver is what gets published, and the sort-based delegate owns every shuffle end to
+    // end -- leaving exactly the files the service already knows how to serve. The posture is the
+    // kill switch's, reached from a different setting.
+    val conf = streamingConf().set(SHUFFLE_SERVICE_ENABLED, true)
+    val dependency = shuffleDep(numPartitions = 4)
+    withManager(conf, isDriver = true) { manager =>
+      val handle = manager.registerShuffle(0, dependency)
+      assert(!handle.isInstanceOf[StreamingShuffleHandle[_, _, _]],
+        s"an application with the external shuffle service enabled must not be given a streaming " +
+          s"handle, but was given ${handle.getClass.getName}")
+      withSortManager(conf) { sort =>
+        val sortHandle = sort.registerShuffle(0, dependency)
+        assert(handle.getClass === sortHandle.getClass,
+          s"the handle must be exactly what a standalone SortShuffleManager produces, so the " +
+            s"service sees the files it already knows how to serve, but got " +
+            s"${handle.getClass.getName} against ${sortHandle.getClass.getName}")
+      }
+      // And the reader and writer follow the handle: a sort-based handle is not a streaming handle,
+      // so every service-provider call for it is the delegate's.
+      assert(manager.shuffleBlockResolver.isInstanceOf[IndexShuffleBlockResolver],
+        "the resolver published under an enabled service must be the delegate's index resolver, " +
+          s"which is the only resolver the service can read, but was " +
+          s"${manager.shuffleBlockResolver.getClass.getName}")
+      withSortManager(conf) { sort =>
+        assert(manager.shuffleBlockResolver.getClass === sort.shuffleBlockResolver.getClass,
+          "and it must be the same class a standalone SortShuffleManager publishes, not merely " +
+            "something index-shaped")
+      }
+      assert(pushBasedMergeWouldEngage(manager),
+        "ShuffleWriteProcessor's push-merge branch must fire under an enabled service, because " +
+          "that is part of what makes this posture indistinguishable from sort-based shuffle")
+    }
   }
 
   test("each fallback condition routes a live manager's writer reader and unregister to sort") {
@@ -1018,12 +1129,9 @@ class StreamingShuffleManagerSuite extends SparkFunSuite
       (StreamingShuffleFallbackReason.MemoryPressure,
         policy => policy.recordAllocationGrant(requestedBytes = 1024L, grantedBytes = 512L)),
       (StreamingShuffleFallbackReason.NetworkSaturation,
-        // A run of over-capacity samples rather than one: a single one is a pacing bucket's legal
-        // burst, and the policy requires the run before it calls the link saturated.
-        policy => (1L to StreamingShuffleFallbackPolicy.SATURATION_SUSTAINED_SAMPLES).foreach { _ =>
-          policy.recordLinkUtilization(
-            usedBytesPerSecond = 990.0d, capacityBytesPerSecond = 1000.0d)
-        }),
+        // One reading strictly above the ninety percent share, which is the whole condition.
+        policy => policy.recordLinkUtilization(
+          usedBytesPerSecond = 990.0d, capacityBytesPerSecond = 1000.0d)),
       (StreamingShuffleFallbackReason.ProtocolVersionMismatch,
         policy => policy.checkProtocolVersion((ProtocolVersion + 1).toByte)),
       (StreamingShuffleFallbackReason.ConsumerTooSlow, policy => {
@@ -1114,7 +1222,7 @@ class StreamingShuffleManagerSuite extends SparkFunSuite
   // shuffle that succeeds.
   // -----------------------------------------------------------------------------------------------
 
-  test("streaming channels carry the platform's auth handshake exactly when it is enabled") {
+  test("streaming channels require the platform auth handshake and fail closed without it") {
     val authenticated = new SparkConf(false)
       .set(NETWORK_AUTH_ENABLED, true)
       .set(AUTH_SECRET, "streaming-shuffle-manager-suite-secret")
@@ -1155,23 +1263,76 @@ class StreamingShuffleManagerSuite extends SparkFunSuite
     val plaintextSecurity = new SecurityManager(plaintext)
     assert(!plaintextSecurity.isAuthenticationEnabled(),
       "the plaintext configuration must really disable authentication")
-    assert(StreamingShuffleServerHandler.streamingClientBootstraps(
-        plaintext, plaintextTransport, Some(plaintextSecurity)).isEmpty,
-      "with authentication disabled the list must be empty, which reproduces the platform's " +
-        "behaviour for every other connection in the same application rather than inventing one")
-    assert(StreamingShuffleServerHandler.streamingServerBootstraps(
-        plaintextTransport, Some(plaintextSecurity)).isEmpty,
-      "with authentication disabled the producer server must accept channels exactly as every " +
-        "other server in the application does")
+    val plaintextClientRefusal = intercept[SparkException] {
+      StreamingShuffleServerHandler.streamingClientBootstraps(
+        plaintext, plaintextTransport, Some(plaintextSecurity))
+    }
+    assert(plaintextClientRefusal.getMessage.contains(NETWORK_AUTH_ENABLED.key),
+      s"the client refusal must name the missing security gate, but said " +
+        s"${plaintextClientRefusal.getMessage}")
+    val plaintextServerRefusal = intercept[SparkException] {
+      StreamingShuffleServerHandler.streamingServerBootstraps(
+        plaintextTransport, Some(plaintextSecurity))
+    }
+    assert(plaintextServerRefusal.getMessage.contains(NETWORK_AUTH_ENABLED.key),
+      s"the server refusal must name the missing security gate, but said " +
+        s"${plaintextServerRefusal.getMessage}")
 
-    // No environment to read a secret from: the posture must be the plaintext one rather than a
-    // handshake with no secret behind it.
-    assert(StreamingShuffleServerHandler.streamingClientBootstraps(
-        authenticated, authenticatedTransport, security = None).isEmpty &&
-        StreamingShuffleServerHandler.streamingServerBootstraps(
-          authenticatedTransport, security = None).isEmpty,
-      "without a security manager there is no secret to complete a handshake with, so no " +
-        "bootstrap may be installed")
+    // No environment to read a secret from is also a refusal, never a plaintext exception.
+    intercept[SparkException] {
+      StreamingShuffleServerHandler.streamingClientBootstraps(
+        authenticated, authenticatedTransport, security = None)
+    }
+    intercept[SparkException] {
+      StreamingShuffleServerHandler.streamingServerBootstraps(
+        authenticatedTransport, security = None)
+    }
+  }
+
+  test("the coordinator refuses a producer address that could forge a log record") {
+    // CWE-117. A stored producer address is handed to consumers and written to log records for as
+    // long as the producer lives, so a peer that can put a line terminator into one can end the
+    // driver's record early and forge a second, entirely plausible one after it. The test exists
+    // because `Character.isISOControl` alone does NOT close that hole: it covers U+0000-U+001F and
+    // U+007F-U+009F only, while U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR terminate a
+    // line for a great many readers of a log stream -- JSON and JavaScript tooling in particular.
+    sc = new SparkContext(
+      withLocalMaster(streamingConf(), "streaming-shuffle-manager-log-forgery", "local[2]"))
+    val coordinator = new StreamingShuffleCoordinator(sc.env.rpcEnv, sc.conf, newManualClock())
+    val shuffleId = 11
+    val grant = coordinator.registerShuffle(shuffleId, numPartitions = 2, numMaps = 1,
+      ProtocolVersion).getOrElse(
+      fail("the coordinator must accept a well-formed registration of the current protocol"))
+
+    def register(executorId: String, host: String): Boolean = {
+      coordinator.registerProducer(shuffleId, grant.capabilityToken,
+        StreamingShuffleProducerLocation(executorId = executorId, host = host, port = 7337,
+          mapId = 0L, mapIndex = 0, taskAttemptId = 0L,
+          blockManagerId = BlockManagerId(executorId, host, 7337)),
+        numPartitions = 2, ProtocolVersion).accepted
+    }
+
+    // Every shape of line terminator, in either identifier, refused on the same terms.
+    // The code points are computed rather than written as unicode escapes, because a unicode
+    // escape in Scala source is processed by the SCANNER: writing one here would put a real line
+    // separator into the middle of this file, which is a compile error rather than a test.
+    Seq(
+      (0x2028.toChar, "U+2028 LINE SEPARATOR"),
+      (0x2029.toChar, "U+2029 PARAGRAPH SEPARATOR"),
+      ('\n', "a line feed"),
+      ('\r', "a carriage return"),
+      (0.toChar, "a NUL")).foreach { case (character, description) =>
+      assert(!register(s"exec$character-1", "producer-host"),
+        s"an executor id carrying $description must be refused, because it would let a peer " +
+          "forge a line in the driver's log")
+      assert(!register("exec-1", s"producer$character-host"),
+        s"and a host carrying $description must be refused for the same reason")
+    }
+
+    // The refusals are refusals of the ADDRESS and not of registration in general: the identical
+    // call with clean identifiers is accepted, so the case cannot pass by rejecting everything.
+    assert(register("exec-1", "producer-host"),
+      "a producer whose address carries no line terminator must be registered")
   }
 
   test("the coordinator refuses an unauthorised caller at every gate without acting") {
@@ -1278,6 +1439,8 @@ class StreamingShuffleManagerSuite extends SparkFunSuite
       val innocent = new EmbeddedChannel(DefaultChannelId.newInstance())
       val abusiveClient = new TransportClient(abusive, new TransportResponseHandler(abusive))
       val innocentClient = new TransportClient(innocent, new TransportResponseHandler(innocent))
+      abusiveClient.setClientId("streaming-shuffle-manager-suite")
+      innocentClient.setClientId("streaming-shuffle-manager-suite")
       // Too short to carry the routing identity a router dispatches on, so handling fails outright
       // rather than being routed anywhere.
       val unhandleable = ByteBuffer.wrap(Array[Byte](1, 2, 3, 4))
@@ -1337,6 +1500,165 @@ class StreamingShuffleManagerSuite extends SparkFunSuite
           s"${listener.producerCount}")
     } finally {
       listener.releaseAll()
+    }
+  }
+
+  test("the malformed-channel ledger fails closed when every tracking slot is occupied") {
+    val limits = StreamingShuffleListener.DefaultLimits.copy(
+      maxMalformedFramesPerChannel = 3,
+      maxTrackedMalformedChannels = 2)
+    val listener = new StreamingShuffleListener(streamingConf(), newManualClock(), limits)
+
+    def authenticatedClient(name: String): (EmbeddedChannel, TransportClient) = {
+      val channel = new EmbeddedChannel(DefaultChannelId.newInstance())
+      val client = new TransportClient(channel, new TransportResponseHandler(channel))
+      client.setClientId(name)
+      (channel, client)
+    }
+
+    val first = authenticatedClient("malformed-peer-1")
+    val second = authenticatedClient("malformed-peer-2")
+    val overflow = authenticatedClient("malformed-peer-3")
+    val malformed = ByteBuffer.wrap(Array[Byte](1, 2, 3, 4))
+    try {
+      listener.receive(first._2, malformed.duplicate())
+      listener.receive(second._2, malformed.duplicate())
+      assert(listener.trackedMalformedChannelCount === 2,
+        "the two configured malformed-channel slots must both be occupied")
+
+      listener.receive(overflow._2, malformed.duplicate())
+      assert(!overflow._2.isActive,
+        "a new malformed channel must fail closed when the tracking ledger is full")
+      assert(listener.abusiveChannelClosedCount === 1L,
+        "the untracked overflow channel must be closed on its first malformed frame")
+      assert(listener.trackedMalformedChannelCount === 2,
+        "failing closed must not grow the bounded malformed-channel ledger")
+
+      listener.receive(first._2, malformed.duplicate())
+      listener.receive(first._2, malformed.duplicate())
+      assert(!first._2.isActive,
+        "a channel already in the ledger must still close at its configured allowance")
+      assert(listener.abusiveChannelClosedCount === 2L,
+        "the overflow channel and the tracked channel must each be counted once")
+      assert(second._2.isActive,
+        "one channel exhausting its allowance must not close another tracked channel")
+    } finally {
+      Seq(first, second, overflow).foreach { case (channel, _) =>
+        channel.finishAndReleaseAll()
+      }
+      listener.releaseAll()
+    }
+  }
+
+  test("listener quotas bound participant channels and routes before state is created") {
+    def authenticatedClient(name: String): (EmbeddedChannel, TransportClient) = {
+      val channel = new EmbeddedChannel(DefaultChannelId.newInstance())
+      val client = new TransportClient(channel, new TransportResponseHandler(channel))
+      client.setClientId(name)
+      (channel, client)
+    }
+
+    def sendHeartbeat(
+        listener: StreamingShuffleListener,
+        client: TransportClient,
+        shuffleId: Int,
+        mapId: Long): Unit = {
+      listener.receive(client,
+        new HeartbeatMessage(shuffleId, mapId, 0, 0L, shuffleId.toLong * 1000L + mapId)
+          .toByteBuffer())
+    }
+
+    val channelLimits = StreamingShuffleListener.DefaultLimits.copy(
+      maxParticipantChannels = 3,
+      maxParticipantChannelsPerPeer = 2,
+      maxParticipantRoutes = 6,
+      maxParticipantRoutesPerPeer = 4,
+      maxParticipantRoutesPerChannel = 2)
+    val channelListener =
+      new StreamingShuffleListener(streamingConf(), newManualClock(), channelLimits)
+    val channelHandler = mock(classOf[StreamingShuffleServerHandler])
+    channelListener.register(70, 1L, channelHandler)
+    val peerA1 = authenticatedClient("participant-peer-a")
+    val peerA2 = authenticatedClient("participant-peer-a")
+    val peerA3 = authenticatedClient("participant-peer-a")
+    val peerB1 = authenticatedClient("participant-peer-b")
+    val peerB2 = authenticatedClient("participant-peer-b")
+    try {
+      Seq(peerA1, peerA2).foreach(entry => sendHeartbeat(channelListener, entry._2, 70, 1L))
+      assert(channelListener.participantChannelCount === 2,
+        "two channels from one peer must be admitted below its quota")
+
+      sendHeartbeat(channelListener, peerA3._2, 70, 1L)
+      assert(!peerA3._2.isActive,
+        "a third channel from the same peer must be refused before channel state is created")
+      assert(channelListener.participantChannelCount === 2,
+        "a per-peer channel refusal must leave the channel registry unchanged")
+
+      sendHeartbeat(channelListener, peerB1._2, 70, 1L)
+      assert(channelListener.participantChannelCount === 3,
+        "a different peer may use the executor's remaining channel slot")
+      sendHeartbeat(channelListener, peerB2._2, 70, 1L)
+      assert(!peerB2._2.isActive,
+        "a channel beyond the executor-wide ceiling must be refused")
+      assert(channelListener.participantChannelCount === 3 &&
+          channelListener.participantRouteCount === 3,
+        "refused channels must add neither channel nor participant-route state")
+      assert(channelListener.remoteStateRefusalCount === 2L,
+        "the per-peer and executor-wide channel refusals must both be counted")
+    } finally {
+      Seq(peerA1, peerA2, peerA3, peerB1, peerB2).foreach { case (channel, client) =>
+        channelListener.channelInactive(client)
+        channel.finishAndReleaseAll()
+      }
+      channelListener.releaseAll()
+    }
+
+    val routeLimits = StreamingShuffleListener.DefaultLimits.copy(
+      maxParticipantChannels = 10,
+      maxParticipantChannelsPerPeer = 10,
+      maxParticipantRoutes = 4,
+      maxParticipantRoutesPerPeer = 3,
+      maxParticipantRoutesPerChannel = 2)
+    val routeListener =
+      new StreamingShuffleListener(streamingConf(), newManualClock(), routeLimits)
+    val routeHandler = mock(classOf[StreamingShuffleServerHandler])
+    (1L to 3L).foreach(mapId => routeListener.register(71, mapId, routeHandler))
+    val channelBound = authenticatedClient("route-peer-a")
+    val peerBound1 = authenticatedClient("route-peer-a")
+    val peerBound2 = authenticatedClient("route-peer-a")
+    val global1 = authenticatedClient("route-peer-b")
+    val global2 = authenticatedClient("route-peer-b")
+    val globalOverflow = authenticatedClient("route-peer-c")
+    try {
+      sendHeartbeat(routeListener, channelBound._2, 71, 1L)
+      sendHeartbeat(routeListener, channelBound._2, 71, 2L)
+      sendHeartbeat(routeListener, channelBound._2, 71, 3L)
+      assert(!channelBound._2.isActive && routeListener.participantRouteCount === 2,
+        "the per-channel route ceiling must refuse a third producer before allocating its entry")
+      routeListener.channelInactive(channelBound._2)
+
+      sendHeartbeat(routeListener, peerBound1._2, 71, 1L)
+      sendHeartbeat(routeListener, peerBound1._2, 71, 2L)
+      sendHeartbeat(routeListener, peerBound2._2, 71, 1L)
+      sendHeartbeat(routeListener, peerBound2._2, 71, 2L)
+      assert(!peerBound2._2.isActive && routeListener.participantRouteCount === 3,
+        "the per-peer route ceiling must refuse state while executor capacity remains")
+      routeListener.channelInactive(peerBound2._2)
+
+      sendHeartbeat(routeListener, global1._2, 71, 1L)
+      sendHeartbeat(routeListener, global2._2, 71, 1L)
+      sendHeartbeat(routeListener, globalOverflow._2, 71, 1L)
+      assert(!globalOverflow._2.isActive && routeListener.participantRouteCount === 4,
+        "the executor route ceiling must refuse a new peer before allocating its first route")
+      assert(routeListener.remoteStateRefusalCount === 3L,
+        "channel, peer and executor route refusals must each be counted")
+    } finally {
+      Seq(channelBound, peerBound1, peerBound2, global1, global2, globalOverflow).foreach {
+        case (channel, client) =>
+          routeListener.channelInactive(client)
+          channel.finishAndReleaseAll()
+      }
+      routeListener.releaseAll()
     }
   }
 
@@ -1498,11 +1820,10 @@ class StreamingShuffleManagerSuite extends SparkFunSuite
     // and a spill threshold that moved would change the point at which eviction triggers half way
     // through a shuffle. Neither is asserted by observing the manager, so neither was covered.
     //
-    // A live context is needed rather than a bare SparkConf: the buffer allowance is derived from
-    // the on-heap unified memory region through the environment's memory manager, and the spill
-    // manager is a real memory consumer of the task memory manager. Both are the production
-    // derivation path, not a stand-in for it -- the point is to prove that the production path
-    // reads the configuration exactly once.
+    // A live context is needed rather than a bare SparkConf: the spill manager is a real memory
+    // consumer of the task memory manager, and that is the production derivation path rather than a
+    // stand-in for it -- the point is to prove that the production path reads the configuration
+    // exactly once.
     sc = new SparkContext(
       withLocalMaster(streamingConf(), "streaming-shuffle-manager-immutable", "local[2]"))
     val partitions = 8
@@ -1569,23 +1890,23 @@ class StreamingShuffleManagerSuite extends SparkFunSuite
       try {
         restarted.registerPartitionCount(partitions)
         val restartedBudget = restarted.totalBudgetBytes
-        // Exact, and derived from the unified-memory reading rather than by rescaling the first
-        // allowance. Rescaling would be wrong arithmetic dressed as an equality: the allowance
-        // takes the product before the division, so for a heap that is not a clean multiple of a
-        // hundred `budget(10) / 10 * 40` falls short of `budget(40)` by the remainder the first
-        // division threw away -- which is exactly the truncation the derivation exists to avoid.
-        // `exactPercentageOf` computes the same quantity independently, in `BigInt`, from the very
-        // quota object the restarted component memoised.
-        val unifiedBytes = MemorySpillManager.executorQuota(conf).unifiedMemoryBytes
-        assert(restartedBudget === exactPercentageOf(unifiedBytes, mutatedBufferSizePercent),
+        // Exact, and derived from the configured executor memory rather than by rescaling the
+        // first allowance. Rescaling would be wrong arithmetic dressed as an equality: the
+        // allowance takes the product before the division, so for a memory size that is not a
+        // clean multiple of a hundred `budget(10) / 10 * 40` falls short of `budget(40)` by the
+        // remainder the first division threw away -- which is exactly the truncation the derivation
+        // exists to avoid. `exactPercentageOf` computes the same quantity independently, in
+        // `BigInt`, from the very quota object the restarted component memoised.
+        val executorBytes = MemorySpillManager.executorQuota(conf).executorMemoryBytes
+        assert(restartedBudget === exactPercentageOf(executorBytes, mutatedBufferSizePercent),
           s"a component built after the change must observe it: $mutatedBufferSizePercent% of " +
-            s"the $unifiedBytes byte unified region is " +
-            s"${exactPercentageOf(unifiedBytes, mutatedBufferSizePercent)}, but it reported " +
+            s"the $executorBytes byte executor memory is " +
+            s"${exactPercentageOf(executorBytes, mutatedBufferSizePercent)}, but it reported " +
             s"$restartedBudget")
-        assert(budgetBytes === exactPercentageOf(unifiedBytes, initialBufferSizePercent),
+        assert(budgetBytes === exactPercentageOf(executorBytes, initialBufferSizePercent),
           s"and the allowance it replaced must have been $initialBufferSizePercent% of the same " +
-            s"region, which is ${exactPercentageOf(unifiedBytes, initialBufferSizePercent)}, but " +
-            s"was $budgetBytes")
+            s"memory, which is " +
+            s"${exactPercentageOf(executorBytes, initialBufferSizePercent)}, but was $budgetBytes")
         assert(restartedBudget > budgetBytes,
           "which is a larger allowance, because the mutation raised the percentage")
         // The same product-before-division arithmetic, for the same reason: an eviction point
@@ -1791,6 +2112,146 @@ class StreamingShuffleManagerSuite extends SparkFunSuite
         "exception messages, and a credential printed there is a credential leaked")
   }
 
+  test("the coordinator maintains executor concurrency and producer order incrementally") {
+    val coordinator =
+      new StreamingShuffleCoordinator(mock(classOf[RpcEnv]), streamingConf(), newManualClock())
+    try {
+      val firstShuffle = 6491
+      val secondShuffle = 6492
+      val partitions = 4
+      val firstToken = coordinator.registerShuffle(
+        firstShuffle, partitions, numMaps = 3, ProtocolVersion).get.capabilityToken
+      val secondToken = coordinator.registerShuffle(
+        secondShuffle, partitions, numMaps = 1, ProtocolVersion).get.capabilityToken
+
+      def location(
+          executorId: String,
+          mapIndex: Int,
+          taskAttemptId: Long): StreamingShuffleProducerLocation = {
+        val mapId = 100L + mapIndex
+        val host = s"host-$executorId"
+        val port = 7300 + mapIndex
+        StreamingShuffleProducerLocation(executorId, host, port, mapId, mapIndex, taskAttemptId,
+          BlockManagerId(executorId, host, port))
+      }
+
+      val mapTwo = location("exec-a", mapIndex = 2, taskAttemptId = 12L)
+      val mapZero = location("exec-a", mapIndex = 0, taskAttemptId = 10L)
+      val mapOne = location("exec-b", mapIndex = 1, taskAttemptId = 11L)
+      Seq(mapTwo, mapZero, mapOne).foreach { producer =>
+        assert(coordinator.registerProducer(
+          firstShuffle, firstToken, producer, partitions, ProtocolVersion).accepted)
+      }
+      val secondProducer = location("exec-a", mapIndex = 0, taskAttemptId = 20L)
+      assert(coordinator.registerProducer(
+        secondShuffle, secondToken, secondProducer, partitions, ProtocolVersion).accepted)
+
+      assert(coordinator.producersFor(firstShuffle).map(_.mapIndex) === Seq(0, 1, 2),
+        "the state must preserve map-index order as producers are inserted out of order")
+      assert(coordinator.indexedShuffleCountFor("exec-a") === 2)
+      assert(coordinator.numConcurrentShufflesFor("exec-a") === 2)
+      assert(coordinator.indexedShuffleCountFor("exec-b") === 1,
+        "several producers of one shuffle must count as one executor membership")
+      assert(coordinator.expiryEntryCount === 4,
+        "one liveness deadline must exist per incomplete producer, not per registration event")
+
+      val replacedZero = location("exec-b", mapIndex = 0, taskAttemptId = 30L)
+      assert(coordinator.registerProducer(
+        firstShuffle, firstToken, replacedZero, partitions, ProtocolVersion).accepted)
+      assert(coordinator.indexedShuffleCountFor("exec-a") === 2,
+        "one remaining producer must retain the executor's membership in the first shuffle")
+      assert(coordinator.expiryEntryCount === 4,
+        "replacing a generation must replace its deadline rather than append another")
+
+      val replacedTwo = location("exec-b", mapIndex = 2, taskAttemptId = 32L)
+      assert(coordinator.registerProducer(
+        firstShuffle, firstToken, replacedTwo, partitions, ProtocolVersion).accepted)
+      assert(coordinator.indexedShuffleCountFor("exec-a") === 1,
+        "moving the last producer must remove exactly one shuffle membership")
+      assert(coordinator.indexedShuffleCountFor("exec-b") === 1,
+        "three producers on one executor still represent one active shuffle")
+
+      assert(coordinator.unregisterShuffle(secondShuffle, secondToken))
+      assert(coordinator.indexedShuffleCountFor("exec-a") === 0)
+      assert(coordinator.numConcurrentShufflesFor("exec-a") === 1,
+        "the public divisor must retain its minimum of one after the index becomes empty")
+      assert(coordinator.expiryEntryCount === 3,
+        "unregistration must remove every deadline belonging to the dropped shuffle")
+    } finally {
+      coordinator.onStop()
+    }
+  }
+
+  test("the coordinator expiry index replaces refreshes and reaps only elapsed targets") {
+    val clock = newManualClock()
+    val coordinator =
+      new StreamingShuffleCoordinator(mock(classOf[RpcEnv]), streamingConf(), clock)
+    try {
+      val shuffleId = 6493
+      val partitions = 2
+      val token = coordinator.registerShuffle(
+        shuffleId, partitions, numMaps = 2, ProtocolVersion).get.capabilityToken
+
+      def location(
+          executorId: String,
+          mapIndex: Int,
+          taskAttemptId: Long): StreamingShuffleProducerLocation = {
+        val mapId = 200L + mapIndex
+        val host = s"host-$executorId"
+        val port = 7400 + mapIndex
+        StreamingShuffleProducerLocation(executorId, host, port, mapId, mapIndex, taskAttemptId,
+          BlockManagerId(executorId, host, port))
+      }
+
+      val incomplete = location("exec-live", mapIndex = 0, taskAttemptId = 40L)
+      val completed = location("exec-complete", mapIndex = 1, taskAttemptId = 41L)
+      Seq(incomplete, completed).foreach { producer =>
+        assert(coordinator.registerProducer(
+          shuffleId, token, producer, partitions, ProtocolVersion).accepted)
+      }
+      assert(coordinator.expiryEntryCount === 2)
+
+      (1 to 100).foreach { _ =>
+        assert(coordinator.heartbeatProducer(shuffleId, token, incomplete.generation).live)
+      }
+      assert(coordinator.expiryEntryCount === 2,
+        "repeated refreshes must replace one indexed deadline rather than append stale entries")
+      assert(coordinator.completeProducer(shuffleId, token, completed.generation))
+      assert(coordinator.expiryEntryCount === 1,
+        "a completed producer is exempt from silence-based reaping and needs no deadline")
+
+      clock.advance(StreamingShuffleCoordinator.PRODUCER_LIVENESS_TIMEOUT_MS)
+      assert(coordinator.reapStaleProducers() === 0,
+        "the strict liveness bound must not expire a producer at exact equality")
+      assert(coordinator.producersFor(shuffleId).map(_.mapIndex) === Seq(0, 1))
+      clock.advance(1L)
+      assert(coordinator.reapStaleProducers() === 1)
+      assert(coordinator.producersFor(shuffleId).map(_.mapIndex) === Seq(1),
+        "only the elapsed incomplete generation may be reaped")
+      assert(coordinator.indexedShuffleCountFor("exec-live") === 0)
+      assert(coordinator.indexedShuffleCountFor("exec-complete") === 1)
+      assert(coordinator.expiryEntryCount === 0)
+
+      val emptyShuffle = 6494
+      val emptyToken = coordinator.registerShuffle(
+        emptyShuffle, partitions, numMaps = 0, ProtocolVersion).get.capabilityToken
+      assert(emptyToken.nonEmpty)
+      assert(coordinator.expiryEntryCount === 1,
+        "an empty registration must hold exactly one idle-eviction deadline")
+      clock.advance(StreamingShuffleCoordinator.EMPTY_STATE_TTL_MS)
+      assert(coordinator.reapStaleProducers() === 0)
+      assert(coordinator.activeShuffleIds.contains(emptyShuffle),
+        "an empty shuffle must remain registered at the exact idle deadline")
+      clock.advance(1L)
+      assert(coordinator.reapStaleProducers() === 0)
+      assert(!coordinator.activeShuffleIds.contains(emptyShuffle),
+        "the expiry index must evict an empty shuffle after its strict deadline")
+      assert(coordinator.expiryEntryCount === 0)
+    } finally {
+      coordinator.onStop()
+    }
+  }
+
   test("no coordinator value renders the capability token, whatever asks it to render itself") {
     // The token is the whole of the coordinator's authorization: a peer holding it may replace a
     // producer address, refresh a liveness window, invalidate a generation, force a shuffle onto
@@ -1828,7 +2289,7 @@ class StreamingShuffleManagerSuite extends SparkFunSuite
         protocolVersion = ProtocolVersion,
         coordinatorEpoch = grant.get.coordinatorEpoch,
         capabilityToken = token,
-        producers = Map(0 -> StreamingShuffleProducerEntry(location, 0L)))
+        producers = SortedMap(0 -> StreamingShuffleProducerEntry(location, 0L)))
 
       // Every value the coordinator defines that carries the token, named individually rather than
       // gathered by reflection, so that a value added later without a redacting `toString` fails
@@ -2032,7 +2493,7 @@ class StreamingShuffleManagerSuite extends SparkFunSuite
     }
   }
 
-  test("streaming channels authenticate when the application does and refuse a peer without it") {
+  test("streaming requires authentication by default and refuses every unauthenticated peer") {
     // A streaming shuffle channel carries serialized records straight into Spark's deserialization,
     // so an unauthenticated one is a remote code execution surface: the block checksum is a CRC32C,
     // which detects corruption and forges trivially, and is therefore no part of the answer. The
@@ -2044,20 +2505,30 @@ class StreamingShuffleManagerSuite extends SparkFunSuite
     val appId = "streaming-shuffle-auth"
     val secret = "streaming-shuffle-application-secret"
 
-    // With authentication off the lists are empty, which reproduces the platform's behaviour for
-    // every other connection in the same application rather than inventing a different one.
-    val plainConf = streamingConf().set("spark.app.id", appId)
+    // With authentication off the manager delegates to sort and neither transport side can be
+    // constructed. Enabling the streaming key is therefore not an insecure override.
+    val plainConf = streamingConf()
+      .set("spark.app.id", appId)
+      .set(NETWORK_AUTH_ENABLED, false)
     val plainSecurity = new SecurityManager(plainConf)
     val plainTransportConf = StreamingShuffleServerHandler.streamingTransportConf(
       plainConf, security = Some(plainSecurity))
     assert(!plainSecurity.isAuthenticationEnabled(),
       "authentication must be off for the plaintext half of this case")
-    assert(StreamingShuffleServerHandler.streamingClientBootstraps(plainConf, plainTransportConf,
-        Some(plainSecurity)).isEmpty,
-      "with authentication off a streaming consumer must install no client bootstrap")
-    assert(StreamingShuffleServerHandler.streamingServerBootstraps(plainTransportConf,
-        Some(plainSecurity)).isEmpty,
-      "with authentication off a streaming producer must install no server bootstrap")
+    withManager(plainConf, isDriver = false) { manager =>
+      assert(manager.shuffleBlockResolver.isInstanceOf[IndexShuffleBlockResolver],
+        "authentication off must leave the selected streaming manager on the sort resolver")
+      assert(manager.boundStreamingListener.isEmpty,
+        "authentication off must never bind a streaming listener")
+    }
+    intercept[SparkException] {
+      StreamingShuffleServerHandler.streamingClientBootstraps(
+        plainConf, plainTransportConf, Some(plainSecurity))
+    }
+    intercept[SparkException] {
+      StreamingShuffleServerHandler.streamingServerBootstraps(
+        plainTransportConf, Some(plainSecurity))
+    }
 
     // With authentication on, both ends install the platform's own handshake.
     val authConf = streamingConf()
@@ -2097,12 +2568,32 @@ class StreamingShuffleManagerSuite extends SparkFunSuite
     // it, so that a frame arriving is proof the handshake completed.
     val listener = new StreamingShuffleListener(authConf)
     val transportContext = new TransportContext(transportConf, listener)
-    var server: TransportServer = null
+    var server: StreamingShuffleListener.BoundServer = null
     var authorizedFactory: TransportClientFactory = null
-    var strangerFactory: TransportClientFactory = null
+    var unauthenticatedFactory: TransportClientFactory = null
     try {
-      server = transportContext.createServer(0, serverBootstraps)
+      server = new StreamingShuffleListener.BoundServer(
+        transportContext, transportConf, listener, serverBootstraps)
       assert(server.getPort > 0, "the producer server must have bound a port")
+
+      // Defense in depth at the listener itself. This bypasses the auth bootstrap deliberately; a
+      // valid frame still reaches no header decode and creates no route state without a principal.
+      val directChannel = new EmbeddedChannel(DefaultChannelId.newInstance())
+      val directClient = new TransportClient(
+        directChannel, new TransportResponseHandler(directChannel))
+      val directHeartbeat =
+        new HeartbeatMessage(4711, 1L, 0, 0L, DirectConsumerToken)
+      val unroutableBeforeDirect = listener.unroutableFrameCount
+      listener.receive(directClient, directHeartbeat.toByteBuffer())
+      assert(listener.unauthenticatedFrameCount === 1L,
+        "the listener must count an unauthenticated frame refused before routing")
+      assert(listener.unroutableFrameCount === unroutableBeforeDirect,
+        "an unauthenticated frame must be refused before its producer identity is inspected")
+      assert(listener.participantChannelCount === 0 && listener.participantRouteCount === 0,
+        "an unauthenticated frame must allocate no channel or producer participation state")
+      assert(!directClient.isActive,
+        "the listener must close a direct unauthenticated channel on its first frame")
+      directChannel.finishAndReleaseAll()
 
       // The holder of the application secret gets a channel and can put a frame on it.
       authorizedFactory = transportContext.createClientFactory(clientBootstraps)
@@ -2115,7 +2606,8 @@ class StreamingShuffleManagerSuite extends SparkFunSuite
         // A well-formed frame for a producer this executor does not host. What it proves is that
         // the frame crossed an authenticated channel and reached the routing layer: an
         // unauthenticated channel would never have been established for it to cross.
-        val heartbeat = new HeartbeatMessage(4711, 1L, 0, 0L)
+        val heartbeat =
+          new HeartbeatMessage(4711, 1L, 0, 0L, DirectConsumerToken)
         client.send(heartbeat.toByteBuffer())
         eventually(timeout(10.seconds), interval(50.milliseconds)) {
           assert(listener.unroutableFrameCount > unroutableBefore,
@@ -2127,32 +2619,39 @@ class StreamingShuffleManagerSuite extends SparkFunSuite
         client.close()
       }
 
-      // A peer that cannot present the application secret gets no channel at all. Asserted against
-      // a *different* secret rather than against no authentication, because that is the stronger
-      // statement: it is the handshake failing rather than the two ends disagreeing about whether
-      // to perform one.
-      val strangerConf = streamingConf()
-        .set("spark.app.id", appId)
-        .set(NETWORK_AUTH_ENABLED, true)
-        .set(AUTH_SECRET, "a-secret-this-application-never-issued")
-      val strangerSecurity = new SecurityManager(strangerConf)
-      strangerFactory = transportContext.createClientFactory(
-        StreamingShuffleServerHandler.streamingClientBootstraps(strangerConf, transportConf,
-          Some(strangerSecurity)))
-      val refusal = intercept[Exception] {
-        strangerFactory.createClient(Utils.localHostName(), server.getPort)
+      // A client that opens the TCP connection but installs no authentication bootstrap cannot
+      // complete a streaming RPC: the auth wrapper refuses it before its frame reaches the
+      // listener.
+      unauthenticatedFactory = transportContext.createClientFactory(
+        java.util.Collections.emptyList[TransportClientBootstrap]())
+      val unauthenticated = unauthenticatedFactory.createClient(
+        Utils.localHostName(), server.getPort)
+      try {
+        assert(unauthenticated.getClientId == null,
+          "the negative client must not have an identity before it sends its frame")
+        val unroutableBefore = listener.unroutableFrameCount
+        val refusal = intercept[Exception] {
+          unauthenticated.sendRpcSync(directHeartbeat.toByteBuffer(), 5000L)
+        }
+        assert(refusal != null,
+          "an unauthenticated connection must not receive a successful streaming RPC response")
+        assert(listener.unroutableFrameCount === unroutableBefore,
+          "the auth wrapper must refuse the frame before the streaming listener can route it")
+      } finally {
+        unauthenticated.close()
       }
-      assert(refusal != null,
-        "a consumer without the application secret must be refused a streaming channel")
+
     } finally {
-      if (strangerFactory != null) {
-        strangerFactory.close()
-      }
       if (authorizedFactory != null) {
         authorizedFactory.close()
       }
+      if (unauthenticatedFactory != null) {
+        unauthenticatedFactory.close()
+      }
       if (server != null) {
         server.close()
+        assert(server.isTerminated,
+          "closing the streaming listener must await both owned event-loop termination futures")
       }
       transportContext.close()
       listener.releaseAll()
