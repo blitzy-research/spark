@@ -240,6 +240,14 @@ values.
 | `spark.shuffle.streaming.maxBandwidthMBps` | unset | positive when set; unset means uncapped |
 | `spark.shuffle.streaming.debug` | `false` | additional diagnostic logging |
 
+Those ranges are enforced, not advisory. A `spark.shuffle.streaming.bufferSizePercent` outside
+1-50, a `spark.shuffle.streaming.spillThreshold` outside 50-95, or a non-positive
+`spark.shuffle.streaming.maxBandwidthMBps` is **rejected when the configuration value is read** --
+which for these properties is when the streaming components are constructed, on the driver and on
+each executor -- rather than being clamped to the nearest legal value. The failure names both the
+property and the value it refused, so a mistyped percentage surfaces at once instead of leaving the
+job to run against a budget nobody chose.
+
 ## Sizing the buffers
 
 `spark.shuffle.streaming.bufferSizePercent` is a percentage of **`spark.executor.memory`** itself,
@@ -545,8 +553,10 @@ mandatory; TLS and trusted-network isolation remain explicit deployment decision
   and is then held immutably. There is no dynamic reconfiguration: to change any of them, restart
   the executors.
 * **Blocks are capped at 2 MiB (2,097,152 bytes).** The cap bounds framing and retransmission work.
-* **Telemetry overhead is budgeted below 1% CPU.** Counters update on events rather than per
-  record, and the buffer-utilisation gauge is calculated when read.
+* **Telemetry overhead is budgeted below 1% CPU.** Counter updates are **lock-free** -- each is a
+  single striped-adder increment, taking no lock that a task thread or a network event-loop thread
+  could contend on -- and they happen on discrete events rather than per record; the
+  buffer-utilisation gauge is calculated when read.
   `StreamingShufflePerformanceBenchmark` measures it directly, as paired current-thread CPU samples
   with the metrics source off and on, and reports the difference and the cost of one metric
   operation. A JVM that cannot expose current-thread CPU time is reported as unavailable rather than
@@ -632,6 +642,13 @@ These are engineering acceptance targets, not guarantees and not CI performance 
   measured as delivered records per elapsed second after a warm-up allowance. Wall clock is the sole
   gate: dividing by process CPU time changes the promised denominator and can hide wall-time decay
   caused by coordination, blocking or retained work.
+* **Zero regression for memory-bound workloads is delivered by automatic fallback, not by an
+  intrinsic property of the streaming path.** Nothing about pipelining makes streaming safe on an
+  executor that cannot spare the buffer budget. What holds such a workload at parity is delegation:
+  the reservation is refused, the `MemoryPressure` predicate stands the shuffle down, and unmodified
+  sort-based shuffle serves it to completion. The structurally slow consumer and the saturated link
+  reach the same objective by the same route. See
+  [Graceful degradation](#graceful-degradation).
 
 Correctness is not a percentage target: every validated failure path must complete with output
 identical to sort-based shuffle, either on the streaming path or through automatic fallback.
@@ -643,8 +660,14 @@ identical to sort-based shuffle, either on the streaming path or through automat
   materialization work, accounted for in
   [What the latency comes from](#what-the-latency-comes-from).
 * No new Web UI page, tab, route, REST endpoint, CLI command or front-end asset.
+* No design assets. None were provided for this feature, and with no user-interface surface to
+  build, none are in scope.
 * No new metrics sink, JMX agent or monitoring service.
-* No new dependency, configuration file, public API, language binding or block-identifier type.
+* No new dependency and no new configuration file. All five properties are typed entries in Spark's
+  existing core configuration package object, the `conf/*.template` files are untouched, and the
+  CRC32C block checksum comes from the JDK's own `java.util.zip.CRC32C` -- an algorithm Spark
+  already accepts for shuffle checksums.
+* No new public API, language binding or block-identifier type.
 * No push-based-shuffle or External Shuffle Service merge interoperation while the streaming
   manager is selected.
 * No OS-level or network-level QoS marking.
