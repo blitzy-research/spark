@@ -24,16 +24,8 @@ private[spark] object StaticSources {
    * The set of all static sources. These sources may be reported to from any class, including
    * static classes, without requiring reference to a SparkEnv.
    */
-  // Appending to allSources here is the entire REGISTRATION mechanism for the streaming shuffle
-  // metrics: the metrics system registers every element of this sequence when it starts, on the
-  // driver and on every executor alike, whenever static sources are enabled -- which is the
-  // default, and which spark.metrics.staticSources.enabled=false turns off for this whole list.
-  // Registration is separate from EXPORT: appending a source here configures no sink, and every
-  // sink is opt-in through metrics.properties, so the four shuffle.streaming metrics become
-  // visible over JMX once an operator enables JmxSink (shipped commented out in
-  // conf/metrics.properties.template) and over any other sink they have already configured. What
-  // this append does guarantee is that the streaming shuffle needs no metrics agent or sink of its
-  // own. The source is referenced fully qualified rather than imported.
+  // MetricsSystem registers static sources on the driver and executors at startup; sink
+  // configuration remains independent.
   val allSources =
     Seq(
       CodegenMetrics,

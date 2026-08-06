@@ -198,9 +198,10 @@ taken. Both halves of the claim are established by the suites rather than assert
 
 The performance figures for this feature are **acceptance targets measured by a benchmark**, not
 thresholds enforced by a build gate. `StreamingShufflePerformanceBenchmark` produces a comparative
-sort-versus-streaming report (latency, memory, spill and bandwidth) for a 100 MB, 10-partition
-`groupByKey`, plus a CPU-bound case that isolates coordination overhead. Judge streaming on that
-report against your own workload; nothing in the standard test run asserts a percentage.
+sort-versus-streaming report (latency, memory, spill and bandwidth) for a 100 MiB
+(104,857,600 bytes), 10-partition `groupByKey`, plus a CPU-bound case that isolates coordination
+overhead. Judge streaming on that report against your own workload; nothing in the standard test
+run asserts a percentage.
 
 The report carries a third scenario, and it is the one to read if the section above left you
 wondering what the pipelining is worth. **Producer/consumer overlap** delivers one volume twice --
@@ -213,7 +214,7 @@ Read that reduction as the value of the overlap on the path the shuffle abstract
 a scheduled job's latency and may not be added to the figure from the comparison above, because a
 scheduled job attaches its consumer only after its map stage has finished.
 
-Two figures in that report deserve a caveat, because they are easy to over-read:
+Three figures in that report deserve a caveat, because they are easy to over-read:
 
 * **Spill attribution.** Spill counters are per-JVM. A report gathered only on the driver can show
   zero spill for a run in which executors spilled; the benchmark either collects executor-side
@@ -252,7 +253,7 @@ job to run against a budget nobody chose.
 
 `spark.shuffle.streaming.bufferSizePercent` is a percentage of **`spark.executor.memory`** itself,
 which is the figure an operator already sizes the executor by. At the default of 20, a 4g executor
-reserves 819MiB across all of its streaming buffers. The aggregate budget is:
+reserves 819 MiB across all of its streaming buffers. The aggregate budget is:
 
     (executorMemory * bufferPercent) / 100
 
@@ -475,7 +476,7 @@ new sink, metrics agent or user-interface surface. See the
 Other practical notes:
 
 * The counters are **running totals for the life of the JVM**. They do not reset when a shuffle
-  finishes or falls back, so difference successive samples to obtain a rate.
+  finishes or falls back, so difference between successive samples to obtain a rate.
 * Spark's **standard** shuffle metrics work unchanged. Bytes written, records written, remote and
   local bytes read, blocks fetched, fetch wait time, spilled bytes and peak execution memory are
   all populated for streaming shuffles. Existing Web UI and History Server views consume those
@@ -628,7 +629,7 @@ unsuitable workload can still pay the cost of attempting the streaming path befo
 
 These are engineering acceptance targets, not guarantees and not CI performance gates:
 
-* The 30-50% end-to-end latency objective is measured on a shuffle-bound workload of 100 MB or more
+* The 30-50% end-to-end latency objective is measured on a shuffle-bound workload of 100 MiB or more
   across 10 or more partitions, by `StreamingShufflePerformanceBenchmark`, and it is priced from the
   work streaming actually removes: the map-side sort and its index-and-data pair, the reduce side's
   fetch round trip and whole-partition materialization, and the map task's tail write. It is not
@@ -660,8 +661,6 @@ identical to sort-based shuffle, either on the streaming path or through automat
   materialization work, accounted for in
   [What the latency comes from](#what-the-latency-comes-from).
 * No new Web UI page, tab, route, REST endpoint, CLI command or front-end asset.
-* No design assets. None were provided for this feature, and with no user-interface surface to
-  build, none are in scope.
 * No new metrics sink, JMX agent or monitoring service.
 * No new dependency and no new configuration file. All five properties are typed entries in Spark's
   existing core configuration package object, the `conf/*.template` files are untouched, and the

@@ -1254,7 +1254,7 @@ This is the component with the largest amount of instrumented metrics
     JVM: they retain the events already counted and do not return to 0 when a shuffle finishes,
     when a shuffle falls back to the sort-based shuffle, or when the executor stops streaming, so
     a non-zero reading may describe streaming activity that has already ended; read them as
-    running totals and difference successive samples to obtain a rate.
+    running totals and difference between successive samples to obtain a rate.
   - bufferUtilizationPercent (gauge): executor-wide utilization of the streaming shuffle buffer
     budget, as a percentage. The numerator is every byte of streaming shuffle buffer held on the
     executor, in both directions and across all four categories the budget charges -- producer
@@ -1512,7 +1512,7 @@ These metrics are exposed by Spark executors.
     JVM: they retain the events already counted and do not return to 0 when a shuffle finishes,
     when a shuffle falls back to the sort-based shuffle, or when the executor stops streaming, so
     a non-zero reading may describe streaming activity that has already ended; read them as
-    running totals and difference successive samples to obtain a rate.
+    running totals and difference between successive samples to obtain a rate.
   - bufferUtilizationPercent (gauge): executor-wide utilization of the streaming shuffle buffer
     budget, as a percentage. The numerator is every byte of streaming shuffle buffer held on the
     executor, in both directions and across all four categories the budget charges -- producer

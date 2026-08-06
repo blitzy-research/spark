@@ -39,94 +39,33 @@ import org.apache.spark.scheduler.{SparkListener, SparkListenerTaskEnd}
 /**
  * Comparative benchmark of the streaming shuffle against the sort-based baseline it exists to beat.
  *
- * The feature names one reference workload -- a 100 MB `groupByKey` across ten partitions -- and
- * three acceptance targets against it: a 30 to 50 percent latency reduction, under 10 percent
- * memory overhead, and a spill rate under 5 percent. This object runs that workload twice, once on
- * sort-based shuffle and once on streaming shuffle, and emits a single comparative report covering
- * latency, memory, spill and bandwidth.
+ * The reference workload is a 100 MiB (104,857,600 bytes) `groupByKey` across ten partitions, run
+ * once on each path, alongside a CPU-bound comparison and a producer/consumer overlap measurement.
  *
- * ==It reports; it does not gate==
- *
- * Every figure is recorded for a human to judge, and nothing here enforces a threshold. That is
- * a decision, not an omission: this repository holds roughly ninety-four on-demand benchmark
- * classes and not one of them enforces a performance bound, because a percentage measured on a
- * loaded machine would fail for a reason that is not a defect. The acceptance targets are
- * printed beside the measurements so the judgement can be made, and no measurement can fail
- * the run.
- *
- * ==Why this is an object and not a suite==
- *
- * `BenchmarkBase` extends no test base class, so a benchmark cannot be a suite; it is an object
- * whose inherited `main` drives `runBenchmarkSuite`. The context is therefore built and stopped
- * here rather than by a suite fixture, and it is stopped in a `finally` because the harness's
- * `main` calls `afterAll` only on the path where nothing threw.
- *
- * ==Why both cases run on the same cluster master==
- *
- * Both cases run on `local-cluster[2,1,1024]`, and both on the SAME master, because two elapsed
- * times taken on different masters would be comparing the masters rather than the shuffles. A
- * local master would be worse than merely unfaithful: in local mode the executor skips shuffle
- * manager initialisation, because the driver's instance already exists, so one manager would serve
- * both the producer and the consumer role and no block would cross a JVM boundary. Two real
- * executor JVMs give the driver-registers / executor-resolves rendezvous and genuine
- * cross-executor transfer of retained output. The DAG scheduler remains unmodified and still starts
- * the reduce stage after the map stage finishes.
- *
- * ==What is measured, and where each figure comes from==
- *
- * Latency is wall-clock time taken around the job alone, so cluster start-up is charged to neither
- * case, and the harness times the same runs independently. Memory is sampled inside executor tasks:
- * full JVM heap, native buffer pools, and every category of the aggregate streaming quota are read
- * together. Spark's existing `TaskMetrics.peakExecutionMemory` is printed beside that full
- * footprint instead of being mistaken for it. Spill and bandwidth come from the existing task
- * accumulators read through a `SparkListener`, the same read path an operator's own tooling uses.
- * The four `shuffle.streaming` metrics are also sampled on the executors, and the registry backing
- * them is reset as the case switches so that each case reports its own reading.
- *
- * {{{
- *   To run this benchmark:
- *   1. without sbt: bin/spark-submit --class <this class> <spark core test jar>
- *   2. build/sbt "core/Test/runMain <this class>"
- *   3. generate result:
- *      SPARK_GENERATE_BENCHMARK_FILES=1 build/sbt "core/Test/runMain <this class>"
- *      Results will be written to
- *      "benchmarks/StreamingShufflePerformanceBenchmark-results.txt".
- *
- *   where <this class> is
- *   org.apache.spark.shuffle.streaming.StreamingShufflePerformanceBenchmark
- *
- *   An optional first argument overrides the master both cases run on, for use where executor
- *   processes cannot be started, for example
- *   build/sbt "core/Test/runMain <this class> local[8]"
- * }}}
+ * This is a report, not a gate: like every benchmark in this project it records comparative figures
+ * and asserts no threshold, so the latency, memory and spill acceptance targets are read off the
+ * report rather than enforced by a test run. Spill is reported split by cause, because the disk
+ * volume of a healthy streaming run is dominated by the end-of-stream durability flush that a
+ * successful map task always performs -- the streaming counterpart of the files the sort path
+ * writes as `shuffleBytesWritten` -- while the under-five-percent target concerns only eviction
+ * under memory pressure, which is what `shuffle.streaming.spillCount` counts.
  */
 object StreamingShufflePerformanceBenchmark extends BenchmarkBase with StreamingShuffleTestHelper {
 
   import StreamingShuffleTestHelper._
 
-  // ---------------------------------------------------------------------------------------------
-  // The workload. Every value the feature names is taken from the shared fixtures rather than
-  // restated, so this benchmark and the suites cannot drift apart on what "the reference workload"
-  // means.
-  // ---------------------------------------------------------------------------------------------
-
-  /** The shuffle width the feature names: ten reduce partitions. */
   private val PartitionCount: Int = DefaultPartitionCount
 
-  /** The dataset the feature names: one hundred mebibytes. */
   private val DatasetBytes: Long = TargetDatasetBytes
 
-  /** Records the dataset carries, which is what the harness rates each case against. */
   private val RecordCount: Long =
     PartitionCount.toLong * recordsPerPartitionFor(PartitionCount, DatasetBytes).toLong
 
-  /** Name of the scenario, printed by the harness above its comparison table. */
   private val ScenarioName: String = "Streaming shuffle versus sort-based shuffle"
 
   /** CPU-bound comparison that isolates shuffle coordination beneath deterministic compute. */
   private val CpuScenarioName: String = "CPU-bound shuffle coordination"
 
-  /** Name of the comparison table, derived so it can never disagree with the workload above. */
   private val ComparisonName: String =
     s"groupByKey, ${DatasetBytes / BytesPerMebibyte} MB over $PartitionCount partitions"
 
@@ -138,99 +77,30 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
   private val CpuComparisonName: String =
     s"deterministic CPU mix, $CpuWorkItems records over $PartitionCount partitions"
 
-  // ---------------------------------------------------------------------------------------------
-  // The environment. Both cases share one master, for the reason set out in this object's
-  // documentation, and the shape below is the one the integration suite established for the very
-  // same 100 MB measurement.
-  // ---------------------------------------------------------------------------------------------
-
-  /** Two real executor JVMs, one core and one gibibyte each. */
   private val ClusterMaster: String = "local-cluster[2,1,1024]"
 
-  /** Prefix that identifies a master which starts genuine executor processes. */
   private val ClusterMasterPrefix: String = "local-cluster"
 
-  /** Executors the cluster master promises, waited for so scheduling is never a race. */
   private val ExecutorCount: Int = 2
 
-  /** How long an executor is given to register before the wait is abandoned. */
   private val ExecutorStartupTimeoutMillis: Long = 60000L
 
-  /** How long the listener bus is given to deliver a run's events before the drain gives up. */
   private val ListenerDrainTimeoutMillis: Long = 60000L
 
-  /**
-   * Measured iterations per case, over and above the harness's unmeasured warm-up run.
-   *
-   * Three, matching the shuffle checksum benchmark, which is enough for a best-of to shed the worst
-   * of the machine's own noise without turning an on-demand run into an overnight one.
-   */
   private val MeasuredIterations: Int = 3
 
-  // ---------------------------------------------------------------------------------------------
-  // The overlap scenario. The two cases above compare whole scheduled jobs, and a whole job under
-  // the unmodified DAG scheduler submits its reduce stage only once its map stage reports available
-  // output -- so neither of them can measure the defining behaviour of this feature, which is a
-  // consumer being served WHILE a producer produces. Task submission is an absolute preservation
-  // zone (AAP 0.2.1, 0.2.2 and 0.8.2 Tier 1), so this scenario stops waiting for the scheduler to
-  // provide the attachment and makes it directly, through the production manager, writer, reader,
-  // coordinator rendezvous and transport, and measures the one difference that matters: the same
-  // volume delivered to a consumer attached DURING production, against the same volume delivered to
-  // a consumer attached AFTER it. Everything else about the two cases is identical, so the gap
-  // between them is the overlap and nothing else.
-  // ---------------------------------------------------------------------------------------------
-
-  /** Name of the overlap scenario, printed by the harness above its comparison table. */
   private val OverlapScenarioName: String = "Producer/consumer overlap on the streaming path"
 
-  /**
-   * The master the overlap cases run on.
-   *
-   * A local master, and for a reason that is the opposite of the cluster cases': the attachment is
-   * made by this JVM, so both halves must be served by one manager instance, which is exactly what
-   * local mode gives -- an executor skips shuffle manager initialisation when the driver's instance
-   * already exists. Both overlap cases share this master, so the comparison between them is still a
-   * comparison of shuffles rather than of masters.
-   */
   private val OverlapMaster: String = "local[4]"
 
-  /**
-   * Declared partitions of the overlap shuffle.
-   *
-   * Two, with every key a multiple of two, so every record lands in partition zero and the single
-   * consumer of `[0, 1)` reads the whole of the map output. A consumer that read only part of it
-   * would be comparing two fractions rather than two deliveries of the same volume. This is the
-   * shape the integration suite's overlap case established, and it is repeated rather than
-   * re-derived so the measurement and the assertion cannot drift apart.
-   */
   private val OverlapPartitions: Int = 2
 
-  /**
-   * Records each overlap run streams.
-   *
-   * Chosen for block count rather than for byte count: a run that fits in one or two blocks offers
-   * a consumer nothing to consume until production is nearly over, so it could not show an overlap
-   * however well the subsystem pipelined. Eight million integer pairs frame tens of blocks with
-   * compression off, which is what gives a consumer attached at the first block nearly the whole of
-   * the producer's lifetime to work in -- and what makes each run long enough that the elapsed
-   * comparison is not dominated by one JVM's own warm-up noise.
-   */
   private val OverlapRecords: Int = 8000000
 
-  /** How long an overlap run's two threads are given before the measurement is abandoned. */
   private val OverlapJoinTimeoutMillis: Long = 180000L
 
-  /** Map id both overlap cases produce under; each run registers a shuffle of its own. */
   private val OverlapMapId: Long = 0L
 
-  /**
-   * First task attempt id an overlap run uses, and the stride between runs.
-   *
-   * Distinct per run, and deliberately: a `MemoryManager` accounts execution memory per task
-   * attempt id, so two runs sharing an id would share an accounting entry and the second run's
-   * release could be charged the first run's outstanding bytes. The base is well clear of the small
-   * ids real tasks are handed.
-   */
   private val OverlapAttemptBase: Long = 9200L
 
   private val OverlapAttemptStride: Long = 2L
@@ -240,35 +110,22 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
   private val OverlapComparisonName: String =
     s"$OverlapRecords records streamed to one consumer"
 
-  /** Label of the case in which the consumer is attached before the first record is produced. */
   private val OverlapLiveCaseName: String = "consumer attached during production"
 
-  /** Label of the case in which the consumer is attached only after the producer has stopped. */
   private val OverlapRetainedCaseName: String = "consumer attached after production"
 
-  /** Label of the sort-based case, which is the report's reference point. */
   private val BaselineCaseName: String = "sort-based shuffle (baseline)"
 
-  /** Label of the streaming case. */
   private val StreamingCaseName: String = "streaming shuffle"
 
-  /** Application name of the baseline context, so a failure names the case it came from. */
   private val BaselineAppName: String = "streaming-shuffle-benchmark-sort-baseline"
 
-  /** Application name of the streaming context. */
   private val StreamingAppName: String = "streaming-shuffle-benchmark-streaming"
 
   private val CpuBaselineAppName: String = "streaming-shuffle-benchmark-cpu-sort"
 
   private val CpuStreamingAppName: String = "streaming-shuffle-benchmark-cpu-streaming"
 
-  // ---------------------------------------------------------------------------------------------
-  // The acceptance targets, and the report's own presentation constants. The latency window comes
-  // from the shared fixtures; the other two targets exist nowhere else in the tree, so they are
-  // named here rather than left as bare numbers inside a string.
-  // ---------------------------------------------------------------------------------------------
-
-  /** Ceiling of the reported memory overhead, as a whole percentage of the baseline. */
   private val MaxMemoryOverheadPercent: Int = 10
 
   /** Improvement window the CPU-bound acceptance target names. */
@@ -276,123 +133,64 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
 
   private val MaxCpuBoundImprovementPercent: Int = 10
 
-  /**
-   * The workload shapes memory overhead is reported at, narrowest first.
-   *
-   * <b>Why more than one.</b> The streaming path's buffer allowance is
-   * `(executorMemory * bufferSizePercent) / numPartitions`, so a shuffle's width is the very
-   * quantity the overhead depends on -- and the sort-based path's peak execution memory at a narrow
-   * shape is close to nothing, which makes an overhead expressed as a percentage of it enormous
-   * however small the absolute difference. One shape therefore cannot support a claim about memory
-   * overhead in either direction: a favourable width would let compliance be overstated, and an
-   * unfavourable one would report thousands of percent for a few mebibytes. Three widths, each with
-   * its absolute figures printed beside its percentage, is what makes the reading honest.
-   *
-   * The reference width comes first in the acceptance verdict because it is the shape the feature
-   * names; the other two are reported beside it, never instead of it.
-   */
   private val NarrowPartitionCount: Int = 2
 
   private val WidePartitionCount: Int = 200
 
-  /**
-   * Dataset size the two additional shapes run at.
-   *
-   * A small fraction of the reference size, because what those shapes are measured for is the
-   * relationship between shuffle width and buffer allowance rather than throughput at volume, and a
-   * shape that took as long as the reference workload would double the cost of an on-demand
-   * benchmark for information the reference shape already carries.
-   */
   private val ShapeProbeBytes: Long = 8L * 1024L * 1024L
 
-  /** Ceiling of the reported spill rate, as a whole percentage of the bytes the shuffle moved. */
   private val MaxSpillRatePercent: Int = 5
 
-  /** Width the report pads its labels to, so the figures line up in a column. */
   private val LabelWidth: Int = 52
 
-  /** Rule the report separates its sections with. */
   private val ReportRule: String = "-" * 96
 
-  /** Heading the report opens with. */
   private val ReportHeading: String = "Streaming shuffle acceptance report"
 
-  /** What the report prints when the live environment cannot name its shuffle manager. */
   private val UnknownManagerName: String = "unavailable"
 
-  /** What the report prints for an absent bandwidth cap, which means uncapped and never zero. */
   private val UncappedBandwidth: String = "unset, which means uncapped egress"
 
-  /** Milliseconds in a second, used by the bandwidth arithmetic. */
   private val MillisPerSecond: Long = TimeUnit.SECONDS.toMillis(1L)
 
-  /** Tenths of a percent in a whole, the fixed-point scale every percentage is computed in. */
   private val TenthsPerWhole: Long = 1000L
 
-  /** The reading a case carries before it has run, so no accessor ever answers with a null. */
   private val EmptyTelemetry: StreamingTelemetry =
     new StreamingTelemetry(0L, 0L, 0L, 0L, 0)
 
   private val EmptyMemoryFootprint: MemoryFootprint =
     new MemoryFootprint(0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L)
 
-  /** Sampling interval for executor memory while grouped output is consumed. */
   private val MemorySampleInterval: Int = 256
 
-  /** Representative CPU accounting shape for telemetry source-on/source-off comparison. */
   private val TelemetryCpuWorkItems: Int = 500000
 
   private val TelemetryCpuSampleInterval: Int = 4096
 
   private val TelemetryCpuSamples: Int = 5
 
-  /**
-   * Metric operations the source-on loop performs at each sampled event.
-   *
-   * One gauge read plus three counter increments. Named rather than inlined because the per-event
-   * cost is the total divided by OPERATIONS, not by passes: dividing by passes would report the
-   * cost of four operations under the label of one and understate it fourfold.
-   */
   private val TelemetryOpsPerSampledEvent: Int = 4
 
   private val MaxTelemetryCpuOverheadPercent: Int = 1
 
-  /** One representative producer contribution for source-on gauge reads. */
   private val TelemetryCpuContributor: StreamingShuffleBufferUtilizationContributor =
     new StreamingShuffleBufferUtilizationContributor {
       override def contributedBufferedBytes: Long = BytesPerMebibyte
       override def contributedBudgetBytes: Long = 4L * BytesPerMebibyte
     }
 
-  /** Scope and availability of the executor-side streaming telemetry in this report. */
   private val TelemetryScopeNote: Seq[String] = Seq(
     "  Note: the four metrics are sampled inside the workload tasks and merged once per executor.",
     "  A zero spillCount is therefore an executor-side zero. If no executor sample is available,",
     "  pressure-spill attribution is printed as unavailable rather than as a misleading zero.")
 
-  /**
-   * What the ordinary stage-boundary comparison can attribute without claiming scheduler changes.
-   *
-   * The DAG scheduler remains an absolute preservation zone and submits a reduce stage only after
-   * its map stage finishes. This benchmark therefore measures the implementation that exists:
-   * framing, checksumming, retained-output publication and transport against sort, index
-   * publication and ordinary block fetch. It reports the thirty to fifty percent project target
-   * beside that measurement, but never explains a result using overlap the workload cannot have.
-   */
   private val LatencyAttributionNote: Seq[String] = Seq(
     "  Note: the DAG scheduler is unmodified and starts reduce tasks after the map stage finishes.",
     "  This comparison measures framing, checksumming, retained-output publication and transport",
     "  against sort, index publication and ordinary block fetch. It claims no map/reduce overlap.",
     "  The overlap the subsystem does deliver is measured on its own, in the section below.")
 
-  /**
-   * What the overlap comparison establishes, and what it must not be read as establishing.
-   *
-   * The two arms differ only in when the consumer attaches, so their difference is the value of the
-   * overlap on the path this subsystem owns. It is not a scheduled job's figure and cannot be added
-   * to one: a scheduled job attaches its consumer only after the map stage finishes, which is the
-   * scheduler's own contract and an absolute preservation zone for this feature.
-   */
+  /** What the overlap comparison establishes, and what it must not be read as establishing. */
   private val OverlapAttributionNote: Seq[String] = Seq(
     "  Note: both arms stream the same volume through the same manager, writer, reader, rendezvous",
     "  and transport, on one context, and differ only in when the consumer attaches. The reduction",
@@ -400,56 +198,22 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
     "  job's latency and may not be added to the figure above: a scheduled job attaches its",
     "  consumer only once the map stage has finished, which nothing inside this boundary may move.")
 
-  /** The standing reminder that this file measures and does not gate. */
   private val TargetsNote: Seq[String] = Seq(
     "  Note: every figure above is reported for a human to judge. This benchmark enforces no",
     "  threshold, in keeping with every other benchmark in this repository.")
 
-  // ---------------------------------------------------------------------------------------------
-  // Live state. Spark permits one context per JVM, so the two cases cannot hold one each; the
-  // harness runs every iteration of one case before touching the next, which is what makes a single
-  // cell sufficient.
-  // ---------------------------------------------------------------------------------------------
-
-  /** The context serving the case currently running, if one is up. */
   private var activeContext: Option[SparkContext] = None
 
-  /** The case the active context was built for, so that a switch of case is detected. */
   private var activeCase: Option[CaseObservation] = None
 
-  /**
-   * Attempt id the next overlap run takes, advanced by the stride once it has been handed out.
-   *
-   * A plain field rather than an atomic, because the harness runs one case at a time on one thread
-   * and this is read and advanced only there, before either of a run's own threads is started.
-   */
   private var nextOverlapAttemptId: Long = OverlapAttemptBase
 
-  // ---------------------------------------------------------------------------------------------
-  // The comparison.
-  // ---------------------------------------------------------------------------------------------
-
-  /**
-   * Runs the whole comparison: the sort-based baseline, then streaming, then the report.
-   *
-   * The two cases are handed to the harness as ordinary cases, so the table it prints carries its
-   * own best, mean, standard deviation, rate and relative columns for both. The report emitted
-   * afterwards adds the dimensions the harness knows nothing about -- full memory, spill,
-   * bandwidth, executor telemetry and telemetry CPU cost -- and restates latency beside the
-   * acceptance windows.
-   *
-   * @param mainArgs program arguments; an optional first element overrides the master both cases
-   *                 run on, which is what lets the comparison still be taken in an environment
-   *                 that cannot start executor processes
-   */
   override def runBenchmarkSuite(mainArgs: Array[String]): Unit = {
     val master = masterFrom(mainArgs)
     val baseline = new CaseObservation(
       BaselineCaseName, withLocalMaster(sortBaselineConf(), BaselineAppName, master), master)
     // BOTH keys, set through their typed entries by the shared fixture: spark.shuffle.manager
-    // selects the manager class and spark.shuffle.streaming.enabled opens its behaviour gate. With
-    // the gate left at its default of false the streaming manager would forward every call to the
-    // sort-based manager it holds internally, and this benchmark would be comparing sort with sort.
+    // selects the manager class and spark.shuffle.streaming.enabled opens its behaviour gate.
     val streaming = new CaseObservation(
       StreamingCaseName, withLocalMaster(streamingConf(), StreamingAppName, master), master)
     val cpuBaseline = new CaseObservation(
@@ -480,17 +244,11 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
         benchmark.run()
       }
       stopActiveContext()
-      // ONE observation for both overlap cases, and therefore one context for both: the two cases
-      // differ only in when the consumer attaches, so a context of their own each would have made
-      // them differ in a second respect as well.
       val overlapContext = new CaseObservation(
         OverlapScenarioName,
         withLocalMaster(overlapConf(), OverlapAppName, OverlapMaster),
         OverlapMaster)
       val overlap = new OverlapObservation
-      // The context is brought up before either arm runs, so neither charges cluster start-up to
-      // the overlap. Without this the arm that ran first would carry it alone, and the mean of two
-      // arms measured on different terms is not a comparison of anything.
       require(contextFor(overlapContext) != null, "the overlap context must be live")
       runBenchmark(OverlapScenarioName) {
         val benchmark = new Benchmark(OverlapComparisonName, OverlapRecords.toLong,
@@ -509,64 +267,30 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
       emitReport(master, baseline, streaming, cpuBaseline, cpuStreaming, telemetryCpu,
         overlapContext, overlap)
     } finally {
-      // Unconditional, so neither a failure in a case nor a failure while reporting can leave a
-      // live context behind. The harness's own main reaches afterAll only when nothing threw.
       stopActiveContext()
     }
   }
 
-  /**
-   * Final safety net for the context, run by the harness once the suite has returned.
-   *
-   * Stopping is idempotent, so this costs nothing on the ordinary path and still covers a context
-   * that some future path started outside the block above.
-   */
   override def afterAll(): Unit = {
     stopActiveContext()
   }
 
-  /**
-   * The master both cases run on.
-   *
-   * Both take the same one: two elapsed times measured on different masters would be comparing the
-   * masters. An override is honoured exactly as given, and a blank argument is treated as no
-   * argument rather than as a request for a nameless master.
-   *
-   * @param mainArgs program arguments as the harness passed them
-   * @return the master URL
-   */
   private def masterFrom(mainArgs: Array[String]): String = {
     mainArgs.headOption.map(argument => argument.trim).filter(_.nonEmpty).getOrElse(ClusterMaster)
   }
 
-  /**
-   * Runs the reference workload once for a case and records what it cost.
-   *
-   * The context is obtained before the clock starts, so a case's first iteration does not charge
-   * cluster start-up to the shuffle. Timing the job alone is also what makes this object's figures
-   * agree with the harness's for every iteration rather than only for the measured ones, since the
-   * iteration that pays for start-up is precisely the warm-up the harness discards.
-   *
-   * @param observation the case to run and to record against
-   */
+  /** Runs the reference workload once for a case and records what it cost. */
   private def runCase(observation: CaseObservation): Unit = {
     val context = contextFor(observation)
     observation.recorder.beginWindow()
     val startedAt = System.nanoTime()
     val workload = observeGroupedWorkload(groupedReferenceWorkload(context))
     val elapsedNanos = System.nanoTime() - startedAt
-    // Task-end events arrive on the listener bus's own thread, so the bus is drained before the
-    // accumulated figures are read; otherwise the tasks of the run just finished might not be in
-    // them yet.
     drainListenerBus(context)
     val metrics = observation.recorder.finishWindow()
     observation.observeRun(elapsedNanos, workload, metrics)
     observation.observeShapeFootprint(shapeName(PartitionCount), workload.memory)
     if (observation.runCount == 1) {
-      // Once per case, on the harness's warm-up iteration, and in this case's own context: closing
-      // the recorder window after each shape prevents its task metrics from contaminating the
-      // reference comparison. They are deliberately not timed -- the latency comparison is the
-      // reference workload's alone, and adding shapes to it would compare different workloads.
       Seq(NarrowPartitionCount, WidePartitionCount).foreach { partitions =>
         observation.recorder.beginWindow()
         val shape = observeGroupedWorkload(
@@ -578,7 +302,6 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
     }
   }
 
-  /** Runs the representative CPU-bound shuffle once and records its isolated task-metric window. */
   private def runCpuCase(observation: CaseObservation): Unit = {
     val context = contextFor(observation)
     observation.recorder.beginWindow()
@@ -589,12 +312,6 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
     observation.observeRun(elapsedNanos, workload, observation.recorder.finishWindow())
   }
 
-  /**
-   * Consumes grouped output on the executors and returns compact executor-side observations.
-   *
-   * Sampling inside the result tasks makes both telemetry and full memory readings belong to the
-   * executor JVMs that ran the streaming writer and reader rather than to the driver.
-   */
   private def observeGroupedWorkload(grouped: RDD[_]): WorkloadObservation = {
     val observations = grouped.mapPartitions { records =>
       val sampler = new ExecutorMemorySampler
@@ -614,7 +331,6 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
     aggregateExecutorObservations(observations)
   }
 
-  /** Reduces per-partition observations to one case reading without double-counting an executor. */
   private def aggregateExecutorObservations(
       observations: Seq[ExecutorWorkloadObservation]): WorkloadObservation = {
     val byExecutor = observations.groupBy(_.executorId)
@@ -627,12 +343,6 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
     new WorkloadObservation(observations.map(_.groupsProduced).sum, telemetry, memory)
   }
 
-  /**
-   * The label the report prints for one workload shape.
-   *
-   * @param partitions the shape's map and reduce width
-   * @return the label, which is also the key a case's shape peaks are held under
-   */
   private def shapeName(partitions: Int): String = {
     if (partitions == PartitionCount) {
       s"$partitions partitions, ${DatasetBytes / BytesPerMebibyte} MiB (reference)"
@@ -641,18 +351,6 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
     }
   }
 
-  /**
-   * The workload the feature names: one hundred mebibytes grouped by key across ten partitions.
-   *
-   * The dataset is generated on the executors from their own partition and record indices rather
-   * than shipped from the driver, so a hundred mebibytes never enters the driver heap and the input
-   * is byte-for-byte identical for both cases. Counting the groups is the action, because it forces
-   * the whole shuffle -- every partition is read and every value deserialized -- without pulling
-   * the result back to the driver.
-   *
-   * @param context the live context to build on
-   * @return the grouped dataset, not yet computed
-   */
   private def groupedReferenceWorkload(context: SparkContext): RDD[(Int, Iterable[String])] = {
     largeDataset(context, PartitionCount, DatasetBytes).groupByKey(PartitionCount)
   }
@@ -686,22 +384,6 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
     mixed
   }
 
-  // ---------------------------------------------------------------------------------------------
-  // The overlap measurement.
-  // ---------------------------------------------------------------------------------------------
-
-  /**
-   * The configuration both overlap cases run under.
-   *
-   * Shuffle compression is off, and that is a property of the MEASUREMENT rather than of the
-   * subsystem: a codec buffers a whole frame before it yields a byte, so with compression on a
-   * consumer can need the tail of a partition before it can produce its first record, and the
-   * producer's pipelining would be hidden behind the codec's buffering. The integration suite's
-   * overlap case turns it off for the same reason, and asserts the wrapping contract under
-   * compression separately.
-   *
-   * @return the configuration, master and application name not yet applied
-   */
   private def overlapConf(): SparkConf = {
     streamingConf().set(SHUFFLE_COMPRESS, false)
   }
@@ -709,36 +391,15 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
   /**
    * Streams one overlap run and returns what it cost and what it moved.
    *
-   * Both cases stream the same volume through the same manager, writer, reader, coordinator
-   * rendezvous and transport, on the same context, and differ in exactly one respect: whether the
-   * consumer is attached while the producer is still producing or only once it has stopped. The
-   * elapsed window runs from just before the producer starts to after both halves have finished,
-   * the producer's stop included, because the stop is where a producer makes durable whatever its
-   * consumers did not take -- which is a cost the attachment instant decides and not one this
-   * measurement may exclude.
-   *
-   * ==Why the producer never waits for the consumer here==
-   *
-   * The integration suite's overlap case makes its producer WAIT for the consumer to have consumed,
-   * because a test must prove the overlap happened. A benchmark must not: a wait would put the
-   * consumer's latency inside the producer's elapsed time and would measure the fixture rather than
-   * the subsystem. This run therefore lets both halves proceed at their own pace and REPORTS how
-   * many records were read while the producer was still producing, so a reader of the report can
-   * see how much overlap the measurement actually contained.
-   *
-   * @param observation the case whose context both overlap cases share
-   * @param attachDuringProduction whether the consumer is started at the first block or only once
-   *                               production has finished
-   * @return what the run moved, spilled and cost
+   * @param attachDuringProduction whether the consumer is started at the first block or only
+   *     once production has finished
    */
   private def measureOverlapPath(
       observation: CaseObservation,
       attachDuringProduction: Boolean): OverlapRun = {
     val context = contextFor(observation)
     val manager = SparkEnv.get.shuffleManager.asInstanceOf[StreamingShuffleManager]
-    // A shuffle of its own per run, so no run inherits another's registration state. The
-    // registrations are left for the context's teardown to release, exactly as the integration
-    // suite leaves them: they hold no memory once each run's task contexts have completed.
+    // A shuffle of its own per run, so no run inherits another's registration state.
     val dependency = shuffleDependencyFor(context, context.getConf,
       numPartitions = OverlapPartitions, numRecords = 1)
     val handle = dependency.shuffleHandle.asInstanceOf[StreamingShuffleHandle[Int, Int, Int]]
@@ -761,9 +422,7 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
     val producerFailure = new AtomicReference[Throwable](null)
     val consumerFailure = new AtomicReference[Throwable](null)
     // Each half stamps the instant it stopped working, so the elapsed window below closes when the
-    // two halves finished rather than when the settlement that follows them finished. Reading the
-    // clock after the settlement would fold this fixture's teardown into a latency figure, which is
-    // the one thing a latency benchmark may never do.
+    // two halves finished rather than when the settlement that follows them finished.
     val producerFinishedAt = new AtomicLong(0L)
     val consumerFinishedAt = new AtomicLong(0L)
 
@@ -775,20 +434,12 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
             writerContext.taskMetrics.shuffleWriteMetrics)
           .asInstanceOf[StreamingShuffleWriter[Int, Int, Int]]
         writerHandle.set(writer)
-        // Announced only once the writer exists, because a writer is what publishes this producer
-        // to the coordinator: a consumer started earlier would spend its rendezvous budget on an
-        // address that is not there yet.
         writerReady.countDown()
         writer.write(overlapRecords(produced))
         producing.set(false)
         productionFinished.countDown()
         // The end of stream is signalled by `write` itself, so the consumer can finish before this
-        // producer stops. Waiting for it is what makes the durable figure below the window the
-        // CONSUMER left rather than one this measurement created by stopping early -- so whether
-        // the wait was satisfied is recorded, and a run whose wait expired is refused below instead
-        // of being reported as though the window it measured meant something. The stop still runs
-        // either way, because it is the production withdrawal path and a run that skipped it would
-        // leave this fixture's state for the next run to inherit.
+        // producer stops.
         consumptionDrained.set(
           consumptionFinished.await(OverlapJoinTimeoutMillis, TimeUnit.MILLISECONDS))
         writer.stop(success = true)
@@ -827,13 +478,7 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
     }, "streaming-shuffle-benchmark-overlap-consumer")
 
     val startedAt = System.nanoTime()
-    // The shared settlement owns both halves. It joins them inside the budget and, only if that
-    // expires, releases the three latches this run's halves park on, interrupts whatever that did
-    // not free, re-joins inside a bounded grace, and completes the two task contexts afterwards
-    // rather than before. Completing them first would leave a live thread charging allocations to a
-    // finished accounting entry, and neither half is a daemon, so one left behind can outlive the
-    // benchmark run entirely; a half that survives every stage fails the run by name with its
-    // stack, which is the only honest outcome for a measurement that did not finish.
+    // The shared settlement owns both halves.
     runBoundedThreadedScenario(
       threads = Seq(producer, consumer),
       taskContexts = Seq(writerContext, readerContext),
@@ -845,12 +490,6 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
         consumptionFinished.countDown()
       }) {
       producer.start()
-      // The attachment instant is the ONLY thing the two overlap cases differ in, so the wait that
-      // establishes it is a precondition of the measurement rather than a part of it. Its result is
-      // therefore required rather than discarded: a wait that expired means the consumer attached
-      // somewhere other than where this case is defined to attach it, and the run raises here --
-      // before a single figure is calculated -- instead of reporting a row for a case it did not
-      // actually run.
       if (attachDuringProduction) {
         requireOverlapPrecondition(writerReady, "the producer to have been given a writer")
       } else {
@@ -858,33 +497,17 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
       }
       consumer.start()
     }
-    // Closed at the later of the two halves' own finishing stamps, so the window is exactly what
-    // this method documents -- from just before the producer started to after both halves finished,
-    // the producer's stop included -- with the settlement and the context completions that follow
-    // them left outside it.
     val elapsedNanos = math.max(producerFinishedAt.get(), consumerFinishedAt.get()) - startedAt
     requireOverlapRunSucceeded(producerFailure, consumerFailure, consumptionDrained.get())
-    // Read after the task contexts have been completed, which is the only point at which the
-    // durable figure exists: on the successful path the spill manager publishes onto
-    // `TaskMetrics.diskBytesSpilled` from its task-completion listener, not from the writer's stop,
-    // so a read taken before completion would report every run as having made nothing durable.
     val run = overlapRunOf(elapsedNanos, writerHandle.get(), writerContext, produced, consumed,
       consumedDuringProduction)
     // The registration is released last: after both task contexts have completed, so it outlives
     // every reservation taken against it, and only on the success path, so a cleanup failure can
-    // never mask the failure that caused it. Releasing it at all is what keeps each run's
-    // arbitration and rendezvous state out of the next run's measurement.
+    // never mask the failure that caused it.
     manager.unregisterShuffle(handle.shuffleId)
     run
   }
 
-  /**
-   * The records an overlap run produces, all of which land in reduce partition zero.
-   *
-   * @param produced counter advanced as each record is handed over, so the run can report how far
-   *                 production had got at any instant
-   * @return the record iterator, which is exhausted exactly once
-   */
   private def overlapRecords(produced: AtomicInteger): Iterator[Product2[Int, Int]] = {
     new Iterator[Product2[Int, Int]] {
       override def hasNext: Boolean = produced.get() < OverlapRecords
@@ -896,23 +519,7 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
     }
   }
 
-  /**
-   * Fails the run rather than reporting a measurement that did not happen.
-   *
-   * This is not a threshold and does not contradict this object's reporting-only stance: a figure
-   * from a half-finished delivery would not be a slow measurement, it would not be a measurement at
-   * all, and presenting one as if it were is the single most misleading thing a benchmark can do.
-   *
-   * Both halves having actually stopped is not checked here, because
-   * [[StreamingShuffleTestHelper.runBoundedThreadedScenario]] already owns that: it raises for any
-   * thread that survived its join budget, a released wait and an interrupt, so a run that reaches
-   * this point has two finished halves by construction.
-   *
-   * @param producerFailure whatever the producer raised, if it raised anything
-   * @param consumerFailure whatever the consumer raised, if it raised anything
-   * @param consumptionDrained whether the producer's wait for its consumer to finish was satisfied,
-   *                           rather than having expired
-   */
+  /** Fails the run rather than reporting a measurement that did not happen. */
   private def requireOverlapRunSucceeded(
       producerFailure: AtomicReference[Throwable],
       consumerFailure: AtomicReference[Throwable],
@@ -933,18 +540,6 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
     }
   }
 
-  /**
-   * Requires a sequencing latch to have opened inside the run's budget.
-   *
-   * The two overlap cases are defined by WHEN the consumer attaches, so the wait that establishes
-   * the attachment instant decides which case was run. A wait whose result is discarded lets a run
-   * that attached at the wrong instant -- or at no instant at all -- be reported as though it had
-   * attached at the right one, and there is no figure in the report that would reveal it. Raising
-   * here is what keeps a row and the case it is labelled with the same thing.
-   *
-   * @param latch the sequencing latch to wait on
-   * @param awaited what the latch signals, named in the failure so a timeout is attributable
-   */
   private def requireOverlapPrecondition(latch: CountDownLatch, awaited: String): Unit = {
     val opened = latch.await(OverlapJoinTimeoutMillis, TimeUnit.MILLISECONDS)
     if (!opened) {
@@ -955,21 +550,6 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
     }
   }
 
-  /**
-   * Reads everything one finished overlap run has to say about itself.
-   *
-   * The streamed and durable byte figures come from the writer's own task metrics, which are the
-   * accumulators Spark already reports, so they are the same figures an operator would see rather
-   * than a private accounting of this benchmark's own.
-   *
-   * @param elapsedNanos wall time from just before the producer started to both halves finished
-   * @param writer the writer the producer used, which may be absent if it never got one
-   * @param writerContext the producer's task context, whose metrics carry the byte figures
-   * @param produced records the producer handed over
-   * @param consumed records the consumer read
-   * @param consumedDuringProduction records read before production finished
-   * @return the run
-   */
   private def overlapRunOf(
       elapsedNanos: Long,
       writer: StreamingShuffleWriter[Int, Int, Int],
@@ -990,29 +570,12 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
       if (writer == null) None else writer.standDownDescription)
   }
 
-  // ---------------------------------------------------------------------------------------------
-  // Context lifecycle.
-  // ---------------------------------------------------------------------------------------------
-
-  /**
-   * The context for a case, started on first use and reused for that case's later iterations.
-   *
-   * Swapping happens here rather than around `benchmark.run()` because the harness owns the loop:
-   * it runs every iteration of one case before touching the next, so the first iteration of a case
-   * is exactly the moment its context is needed and the previous case's is not. Reuse matters for
-   * the measurement, not merely for the clock: a context that stays up keeps its executors warm, so
-   * the measured iterations compare two shuffles rather than two cluster start-ups.
-   *
-   * @param observation the case whose context is wanted
-   * @return a live context configured for that case
-   */
+  /** The context for a case, started on first use and reused for that case's later iterations. */
   private def contextFor(observation: CaseObservation): SparkContext = {
     activeContext match {
       case Some(context) if activeCase.exists(current => current eq observation) => context
       case _ =>
         stopActiveContext()
-        // The metrics source is a JVM singleton, so its counters carry from one case into the next.
-        // Resetting at the switch is what makes each case's telemetry a reading of its own.
         resetStreamingShuffleMetrics()
         val context = new SparkContext(observation.conf)
         context.addSparkListener(observation.recorder)
@@ -1024,58 +587,22 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
     }
   }
 
-  /**
-   * Waits for the executors a cluster master promises, so scheduling is never a race.
-   *
-   * Guarded on the master because the wait counts registered executors against the driver, and a
-   * local master registers none: applying it there would time out after a minute for a reason that
-   * has nothing to do with the shuffle.
-   *
-   * @param context the context that has just been started
-   * @param master the master it was started on
-   */
   private def awaitExecutors(context: SparkContext, master: String): Unit = {
     if (master.startsWith(ClusterMasterPrefix)) {
       TestUtils.waitUntilExecutorsUp(context, ExecutorCount, ExecutorStartupTimeoutMillis)
     }
   }
 
-  /**
-   * Stops whatever context is live and forgets it, leaving the JVM free to start the next one.
-   *
-   * Idempotent, so it is safe from the completion path and the failure path alike. The listener is
-   * deliberately not detached first: stopping the context flushes its bus, and detaching before the
-   * flush would discard the very task-end events the last run's figures are drawn from.
-   */
   private def stopActiveContext(): Unit = {
     activeContext.foreach(context => context.stop())
     activeContext = None
     activeCase = None
   }
 
-  /**
-   * Waits for the listener bus to deliver everything a run queued.
-   *
-   * A timeout is allowed to fail the run. Reporting figures from a listener window that did not
-   * finish draining would present incomplete task metrics as a measurement, which is less useful
-   * than stopping with the actual cause.
-   *
-   * @param context the context whose bus is drained
-   */
   private def drainListenerBus(context: SparkContext): Unit = {
     context.listenerBus.waitUntilEmpty(ListenerDrainTimeoutMillis)
   }
 
-  /**
-   * Simple name of the shuffle manager the live driver environment holds.
-   *
-   * Reported so that the comparison is evidence about the manager which actually served the run,
-   * rather than about the configuration that asked for one: a streaming case whose behaviour gate
-   * was closed would delegate every call to the sort-based manager and would otherwise be
-   * indistinguishable, in the report, from a genuine streaming measurement.
-   *
-   * @return the manager's simple class name, or a placeholder when no environment can name one
-   */
   private def shuffleManagerClassName(): String = {
     val env = SparkEnv.get
     if (env == null || env.shuffleManager == null) {
@@ -1085,16 +612,7 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
     }
   }
 
-  /**
-   * The four `shuffle.streaming` metrics as they stand, read through the metrics registry.
-   *
-   * Taken inside each result task rather than once on the driver, because every executor owns its
-   * own registry and the case switch resets only the current JVM. The three counters are cumulative
-   * across the case. The utilisation gauge is computed when read, so each result partition samples
-   * it while that executor is still serving or consuming the workload.
-   *
-   * @return the snapshot
-   */
+  /** The four `shuffle.streaming` metrics as they stand, read through the metrics registry. */
   private def telemetrySnapshot(): StreamingTelemetry = {
     new StreamingTelemetry(
       observedBufferUtilizationPercent(),
@@ -1104,7 +622,6 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
       1)
   }
 
-  /** Measures source-on/source-off CPU cost without putting a threshold in the run. */
   private def measureTelemetryCpuOverhead(): TelemetryCpuObservation = {
     measuredTelemetryCpuSample(sourceEnabled = false)
     measuredTelemetryCpuSample(sourceEnabled = true)
@@ -1157,7 +674,6 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
     }
   }
 
-  /** Representative CPU work with sparse metric updates matching the source's event-level use. */
   private def telemetryCpuLoop(sourceEnabled: Boolean): Long = {
     var item = 0
     var checksum = 0L
@@ -1178,7 +694,6 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
     checksum ^ localEvents
   }
 
-  /** Current-thread CPU time around one body, or unavailable when the JVM cannot expose it. */
   private def measuredThreadCpuNanos(body: => Long): Option[(Long, Long)] = {
     try {
       val bean = ManagementFactory.getThreadMXBean
@@ -1198,53 +713,22 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
     }
   }
 
-  /**
-   * Metric operations the source-on loop priced: the per-operation denominator.
-   *
-   * @return gauge reads plus counter increments performed across the whole loop
-   */
   private def telemetryOperationCount: Long = {
     val sampledEvents =
       (TelemetryCpuWorkItems + TelemetryCpuSampleInterval - 1) / TelemetryCpuSampleInterval
     sampledEvents.toLong * TelemetryOpsPerSampledEvent.toLong
   }
 
-  /**
-   * Cost of one metric operation, in nanoseconds, from the source-on/source-off difference.
-   *
-   * @param differenceNanos source-on CPU time less source-off CPU time
-   * @return nanoseconds per metric operation, floored at zero because a negative difference means
-   *         the two arms were indistinguishable rather than that telemetry saved time
-   */
   private def telemetryNanosPerOperation(differenceNanos: Long): Long = {
     val operations = telemetryOperationCount
     if (operations <= 0L || differenceNanos <= 0L) 0L else differenceNanos / operations
   }
 
-  /** Lower-median reading, used so one noisy CPU sample cannot dominate the report. */
   private def medianLong(values: Seq[Long]): Long = {
     val ordered = values.sorted
     ordered((ordered.size - 1) / 2)
   }
 
-
-  // ---------------------------------------------------------------------------------------------
-  // The report. One section per dimension, so that each is readable on its own and a reader can
-  // find the figure they came for without reading the rest.
-  // ---------------------------------------------------------------------------------------------
-
-  /**
-   * Emits the comparative report over the harness's result stream and to the console.
-   *
-   * @param master the master both cases ran on
-   * @param baseline the sort-based case
-   * @param streaming the streaming case
-   * @param cpuBaseline sort-based CPU-bound case
-   * @param cpuStreaming streaming CPU-bound case
-   * @param telemetryCpu source-on/source-off CPU accounting
-   * @param overlapContext the case whose context both overlap arms shared
-   * @param overlap both arms of the producer/consumer overlap comparison
-   */
   private def emitReport(
       master: String,
       baseline: CaseObservation,
@@ -1269,14 +753,6 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
         Seq(ReportRule))
   }
 
-  /**
-   * What was run, how much of it, and how many times.
-   *
-   * @param master the master both cases ran on
-   * @param baseline the sort-based case
-   * @param streaming the streaming case
-   * @return the section's lines
-   */
   private def workloadSection(
       master: String,
       baseline: CaseObservation,
@@ -1296,23 +772,6 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
         s"${baseline.groupsProduced} baseline, ${streaming.groupsProduced} streaming"))
   }
 
-  /**
-   * What each case actually asked Spark for, read back through the typed configuration entries.
-   *
-   * The two-tier activation model is why this is worth printing. `spark.shuffle.manager` selects
-   * which manager class is instantiated and `spark.shuffle.streaming.enabled` gates that class's
-   * behaviour, so a streaming case whose gate was left at its default of false would delegate every
-   * service-provider call to the sort-based manager and the comparison would silently be sort
-   * against sort. Both keys are shown, together with the manager class the live driver environment
-   * held once each context was up, so the reader can see the activation rather than assume it.
-   *
-   * The bandwidth entry is optional and its ABSENCE is the unlimited state, never zero, so it is
-   * rendered as such instead of being shown as a number that would misdescribe it.
-   *
-   * @param baseline the sort-based case
-   * @param streaming the streaming case
-   * @return the section's lines
-   */
   private def activationSection(
       baseline: CaseObservation,
       streaming: CaseObservation): Seq[String] = {
@@ -1338,16 +797,6 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
         s"${baseline.managerInService} / ${streaming.managerInService}"))
   }
 
-  /**
-   * Latency, and the reduction the feature is judged on.
-   *
-   * The best run of each case is compared rather than the mean, because the best is the run least
-   * polluted by whatever else the machine was doing, and both cases are given the same treatment.
-   *
-   * @param baseline the sort-based case
-   * @param streaming the streaming case
-   * @return the section's lines
-   */
   private def latencySection(
       baseline: CaseObservation,
       streaming: CaseObservation): Seq[String] = {
@@ -1372,35 +821,6 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
   /**
    * The overlap itself: the same volume delivered to a consumer attached during production, against
    * the same volume delivered to a consumer attached after it.
-   *
-   * ==Why this section exists at all==
-   *
-   * The latency section above compares two whole scheduled jobs, and under the unmodified DAG
-   * scheduler a whole job submits its reduce stage only once its map stage reports available
-   * output.
-   * That stage boundary is not a defect of the measurement, it is the scheduler's contract, and it
-   * is an absolute preservation zone for this feature: AAP 0.2.1 and 0.2.2 forbid modifying the DAG
-   * scheduler, the task lifecycle or task scheduling algorithms, and AAP 0.8.2 Tier 1 restates the
-   * prohibition file by file. So the latency section carries a note saying it claims no overlap,
-   * and it is right to.
-   *
-   * What IS entirely inside the shuffle abstraction -- which AAP 0.2.1 fixes as the whole
-   * modification scope -- is whether a consumer that IS attached during production is served while
-   * production continues, and what that is worth. This section measures exactly that, on the
-   * production manager, writer, reader, coordinator rendezvous and transport, with the attachment
-   * instant as the single difference between its two arms.
-   *
-   * ==How to read it, and how not to==
-   *
-   * The reduction below is the value of the overlap on the path the subsystem controls. It is NOT a
-   * claim about a scheduled job's end-to-end latency, and it may not be added to the latency
-   * section's figure: a scheduled job does not attach its consumer during production, so it does
-   * not collect this. The records-read-during-production row is what says how much overlap each arm
-   * actually contained, and the durable-bytes rows are what the overlap bought in avoided writes.
-   *
-   * @param contextCase the case whose context both arms shared, read for the manager in service
-   * @param overlap both arms as they were accumulated
-   * @return the section's lines
    */
   private def overlapSection(
       contextCase: CaseObservation,
@@ -1417,10 +837,6 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
       row("workload", OverlapComparisonName),
       row("master, shared by both arms", OverlapMaster),
       row("shuffle manager in service", contextCase.managerInService),
-      // Printed because the value of an overlap is bounded by the parallelism available to it: on a
-      // machine with no spare processor the two halves cannot proceed at once however well the
-      // subsystem pipelines, and a reader comparing two arms deserves to know which case they are
-      // reading. This is the JVM's own view of what it was allowed, not the host's core count.
       row("processors available to this JVM",
         Runtime.getRuntime.availableProcessors.toString),
       row("shuffle compression", "off, so pipelining is not hidden behind a codec's buffering"),
@@ -1452,7 +868,6 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
       OverlapAttributionNote
   }
 
-  /** Best, mean and run count of one overlap arm, in the shape the latency section uses. */
   private def overlapElapsedDescription(
       overlap: OverlapObservation,
       runs: Seq[OverlapRun]): String = {
@@ -1467,13 +882,8 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
   /**
    * CPU-bound comparison, with identical deterministic compute wrapped around both shuffle paths.
    *
-   * The same work items and mixing rounds are used in both cases, so the elapsed-time difference
-   * isolates the scheduler and shuffle-coordination work left once deterministic application CPU is
-   * held constant. Like every other section, this reports the target and does not enforce it.
-   *
    * @param baseline the sort-based CPU-bound case
    * @param streaming the streaming CPU-bound case
-   * @return the section's lines
    */
   private def cpuBoundSection(
       baseline: CaseObservation,
@@ -1496,34 +906,12 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
       row("", "the shuffle, so the difference is coordination beneath fixed CPU work"))
   }
 
-  /**
-   * Every run of a case as a list of milliseconds, in the order the runs happened.
-   *
-   * Printed because a best and a mean describe a distribution only if its width is visible. A
-   * reduction that fell short across every run and one that fell short because a single run was
-   * slow call for different responses, and only the samples distinguish them.
-   *
-   * @param observation the case whose runs are listed
-   * @return the runs, comma separated, in milliseconds
-   */
   private def runSamples(observation: CaseObservation): String = {
     val samples = observation.elapsedNanosSamples.map(nanos => millisOf(nanos).toString)
     if (samples.isEmpty) "no run recorded" else s"${samples.mkString(", ")} ms"
   }
 
-  /**
-   * Full executor memory, sampled in the tasks that consume each workload.
-   *
-   * Heap and native buffer-pool use are sampled together, then merged as a high-water mark per
-   * executor and summed across represented executors. The streaming quota and its four ownership
-   * categories are reported beside that footprint but are not added to it: those bytes already
-   * live in heap or native memory. Spark's task execution-memory peak remains useful, so it is
-   * printed as a separate, deliberately narrower reading.
-   *
-   * @param baseline the sort-based case
-   * @param streaming the streaming case
-   * @return the section's lines
-   */
+  /** Full executor memory, sampled in the tasks that consume each workload. */
   private def memorySection(
       baseline: CaseObservation,
       streaming: CaseObservation): Seq[String] = {
@@ -1579,7 +967,6 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
         row("", "to add again. Shape probes use isolated task-metric windows."))
   }
 
-  /** One full executor footprint rendered without hiding its heap and native constituents. */
   private def footprintDescription(footprint: MemoryFootprint): String = {
     s"${footprint.totalBytes} bytes = ${footprint.heapBytes} heap + " +
       s"${footprint.nativeBytes} native"
@@ -1606,39 +993,6 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
   /**
    * Spill, taken from Spark's own spill accumulators and from no counter of this feature's own,
    * reported split by cause.
-   *
-   * <b>Why one rate was not enough, and why this is a reporting correction rather than a softened
-   * target.</b> Disk bytes over shuffle bytes written answers "how much of what we moved went
-   * through the disk", and on the streaming path the honest answer is "most of it" -- but almost
-   * none of that is spill in the sense the acceptance target means. Two different things reach
-   * `diskBytesSpilled`:
-   *
-   *  - '''Spill under pressure.''' Buffer utilisation met the configured threshold, or an
-   * allocation
-   *    needed room, so resident blocks were evicted. This is the condition the under-five-percent
-   *    target is about, and `shuffle.streaming.spillCount` counts exactly its events.
-   *  - '''The end-of-stream durability flush.''' Every successful streaming map task ends by making
-   *    its still-unacknowledged output durable, because the unmodified DAG scheduler submits no
-   *    reduce task until the map stage has finished: the consumers of that output do not exist yet,
-   *    and the executor-scoped block resolver serves them from spilled segments once they do. Those
-   *    bytes are the streaming path's counterpart to the shuffle files the sort-based path writes
-   * for
-   *    exactly the same reason -- and the sort path's own write is accounted as
-   *    `shuffleBytesWritten`, never as spill, which is why the baseline reads zero here while
-   * having
-   *    written every byte of its output to the same disk. Comparing the two totals as though they
-   *    measured the same thing is a category error, and it is the reason a single rate reported
-   *    sixty-three percent for a run in which nothing was ever under memory pressure.
-   *
-   * The combined rate is still reported first and unchanged, because it is the true cost of the
-   * disk on this path and an operator sizing local storage needs it. What is added is the
-   * attribution, so that the figure the target names can be read off rather than inferred -- and so
-   * that a `spillCount` of zero beside a large disk volume reads as the explanation it is instead
-   * of as a contradiction.
-   *
-   * @param baseline the sort-based case
-   * @param streaming the streaming case
-   * @return the section's lines
    */
   private def spillSection(
       baseline: CaseObservation,
@@ -1660,17 +1014,6 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
       spillAttribution(streaming)
   }
 
-  /**
-   * The note that explains which of the two rates above the reader should act on.
-   *
-   * Conditional, because the two cases it distinguishes call for different readings and a note that
-   * covered both would say neither. With no threshold-driven event the whole disk volume is the
-   * durability flush and there is nothing to tune; with events present the volume is a mixture this
-   * benchmark cannot split further, and saying so is more useful than implying it can.
-   *
-   * @param streaming the streaming case
-   * @return the note's lines
-   */
   private def spillAttribution(streaming: CaseObservation): Seq[String] = {
     if (!streaming.telemetry.available) {
       Seq(
@@ -1698,39 +1041,17 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
     }
   }
 
-  /** Executor-side spill-event count, never a driver-local zero when no sample was returned. */
   private def spillCountDescription(observation: CaseObservation): String = {
     if (observation.telemetry.available) observation.telemetry.spillCount.toString
     else "unavailable"
   }
 
-  /** Pressure-spill rate qualified by whether executor-side event attribution was available. */
   private def pressureSpillRateDescription(observation: CaseObservation): String = {
     pressureSpillRateTenths(observation)
       .map(tenths => s"${renderTenths(tenths)} percent")
       .getOrElse("unavailable")
   }
 
-  /**
-   * Write amplification: records the producing side wrote against records the consuming side read.
-   *
-   * <b>Why this belongs in the report.</b> A shuffle abandoned part way through and produced again
-   * costs its records twice, and nothing else in this report would show it: the latency section
-   * would simply read slower, and the spill section would read larger, with no indication that the
-   * extra work was the same work done twice. Records written against records read is the direct
-   * reading, and it is taken from the very reporters the sort-based path populates, so both cases
-   * are measured the same way.
-   *
-   * On a healthy run of either path the two figures agree exactly: every record written is read
-   * once. Written above read means some producer's output was discarded and produced again -- a
-   * retried map task, or a stage the unmodified scheduler recomputed after a fetch failure. Read
-   * above written would mean a reduce task ran more than once over the same output, which a retried
-   * reduce task does.
-   *
-   * @param baseline the sort-based case
-   * @param streaming the streaming case
-   * @return the section's lines
-   */
   private def writeAmplificationSection(
       baseline: CaseObservation,
       streaming: CaseObservation): Seq[String] = {
@@ -1744,12 +1065,6 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
       row("", "again, by a retried map task or a recomputed stage"))
   }
 
-  /**
-   * One case's records written, records read and the amplification between them.
-   *
-   * @param observation the case to describe
-   * @return the description, records and percentage together
-   */
   private def amplificationDescription(observation: CaseObservation): String = {
     val written = observation.shuffleRecordsWritten
     val read = observation.shuffleRecordsRead
@@ -1757,29 +1072,6 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
     s"$written written, $read read, ${renderTenths(amplification)} percent amplification"
   }
 
-  /**
-   * Bandwidth, derived from the REMOTE shuffle bytes the accumulators report over the best run.
-   *
-   * <b>Why remote bytes and not total.</b> `ShuffleReadMetrics.totalBytesRead` is the sum of local
-   * and remote bytes, and a local read never touches a link -- it is a file the same executor
-   * wrote, or a buffer the same executor holds. Labelling that sum "bandwidth" overstates the
-   * link's load by however much of the shuffle stayed on one host, which on a two-executor cluster
-   * is a large fraction and on a `local` master is all of it, where a "bandwidth" figure would be
-   * reported for a run that put nothing on any wire at all. `remoteBytesRead` is the part that
-   * crossed a link, so it is the only part a bandwidth figure may be computed from. Both are
-   * printed, so the local share is visible rather than folded away.
-   *
-   * Byte totals are divided by the number of runs recorded before the rate is taken, because the
-   * accumulators are cumulative over every run of a case while the elapsed time is one run's.
-   *
-   * The byte figures are what the accumulators report, which is bytes after shuffle compression,
-   * and that is the right basis for a bandwidth figure: what a link carries is the compressed
-   * stream, not the dataset it was built from.
-   *
-   * @param baseline the sort-based case
-   * @param streaming the streaming case
-   * @return the section's lines
-   */
   private def bandwidthSection(
       baseline: CaseObservation,
       streaming: CaseObservation): Seq[String] = {
@@ -1808,13 +1100,6 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
           s"${perRun(streaming.fetchWaitTime, streaming.runCount)}"))
   }
 
-  /**
-   * The four `shuffle.streaming` metrics, plus the bookkeeping that qualifies the figures above.
-   *
-   * @param baseline the sort-based case
-   * @param streaming the streaming case
-   * @return the section's lines
-   */
   private def telemetrySection(
       baseline: CaseObservation,
       streaming: CaseObservation): Seq[String] = {
@@ -1842,21 +1127,10 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
       "") ++ TelemetryScopeNote ++ Seq("") ++ TargetsNote
   }
 
-  /** Metric value qualified by whether an executor-side sample was returned. */
   private def telemetryValue(telemetry: StreamingTelemetry, value: Long): String = {
     if (telemetry.available) value.toString else "unavailable"
   }
 
-  /**
-   * Source-on/source-off current-thread CPU accounting for the streaming telemetry implementation.
-   *
-   * Paired samples are alternated and reduced with the lower median, so launch order and one noisy
-   * reading cannot decide the result. JVMs that cannot expose current-thread CPU time are reported
-   * as unavailable rather than silently substituting wall time.
-   *
-   * @param observation the paired CPU readings
-   * @return the section's lines
-   */
   private def telemetryCpuSection(observation: TelemetryCpuObservation): Seq[String] = {
     (observation.sourceOffNanos, observation.sourceOnNanos) match {
       case (Some(sourceOff), Some(sourceOn)) =>
@@ -1885,16 +1159,6 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
     }
   }
 
-  /**
-   * Writes the report to the harness's result stream when one is open, and always to the console.
-   *
-   * The stream is open only when `SPARK_GENERATE_BENCHMARK_FILES=1` asked for a result file, so the
-   * console copy is what a developer running the benchmark interactively actually reads. Bytes are
-   * encoded explicitly rather than through the platform default, so a result file is identical
-   * wherever it was produced and can be compared against a later run without a false difference.
-   *
-   * @param lines the report, one element per line
-   */
   private def emit(lines: Seq[String]): Unit = {
     val text = lines.mkString("", "\n", "\n")
     output.foreach(stream => stream.write(text.getBytes(StandardCharsets.UTF_8)))
@@ -1903,67 +1167,25 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
     // scalastyle:on println
   }
 
-
-  // ---------------------------------------------------------------------------------------------
-  // Presentation and arithmetic. Every percentage is computed in integer tenths and rendered by
-  // hand: fixed-point integers cannot drift the way a float can, and rendering by hand keeps the
-  // report free of the locale-dependent decimal separators and digit-grouping characters that a
-  // formatted float would introduce -- some of which are not ASCII at all.
-  // ---------------------------------------------------------------------------------------------
-
-  /**
-   * One report row: an indented label padded to a fixed width, then its figure.
-   *
-   * A label longer than the column keeps one separating space rather than colliding with its value,
-   * so a long configuration key is still readable.
-   *
-   * @param label what the row reports
-   * @param value the figure
-   * @return the rendered row
-   */
   private def row(label: String, value: String): String = {
     val padding = math.max(1, LabelWidth - label.length)
     s"  $label${" " * padding}$value"
   }
 
-  /**
-   * A case's elapsed times, best and mean, in milliseconds.
-   *
-   * @param observation the case
-   * @return the rendered description
-   */
   private def elapsedDescription(observation: CaseObservation): String = {
     s"best ${millisOf(observation.bestNanos)} ms, mean ${millisOf(observation.meanNanos)} ms"
   }
 
-  /**
-   * A case's spill volumes, in memory and to disk, summed over every run recorded.
-   *
-   * @param observation the case
-   * @return the rendered description
-   */
   private def spillDescription(observation: CaseObservation): String = {
     s"${observation.memoryBytesSpilled} bytes in memory, " +
       s"${observation.diskBytesSpilled} bytes to disk"
   }
 
-  /**
-   * A case's throughput, as the shuffle bytes one run read over the best time a run took.
-   *
-   * @param observation the case
-   * @return the rendered description
-   */
   private def bandwidthDescription(observation: CaseObservation): String = {
     val bytesPerRun = perRun(observation.shuffleRemoteBytesRead, observation.runCount)
     s"${renderTenths(mebibytesPerSecondTenths(bytesPerRun, observation.bestNanos))} MB/s"
   }
 
-  /**
-   * A case's spill rate: disk bytes spilled as tenths of a percent of the shuffle bytes written.
-   *
-   * @param observation the case
-   * @return tenths of a percent
-   */
   private def spillRateTenths(observation: CaseObservation): Long = {
     percentTenths(observation.diskBytesSpilled, observation.shuffleBytesWritten)
   }
@@ -1971,17 +1193,6 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
   /**
    * A case's spill rate attributable to memory pressure, which is the figure the acceptance target
    * names.
-   *
-   * Derived from the event count rather than from a second volume accumulator, because there is no
-   * second accumulator to derive it from and inventing one would mean a fifth streaming metric,
-   * which the specification fixes at four. The derivation is exact in the case that matters: with
-   * no threshold-driven event, no byte can have left memory under pressure, so the pressure rate is
-   * zero however large the combined volume is. With events present the combined rate is reported as
-   * the upper bound it is, and the note beside it says so rather than pretending to a split this
-   * benchmark cannot make.
-   *
-   * @param observation the case
-   * @return the rate in tenths of a percent, or none without executor-side attribution
    */
   private def pressureSpillRateTenths(observation: CaseObservation): Option[Long] = {
     if (!observation.telemetry.available) {
@@ -1993,63 +1204,20 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
     }
   }
 
-  /**
-   * Renders a value expressed in tenths as a decimal string carrying one fraction digit.
-   *
-   * The sign is applied to the rendering rather than left to fall out of the division, because
-   * integer division of a negative value would otherwise lose the sign on a magnitude below one
-   * tenth of a whole and report a regression as progress.
-   *
-   * @param tenths the value, in tenths
-   * @return the rendered value
-   */
   private def renderTenths(tenths: Long): String = {
     val sign = if (tenths < 0L) "-" else ""
     val magnitude = math.abs(tenths)
     s"$sign${magnitude / 10L}.${magnitude % 10L}"
   }
 
-  /**
-   * The share `part` is of `whole`, in tenths of a percent.
-   *
-   * Answers zero when there is nothing to divide by, so the report is total: there is no input for
-   * which this throws and no sentinel it returns in place of a percentage. A negative numerator is
-   * carried through rather than clamped, because a figure below the baseline is exactly what the
-   * memory and latency sections need to be able to say.
-   *
-   * @param part the numerator
-   * @param whole the denominator
-   * @return tenths of a percent
-   */
   private def percentTenths(part: Long, whole: Long): Long = {
     if (whole <= 0L) 0L else part * TenthsPerWhole / whole
   }
 
-  /**
-   * How far `measured` fell below `baseline`, in tenths of a percent of the baseline.
-   *
-   * Negative when the measured path was the slower one, reported as it stands rather than
-   * clamped: a regression shown as zero would be indistinguishable from parity.
-   *
-   * @param baseline the reference figure
-   * @param measured the figure being compared against it
-   * @return tenths of a percent of reduction
-   */
   private def reductionTenths(baseline: Long, measured: Long): Long = {
     percentTenths(baseline - measured, baseline)
   }
 
-  /**
-   * Throughput in tenths of a mebibyte per second.
-   *
-   * Elapsed time is reduced to milliseconds before the division so the numerator stays far
-   * away from overflowing a `Long` even for a multi-gigabyte total, and a run too quick to have
-   * taken a whole millisecond is charged one rather than dividing by zero.
-   *
-   * @param bytes bytes moved
-   * @param nanos the time they took
-   * @return tenths of a mebibyte per second
-   */
   private def mebibytesPerSecondTenths(bytes: Long, nanos: Long): Long = {
     if (bytes <= 0L || nanos <= 0L) {
       0L
@@ -2059,23 +1227,11 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
     }
   }
 
-  /**
-   * A cumulative total shared out over the runs that contributed to it.
-   *
-   * @param total the cumulative figure
-   * @param runs runs recorded
-   * @return the per-run share, or zero when no run was recorded
-   */
   private def perRun(total: Long, runs: Int): Long = {
     if (runs <= 0) 0L else total / runs.toLong
   }
 
-  /** Milliseconds a nanosecond figure amounts to, which is the unit the report states times in. */
   private def millisOf(nanos: Long): Long = TimeUnit.NANOSECONDS.toMillis(nanos)
-
-  // ---------------------------------------------------------------------------------------------
-  // What a case is, and what it observed.
-  // ---------------------------------------------------------------------------------------------
 
   /** Compact result of one grouped workload after its executor-side observations are merged. */
   private class WorkloadObservation(
@@ -2126,13 +1282,7 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
     }
   }
 
-  /**
-   * Isolated task-metric window for one reference run or one shape probe.
-   *
-   * Remote bytes and local-plus-remote bytes are carried SEPARATELY and deliberately. A bandwidth
-   * figure may only be computed from the part that crossed a link, and `totalBytesRead` is the sum
-   * of local and remote; see [[bandwidthSection]].
-   */
+  /** Isolated task-metric window for one reference run or one shape probe. */
   private class TaskMetricWindow(
       val taskEndCount: Long,
       val memoryBytesSpilled: Long,
@@ -2155,15 +1305,11 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
    * One overlap run: what it delivered, what it cost, and what it had to make durable.
    *
    * @param elapsedNanos wall time from just before the producer started to both halves finished
-   * @param recordsProduced records the producer handed to the writer
    * @param recordsConsumed records the consumer read, which must equal the above
-   * @param recordsConsumedDuringProduction records read before production finished, which is how
-   *                                        much overlap this run actually contained
-   * @param blocksStreamed blocks the writer handed to egress
+   * @param recordsConsumedDuringProduction records read before production finished, which is
+   *     how much overlap this run actually contained
    * @param streamedBytes bytes the writer reported on the task's shuffle write accumulator
    * @param durableBytes bytes that reached disk, reported on the task's spill accumulator
-   * @param spillsObserved spill events the writer's spill manager counted
-   * @param standDownDescription why streaming stood down mid-write, if it did
    */
   private class OverlapRun(
       val elapsedNanos: Long,
@@ -2176,26 +1322,17 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
       val spillsObserved: Long,
       val standDownDescription: Option[String])
 
-  /**
-   * Both arms of the overlap comparison, accumulated as the harness runs them.
-   *
-   * The two arms are kept apart rather than merged into one `CaseObservation` each, because they
-   * share a context and a configuration and differ only in the instant the consumer attaches: two
-   * case observations would have implied two environments and invited the reader to compare them as
-   * if they were independent.
-   */
+  /** Both arms of the overlap comparison, accumulated as the harness runs them. */
   private class OverlapObservation {
 
     private val live = new mutable.ArrayBuffer[OverlapRun]()
 
     private val retained = new mutable.ArrayBuffer[OverlapRun]()
 
-    /** Records a run in which the consumer was attached while the producer was still producing. */
     def observeLive(run: OverlapRun): Unit = {
       live += run
     }
 
-    /** Records a run in which the consumer was attached only once production had finished. */
     def observeRetained(run: OverlapRun): Unit = {
       retained += run
     }
@@ -2204,17 +1341,14 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
 
     def retainedRuns: Seq[OverlapRun] = retained.toSeq
 
-    /** Fastest run of an arm, or zero before that arm has run. */
     def bestNanos(runs: Seq[OverlapRun]): Long = {
       if (runs.isEmpty) 0L else runs.map(_.elapsedNanos).min
     }
 
-    /** Mean run of an arm, or zero before that arm has run. */
     def meanNanos(runs: Seq[OverlapRun]): Long = {
       if (runs.isEmpty) 0L else runs.map(_.elapsedNanos).sum / runs.size.toLong
     }
 
-    /** Every run of an arm in the order the runs happened, in milliseconds. */
     def samples(runs: Seq[OverlapRun]): String = {
       if (runs.isEmpty) {
         "no run recorded"
@@ -2223,17 +1357,14 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
       }
     }
 
-    /** Field-wise maximum of one figure across an arm's runs, never a single run's reading. */
     def peak(runs: Seq[OverlapRun], figure: OverlapRun => Long): Long = {
       if (runs.isEmpty) 0L else runs.map(figure).max
     }
 
-    /** Field-wise minimum of a figure across an arm's runs. */
     def trough(runs: Seq[OverlapRun], figure: OverlapRun => Long): Long = {
       if (runs.isEmpty) 0L else runs.map(figure).min
     }
 
-    /** Whether every run of both arms delivered every record it produced. */
     def deliveredEverything: Boolean = {
       val runs = live ++ retained
       runs.nonEmpty && runs.forall { run =>
@@ -2241,20 +1372,12 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
       }
     }
 
-    /** Descriptions of every stand-down either arm observed, which should be none. */
     def standDowns: Seq[String] = (live ++ retained).flatMap(_.standDownDescription).toSeq
   }
 
-  /**
-   * Everything one case of the comparison is, and everything it turned out to cost.
-   *
-   * @param caseName label the harness prints for the case and the report keys it by
-   * @param conf configuration the case's context is built from, tunables and all
-   * @param master master the context is started on, which decides whether executors are awaited
-   */
+  /** Everything one case of the comparison is, and everything it turned out to cost. */
   private class CaseObservation(val caseName: String, val conf: SparkConf, val master: String) {
 
-    /** Reads Spark's own task accumulators for every task this case runs. */
     val recorder: ShuffleTaskMetricsRecorder = new ShuffleTaskMetricsRecorder
 
     private var runs: Int = 0
@@ -2291,31 +1414,11 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
 
     private var fetchWait: Long = 0L
 
-    /**
-     * Every run's elapsed time, in the order the runs happened.
-     *
-     * Kept because a best and a mean describe a distribution only if a reader is told how wide it
-     * is. A latency figure that missed its acceptance target by a wide margin, and one that missed
-     * it because a single run was slow, call for different responses, and only the samples can tell
-     * them apart.
-     */
+    /** Every run's elapsed time, in the order the runs happened. */
     private val elapsedSamples = new mutable.ArrayBuffer[Long]()
 
-    /** Full executor footprint of each workload shape, in measurement order. */
     private val shapeFootprints = new mutable.LinkedHashMap[String, MemoryFootprint]()
 
-    /**
-     * Records one completed run of the workload.
-     *
-     * Every run is recorded, the harness's unmeasured warm-up included, because each one is
-     * work the executors genuinely did and more samples make the accumulated figures steadier.
-     * Elapsed times are kept as a best and a mean; the comparison uses the best, and the mean
-     * is printed beside it so a reader can see how much the two differ.
-     *
-     * @param elapsedNanos wall time the job took, cluster start-up excluded
-     * @param workload executor-side group count, telemetry and full memory observations
-     * @param metrics isolated task metrics from this reference run only
-     */
     def observeRun(
         elapsedNanos: Long,
         workload: WorkloadObservation,
@@ -2340,59 +1443,36 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
       elapsedSamples += elapsedNanos
     }
 
-    /**
-     * Records the full executor footprint one workload shape reached, taking field-wise maxima when
-     * a shape is measured more than once.
-     *
-     * @param shapeName the shape's label, which the report prints
-     * @param footprint the executor-side heap, native and quota reading
-     */
     def observeShapeFootprint(shapeName: String, footprint: MemoryFootprint): Unit = {
       shapeFootprints(shapeName) =
         shapeFootprints.get(shapeName).map(_.max(footprint)).getOrElse(footprint)
     }
 
-    /** Full executor footprint recorded for one shape. */
     def shapeFootprint(shapeName: String): MemoryFootprint =
       shapeFootprints.getOrElse(shapeName, EmptyMemoryFootprint)
 
-    /** Shapes measured for this case, in the order they were measured. */
     def measuredShapes: Seq[String] = shapeFootprints.keys.toSeq
 
-    /**
-     * Records the shuffle manager the live environment held when this case's context came up.
-     *
-     * @param managerClassName simple class name of that manager
-     */
     def recordManagerInService(managerClassName: String): Unit = {
       manager = managerClassName
     }
 
-    /** Runs recorded so far, warm-up included. */
     def runCount: Int = runs
 
-    /** The fastest run observed, or zero before any run has been observed. */
     def bestNanos: Long = if (runs == 0) 0L else bestElapsedNanos
 
-    /** The mean run observed, or zero before any run has been observed. */
     def meanNanos: Long = if (runs == 0) 0L else totalElapsedNanos / runs.toLong
 
-    /** The slowest run observed, or zero before any run has been observed. */
     def worstNanos: Long = if (elapsedSamples.isEmpty) 0L else elapsedSamples.max
 
-    /** Every run's elapsed time, in the order the runs happened. */
     def elapsedNanosSamples: Seq[Long] = elapsedSamples.toSeq
 
-    /** Groups the workload produced, which every run of a case should agree on. */
     def groupsProduced: Long = groups
 
-    /** Simple class name of the shuffle manager that served this case. */
     def managerInService: String = manager
 
-    /** The streaming metrics as they stood at the end of this case's most recent run. */
     def telemetry: StreamingTelemetry = lastTelemetry
 
-    /** Full executor heap plus native footprint observed across the case. */
     def memoryFootprint: MemoryFootprint = fullMemory
 
     def taskEndCount: Long = taskEnds
@@ -2407,10 +1487,8 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
 
     def shuffleRecordsWritten: Long = recordsWritten
 
-    /** Bytes that crossed a link, which is the only basis a bandwidth figure may be taken from. */
     def shuffleRemoteBytesRead: Long = remoteBytesRead
 
-    /** Local plus remote bytes: what the accumulator reports, and NOT a wire figure. */
     def shuffleTotalBytesRead: Long = totalBytesRead
 
     def shuffleRecordsRead: Long = recordsRead
@@ -2420,12 +1498,6 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
 
   /**
    * A reading of the four `shuffle.streaming` metrics, taken together so they describe one moment.
-   *
-   * @param bufferUtilizationPercent the gauge, which is computed when it is read
-   * @param spillCount spill events counted since the case's registry was reset
-   * @param backpressureEvents transitions into a throttled state counted since that reset
-   * @param partialReadInvalidations per-producer invalidations counted since that reset
-   * @param executorCount executor registries represented by this merged reading
    */
   private class StreamingTelemetry(
       val bufferUtilizationPercent: Long,
@@ -2487,18 +1559,7 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
     def observed: MemoryFootprint = peak
   }
 
-  /**
-   * Accumulates the task metrics Spark already reports, for every task a case runs.
-   *
-   * Reading `TaskMetrics` through a listener is the same path an operator's own tooling takes, so
-   * what this records is also evidence that the streaming write and read paths report through
-   * Spark's existing accumulators rather than through a channel of their own. Parallel counters
-   * would have left the streaming path invisible to every Spark observability surface there already
-   * is, which is why none are introduced here.
-   *
-   * Every callback and every accessor is synchronized, because the listener bus delivers on its own
-   * thread while the benchmark reads from the driver thread.
-   */
+  /** Accumulates the task metrics Spark already reports, for every task a case runs. */
   private class ShuffleTaskMetricsRecorder extends SparkListener {
 
     private var windowActive: Boolean = false
@@ -2523,7 +1584,6 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
 
     private var fetchWaitTime: Long = 0L
 
-    /** Opens a clean task-metric window for one reference run or one shape probe. */
     def beginWindow(): Unit = synchronized {
       windowActive = true
       tasksEnded = 0L
@@ -2541,8 +1601,6 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
     override def onTaskEnd(taskEnd: SparkListenerTaskEnd): Unit = synchronized {
       if (windowActive) {
         tasksEnded += 1L
-        // The metrics are documented as null for a task that failed, so a failure adds to the task
-        // count and to nothing else instead of bringing the listener bus thread down.
         val metrics: TaskMetrics = taskEnd.taskMetrics
         if (metrics != null) {
           memorySpilled += metrics.memoryBytesSpilled
@@ -2558,7 +1616,6 @@ object StreamingShufflePerformanceBenchmark extends BenchmarkBase with Streaming
       }
     }
 
-    /** Closes and returns the current isolated window. */
     def finishWindow(): TaskMetricWindow = synchronized {
       windowActive = false
       new TaskMetricWindow(
