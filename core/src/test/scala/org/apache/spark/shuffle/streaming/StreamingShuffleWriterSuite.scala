@@ -24,7 +24,8 @@ import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong}
 import scala.collection.mutable
 import scala.util.control.NonFatal
 
-import _root_.io.netty.channel.{Channel, DefaultChannelId}
+import _root_.io.netty.channel.{Channel, ChannelHandlerContext,
+  ChannelOutboundHandlerAdapter, ChannelPromise, DefaultChannelId}
 import _root_.io.netty.channel.embedded.EmbeddedChannel
 import org.scalatest.PrivateMethodTester
 import org.scalatest.matchers.must.Matchers
@@ -49,7 +50,8 @@ class StreamingShuffleWriterSuite
     with SharedSparkContext
     with Matchers
     with PrivateMethodTester
-    with StreamingShuffleTestHelper {
+    with StreamingShuffleTestHelper
+    with StreamingShuffleHadoopCredentialIsolation {
 
   import StreamingShuffleTestHelper._
 
@@ -713,6 +715,47 @@ class StreamingShuffleWriterSuite
 
     /** Closes the channel the way a reduce task that has finished reading does. */
     def disconnect(): Unit = crash()
+
+    /**
+     * Resets the connection the way a peer whose socket was torn down does.
+     *
+     * The third way a consumer can go, and the one neither [[crash]] nor [[vanish]] reaches: the
+     * transport itself raises the failure, which is what a producer observes as `send(..) failed
+     * with error(-104): Connection reset by peer`. It arrives through `exceptionCaught` rather than
+     * through an inactive-channel transition, so it is a distinct code path at the producer and not
+     * merely a differently worded close.
+     *
+     * @param cause the transport failure the producer's channel is to raise
+     */
+    def reset(cause: Throwable): Unit = {
+      awaitDataPlane("consumer reset")
+      channel.close().syncUninterruptibly()
+      handler.exceptionCaught(cause, client)
+      awaitDataPlane("consumer reset cleanup")
+    }
+
+    /**
+     * Makes every subsequent write to this channel fail, while leaving the channel active.
+     *
+     * The fourth way a consumer can go, and the only one that reaches the producer through a failed
+     * write future rather than through a channel transition: a socket that is still open as far as
+     * this end is concerned but cannot be written to, which is what a peer whose host has gone
+     * looks like until TCP notices. Closing the channel does not reach it, because the producer
+     * checks that a channel is active before it writes and keeps the block queued when it is not.
+     *
+     * @param cause the failure each write promise is completed with
+     */
+    def failWrites(cause: Throwable): Unit = {
+      awaitDataPlane("install write failure")
+      channel.pipeline().addFirst(new ChannelOutboundHandlerAdapter {
+        override def write(
+            ctx: ChannelHandlerContext,
+            message: Any,
+            promise: ChannelPromise): Unit = {
+          promise.setFailure(cause)
+        }
+      })
+    }
   }
 
   /** A sort-based writer that records what it was handed. */
@@ -2339,7 +2382,19 @@ class StreamingShuffleWriterSuite
             }
             record
         }
-        harness.writer.write(observed)
+        // Watched, because this is the one case in the suite that streams tens of thousands of
+        // records into a channel whose consumer never drains it, and it is therefore the case a
+        // regression in egress serialisation would strand first. The `failAfter` net the base suite
+        // wraps every body in cannot bound that: it interrupts, and a thread inside a computational
+        // loop never observes an interrupt, so the failure mode is a run that never finishes and
+        // reports nothing. The watchdog does not stop such a loop -- nothing in the JVM can -- but
+        // it names it in the log while it is happening, and it fails outright the merely
+        // pathological variant that still terminates. The reading is the writer's own streamed
+        // block counter, which advances for as long as the producer is making progress.
+        withProgressWatchdog("the writer streaming to a consumer that stops acknowledging")(
+            harness.writer.blocksStreamed) {
+          harness.writer.write(observed)
+        }
 
         assert(harness.writer.consumerStallCount === 1L,
           s"The stall must be reported exactly once per stalled stream, yet it was reported " +
@@ -2491,6 +2546,104 @@ class StreamingShuffleWriterSuite
             s"covered ${replayed.mkString(", ")} while ${spilled.mkString(", ")} were on disk")
       }
       resumed.crash()
+    }
+  }
+
+  test("a consumer channel reset never fails the producing map task") {
+    // A consumer socket that is torn down rather than closed is the same event to this map output
+    // as one that closes gracefully -- `channelInactive` has always retained the unacknowledged
+    // window and left the task alone -- but it arrives through `exceptionCaught`, and that used to
+    // latch the raw transport error on this task's error notifier. The successful stop sequence
+    // then re-threw it AFTER establishing the retained output was durable and reachable, so a map
+    // task whose output was complete failed anyway. Because a map-task failure spends that task's
+    // own failure budget instead of asking for anything to be recomputed, a master that permits a
+    // single attempt -- which a plain local[n] forces -- aborted the whole job over one reset
+    // consumer socket.
+    val clock = newManualClock()
+    withHarness(newHarness(numPartitions = DegradationPartitions,
+        executorMemoryBytes = DegradationExecutorMemoryBytes, clock = clock)) { harness =>
+      val consumer = new ConsumerChannel(harness.serverHandler, consumerId)
+      consumer.subscribe(partitionId = 0)
+      harness.writer.write(deterministicRecords(StreamedRecordsPerConsumerCase, seed = 91L,
+        keySpace = 8).iterator)
+      assert(consumer.drainInboundBlocks().nonEmpty,
+        "the consumer must have been served before it is reset, or the window it leaves behind " +
+          "is empty and the case asserts nothing")
+      assert(harness.serverHandler.unacknowledgedBlockCount > 0,
+        "and it must still owe acknowledgements, since the retention that makes the reset " +
+          "survivable is retention of exactly those blocks")
+
+      consumer.reset(new java.io.IOException(
+        "send(..) failed with error(-104): Connection reset by peer"))
+      assert(harness.serverHandler.liveConsumerCount === 0,
+        "a reset channel must leave no live session behind")
+
+      val status = harness.writer.stop(success = true)
+      assert(status.isDefined,
+        "A map task whose retained output is durable must publish its status: the consumer that " +
+          "reset is served by the consumer-failure protocol, and failing the producer instead " +
+          "spends a task attempt on a fault the producer did not cause")
+      assert(harness.writer.getPartitionLengths().exists(_ > 0L),
+        "and the status must describe output that was really streamed")
+      // Durable and owned by the executor-scoped resolver, which is what makes the reset harmless:
+      // the consumer that lost its socket -- or the reduce attempt that replaces it -- reads the
+      // very bytes whose writes failed.
+      assert(harness.blockResolver.registeredProducerCount > 0,
+        "and that output must be reachable through the resolver after the task ends")
+    }
+  }
+
+  test("a refused egress write is accounted to the consumer and not to the producing task") {
+    // The other half of the same rule, and the half the reset case cannot reach. A peer whose host
+    // has gone leaves a socket this end still believes in, so the session stays live and a block
+    // written to it is refused by the transport rather than by a channel transition: the failure
+    // arrives through the write future, once per block. Those futures were latched on the producing
+    // task's notifier too, so one departed consumer contributed as many latched failures as it was
+    // owed blocks -- and the successful stop sequence re-threw the first of them.
+    //
+    // Asserted at the seam rather than by driving a whole map output to completion, because what
+    // changed is where a refused write is accounted. Whether a consumer that never returns
+    // eventually fails the attempt is a different question with an answer of its own: the
+    // acknowledgement watchdog replays it five times on the one second ladder and escalates, which
+    // is asserted separately and remains the only route from a consumer problem to a failed task.
+    val clock = newManualClock()
+    withHarness(newHarness(clock = clock)) { harness =>
+      harness.spillManager.registerPartitionCount(defaultPartitions)
+      assert(harness.blockResolver.registerProducer(harness.shuffleId, defaultMapId,
+          defaultTaskAttemptId, harness.spillManager),
+        "the fixture must be able to publish its retained output before offering a block")
+      val priority = StreamingShuffleServerHandler.EgressPriority(
+        stageId = 0, stageAttemptNumber = 0, taskAttemptId = defaultTaskAttemptId,
+        attemptNumber = 0)
+      val consumer = new ConsumerChannel(harness.serverHandler, consumerId)
+      consumer.subscribe(partitionId = 0)
+      consumer.drainInbound()
+
+      // The channel stays active and every write to it is refused, which is the only shape that
+      // reaches the write future: the producer checks that a channel is active before writing, so a
+      // closed one leaves the block queued instead of refused.
+      consumer.failWrites(new java.io.IOException(
+        "send(..) failed with error(-104): Connection reset by peer"))
+      val sequenceNumber = admitAndEnqueue(harness, partitionId = 0, priority = priority)
+      // Settles the producer's data plane, which is the thread the egress write is issued from, and
+      // establishes that nothing reached the socket: a refused write delivers no frame.
+      assert(consumer.drainInbound().isEmpty,
+        "a refused write must deliver nothing to the consumer")
+
+      assert(harness.serverHandler.egressFailureCount > 0L,
+        s"the refusal must be observed and accounted against the consumer's channel, but " +
+          s"${harness.serverHandler.egressFailureCount} were counted")
+      assert(!harness.components.errorNotifier.hasError,
+        s"and it must NOT be latched on the producing task, because a map task that failed here " +
+          s"spent its own failure budget on a consumer's socket: the notifier held " +
+          s"${harness.components.errorNotifier.error.map(_.getMessage).getOrElse("nothing")}")
+      // Nothing is lost by not failing: the block the refused write carried was never acknowledged,
+      // so it is exactly what the retained window holds and what a replay re-sends.
+      assert(harness.spillManager.retainedBlockCount(0) > 0,
+        "the block whose write was refused must still be retained for replay")
+      assert(harness.spillManager.retainedPayload(0, sequenceNumber).isDefined,
+        s"and block $sequenceNumber must still be replayable byte for byte")
+      consumer.crash()
     }
   }
 
@@ -2841,8 +2994,9 @@ class StreamingShuffleWriterSuite
         sortWriterFactory = Some(() => delegate)),
       expectedReason = StreamingShuffleFallbackReason.NetworkSaturation,
       prepare = fixture => {
-        fixture.fallbackPolicy.recordLinkUtilization(
-          usedBytesPerSecond = 990.0d, capacityBytesPerSecond = 1000.0d)
+        // Above the ninety percent share across the run of measurement intervals the condition is
+        // sustained over; one reading is a legal burst rather than a saturated link.
+        driveLinkSaturation(fixture.fallbackPolicy, 990.0d, 1000.0d)
         assert(fixture.fallbackPolicy.hasTripped,
           "the fixture's policy must have latched a trip before the first record")
       })
@@ -3300,8 +3454,7 @@ class StreamingShuffleWriterSuite
       val tripping = records.iterator.map { record =>
         if (!tripped) {
           tripped = true
-          fixture.fallbackPolicy.recordLinkUtilization(
-            usedBytesPerSecond = 990.0d, capacityBytesPerSecond = 1000.0d)
+          driveLinkSaturation(fixture.fallbackPolicy, 990.0d, 1000.0d)
           assert(fixture.fallbackPolicy.hasTripped,
             "the link saturation condition must trip the policy the writer consults")
         }
@@ -3370,8 +3523,11 @@ class StreamingShuffleWriterSuite
         val refusal = intercept[SparkException] {
           fixture.writer.write(
             acknowledgeThenTrip(fixture, consumer, DegradationRecords, seed = 233L) { policy =>
-              policy.recordLinkUtilization(
-                usedBytesPerSecond = 990.0d, capacityBytesPerSecond = 1000.0d)
+              // Driven across a run of consecutive measurement intervals, because saturation is
+              // concluded from a sustained run rather than from one reading: a single sample above
+              // the threshold is the mandatory maximum-sized frame a pacing bucket must be able to
+              // admit, which a compliant producer is entitled to send.
+              driveLinkSaturation(policy, 990.0d, 1000.0d)
               assert(policy.trippedReason.contains(
                   StreamingShuffleFallbackReason.NetworkSaturation),
                 s"link saturation must trip NetworkSaturation, but the policy reported " +
@@ -3462,8 +3618,9 @@ class StreamingShuffleWriterSuite
       val tripping = records.iterator.map { record =>
         if (!tripped) {
           tripped = true
-          fixture.fallbackPolicy.recordLinkUtilization(
-            usedBytesPerSecond = 990.0d, capacityBytesPerSecond = 1000.0d)
+          // A run of over-capacity measurement intervals, which is what the condition is
+          // evaluated over; the helper supplies every instant, so no clock is needed here.
+          driveLinkSaturation(fixture.fallbackPolicy, 990.0d, 1000.0d)
           assert(fixture.fallbackPolicy.hasTripped,
             "the link saturation condition must trip the policy the writer consults")
         }
@@ -3506,7 +3663,7 @@ class StreamingShuffleWriterSuite
       fixture.writer.write(records.iterator.map { record =>
         if (!tripped) {
           tripped = true
-          fixture.fallbackPolicy.recordLinkUtilization(990.0d, 1000.0d)
+          driveLinkSaturation(fixture.fallbackPolicy, 990.0d, 1000.0d)
         }
         record
       })

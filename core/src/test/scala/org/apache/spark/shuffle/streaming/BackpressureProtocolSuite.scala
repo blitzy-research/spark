@@ -29,7 +29,8 @@ import org.scalatest.matchers.should.Matchers
 import org.apache.spark.{SparkConf, SparkFunSuite, SparkIllegalArgumentException, TaskContext}
 import org.apache.spark.internal.config.{EXECUTOR_MEMORY, SHUFFLE_STREAMING_BUFFER_SIZE_PERCENT,
   SHUFFLE_STREAMING_MAX_BANDWIDTH_MBPS, SHUFFLE_STREAMING_SPILL_THRESHOLD}
-import org.apache.spark.network.shuffle.protocol.streaming.{AckMessage, StreamingShuffleMessageType}
+import org.apache.spark.network.shuffle.protocol.streaming.{AckMessage, DataBlockMessage,
+  StreamingShuffleMessageType}
 import org.apache.spark.rpc.RpcEnv
 import org.apache.spark.shuffle.{ShuffleReadMetricsReporter, ShuffleWriteMetricsReporter}
 import org.apache.spark.util.{Clock, ManualClock}
@@ -40,7 +41,8 @@ import org.apache.spark.util.{Clock, ManualClock}
  */
 class BackpressureProtocolSuite extends SparkFunSuite
   with Matchers
-  with StreamingShuffleTestHelper {
+  with StreamingShuffleTestHelper
+  with StreamingShuffleHadoopCredentialIsolation {
 
   import StreamingShuffleTestHelper._
 
@@ -1430,12 +1432,58 @@ class BackpressureProtocolSuite extends SparkFunSuite
       "the trip is strictly beyond ninety percent, so exactly ninety does NOT fire")
     assert(protocol.state === BackpressureState.Flowing, "and the executor stays flowing")
 
-    clock.advance(BackpressureProtocol.SATURATION_SAMPLE_WINDOW_MS)
-    protocol.onDataReceived(observedKey, 2L, aboveNinetyPercent)
-    assert(protocol.ingressBytesPerSecond === aboveNinetyPercent, "one interval later, one rung up")
-    assert(protocol.linkSaturationPercent > LinkSaturationTripPercent, "the link is beyond ninety")
-    assert(protocol.isLinkSaturated,
-      "so saturation trips on the FIRST interval that reads over capacity")
+    // One rung up, and the link is now beyond the share -- but one interval of that is not
+    // saturation. This subsystem is REQUIRED to emit a burst that reads over capacity for one
+    // interval of a small administered link: a pacing bucket must be able to admit one
+    // maximum-sized encoded frame or it would refuse every frame forever, so its burst allowance is
+    // at least one frame however small its paced share is, and a bucket that starts full delivers
+    // that burst plus one interval's refill inside the first interval. Treating that as saturation
+    // stood healthy shuffles down and forced their map stages to be recomputed. A run of
+    // consecutive intervals is what distinguishes the burst from the condition, and how long that
+    // run has to be is derived from THIS capacity, because the run is what the mandatory burst is
+    // amortised into: a small capacity needs a longer run than a large one. Each individual reading
+    // stays trustworthy for the reason asserted above: it is a rate over a full sampling window,
+    // and a link quiet for two windows reads as idle rather than as saturated.
+    val requiredRun = protocol.requiredSaturatedIntervalCount
+    assert(requiredRun === StreamingShuffleFallbackPolicy.sustainedIntervalsFor(
+      declaredCapacityBytes.toDouble),
+      "the protocol and the policy must require the same run of the same capacity, or an " +
+        "operator would be shown a degradation the policy is not acting on")
+    assert(requiredRun >= BackpressureProtocol.LINK_SATURATION_SUSTAINED_INTERVALS,
+      "and the derived run is never shorter than the floor")
+    assert(requiredRun * declaredCapacityBytes.toDouble *
+        StreamingShuffleFallbackPolicy.SATURATION_HEADROOM_RATIO >=
+      DataBlockMessage.MAX_ENCODED_FRAME_BYTES.toDouble,
+      "because the run exists to absorb one mandatory maximum-sized frame into the headroom a " +
+        "compliant producer has, so a shorter one would trip on a frame this subsystem is " +
+        "obliged to send")
+    var sequence = 2L
+    (1L to requiredRun).foreach { interval =>
+      clock.advance(BackpressureProtocol.SATURATION_SAMPLE_WINDOW_MS)
+      protocol.onDataReceived(observedKey, sequence, aboveNinetyPercent)
+      sequence += 1L
+      assert(protocol.ingressBytesPerSecond === aboveNinetyPercent,
+        "one interval later, one rung up")
+      assert(protocol.linkSaturationPercent > LinkSaturationTripPercent,
+        "the link is beyond ninety")
+      val saturated = protocol.isLinkSaturated
+      assert(protocol.saturatedIntervalCount === interval,
+        s"interval $interval over capacity must count as $interval consecutive interval(s)")
+      if (interval < requiredRun) {
+        assert(!saturated,
+          s"$interval interval(s) over capacity is a burst rather than a saturated link")
+        assert(protocol.state === BackpressureState.Flowing,
+          "so the executor keeps streaming while the run is short of the threshold")
+      } else {
+        assert(saturated,
+          s"$interval consecutive interval(s) over capacity is the saturation condition")
+      }
+    }
+    // Polling faster than the rate is republished cannot advance the run, which is the property
+    // that makes the bound a duration rather than a call count.
+    assert(protocol.isLinkSaturated, "the latched verdict stands within the same interval")
+    assert(protocol.saturatedIntervalCount === requiredRun,
+      "and re-reading the same interval does not lengthen the run")
     assert(protocol.state === BackpressureState.Degraded, "and the executor degrades")
     assert(protocol.degradationReasons === Seq(BackpressureDegradationReason.LinkSaturation),
       "naming the third of the four conditions")

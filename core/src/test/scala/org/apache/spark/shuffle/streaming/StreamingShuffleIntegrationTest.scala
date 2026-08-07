@@ -37,7 +37,9 @@ import org.apache.spark.internal.LogKeys.{BYTE_SIZE, COUNT, DURATION, MAX_SIZE, 
   PERCENT, REASON, RECORDS, TIME_UNITS, TOTAL}
 import org.apache.spark.internal.config.{SHUFFLE_COMPRESS, SHUFFLE_MANAGER,
   SHUFFLE_STREAMING_BUFFER_SIZE_PERCENT, SHUFFLE_STREAMING_ENABLED,
-  SHUFFLE_STREAMING_SPILL_THRESHOLD, STAGE_MAX_CONSECUTIVE_ATTEMPTS, TASK_MAX_FAILURES}
+  SHUFFLE_STREAMING_MAX_BANDWIDTH_MBPS, SHUFFLE_STREAMING_SPILL_THRESHOLD,
+  STAGE_MAX_CONSECUTIVE_ATTEMPTS, TASK_MAX_FAILURES}
+import org.apache.spark.network.shuffle.protocol.streaming.DataBlockMessage
 import org.apache.spark.rdd.RDD
 import org.apache.spark.scheduler.{JobSucceeded, SparkListener, SparkListenerJobEnd,
   SparkListenerStageCompleted, SparkListenerStageSubmitted, SparkListenerTaskEnd}
@@ -53,7 +55,8 @@ import org.apache.spark.util.{CollectionAccumulator, LongAccumulator, ManualCloc
 class StreamingShuffleIntegrationTest
   extends SparkFunSuite
   with LocalSparkContext
-  with StreamingShuffleTestHelper {
+  with StreamingShuffleTestHelper
+  with StreamingShuffleHadoopCredentialIsolation {
 
   import StreamingShuffleTestHelper._
 
@@ -109,6 +112,65 @@ class StreamingShuffleIntegrationTest
 
   private val FaultInjectionDatasetBytes: Long = TargetDatasetBytes
 
+  // ---------------------------------------------------------------------------------------------
+  // The capped-bandwidth scenario's shape. Every figure here is chosen against what the case has to
+  // exercise rather than for convenience.
+  // ---------------------------------------------------------------------------------------------
+
+  /**
+   * The link capacity the capped scenario declares, in MB/s.
+   *
+   * One, which is the smallest capacity the configuration entry accepts and the value at which the
+   * mandatory burst allowance is furthest above the administered rate: the bucket must admit one
+   * two-mebibyte frame, so its first interval can carry more than twice the declared capacity. That
+   * is the reading the saturation predicate must not mistake for a saturated link.
+   */
+  private val CappedBandwidthMBps: Int = 1
+
+  /**
+   * Width of the capped scenario's shuffle.
+   *
+   * Eight, matching the shape the defect was reproduced on, and wide enough that several producers
+   * pace concurrently against one executor-wide allowance.
+   */
+  private val CappedBandwidthPartitionCount: Int = 8
+
+  /**
+   * Dataset the capped scenario shuffles: four mebibytes.
+   *
+   * Sized against the measurement rather than against the machine. A rate window closes once a
+   * second, and at a one MB/s cap four mebibytes cannot cross the wire in less than four of those
+   * windows, so the run is long enough for the predicate to be evaluated repeatedly -- which is
+   * exactly what the tree's other capped case, moving barely a hundred kilobytes, is too small to
+   * do. It is deliberately far smaller than the hundred-mebibyte reference dataset, because a paced
+   * run takes proportionally longer and the case is about a failure mode rather than about volume.
+   */
+  private val CappedBandwidthDatasetBytes: Long = 4L * 1024L * 1024L
+
+  /**
+   * The master the capped scenario runs on.
+   *
+   * A plain in-process master, deliberately: it is what an operator develops against, it is where
+   * the defect was fatal, and it is the topology on which a fetch failure costs the driver's own
+   * block-manager registration and with it the indirect task results already stored under it.
+   */
+  private val CappedBandwidthMaster: String = "local[4]"
+
+  /**
+   * Spark's own default stage-attempt tolerance, asserted rather than assumed.
+   *
+   * The capped scenario's premise is that it runs on stock tolerances, so the value the entry
+   * defaults to is read from the entry itself and compared against the context's, which keeps the
+   * premise true if the default ever moves.
+   */
+  private val DefaultStageAttempts: Int = STAGE_MAX_CONSECUTIVE_ATTEMPTS.defaultValue.get
+
+  /**
+   * Blocks the producing side must put on the wire before the consumer earns one permit.
+   *
+   * Two, which is the fifty-percent consumer the feature's scenario names: production advances
+   * twice for every record consumption is allowed to take.
+   */
   private val BlocksPerConsumerPermit: Long = 2L
 
   private val ConsumerPermitPollLimit: Int = 4
@@ -665,6 +727,56 @@ class StreamingShuffleIntegrationTest
     assert(BandwidthCeilingPercent != LinkSaturationTripPercent,
       "the egress ceiling and the saturation trip are DIFFERENT constants, and conflating them " +
         "would either throttle to the trip point or trip at the throttle point")
+    assert(BandwidthCeilingPercent < LinkSaturationTripPercent,
+      s"correctly paced egress must sit BELOW the saturation trip, or the subsystem would trip " +
+        s"on its own compliant traffic, but the suite reads a $BandwidthCeilingPercent percent " +
+        s"ceiling against a $LinkSaturationTripPercent percent trip")
+    assert(SaturationSustainedIntervals === 3L,
+      s"a saturation run may never be shorter than three consecutive measurement intervals, but " +
+        s"the suite reads $SaturationSustainedIntervals")
+    // The run actually required is derived from the capacity, because it has to absorb that
+    // capacity's mandatory burst allowance. The invariant -- not a magic number -- is that the run
+    // multiplied by the headroom a compliant producer has must cover one maximum-sized frame, or
+    // this subsystem would trip on a frame it is OBLIGED to send. That is asserted directly, at the
+    // smallest capacity the operator guide says is supported and at a capacity large enough for the
+    // burst to be one second of its own paced rate.
+    val headroomRatio = StreamingShuffleFallbackPolicy.SATURATION_HEADROOM_RATIO
+    assert(headroomRatio > 0.0d,
+      s"a compliant producer must have some headroom between the pacing ceiling and the " +
+        s"saturation trip, but the suite reads $headroomRatio")
+    Seq(CappedBandwidthMBps.toDouble * BytesPerMebibyte, 64L * BytesPerMebibyte.toDouble)
+      .foreach { capacity =>
+        val run = saturationIntervalsFor(capacity)
+        assert(run >= SaturationSustainedIntervals,
+          s"the run derived for $capacity bytes/s may not be shorter than the floor, but the " +
+            s"suite reads $run")
+        assert(run <= StreamingShuffleFallbackPolicy.SATURATION_MAX_SUSTAINED_INTERVALS,
+          s"nor longer than the ceiling that keeps the condition reachable, but the suite reads " +
+            s"$run for $capacity bytes/s")
+        assert(run.toDouble * capacity * headroomRatio >=
+          DataBlockMessage.MAX_ENCODED_FRAME_BYTES.toDouble,
+          s"and $run interval(s) of headroom at $capacity bytes/s must cover one " +
+            s"${DataBlockMessage.MAX_ENCODED_FRAME_BYTES}-byte frame, or a compliant producer " +
+            s"would read as a saturated link")
+      }
+    assert(saturationIntervalsFor(CappedBandwidthMBps.toDouble * BytesPerMebibyte) >=
+      saturationIntervalsFor(64L * BytesPerMebibyte.toDouble),
+      "a smaller capacity needs a run at least as long as a larger one, because the same " +
+        "mandatory frame is a larger share of it")
+    assert(saturationIntervalsFor(0.0d) === SaturationSustainedIntervals,
+      "an unusable capacity must yield the floor rather than an arithmetic accident")
+    assert(BackpressureProtocol.LINK_SATURATION_SUSTAINED_INTERVALS ===
+      StreamingShuffleFallbackPolicy.SATURATION_SUSTAINED_INTERVALS,
+      "the protocol's view of the saturation run and the policy's must be the same length, or a " +
+        "shuffle would be reported as degrading on a schedule the policy never acts on")
+    assert(SaturationSampleWindowMillis === 1000L,
+      s"a measurement interval is one second, but the suite reads $SaturationSampleWindowMillis ms")
+    // The burst allowance is why the run exists. A pacing bucket must admit one maximum-sized frame
+    // however small its paced share is, so on a small administered link one legal burst reads above
+    // the trip share for exactly one interval -- which is the reading the run rules out.
+    assert(MinTokenBucketCapacityBytes >= MaxBlockSizeBytes.toLong,
+      s"a bucket must be able to admit one whole block, but the floor reads " +
+        s"$MinTokenBucketCapacityBytes bytes against a $MaxBlockSizeBytes byte block cap")
 
     assert(ProducerConnectionTimeoutMillis === 5000L &&
       JustBeforeProducerTimeoutMillis === 4999L,
@@ -1147,13 +1259,22 @@ class StreamingShuffleIntegrationTest
     val producerFinished = new AtomicBoolean(false)
     val consumedDuringProduction = new AtomicInteger(0)
     val spillWitnessed = new AtomicBoolean(false)
+    val spillEventsWhileStreaming = new AtomicLong(0L)
 
     // "Fell behind" as a condition on the SUBSYSTEM rather than on a clock: the producer's own
-    // eviction count and the task's own spill accumulator.
+    // count of spill EVENTS. Waiting on it is waiting for the retained window to have outgrown the
+    // allowance, which is what a consumer that stopped acknowledging causes and what no amount of
+    // sleeping could establish.
+    //
+    // Deliberately the event count alone, and not `TaskMetrics.diskBytesSpilled`. Both an eviction
+    // and a durable admission -- a block the allowance could not hold, written straight through --
+    // advance this counter, and both mean exactly "memory pressure answered by local disk", the
+    // condition this case exists to observe. The disk accumulator also moves for the end-of-stream
+    // flush every streaming producer performs whether or not it was ever under pressure, so
+    // including it would let a run satisfy this condition without the pressure having occurred.
     def producerSpilled(): Boolean = {
       val writer = writerHandle.get()
-      writer != null &&
-        (writer.spillsObserved > 0L || writerContext.taskMetrics.diskBytesSpilled > 0L)
+      writer != null && writer.spillsObserved > 0L
     }
 
     val producer = new Thread(() => {
@@ -1168,6 +1289,13 @@ class StreamingShuffleIntegrationTest
           LiveFaultBlocksBeforeWait, () => writer.blocksStreamed,
           () => consumerWasAttached.set(
             consumerConsumedOne.await(OverlapWaitTimeoutMillis, TimeUnit.MILLISECONDS))))
+        // Read here, between framing and the stop, and that placement is the whole point: every
+        // spill event this counter holds at this instant happened WHILE the producer was streaming.
+        // The end-of-stream durability flush that makes the still-unacknowledged tail readable
+        // after the task is performed by the stop below and is not a spill event, so it cannot
+        // contribute. A reading taken after `stop`, or polled from the consumer's thread, would be
+        // a race against the producer finishing; this one is a fact about the streaming phase.
+        spillEventsWhileStreaming.set(writer.spillsObserved)
         producerFinished.set(true)
         writer.stop(success = true)
       } catch {
@@ -1195,14 +1323,27 @@ class StreamingShuffleIntegrationTest
           consumerConsumedOne.countDown()
           if (!withheld) {
             withheld = true
+            // The consumer stops consuming, so it stops acknowledging, so the producer's retained
+            // window stops being reclaimed. It resumes only once the subsystem has answered by
+            // putting bytes on local disk, the specified answer to a consumer that cannot keep up.
+            //
+            // Recorded at the instant the condition is first observed, so the reading says "this
+            // withholding consumer itself saw the eviction happen". It is reported and not asserted
+            // on: whether the consumer's own poll happens to fall inside the window between the
+            // eviction and the producer finishing is a thread scheduling decision, and an assertion
+            // a scheduling decision can falsify is exactly what this package refuses to make. The
+            // asserted form of the same claim is taken on the producer's thread, between framing
+            // and the stop, where it is a fact about the streaming phase rather than a race.
             eventually(timeout(LiveFaultConditionTimeout), interval(OverlapPollInterval)) {
-              assert(producerSpilled() || producerFinished.get(),
+              if (producerSpilled()) {
+                spillWitnessed.set(true)
+              }
+              assert(spillWitnessed.get() || producerFinished.get(),
                 s"the producer must have spilled or finished while the consumer withheld its " +
                   s"acknowledgements, but has streamed ${Option(writerHandle.get())
                     .map(_.blocksStreamed).getOrElse(0L)} block(s) with " +
                   s"${writerContext.taskMetrics.diskBytesSpilled} byte(s) on disk")
             }
-            spillWitnessed.set(producerSpilled())
           }
         }
       } catch {
@@ -1243,19 +1384,48 @@ class StreamingShuffleIntegrationTest
 
     // The specified answer happened, on the live data path, driven by a consumer that stopped
     // acknowledging rather than by a fixture calling the spill manager.
+    //
+    // ==What is asserted, and why it is the MECHANISM rather than a byte ratio==
+    //
+    // The discriminating claim is that memory pressure occurred WHILE the producer was streaming
+    // and was answered by local disk. A consumer that keeps pace acknowledges, each acknowledgement
+    // releases the blocks it covers, utilisation never reaches the threshold, and no spill event is
+    // produced at all -- so a spill event observed mid-stream is something a kept-pace run cannot
+    // manufacture, and it is the complement of the bound the overlap case above holds a kept-pace
+    // producer to.
+    //
+    // What is deliberately NOT asserted is that the MAJORITY of the streamed bytes reached disk.
+    // That premise -- "the consumer stopped acknowledging" -- holds only over the window in which
+    // this consumer withheld, and the withholding ends at the first spill event, after which the
+    // consumer resumes, acknowledges, and the producer reclaims the rest exactly as it should. The
+    // majority claim therefore measured the share of production that happened to fall inside the
+    // withheld window, which is relative thread timing and nothing about the subsystem: the same
+    // correct behaviour yields any ratio from a small fraction to nearly all of it. The
+    // quantitative comparison with the kept-pace case is kept, but at the level the pair does
+    // establish --
+    // the negation of that case's own ceiling -- rather than at a level only timing can decide.
     val streamedBytes = writerContext.taskMetrics.shuffleWriteMetrics.bytesWritten
     val spilledBytes = writerContext.taskMetrics.diskBytesSpilled
+    val spillEvents = spillEventsWhileStreaming.get()
     assert(streamedBytes > 0L,
       "the producer must have streamed bytes for the comparison below to mean anything")
+    assert(spillEvents > 0L,
+      s"eviction must have happened WHILE the producer was still streaming, since that is what " +
+        s"makes it the answer to a consumer that stopped acknowledging rather than the " +
+        s"end-of-stream durability flush every producer performs; the producer streamed " +
+        s"${Option(writerHandle.get()).map(_.blocksStreamed).getOrElse(0L)} block(s) and had " +
+        s"counted $spillEvents spill event(s) by the time it finished framing")
     assert(spilledBytes > 0L,
       s"a consumer held behind a producer under the minimum $MinBufferSizePercent percent " +
         s"allowance must have driven the retained window onto local disk, and the volume must be " +
         s"reported on Spark's OWN TaskMetrics.diskBytesSpilled, which reads $spilledBytes")
-    assert(2L * spilledBytes > streamedBytes,
-      s"a producer whose consumer stopped acknowledging reclaims nothing, so the MAJORITY of " +
-        s"what it streamed must have been made durable, yet only $spilledBytes of $streamedBytes " +
-        s"streamed byte(s) reached disk, which is the profile of a consumer that kept pace and " +
-        s"not of one that fell behind")
+    assert(spilledBytes * OverlapDurableFractionDivisor >= streamedBytes,
+      s"a producer whose consumer stopped acknowledging reclaims nothing while it is held back " +
+        s"from, so it must make materially more of its output durable than the kept-pace " +
+        s"producer of the overlap case, which is held to under one " +
+        s"${OverlapDurableFractionDivisor}th; yet only $spilledBytes of $streamedBytes streamed " +
+        s"byte(s) reached disk, which is inside that same ceiling and so is the profile of a " +
+        s"consumer that never fell behind at all")
 
     assert(produced.get() === SlowConsumerRecordCount,
       s"the producer must have offered every one of the $SlowConsumerRecordCount records, but " +
@@ -1267,8 +1437,10 @@ class StreamingShuffleIntegrationTest
       log"${MDC(NUM_RECORDS_READ, consumedDuringProduction.get())} of " +
       log"${MDC(RECORDS, consumed.get())} record(s) were read while the producer was still " +
       log"producing; withholding acknowledgements moved ${MDC(MEMORY_SIZE, spilledBytes)} of " +
-      log"${MDC(BYTE_SIZE, streamedBytes)} streamed byte(s) to disk, and the eviction was " +
-      log"observed while the producer was still running: ${MDC(TOTAL, spillWitnessed.get())}")
+      log"${MDC(BYTE_SIZE, streamedBytes)} streamed byte(s) to disk across " +
+      log"${MDC(COUNT, spillEvents)} spill event(s) counted before framing finished, and the " +
+      log"withholding consumer itself saw one while it waited: " +
+      log"${MDC(TOTAL, spillWitnessed.get())}")
   }
 
   test("scenario 4 in the live path: a severed link is silence the reader turns into a failure") {
@@ -1807,6 +1979,116 @@ class StreamingShuffleIntegrationTest
         "selected, so the configured manager must be unchanged")
     assertNoParallelSpillCounters()
   }
+
+  // ---------------------------------------------------------------------------------------------
+  // Scenario 4b: a small finite bandwidth cap, on the master an operator develops against, with
+  // Spark's DEFAULT failure tolerances.
+  //
+  // This is the shape the rest of the suite did not cover, and the gap was load bearing rather than
+  // cosmetic: every other capped case either moves a few hundred kilobytes -- too little for a rate
+  // window to close on -- or raises `spark.task.maxFailures` and
+  // `spark.stage.maxConsecutiveAttempts` far above their defaults, which hides the cost of a
+  // recomputation instead of asserting it never happens. An ordinary multi-megabyte shuffle at a
+  // small cap on a `local[n]` master with stock tolerances aborted the job: the pacing bucket must
+  // admit one maximum-sized frame, so its first interval legitimately read half again the
+  // administered capacity, the saturation predicate tripped on that single reading, and the
+  // shuffle-wide stand-down withdrew every producer's output. The fetch failures that followed are
+  // recovered by the unmodified scheduler, but on a `local[n]` master the executor whose block
+  // manager the scheduler then drops is the driver's own, which loses the indirect task results the
+  // reduce tasks had already stored -- and THOSE failures do count towards
+  // `spark.task.maxFailures`.
+  //
+  // So this case asserts the guarantee the feature rests on, in the configuration that broke it:
+  // declaring a link capacity costs throughput and nothing else.
+  // ---------------------------------------------------------------------------------------------
+
+  test("a small finite bandwidth cap paces a multi-megabyte shuffle without failing the job") {
+    val (baseline, baselineNanos) = sortBaselineDigest(
+      CappedBandwidthPartitionCount, CappedBandwidthDatasetBytes, CappedBandwidthMaster)
+    assert(baseline.nonEmpty, "the sort-based baseline must produce output to compare against")
+
+    // No TASK_MAX_FAILURES and no STAGE_MAX_CONSECUTIVE_ATTEMPTS: the defaults are the point of the
+    // case, because a raised tolerance would absorb exactly the recomputation being ruled out.
+    //
+    // Shuffle compression is disabled for the same reason the other pacing-sensitive cases disable
+    // it: the generated values compress to a small fraction of themselves, and a rate limiter paces
+    // the bytes that cross the wire. With compression on, a four-mebibyte dataset would be
+    // delivered in a fraction of one measurement interval and the predicate this case exists to
+    // exercise would never be evaluated at all.
+    val conf = withLocalMaster(
+      streamingConfWithOverrides(maxBandwidthMBps = Some(CappedBandwidthMBps))
+        .set(SHUFFLE_COMPRESS, false),
+      "streaming-shuffle-integration-capped-bandwidth", CappedBandwidthMaster)
+    sc = new SparkContext(conf)
+    assertStreamingManagerInService()
+    assert(sc.getConf.get(SHUFFLE_STREAMING_MAX_BANDWIDTH_MBPS).contains(CappedBandwidthMBps),
+      s"the run must declare a $CappedBandwidthMBps MB/s link capacity, but declared " +
+        s"${sc.getConf.get(SHUFFLE_STREAMING_MAX_BANDWIDTH_MBPS)}")
+    assert(sc.getConf.get(TASK_MAX_FAILURES) === MaxTaskFailures,
+      s"the case must run on Spark's default task-failure tolerance of $MaxTaskFailures, but the " +
+        s"context holds ${sc.getConf.get(TASK_MAX_FAILURES)}")
+    assert(sc.getConf.get(STAGE_MAX_CONSECUTIVE_ATTEMPTS) === DefaultStageAttempts,
+      s"the case must run on Spark's default stage-attempt tolerance of $DefaultStageAttempts, " +
+        s"but the context holds ${sc.getConf.get(STAGE_MAX_CONSECUTIVE_ATTEMPTS)}")
+
+    val recorder = new StreamingShuffleJobRecorder
+    sc.addSparkListener(recorder)
+    val shuffled =
+      groupedLargeDataset(sc, CappedBandwidthPartitionCount, CappedBandwidthDatasetBytes)
+    assert(isStreamingKeyedShuffle(shuffled),
+      "the shuffle must have been registered on the streaming path, or a capped run would be " +
+        "pacing a sort-based fetch and this scenario would prove nothing about streaming")
+    val (observed, streamingNanos) = try {
+      timed(digestOf(shuffled))
+    } finally {
+      sc.listenerBus.waitUntilEmpty(ListenerDrainTimeoutMillis)
+      sc.removeSparkListener(recorder)
+    }
+
+    // Correctness first: the paced run produced exactly the sort-based output.
+    assertNoDataLoss(observed, baseline, s"a streaming shuffle paced at $CappedBandwidthMBps MB/s")
+    assert(recorder.failedJobCount === 0,
+      s"pacing must never fail a job, but ${recorder.failedJobCount} job(s) failed outright")
+    assert(recorder.succeededJobCount >= 1,
+      "the paced job must have been reported as succeeded")
+
+    // And it cost NOTHING beyond throughput: no fetch failure, no counted task failure and no stage
+    // resubmission. Each is asserted separately because each is a different claim -- a stand-down
+    // that was merely cheap would satisfy the first and fail the third.
+    assert(recorder.fetchFailures.isEmpty,
+      s"a correctly paced link must raise no fetch failure, but raised " +
+        s"${recorder.fetchFailures.size}: ${recorder.fetchFailures.take(2).mkString("; ")}")
+    assert(recorder.countedFailures.isEmpty,
+      s"and no task failure of any kind, but ${recorder.countedFailures.size} were counted: " +
+        s"${recorder.countedFailures.take(2).mkString("; ")}")
+    assert(recorder.maxStageSubmissions === 1,
+      s"and no stage may have been resubmitted, yet the busiest stage was submitted " +
+        s"${recorder.maxStageSubmissions} time(s)")
+
+    // The reason it held: the burst the bucket is obliged to admit is one interval above the share,
+    // and one interval is not a saturated link. Read from the executors that ran the shuffle, so
+    // this is the verdict the streaming path actually reached rather than a driver-side inference.
+    val fallbacks = executorFallbackObservations(sc, CappedBandwidthPartitionCount)
+    assert(fallbacks.nonEmpty, "the fallback probe must have run on at least one executor")
+    fallbacks.foreach { case (executorId, reason) =>
+      assert(reason.isEmpty,
+        s"executor $executorId must not have tripped a fallback condition on a link it was " +
+          s"pacing correctly, but tripped $reason")
+    }
+
+    logInfo(log"Streaming shuffle paced at " +
+      log"${MDC(NUM_BYTES, CappedBandwidthMBps)} MB/s moved " +
+      log"${MDC(MEMORY_SIZE, CappedBandwidthDatasetBytes)} byte(s) across " +
+      log"${MDC(NUM_PARTITIONS, CappedBandwidthPartitionCount)} partitions in " +
+      log"${MDC(DURATION, TimeUnit.NANOSECONDS.toMillis(streamingNanos))} ms against an uncapped " +
+      log"sort-based baseline of " +
+      log"${MDC(TIME_UNITS, TimeUnit.NANOSECONDS.toMillis(baselineNanos))} ms, producing " +
+      log"${MDC(COUNT, observed.size)} group(s) with no fetch failure and no stage resubmission")
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Scenario 5: five concurrent shuffles arbitrating for one executor's buffer allowance.
+  // ---------------------------------------------------------------------------------------------
 
   test("five concurrent shuffles all complete and arbitrate on partition count and volume") {
     assert(ConcurrentPartitionCounts.size === ConcurrentShuffleCount,

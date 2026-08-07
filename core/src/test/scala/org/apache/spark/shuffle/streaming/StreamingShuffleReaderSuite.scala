@@ -186,16 +186,34 @@ private[streaming] object StreamingShuffleTestProducerStream {
 /**
  * A producer connector that hands out embedded channels instead of sockets.
  *
- * @param refusalsBeforeSuccess connection attempts to refuse before the first success, which is
- *     how a suite reaches the reader's bounded retry ladder
+ * Injecting the connector is the whole reason the reader's abstract seam exists: every failure this
+ * suite asserts on -- a refused connection, a lost producer, a corrupt block, a truncated stream --
+ * is reachable here without a port, a thread pool or a timing assumption.
+ *
+ * The connector is owned by whoever built it and closed when that owner stops, never by a reader;
+ * [[closeCallCount]] is what lets a suite prove the reader honours that ownership.
+ *
+ * @param refusalsBeforeSuccess connection attempts to refuse before the first success, which is how
+ *                              a suite reaches the reader's bounded retry ladder
+ * @param failBoundChannelBeforeRefusal a throwable to report to the handler, from another thread
+ *                                      and over a channel the handler is bound to, on every
+ *                                      attempt this connector refuses. That is the production
+ *                                      connect window: a handler is bound to its channel before
+ *                                      the connector decides whether to publish it, so a failure
+ *                                      observed there is latched on the shared notifier by a
+ *                                      handler the reader never receives, and no producer stream
+ *                                      exists to attribute it to
  */
-private[streaming] class StreamingShuffleTestProducerConnector(refusalsBeforeSuccess: Int = 0)
+private[streaming] class StreamingShuffleTestProducerConnector(
+    refusalsBeforeSuccess: Int = 0,
+    failBoundChannelBeforeRefusal: Option[Throwable] = None)
   extends StreamingShuffleProducerConnector {
 
   private val opened = mutable.ArrayBuffer.empty[StreamingShuffleTestProducerStream]
   private val refusalsRemaining = new AtomicInteger(refusalsBeforeSuccess)
   private val attempts = new AtomicInteger(0)
   private val closeCalls = new AtomicInteger(0)
+  private val reportedOnRefusal = new AtomicInteger(0)
 
   val firstConnection: CountDownLatch = new CountDownLatch(1)
 
@@ -204,6 +222,7 @@ private[streaming] class StreamingShuffleTestProducerConnector(refusalsBeforeSuc
       handler: StreamingShuffleClientHandler): Option[TransportClient] = {
     attempts.incrementAndGet()
     if (refusalsRemaining.getAndDecrement() > 0) {
+      failBoundChannelBeforeRefusal.foreach(failure => reportOnBoundChannel(handler, failure))
       None
     } else {
       val channel = new EmbeddedChannel()
@@ -225,6 +244,50 @@ private[streaming] class StreamingShuffleTestProducerConnector(refusalsBeforeSuc
     }
   }
 
+  /**
+   * Binds a channel to the handler, reports a failure on it from another thread, and leaves the
+   * connect to be refused by the caller.
+   *
+   * Every step is required to reach the window this reproduces. The channel is activated first
+   * because a handler refuses a callback from a channel it is not bound to, so a failure reported
+   * to an unbound handler would be rejected instead of latched. The report is made from another
+   * thread because that is where the transport raises it, and because the bridge under test exists
+   * precisely to carry a failure from an I/O thread to the task thread. The data plane is settled
+   * on both sides of the report so the caller can refuse the connect knowing the escalation has
+   * already happened, which is what makes the case deterministic.
+   *
+   * The handler is deliberately not closed here: the reader closes a handler whose connect was
+   * refused, and letting it do so is what keeps this fixture's behaviour the production one.
+   *
+   * @param handler the handler the reader built for this attempt
+   * @param failure the throwable the transport is to report on the bound channel
+   */
+  private def reportOnBoundChannel(
+      handler: StreamingShuffleClientHandler,
+      failure: Throwable): Unit = {
+    val channel = new EmbeddedChannel(DefaultChannelId.newInstance())
+    val client = new TransportClient(channel, new TransportResponseHandler(channel))
+    client.setClientId("streaming-shuffle-reader-suite-refused")
+    handler.channelActive(client)
+    if (!handler.awaitDataPlaneIdle(10000L)) {
+      throw new IllegalStateException(
+        "The consumer data plane did not settle after the refused channel was activated")
+    }
+    val pool = ThreadUtils.newDaemonSingleThreadExecutor("streaming-shuffle-refused-channel-io")
+    try {
+      pool.submit(new Callable[Unit] {
+        override def call(): Unit = handler.exceptionCaught(failure, client)
+      }).get(10000L, TimeUnit.MILLISECONDS)
+    } finally {
+      pool.shutdownNow()
+    }
+    if (!handler.awaitDataPlaneIdle(10000L)) {
+      throw new IllegalStateException(
+        "The consumer data plane did not settle after the refused channel failed")
+    }
+    reportedOnRefusal.incrementAndGet()
+  }
+
   override def close(): Unit = {
     closeCalls.incrementAndGet()
   }
@@ -241,6 +304,9 @@ private[streaming] class StreamingShuffleTestProducerConnector(refusalsBeforeSuc
   def connectAttemptCount: Int = attempts.get()
 
   def closeCallCount: Int = closeCalls.get()
+
+  /** How many refused attempts reported a failure on a channel the handler was bound to. */
+  def reportedOnRefusalCount: Int = reportedOnRefusal.get()
 }
 
 /**
@@ -448,7 +514,8 @@ private[streaming] class StreamingShuffleObservingBackpressure(
 class StreamingShuffleReaderSuite
   extends SparkFunSuite
     with LocalSparkContext
-    with StreamingShuffleTestHelper {
+    with StreamingShuffleTestHelper
+    with StreamingShuffleHadoopCredentialIsolation {
 
   import StreamingShuffleTestHelper._
 
@@ -535,7 +602,8 @@ class StreamingShuffleReaderSuite
       useTaskReporter: Boolean = false,
       cleanupRecorder: Option[StreamingShuffleCleanupRecorder] = None,
       completedMaps: Set[Int] = Set(ProducerMapId.toInt),
-      realTimeReaderClock: Boolean = false) {
+      realTimeReaderClock: Boolean = false,
+      failBoundChannelBeforeRefusal: Option[Throwable] = None) {
 
     val conf: SparkConf = streamingConf()
     val clock: ManualClock = newManualClock()
@@ -561,7 +629,8 @@ class StreamingShuffleReaderSuite
     val fallbackPolicy: StreamingShuffleFallbackPolicy =
       new StreamingShuffleFallbackPolicy(conf, clock)
     val connector: StreamingShuffleTestProducerConnector =
-      new StreamingShuffleTestProducerConnector(refusalsBeforeSuccess)
+      new StreamingShuffleTestProducerConnector(
+        refusalsBeforeSuccess, failBoundChannelBeforeRefusal)
     val coordinatorRef: StreamingShuffleTestCoordinatorRef =
       new StreamingShuffleTestCoordinatorRef(conf, clock, lookupAdvanceMillis)
     val recordingMetrics: RecordingStreamingShuffleReadMetrics =
@@ -1033,6 +1102,132 @@ class StreamingShuffleReaderSuite
         s"${observedPartialReadInvalidations()} was recorded")
     assert(fixture.connector.closeCallCount == 0,
       "The executor-scoped connector is closed by the manager and never by a reader")
+  }
+
+  test("the connection timeout diagnostic reports the silence that actually reached the verdict") {
+    startContext()
+    // A producer that delivers NOTHING -- no block, no heartbeat, no end of stream -- which is what
+    // a crash before the first frame, or a partition that never routed, looks like to a consumer.
+    // It is also the one case in which the reader's per-partition reading has nothing to measure:
+    // the flow-control ledger reaches the verdict, and a diagnostic that quoted the per-partition
+    // reading instead rendered "received nothing for 0 ms, past the 5000 ms connection timeout" --
+    // asserting a silence of zero to be past five seconds, and withholding the only figure that
+    // separates a dead producer from a mis-tuned timeout.
+    val fixture = new ReaderFixture()
+    val records = fixture.reader.read()
+    val stream = fixture.connector.onlyStream
+    assert(stream.handler.millisSinceInbound(fixture.partitionId).isEmpty,
+      "Nothing may have arrived, or this case is not exercising the reading that has no interval")
+
+    advancePastProducerTimeout(fixture.clock)
+    val failure = intercept[FetchFailedException] {
+      withTaskContext(fixture.context) {
+        readRecords(records)
+      }
+    }
+
+    // Asserted as an invariant over the rendered text rather than against one expected sentence,
+    // because which reading reaches the verdict is production's decision and may legitimately
+    // change: whatever silence a connection-timeout diagnostic quotes, it must be at least the
+    // bound it claims that silence is past. That is exactly the property the defect broke.
+    val message = failure.getMessage
+    val timedOut = """(\d+) ms(?: ago)?, past the (\d+) ms connection timeout""".r
+    val quoted = timedOut.findAllMatchIn(message)
+      .map(matched => (matched.group(1).toLong, matched.group(2).toLong))
+      .toSeq
+    assert(quoted.nonEmpty,
+      s"A connection timeout must quote the silence it measured against the bound it fired on, " +
+        s"but it read: $message")
+    assert(quoted.forall { case (silence, bound) => silence >= bound },
+      s"Every silence a connection timeout quotes must be at least the bound it is said to be " +
+        s"past, but $quoted was quoted in: $message")
+    assert(quoted.forall { case (_, bound) => bound == ProducerConnectionTimeoutMillis },
+      s"The bound quoted must be the contracted ${ProducerConnectionTimeoutMillis} ms connection " +
+        s"timeout, but $quoted was quoted in: $message")
+    assert(!message.contains("for 0 ms"),
+      s"A silence of zero can never be past a ${ProducerConnectionTimeoutMillis} ms bound, but " +
+        s"the diagnostic read: $message")
+
+    // The recovery the diagnostic accompanies is unchanged: one atomic per-producer invalidation,
+    // and a fetch failure the unmodified scheduler resolves by recomputing the upstream stage.
+    assert(observedPartialReadInvalidations() == 1L,
+      s"A producer given up on must be counted as one invalidated partial read, but " +
+        s"${observedPartialReadInvalidations()} was")
+    val reason = fetchFailedReasonOf(failure)
+    assert(reason.shuffleId == fixture.shuffleId && reason.reduceId == fixture.partitionId,
+      s"The fetch failure must name the shuffle and reduce partition being read, but it named " +
+        s"shuffle ${reason.shuffleId} partition ${reason.reduceId}")
+    assert(reason.bmAddress == fixture.producer.blockManagerId,
+      s"The fetch failure must carry the producer's own MapStatus address, without which " +
+        s"MapOutputTracker removes nothing, but it carried ${reason.bmAddress}")
+  }
+
+  test("silence evidence names the reading it came from and never quotes another one") {
+    startContext()
+    val fixture = new ReaderFixture()
+    val payload = fixture.encodePartition(StreamedRecords)
+    val blocks = fixture.dataBlocksOf(payload, BlockCount)
+
+    fixture.reader.read()
+    val stream = fixture.connector.onlyStream
+    val handler = stream.handler
+
+    // Before the bound there is no verdict and therefore no evidence to quote. The heartbeat is
+    // sent through the same call the reader makes on every poll window, which is what brings the
+    // per-partition state into existence without anything having arrived on it -- precisely the
+    // arrangement in which the two readings disagree.
+    advanceJustBeforeProducerTimeout(fixture.clock)
+    assert(handler.sendHeartbeatIfDue(fixture.partitionId),
+      "A consumer that has waited past the heartbeat interval must have sent one")
+    assert(handler.producerSilence(fixture.partitionId).isEmpty,
+      s"A producer silent for only ${JustBeforeProducerTimeoutMillis} ms must yield no evidence")
+    assert(!handler.isProducerSilent(fixture.partitionId),
+      "and must not be judged silent, since the verdict is expressed over that same evidence")
+
+    // At the bound, with nothing ever received, the ledger's interval is the only one there is.
+    fixture.clock.advance(1L)
+    val beforeAnyBlock = handler.producerSilence(fixture.partitionId)
+    assert(handler.isProducerSilent(fixture.partitionId),
+      s"At ${ProducerConnectionTimeoutMillis} ms the producer must be judged silent")
+    assert(beforeAnyBlock.exists(_.isInstanceOf[
+        StreamingShuffleClientHandler.ProducerSilence.SinceStreamOpened]),
+      s"With nothing ever received the evidence must be the ledger's own, but it was " +
+        s"$beforeAnyBlock")
+    val openedSilence = beforeAnyBlock.get
+    assert(handler.millisSinceInbound(fixture.partitionId).isEmpty,
+      "The per-partition reading must still have no interval, which is why it cannot be quoted")
+    assert(openedSilence.elapsedMillis >= openedSilence.thresholdMillis,
+      s"Evidence must measure at least the bound it crossed, but it measured " +
+        s"${openedSilence.elapsedMillis} ms against ${openedSilence.thresholdMillis} ms")
+    assert(openedSilence.describe(fixture.partitionId).contains(
+        s"${openedSilence.elapsedMillis} ms"),
+      s"The rendered clause must quote the interval it measured, but it read: " +
+        s"${openedSilence.describe(fixture.partitionId)}")
+
+    // Once a block has arrived the per-partition reading exists, so it is the one reported, and the
+    // figure it quotes is the gap since that block rather than the gap since the stream opened.
+    stream.deliver(blocks.head)
+    assert(handler.producerSilence(fixture.partitionId).isEmpty,
+      "A block resets the silence, so a producer that just delivered is not silent")
+    advancePastProducerTimeout(fixture.clock)
+    val afterBlock = handler.producerSilence(fixture.partitionId)
+    assert(afterBlock.exists(_.isInstanceOf[
+        StreamingShuffleClientHandler.ProducerSilence.SinceInbound]),
+      s"After a delivery the evidence must be this handler's own reading, but it was $afterBlock")
+    assert(afterBlock.map(_.elapsedMillis) ==
+        handler.millisSinceInbound(fixture.partitionId),
+      s"and must quote exactly that reading, but it quoted ${afterBlock.map(_.elapsedMillis)} " +
+        s"against ${handler.millisSinceInbound(fixture.partitionId)}")
+
+    // A terminated stream is complete rather than silent, however long its quiet lasts. The total
+    // announced is the one block actually delivered, because a terminator naming more than has
+    // arrived is a truncation the handler is right to refuse rather than an orderly end.
+    stream.deliver(fixture.terminator(1L))
+    advancePastProducerTimeout(fixture.clock)
+    assert(handler.producerSilence(fixture.partitionId).isEmpty,
+      "An ended stream must yield no silence evidence, or a finished stage would be recomputed")
+    assert(!handler.isProducerSilent(fixture.partitionId),
+      "and must not be judged silent either")
   }
 
   test("a producer that refuses every attempt is invalidated once the budget is spent") {
@@ -2309,6 +2504,147 @@ class StreamingShuffleReaderSuite
       s"and it must invalidate exactly one producer generation, but " +
         s"${fixture.coordinatorRef.invalidationsSent.size} were invalidated")
   }
+
+  test("a transport failure inside the connect window fails the fetch instead of the task") {
+    startContext()
+    // The failure classification the scheduler acts upon must not depend on when a channel broke.
+    // A handler is bound to its channel before the connector decides whether to publish it, so a
+    // connection reset observed inside that window is latched on this reader's notifier by a
+    // handler the reader never receives -- and with no producer stream to attribute it to, the read
+    // used to
+    // raise it as a bare SparkException. That is an ordinary task failure, so the scheduler counted
+    // it against `spark.task.maxFailures` instead of recomputing the stage that produced the bytes
+    // this consumer cannot read, and under a master whose task budget is one attempt -- `local[N]`,
+    // through `SparkContext.MAX_LOCAL_TASK_FAILURES` -- the job aborted outright.
+    val injected = new java.io.IOException(
+      "send(..) failed with error(-104): Connection reset by peer")
+    val fixture = new ReaderFixture(
+      refusalsBeforeSuccess = 1,
+      realTimeReaderClock = true,
+      failBoundChannelBeforeRefusal = Some(injected))
+
+    val failure = intercept[FetchFailedException] {
+      withTaskContext(fixture.context) {
+        fixture.reader.read()
+      }
+    }
+    assert(fixture.connector.reportedOnRefusalCount == 1,
+      s"The case proves nothing unless the refused attempt really did report the failure on a " +
+        s"bound channel, but it reported on ${fixture.connector.reportedOnRefusalCount}")
+    assert(fixture.connector.streams.isEmpty,
+      "and unless no producer stream was ever published, which is the whole of what makes the " +
+        "failure unattributable to one")
+
+    val reason = fetchFailedReasonOf(failure)
+    assert(reason.shuffleId == fixture.shuffleId,
+      s"A transport failure on a producer channel must recover through stage recomputation, so " +
+        s"it must raise a fetch failure naming the shuffle being read, but it named " +
+        s"${reason.shuffleId}")
+    assert(reason.reduceId == fixture.partitionId,
+      s"and it must name the partition being read, but it named ${reason.reduceId}")
+    // The producer being opened is the honest attribution, and it is also the one that recovers:
+    // `MapOutputTracker` removes a map output only when the address in the failure equals the
+    // address in the recorded status, so a fetch failure naming no producer recomputes nothing.
+    assert(reason.bmAddress == fixture.producer.blockManagerId,
+      s"and it must name the producer's own MapStatus address so the tracker removes that one " +
+        s"dead map output, but it named ${reason.bmAddress}")
+    assert(reason.mapId == fixture.producer.mapId && reason.mapIndex == fixture.producer.mapIndex,
+      s"and it must name that producer's map identity, but it named map ${reason.mapId} at index " +
+        s"${reason.mapIndex}")
+    assert(diagnosisOf(failure).contains(injected),
+      s"The failure the transport reported must survive into the fetch failure, but the attached " +
+        s"failures were ${diagnosisOf(failure).map(_.getMessage).mkString("[", ", ", "]")}")
+    assert(failure.getMessage.contains("Connection reset by peer"),
+      s"and the reason an operator reads must state what went wrong, but it read: " +
+        s"${failure.getMessage}")
+    assert(fixture.context.fetchFailed.isDefined,
+      "The fetch failure must be asserted on the task context, because that is what the executor " +
+        "consults when it chooses between FetchFailed and ExceptionFailure")
+    assert(observedPartialReadInvalidations() == 1L,
+      s"The invalidation must be counted exactly once, but " +
+        s"${observedPartialReadInvalidations()} was recorded")
+    assert(fixture.coordinatorRef.invalidationsSent.size == 1,
+      s"and exactly one producer generation must be withdrawn, so the recomputation lands on a " +
+        s"fresh map attempt rather than on the same unreachable output, but " +
+        s"${fixture.coordinatorRef.invalidationsSent.size} were withdrawn")
+  }
+
+  test("a latched failure with no producer left to attribute it to still fails the fetch") {
+    startContext()
+    // The backstop arm of the same funnel. A failure can outlive every stream this read opened --
+    // the task-completion listener releases them all, and it runs on success, on failure and on
+    // cancellation alike -- so the arm that names a producer is not always available. What must not
+    // vary is the classification: a streaming read failure reaches the scheduler as a fetch failure
+    // or the guarantee that every path terminates in a working shuffle is probabilistic.
+    val fixture = new ReaderFixture()
+    val records = fixture.reader.read()
+    val stream = fixture.connector.onlyStream
+    val injected = new java.io.IOException(
+      "send(..) failed with error(-104): Connection reset by peer")
+    injectFromIoThread(stream, injected)
+    // Taken off the hand-off queue here rather than by the read, which is the state a queue that
+    // refused the marker leaves behind: the failure is latched and nothing queued will mention it.
+    var drained = stream.handler.poll()
+    while (drained.isDefined) {
+      drained = stream.handler.poll()
+    }
+    // Releasing the streams is what removes the last producer the funnel could have named.
+    fixture.context.markTaskCompleted(None)
+
+    val failure = intercept[FetchFailedException] {
+      withTaskContext(fixture.context) {
+        records.hasNext
+      }
+    }
+    val reason = fetchFailedReasonOf(failure)
+    assert(reason.shuffleId == fixture.shuffleId,
+      s"An unattributable streaming read failure must still name the shuffle being read, but it " +
+        s"named ${reason.shuffleId}")
+    assert(reason.reduceId == fixture.partitionId,
+      s"and the partition being read, but it named ${reason.reduceId}")
+    // No producer is named, which is the shape `FetchFailedException` sanctions for a failure that
+    // belongs to no one map output, and which the coordinator-unreachable path already uses.
+    assert(reason.bmAddress == null && reason.mapId == -1L && reason.mapIndex == -1,
+      s"and it must name no producer at all, but it named ${reason.bmAddress} map " +
+        s"${reason.mapId} at index ${reason.mapIndex}")
+    assert(diagnosisOf(failure).contains(injected),
+      s"The transport failure must survive into it, but the attached failures were " +
+        s"${diagnosisOf(failure).map(_.getMessage).mkString("[", ", ", "]")}")
+    assert(fixture.context.fetchFailed.isDefined,
+      "and the fetch failure must be asserted on the task context, or the executor reports an " +
+        "ExceptionFailure however the exception is typed")
+  }
+
+  test("a fatal error observed on a producer channel is never downgraded to a fetch failure") {
+    startContext()
+    // Escalation is total for recoverable failures and must stop at fatal ones: a fetch failure
+    // asks the scheduler to recompute and retry, which is the wrong response to a JVM-level
+    // condition the executor has to act on. The notifier re-throws an Error ahead of everything,
+    // and the funnel in front of it must not have converted it first.
+    val fatal = new StackOverflowError("a fatal condition observed on a producer channel")
+    val fixture = new ReaderFixture(
+      refusalsBeforeSuccess = 1,
+      realTimeReaderClock = true,
+      failBoundChannelBeforeRefusal = Some(fatal))
+
+    val raised = intercept[StackOverflowError] {
+      withTaskContext(fixture.context) {
+        fixture.reader.read()
+      }
+    }
+    assert(raised eq fatal,
+      "The fatal condition must be re-thrown exactly as it stands, not wrapped and not replaced")
+    assert(fixture.context.fetchFailed.isEmpty,
+      "No fetch failure may be asserted on the task context, because nothing about a fatal " +
+        "condition says an upstream stage should be recomputed")
+    assert(observedPartialReadInvalidations() == 0L,
+      s"and nothing may be invalidated, but ${observedPartialReadInvalidations()} " +
+        s"invalidation(s) were recorded")
+    assert(fixture.coordinatorRef.invalidationsSent.isEmpty,
+      s"and no producer generation may be withdrawn, but " +
+        s"${fixture.coordinatorRef.invalidationsSent.size} were withdrawn")
+  }
+
 
   test("a wrapped failure reports the cause's message rather than its class name") {
     val notifier = new StreamingShuffleErrorNotifier(shuffleId = 11, debugEnabled = false)

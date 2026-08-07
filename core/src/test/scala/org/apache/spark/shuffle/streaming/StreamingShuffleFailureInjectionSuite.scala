@@ -56,7 +56,8 @@ import org.apache.spark.util.{Clock, LongAccumulator, ManualClock, ThreadUtils}
 class StreamingShuffleFailureInjectionSuite
   extends SparkFunSuite
   with LocalSparkContext
-  with StreamingShuffleTestHelper {
+  with StreamingShuffleTestHelper
+  with StreamingShuffleHadoopCredentialIsolation {
 
   import StreamingShuffleFaultScenario._
   import StreamingShuffleTestHelper._

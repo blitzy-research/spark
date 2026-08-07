@@ -107,7 +107,38 @@ private[spark] class StreamingShuffleManager(conf: SparkConf, isDriver: Boolean)
   /** Whether this JVM builds any streaming state at all. */
   private val streamingActive: Boolean = streamingEnabled && !externalShuffleServiceEnabled
 
-  // The delegate.
+  // Reported once per JVM, at construction, when an operator asked for streaming and a
+  // configuration-level condition means it can never happen.
+  //
+  // This exists because the decline is otherwise completely silent and self-consistent: the
+  // streaming manager is instantiated, its metrics source registers, four MBeans appear, and every
+  // one of them reads a perfectly plausible 0 forever. Nothing in the metrics surface says "this
+  // never activated", so an operator whose telemetry is flat has no way to tell a healthy idle
+  // executor from a configuration that excluded streaming before the first shuffle.
+  //
+  // Warning level, once per JVM, and only for the two conditions that are properties of the
+  // configuration rather than of a workload: authentication being off, and the External Shuffle
+  // Service being on. The kill switch is deliberately not reported -- an operator who set it to
+  // false asked for exactly this -- nor is map-side combining, which is a property of an individual
+  // dependency and would fire on ordinary jobs, nor a fallback trip, which is already reported
+  // where it is observed. Emitting at construction rather than per declined shuffle is what bounds
+  // the volume at one line per executor for the life of the process.
+  if (streamingRequested && !streamingActive) {
+    val exclusion = if (!authenticationEnabled) {
+      log"${MDC(CONFIG, NETWORK_AUTH_ENABLED.key)} is false and the streaming data plane carries " +
+        log"serialized records, so it requires an authenticated transport"
+    } else {
+      log"${MDC(CONFIG, config.SHUFFLE_SERVICE_ENABLED.key)} is true and the External Shuffle " +
+        log"Service cannot serve a streaming shuffle's blocks"
+    }
+    logWarning(log"Streaming shuffle was requested by " +
+      log"${MDC(CONFIG2, SHUFFLE_STREAMING_ENABLED.key)} but cannot be used: " + exclusion +
+      log". Every shuffle is served by the sort-based shuffle manager, and the " +
+      log"shuffle.streaming metrics stay at zero for the life of this process")
+  }
+
+  // The delegate. Constructed unconditionally and first, so that delegation is available from the
+  // moment this object exists -- including from the constructor of anything below it.
 
   private val sortShuffleManager: SortShuffleManager = new SortShuffleManager(conf)
 

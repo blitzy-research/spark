@@ -45,7 +45,8 @@ import org.apache.spark.util.ManualClock
 class StreamingShuffleFallbackSuite
   extends SparkFunSuite
   with LocalSparkContext
-  with StreamingShuffleTestHelper {
+  with StreamingShuffleTestHelper
+  with StreamingShuffleHadoopCredentialIsolation {
 
   import StreamingShuffleFallbackReason._
   import StreamingShuffleTestHelper._
@@ -505,15 +506,34 @@ class StreamingShuffleFallbackSuite
       "a satisfied reservation must leave the streaming path in service")
   }
 
-  test("link utilisation exactly at the saturation threshold does not trip") {
-    val policy = activePolicy(newManualClock())
+  // Trip 3: network utilisation above ninety per cent of the administered link capacity, SUSTAINED
+  // across consecutive measurement intervals. Four independent properties are asserted. The
+  // comparison is STRICTLY greater than, so exactly at the threshold is tolerated rather than
+  // tripped; the run has to span distinct intervals, so one legal burst -- which this subsystem is
+  // required to emit, because a pacing bucket must admit one maximum-sized frame -- is not read as
+  // a saturated link; a reading back inside the share ends the run; and a capacity that is zero,
+  // negative or not finite is not a capacity at all and is refused before any division, which is
+  // why no division by zero and no NaN comparison is reachable however the method is called. Ninety
+  // per cent is the SATURATION TRIP while eighty per cent is the token bucket's ceiling -- one
+  // is a rate limit streaming imposes on itself while it keeps streaming, the other is where it
+  // stops -- and the last case in this group exists to keep them from being conflated.
 
-    (0L until 4L).foreach { _ =>
-      policy.recordLinkUtilization(EgressAtSaturationThreshold, LinkCapacityBytesPerSecond)
+  test("link utilisation exactly at the saturation threshold does not trip") {
+    val clock = newManualClock()
+    val policy = activePolicy(clock)
+
+    // Repeated, so that "exactly ninety does not trip" is established over a run of readings and
+    // not merely for the first one: a reading AT the share must be inert however many of them
+    // arrive, and must leave no partial run behind for a later burst to complete.
+    (0L until SaturationSampleRepetitions).foreach { interval =>
+      policy.recordLinkUtilization(EgressAtSaturationThreshold, LinkCapacityBytesPerSecond,
+        clock.getTimeMillis() + interval * SaturationSampleWindowMillis)
     }
 
     assert(!policy.hasTripped,
       "utilisation of exactly ninety per cent must not trip; the comparison is strictly greater")
+    assert(policy.saturatedIntervalCount == 0L,
+      "a reading at the tolerated share must leave no run of saturated intervals standing")
     assert(policy.trippedReason.isEmpty, "no reason may be reported at the tolerated threshold")
     assert(policy.unevaluableSampleCount == 0L,
       "a sample with a known capacity must be evaluated rather than refused")
@@ -522,17 +542,68 @@ class StreamingShuffleFallbackSuite
       "utilisation at the threshold must leave the streaming path in service")
   }
 
-  test("the first link utilisation reading strictly above the saturation threshold trips") {
+  test("one legal burst above the saturation threshold does not trip, a sustained run does") {
     val clock = newManualClock()
     val policy = activePolicy(clock)
+    val saturatingEgress = EgressAtSaturationThreshold + 1.0d
+    val firstInterval = clock.getTimeMillis()
 
+    // WHY A RUN AND NOT ONE READING. This subsystem is required to emit traffic that reads above
+    // the share for one interval of a small administered link: a pacing bucket must be able to
+    // admit one maximum-sized encoded frame or it would refuse every frame forever, so its burst
+    // allowance is at least one frame however small its share is, and a bucket that starts full
+    // delivers that burst plus one interval's refill in the first interval. Tripping on that
+    // reading stood healthy shuffles down -- every producer invalidated and the map stage
+    // recomputed -- on links carrying nothing but correctly paced streaming traffic. Steady-state
+    // egress is held to the token bucket's eighty percent ceiling, which is below this share, so a
+    // burst clears on the next interval while a genuinely saturated link stays over capacity
+    // interval after interval.
     assert(!policy.hasTripped, "the policy must start untripped, or this case proves nothing")
 
-    policy.recordLinkUtilization(
-      EgressAtSaturationThreshold + 1.0d, LinkCapacityBytesPerSecond, clock.getTimeMillis())
+    policy.recordLinkUtilization(saturatingEgress, LinkCapacityBytesPerSecond, firstInterval)
+    assert(!policy.hasTripped,
+      "one interval above the share is a legal burst and must not stand streaming down")
+    assert(policy.saturatedIntervalCount == 1L, "but it must be counted as one saturated interval")
+
+    // Observations of the SAME interval, which is what a hundred-millisecond poll of a rate that is
+    // republished once a second produces. They must count once between them, or a fast caller would
+    // reach any run length inside a single interval and one burst would trip after 200 ms.
+    (1L until SaturationSampleRepetitions).foreach { poll =>
+      policy.recordLinkUtilization(saturatingEgress, LinkCapacityBytesPerSecond,
+        firstInterval + poll * (SaturationSampleWindowMillis / SaturationSampleRepetitions))
+    }
+    assert(policy.saturatedIntervalCount == 1L,
+      "repeated observations of one measurement interval must count once between them")
+    assert(!policy.hasTripped, "so however fast the caller polls, one interval cannot trip")
+
+    // A reading back inside the share ends the run, because the interval it describes was not
+    // saturated and a run is consecutive by definition.
+    policy.recordLinkUtilization(EgressAtSaturationThreshold, LinkCapacityBytesPerSecond,
+      firstInterval + SaturationSampleWindowMillis)
+    assert(policy.saturatedIntervalCount == 0L,
+      "a reading inside the tolerated share must end the run of saturated intervals")
+
+    // And a genuinely saturated link, which stays over capacity interval after interval, trips on
+    // the interval that completes the run -- and not before it. The run required is asked of the
+    // production derivation rather than written down, because it is a function of the capacity: the
+    // mandatory burst allowance of a small link is many intervals of its paced rate and of a large
+    // one is a single interval, so a fixed number would be either unreachable or too short.
+    val required = saturationIntervalsFor(LinkCapacityBytesPerSecond)
+    assert(required >= SaturationSustainedIntervals,
+      s"the derived run of $required interval(s) may never fall below the floor of " +
+        s"$SaturationSustainedIntervals")
+    val runStart = firstInterval + 2L * SaturationSampleWindowMillis
+    (0L until required - 1L).foreach { interval =>
+      policy.recordLinkUtilization(saturatingEgress, LinkCapacityBytesPerSecond,
+        runStart + interval * SaturationSampleWindowMillis)
+      assert(!policy.hasTripped,
+        s"a run of ${interval + 1L} interval(s) is short of $required and must not trip")
+    }
+    policy.recordLinkUtilization(saturatingEgress, LinkCapacityBytesPerSecond,
+      runStart + (required - 1L) * SaturationSampleWindowMillis)
 
     assert(policy.hasTripped,
-      "the very first reading past the tolerated share must trip, with no run to accumulate")
+      s"$required consecutive saturated interval(s) must trip the condition")
     assert(policy.trippedReason.contains(NetworkSaturation),
       s"the reported reason must be NetworkSaturation but was ${policy.trippedReason}")
     assert(policy.trippedAtTimeMillis.contains(clock.getTimeMillis()),
@@ -578,7 +649,8 @@ class StreamingShuffleFallbackSuite
 
   test("an administered bandwidth cap makes saturation evaluable in bytes per second") {
     val conf = streamingConfWithOverrides(maxBandwidthMBps = Some(AdministeredBandwidthMbps))
-    val policy = new StreamingShuffleFallbackPolicy(conf, newManualClock())
+    val clock = newManualClock()
+    val policy = new StreamingShuffleFallbackPolicy(conf, clock)
     val capacityBytesPerSecond = AdministeredBandwidthMbps.toLong * BytesPerMebibyte
 
     assert(policy.administeredLinkCapacityBytesPerSecond.contains(capacityBytesPerSecond),
@@ -589,7 +661,14 @@ class StreamingShuffleFallbackSuite
     assert(!policy.hasTripped,
       "the administered capacity must tolerate utilisation at the threshold")
 
-    policy.recordLinkUtilization(capacity)
+    // The one-argument overload, which is the production path: a reader reports measured ingress
+    // and the policy takes the capacity from the configuration and the instant from its clock. The
+    // clock is advanced a whole measurement interval between readings, because that is what makes
+    // each one a distinct interval rather than another poll of the same one.
+    (0L until saturationIntervalsFor(capacity)).foreach { interval =>
+      if (interval > 0L) clock.advance(SaturationSampleWindowMillis)
+      policy.recordLinkUtilization(capacity)
+    }
     assert(policy.hasTripped, "a fully saturated administered link must trip")
     assert(policy.trippedReason.contains(NetworkSaturation),
       s"the reported reason must be NetworkSaturation but was ${policy.trippedReason}")
@@ -920,7 +999,10 @@ class StreamingShuffleFallbackSuite
     val clock = newManualClock()
     val policy = activePolicy(clock)
 
-    policy.recordLinkUtilization(LinkCapacityBytesPerSecond, LinkCapacityBytesPerSecond)
+    // A sustained run at the full administered capacity, which is strictly above the tolerated
+    // share. Driven through the shared helper so the run length lives in one place.
+    driveLinkSaturation(policy, LinkCapacityBytesPerSecond, LinkCapacityBytesPerSecond,
+      clock.getTimeMillis())
     assert(policy.trippedReason.contains(NetworkSaturation), "the first condition must be recorded")
     val firstTrippedAt = policy.trippedAtTimeMillis
     assert(firstTrippedAt.contains(clock.getTimeMillis()), "the first trip must be stamped")
@@ -947,7 +1029,12 @@ class StreamingShuffleFallbackSuite
     driveSustainedConsumerSlowness(policy, clock)
     policy.recordProducerThroughput(OtherShuffleId, ProducerBytesPerSecond, clock.getTimeMillis())
     policy.recordAllocationGrant(0L, 0L)
-    policy.recordLinkUtilization(EgressAtSaturationThreshold + 1.0d, LinkCapacityBytesPerSecond)
+    // A saturating reading is part of that sampling state, and it is taken here so that reset is
+    // exercised against a policy that has taken one. A reading left standing across a reset
+    // described a link the next workload never used, and an operator reading it after a later trip
+    // would be told about capacity this workload never consumed.
+    driveLinkSaturation(policy, EgressAtSaturationThreshold + 1.0d, LinkCapacityBytesPerSecond,
+      clock.getTimeMillis())
     assert(policy.hasTripped, "the fixture must have tripped before reset is exercised")
     assert(policy.trackedShuffleCount == 2, "two shuffles must have been sampled")
     assert(policy.unevaluableSampleCount == 1L, "one un-evaluable sample must have been counted")
@@ -959,6 +1046,8 @@ class StreamingShuffleFallbackSuite
     }
     assert(!policy.hasTripped,
       "a reset policy must tolerate utilisation at the threshold exactly as a fresh one does")
+    assert(policy.saturatedIntervalCount == 0L,
+      "reset must discard the run of saturated intervals along with the rest of the sampling state")
 
     assert(!policy.hasTripped, "reset must restore the untripped state")
     assert(policy.trippedReason.isEmpty, "reset must discard the latched reason")
@@ -1022,8 +1111,10 @@ class StreamingShuffleFallbackSuite
         (StreamingShuffleFallbackPolicy, ManualClock) => Unit)] = Seq(
       ConsumerTooSlow -> ((policy, clock) => driveSustainedConsumerSlowness(policy, clock)),
       MemoryPressure -> ((policy, _) => policy.recordAllocationGrant(RequestedBufferBytes, 0L)),
-      NetworkSaturation -> ((policy, _) =>
-        policy.recordLinkUtilization(LinkCapacityBytesPerSecond, LinkCapacityBytesPerSecond)),
+      NetworkSaturation -> ((policy, clock) =>
+        // A sustained run at the full administered capacity, strictly above the tolerated share.
+        driveLinkSaturation(policy, LinkCapacityBytesPerSecond, LinkCapacityBytesPerSecond,
+          clock.getTimeMillis())),
       ProtocolVersionMismatch -> ((policy, _) =>
         assert(!policy.checkProtocolVersion(IncompatibleProtocolVersion),
           "the fixture must actually drive the protocol mismatch it claims to drive")))
@@ -1265,7 +1356,8 @@ class StreamingShuffleFallbackSuite
     val policy = activePolicy(clock)
     driveSustainedConsumerSlowness(policy, clock)
     policy.recordAllocationGrant(RequestedBufferBytes, 0L)
-    policy.recordLinkUtilization(LinkCapacityBytesPerSecond, LinkCapacityBytesPerSecond)
+    driveLinkSaturation(policy, LinkCapacityBytesPerSecond, LinkCapacityBytesPerSecond,
+      clock.getTimeMillis())
     assert(!policy.checkProtocolVersion(IncompatibleProtocolVersion),
       "the incompatible peer must be reported by return value rather than by an exception")
     assert(policy.hasTripped, "the fixture must have latched")

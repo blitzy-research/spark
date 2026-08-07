@@ -132,11 +132,20 @@ private[spark] trait StreamingShuffleRouteRegistry {
  * Threading. The shuffle metrics reporters are documented as single-threaded, so no reporter is
  * ever called from here: this handler publishes plain counters that the writer reads on the task
  * thread and forwards. Nothing here parks, blocks or sleeps; shared state is atomic or concurrent;
- * no lock is held across a channel write; no exception escapes a Netty callback; and every failure
- * observed on an event-loop thread is handed to [[StreamingShuffleErrorNotifier]] so the task
- * thread re-throws it, without which a producing task would wait forever on progress that cannot
- * come. Every instant comes from the injected `Clock`, so no timer thread of this handler's own is
- * needed: liveness is evaluated when it is asked for, on the thread that asks.
+ * no exception escapes a Netty callback; and every failure observed on an event-loop thread is
+ * handed to [[StreamingShuffleErrorNotifier]] so the task thread re-throws it, without which a
+ * producing task would wait forever on progress that cannot come. Every instant comes from the
+ * injected `Clock`, so no timer thread of this handler's own is needed: liveness is evaluated when
+ * it is asked for, on the thread that asks.
+ *
+ * Exactly one monitor exists, it is the consumer's channel, and its scope is one channel operation
+ * and nothing else. A channel's outbound buffer is a linked list that assumes a single mutator, and
+ * one channel carries every producer a consumer reads from this executor: data frames come from the
+ * executor-wide data-plane worker, control frames from the producing task thread and from Netty
+ * callbacks. Netty upholds that assumption for a socket channel by handing a write off when the
+ * caller is not the event loop, but an event loop that reports every thread as its own mutates
+ * inline instead, so the invariant is upheld here in order to hold on every `Channel`. Frames are
+ * built and listeners attached outside the critical section; see `ConsumerSession.onChannel`.
  *
  * A healthy shuffle can legitimately put nothing on the wire. Whether a consumer exists while a
  * producer runs is decided by task submission, and the unmodified scheduler submits a stage only
@@ -348,15 +357,42 @@ private[spark] class StreamingShuffleServerHandler(
     }
   }
 
-  /** Reports an asynchronous write failure to the notifier. */
+  /**
+   * Records an asynchronous write failure against the consumer whose channel refused it.
+   *
+   * A channel write completes on an event-loop thread long after the call that issued it returned,
+   * so a failure that is not observed through the future is lost outright and this listener is what
+   * observes it. One listener instance is allocated for the handler's lifetime rather than one per
+   * write, because a write happens per block.
+   *
+   * <b>What such a failure is, and what it is not.</b> It is a statement about one consumer's
+   * socket, and it is not a fault of this map task. Delivery is confirmed by acknowledgement and
+   * never by a successful write, so a block whose write failed is still in the unacknowledged
+   * window: it stays retained, [[StreamingShuffleWriter]] makes that window durable before it
+   * publishes a status, and a consumer that reconnects is served from it. Latching the transport
+   * error on the producing task's notifier therefore failed a map task whose output was complete
+   * and reachable -- and because a map-task failure consumes the task's own failure budget rather
+   * than asking for anything to be recomputed, a master that permits one attempt (which a plain
+   * `local[n]` forces) aborted the job over one reset consumer socket.
+   *
+   * The consumer-failure protocol already owns this condition and is the only thing that may
+   * escalate it: the acknowledgement watchdog notices a consumer that stops making progress,
+   * retains and spills its window, replays it on reconnection, and fails the attempt only once the
+   * bounded retry budget is spent. This listener therefore reports and accounts, and leaves that
+   * decision where it belongs. It is also what [[channelInactive]] already does for a consumer that
+   * closes its channel gracefully; an ungraceful reset of the same channel says exactly the same
+   * thing about this map output, so the two are treated alike.
+   */
   private val writeFailureListener: ChannelFutureListener = new ChannelFutureListener {
     override def operationComplete(future: ChannelFuture): Unit = {
       if (!future.isSuccess) {
-        errorNotifier.setError(future.cause())
-        // One write is issued per block, so one failing channel fails every write on it.
+        // One write is issued per block, so one failing channel fails every write on it. The record
+        // is bounded so that a single dead consumer cannot spend the executor's whole log budget
+        // restating itself once per block.
         reportBounded(StreamingShuffleServerHandler.egressFailureLogAggregator, egressFailures,
           log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} failed to write to the consumer " +
-            log"channel", future.cause())
+            log"channel; the block stays in the unacknowledged window and is replayed if that " +
+            log"consumer returns", future.cause())
       }
     }
   }
@@ -648,6 +684,28 @@ private[spark] class StreamingShuffleServerHandler(
     total
   }
 
+  /**
+   * Drains one session under a compare-and-set guard, so exactly one thread is inside it at a time.
+   *
+   * <b>Contention here is by design, and it can only ever be between data-plane workers.</b> This
+   * is the one place in the streaming shuffle where a thread can be found blocked on a monitor: a
+   * profile of the subsystem under adversarial load showed a single sample of one data-plane worker
+   * blocked on a monitor owned by another inside [[drainOnce]], for well under one percent of
+   * thread wall time. That is the intended shape rather than a defect, and the reason it can never
+   * reach an event loop is structural: this method has one caller, [[drainReadySessions]], itself
+   * reached only from the runnable [[requestDrain]] submits to the executor-wide data-plane pool.
+   * Every thread that can contend for this guard is therefore a data-plane worker, and a Netty
+   * callback that causes egress only ever marks a session ready and submits -- it performs no spill
+   * read, no checksum scan, no frame copy and no channel drain of its own.
+   *
+   * The guard is a compare-and-set rather than a lock, so a thread which loses it does not wait: it
+   * leaves a wake-up note and returns, and the holder re-runs the pass to pick up whatever arrived
+   * while it was inside. The loop repeats only while the last pass made progress or a note was
+   * left, which is what stops a throttled or unwritable channel from spinning.
+   *
+   * @param session the session to drain
+   * @return bytes written across every pass this call made
+   */
   private def drainSession(session: ConsumerSession): Long = {
     var total = 0L
     var again = true
@@ -761,8 +819,10 @@ private[spark] class StreamingShuffleServerHandler(
       }
       // One flush for the whole batch rather than one per block: the two mebibyte cap only
       // pipelines if consecutive blocks share a syscall instead of trickling out one at a time.
+      // Serialised against every other mutation of this channel's outbound buffer, including the
+      // control frames a producing task emits concurrently; see ConsumerSession.onChannel.
       if (flushNeeded) {
-        channel.flush()
+        session.onChannel(channel.flush())
       }
       emitDeferredTerminations(session)
       if (pacingDelayMs > 0L) {
@@ -865,7 +925,10 @@ private[spark] class StreamingShuffleServerHandler(
           false
         } else {
           considerTerminationReady(session, partitionId)
-          session.channel.write(sendable(block))
+          // The frame is built outside the monitor and the listeners are attached outside it; only
+          // the buffer mutation itself is serialised. See ConsumerSession.onChannel.
+          val frame = sendable(block)
+          session.onChannel(session.channel.write(frame))
             .addListener(releaseTransientOn(framedBytes))
             .addListener(writeFailureListener)
           bytesWritten.addAndGet(framedBytes)
@@ -968,7 +1031,12 @@ private[spark] class StreamingShuffleServerHandler(
       message: StreamingShuffleMessage): ChannelFuture = {
     val framedBytes = StreamingShuffleMessage.framedLength(message.encodedLength()).toLong
     val charged = rateLimiter.tryAcquire(framedBytes)
-    val future = session.channel.writeAndFlush(sendable(message))
+    // A control frame is emitted from the producing task thread and from Netty callbacks, while
+    // data frames are written by the executor-wide data-plane worker, so this is the write that
+    // most needs the channel's monitor: without it the two would mutate one outbound buffer at the
+    // same time. The frame is built and the listener attached outside the critical section.
+    val frame = sendable(message)
+    val future = session.onChannel(session.channel.writeAndFlush(frame))
     future.addListener(writeFailureListener)
     bytesWritten.addAndGet(framedBytes)
     if (debugEnabled && !charged) {
@@ -1114,12 +1182,14 @@ private[spark] class StreamingShuffleServerHandler(
                     log"consumer ${MDC(SESSION_ID, session.consumerId)}")
                 }
               } else {
-                // The claim is surrendered so a reconnecting consumer is terminated properly, and
-                // the failure travels to the task thread rather than being lost with the write.
+                // The claim is surrendered so a reconnecting consumer is terminated properly. The
+                // transport failure itself is not latched on the producing task's notifier, for the
+                // reason [[writeFailureListener]] states: a terminator that could not be written
+                // describes one consumer's socket, the stream it ends is still terminable for that
+                // consumer's next connection, and the map output this task produced is unaffected.
                 session.releaseTerminationClaim(readyPartitionId)
                 considerTerminationReady(session, readyPartitionId)
                 requestDrain()
-                errorNotifier.setError(completed.cause())
                 logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} partition " +
                   log"${MDC(PARTITION_ID, readyPartitionId)} could not signal end of stream to " +
                   log"consumer ${MDC(SESSION_ID, session.consumerId)}", completed.cause())
@@ -1647,13 +1717,27 @@ private[spark] class StreamingShuffleServerHandler(
     }
   }
 
-  /** Latches a channel level failure and closes that consumer's channel. */
+  /**
+   * Closes the consumer channel that raised a transport failure, and only that channel.
+   *
+   * A fault on one consumer's connection says nothing about the others, and tearing them all down
+   * turns one consumer's problem into the map output's problem.
+   *
+   * It does not become this map task's problem either, which is the same rule
+   * [[writeFailureListener]] states and [[channelInactive]] has always applied: closing the session
+   * leaves its unacknowledged window retained for the consumer's next connection, the window is
+   * made durable before a status is published, and the consumer-failure protocol -- the
+   * acknowledgement watchdog with its bounded replay budget -- is the only thing that may turn a
+   * consumer that never returns into a failed attempt. Failing the producing task here instead
+   * spent that task's own failure budget on a fault it did not cause, and aborted jobs under a
+   * master that permits a single attempt.
+   */
   override def exceptionCaught(cause: Throwable, client: TransportClient): Unit = {
     submitDataPlane(client, "a channel-failure transition") {
-      errorNotifier.setError(cause)
       logWarning(log"Streaming shuffle ${MDC(SHUFFLE_ID, shuffleId)} egress channel to " +
         log"${MDC(HOST_PORT, client.getSocketAddress())} raised " +
-        log"${MDC(ERROR, cause.getMessage())}; closing it and failing the producing task", cause)
+        log"${MDC(ERROR, cause.getMessage())}; closing that channel and retaining its " +
+        log"unacknowledged window for replay", cause)
       closeSession(client, "the channel itself raised a transport failure")
     }
   }
@@ -2223,6 +2307,17 @@ private[spark] class StreamingShuffleServerHandler(
    * undelivered.
    */
   def lossyChannelClosureCount: Long = lossyChannelClosures.get()
+
+  /**
+   * Writes to a consumer channel that the transport could not complete.
+   *
+   * One write is issued per block, so a single dead consumer contributes one of these per block it
+   * was owed; the individual warnings are aggregated for that reason, and this total is what
+   * survives the aggregation. It is a per-consumer transport figure and never a fault of this map
+   * output: the blocks those writes carried are still in the unacknowledged window, and the
+   * consumer-failure protocol decides what becomes of them.
+   */
+  def egressFailureCount: Long = egressFailures.get()
 
   /** How many channels have been refused because the session ceiling was already reached. */
   def refusedSessionCount: Long = refusedSessions.get()
@@ -3206,9 +3301,55 @@ private[spark] object StreamingShuffleServerHandler {
     val queue: PriorityBlockingQueue[PendingBlock] =
       new PriorityBlockingQueue[PendingBlock](INITIAL_EGRESS_QUEUE_CAPACITY, EgressOrdering)
 
-    /** Guard that keeps exactly one thread writing to this channel at a time. */
+    /** Guard that keeps exactly one thread running this session's egress drain at a time. */
     val draining: AtomicBoolean = new AtomicBoolean(false)
 
+    /**
+     * Runs one channel operation as the only mutation of this channel's outbound buffer in flight.
+     *
+     * <b>Why serialising is required rather than merely tidy.</b> A `Channel`'s outbound buffer
+     * is a linked list that assumes it is only ever mutated by the channel's own event loop. Netty
+     * upholds that for a socket channel by having `AbstractChannelHandlerContext` hand a write off
+     * when `EventLoop.inEventLoop` is false -- but the assumption is the *channel's*, not a
+     * guarantee owed to every caller: an event loop that reports every thread as its own performs
+     * the mutation inline on whichever thread called instead, and an embedded channel does exactly
+     * that. Frames reach one consumer from places that are genuinely different threads: data frames
+     * from the executor-wide data-plane worker in [[StreamingShuffleServerHandler.drainOnce]],
+     * control frames from the producing task thread through
+     * [[StreamingShuffleServerHandler.sendHeartbeat]] and from Netty callbacks through
+     * [[StreamingShuffleServerHandler.abortUnservableStream]]. On such a channel the two splice
+     * that list concurrently, and the consequence is not a lost frame but a corrupted chain: a
+     * cycle in it turns the flush walk into a non-terminating loop that consumes a core and cannot
+     * be interrupted. Serialising makes the single-mutator invariant hold for every `Channel`
+     * implementation rather than only for the ones that enforce it themselves.
+     *
+     * <b>Why the monitor is the channel itself.</b> One channel is shared by every producer a
+     * consumer reads from this executor, so several sessions -- belonging to several handlers, one
+     * per map output -- write to one outbound buffer. A per-session or per-handler monitor would
+     * therefore serialise the wrong thing and leave exactly the contention it was meant to remove.
+     * The channel is the one object every participant already holds, which makes it the correct
+     * scope and costs no registry to maintain and none to clean up. Nothing in Netty
+     * synchronises on a `Channel` -- `AbstractChannel` declares no synchronized method and
+     * `DefaultChannelPipeline` uses its own monitor -- and nothing in Spark does either, so this
+     * monitor contends only with itself. Deliberately not this session's own monitor, which
+     * [[adoptIdentity]] uses for an
+     * unrelated transition, and which would in any case be the wrong scope.
+     *
+     * <b>Why holding it is safe.</b> A Netty write or flush enqueues and returns; it never parks,
+     * blocks or sleeps. The critical sections are therefore the channel call and nothing else: no
+     * spill read, no checksum scan, no frame copy, no store lookup and no payload allocation. The
+     * only foreign code that can run inside one is a write listener the channel completes inline,
+     * and both of this handler's listeners touch atomics only, so no lock order exists to invert.
+     * [[draining]] is a compare-and-set flag that is never waited on, so it cannot participate in a
+     * cycle either.
+     *
+     * @param operation the `Channel.write`, `Channel.flush` or `Channel.writeAndFlush` call, and
+     *                  nothing else; the scope is that narrow for the reason given above
+     * @return whatever the operation returned
+     */
+    def onChannel[T](operation: => T): T = channel.synchronized(operation)
+
+    /** Whether this session currently has one entry in the handler's ready-session queue. */
     val readyQueued: AtomicBoolean = new AtomicBoolean(false)
 
     /** Fairness snapshot captured when this session enters the ready queue. */

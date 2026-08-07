@@ -47,7 +47,8 @@ class MemorySpillManagerSuite
   extends SparkFunSuite
     with SharedSparkContext
     with Matchers
-    with StreamingShuffleTestHelper {
+    with StreamingShuffleTestHelper
+    with StreamingShuffleHadoopCredentialIsolation {
 
   private val roomyMemoryBytes: Long = 4000000L
 
@@ -1560,6 +1561,64 @@ class MemorySpillManagerSuite
       "Discarding the shared allowance must unregister it from the gauge")
     assert(observedBufferUtilizationPercent() === 0L,
       "With the allowance withdrawn the gauge must read zero again")
+  }
+
+  test("a contributor that cannot be read is left out of the gauge rather than failing it") {
+    // The gauge is read from the metrics reporting thread on behalf of every configured sink, so an
+    // owner that raises must degrade its own contribution and nothing else. Production registers
+    // exactly one contributor whose accessors are an AtomicLong read and a memoised value, so this
+    // is a defect in an owner rather than a reachable state -- which is precisely why the gauge has
+    // to be total for any registry rather than for a well-behaved one.
+    assert(StreamingShuffleMetricsSource.unreadableContributorReadCount === 0L,
+      "beforeEach resets the source, so no abandoned read may be carried in")
+    val healthy = installBufferUtilization(blockCharge, blockCharge * 4L)
+    val onBufferedBytes = new StreamingShuffleBufferUtilizationContributor {
+      override def contributedBufferedBytes: Long =
+        throw new IllegalStateException("this owner cannot report its buffered bytes")
+      override def contributedBudgetBytes: Long = blockCharge * 400L
+    }
+    // Fails on the SECOND answer, which is the case that decides whether the guard is placed
+    // correctly: a gauge that added as it went would keep this owner's buffered bytes and lose its
+    // budget, measuring them against everyone else's allowance and reporting an inflated
+    // percentage rather than a slightly incomplete one.
+    val onBudgetBytes = new StreamingShuffleBufferUtilizationContributor {
+      override def contributedBufferedBytes: Long = blockCharge * 100L
+      override def contributedBudgetBytes: Long =
+        throw new IllegalStateException("this owner cannot report its budget")
+    }
+    try {
+      assert(observedBufferUtilizationPercent() === 25L,
+        s"A quarter-full allowance must read 25 before anything misbehaves, but the gauge read " +
+          s"${observedBufferUtilizationPercent()}")
+
+      StreamingShuffleMetricsSource.registerBufferUtilizationContributor(onBufferedBytes)
+      assert(observedBufferUtilizationPercent() === 25L,
+        s"An owner that cannot answer at all must be left out entirely, leaving the healthy " +
+          s"owner's reading untouched, but the gauge read ${observedBufferUtilizationPercent()}")
+
+      StreamingShuffleMetricsSource.registerBufferUtilizationContributor(onBudgetBytes)
+      assert(observedBufferUtilizationPercent() === 25L,
+        s"An owner that answers its numerator and then fails must contribute NEITHER number, or " +
+          s"its bytes are measured against a budget that is not its own, but the gauge read " +
+          s"${observedBufferUtilizationPercent()}")
+
+      assert(StreamingShuffleMetricsSource.bufferUtilizationContributorCount === 3,
+        s"All three owners must still be registered -- the gauge skips a read, it does not evict " +
+          s"an owner -- but ${StreamingShuffleMetricsSource.bufferUtilizationContributorCount} are")
+      assert(StreamingShuffleMetricsSource.unreadableContributorReadCount >= 3L,
+        s"Every abandoned read must be counted rather than silently swallowed, but only " +
+          s"${StreamingShuffleMetricsSource.unreadableContributorReadCount} were")
+    } finally {
+      StreamingShuffleMetricsSource.unregisterBufferUtilizationContributor(onBufferedBytes)
+      StreamingShuffleMetricsSource.unregisterBufferUtilizationContributor(onBudgetBytes)
+      removeBufferUtilization(healthy)
+    }
+
+    assert(observedBufferUtilizationPercent() === 0L,
+      "With every owner withdrawn the gauge must read zero again")
+    StreamingShuffleMetricsSource.reset()
+    assert(StreamingShuffleMetricsSource.unreadableContributorReadCount === 0L,
+      "reset() must clear the abandoned-read count as it clears the counters")
   }
 
   /**

@@ -26,6 +26,7 @@ import scala.jdk.CollectionConverters._
 
 import _root_.io.netty.channel.DefaultChannelId
 import _root_.io.netty.channel.embedded.EmbeddedChannel
+import org.apache.logging.log4j.Level
 import org.mockito.Mockito.mock
 import org.mockito.invocation.InvocationOnMock
 import org.mockito.stubbing.Answer
@@ -58,7 +59,8 @@ import org.apache.spark.util.{RpcUtils, Utils}
 /** Tests of [[StreamingShuffleManager]] as a `ShuffleManager` service provider. */
 class StreamingShuffleManagerSuite extends SparkFunSuite
   with LocalSparkContext
-  with StreamingShuffleTestHelper {
+  with StreamingShuffleTestHelper
+  with StreamingShuffleHadoopCredentialIsolation {
 
   import StreamingShuffleTestHelper._
 
@@ -299,6 +301,61 @@ class StreamingShuffleManagerSuite extends SparkFunSuite
     }
   }
 
+  test("a requested streaming subsystem that cannot activate says so once, at warning level") {
+    // The decline this covers is silent and entirely self-consistent without it: the streaming
+    // manager is instantiated, its metrics source registers, four MBeans appear, and every one of
+    // them reads a plausible 0 forever. An operator following the monitoring documentation cannot
+    // then distinguish an idle executor from a configuration that excluded streaming, which
+    // is exactly the diagnosis this line exists to make possible.
+    val requestedWithoutAuth = testEnvelopeConf()
+      .set(SHUFFLE_MANAGER, StreamingShuffleManager.SHORT_NAME)
+      .set(SHUFFLE_STREAMING_ENABLED, true)
+      .set(NETWORK_AUTH_ENABLED, false)
+
+    val appender = new LogAppender("streaming requested but excluded")
+    withLogAppender(
+      appender,
+      loggerNames = Seq(classOf[StreamingShuffleManager].getName),
+      level = Some(Level.WARN)) {
+      withManager(requestedWithoutAuth, isDriver = true) { manager =>
+        assert(manager.shuffleBlockResolver != null,
+          "the excluded manager must still be fully constructed and delegating")
+      }
+    }
+    val excluded = appender.loggingEvents
+      .map(_.getMessage.getFormattedMessage)
+      .filter(_.contains("Streaming shuffle was requested"))
+    assert(excluded.size == 1,
+      s"exactly one line must report the exclusion but ${excluded.size} did: ${excluded.mkString}")
+    assert(excluded.head.contains(NETWORK_AUTH_ENABLED.key),
+      s"the line must name the setting that excluded streaming, but read: ${excluded.head}")
+    assert(excluded.head.contains("sort-based shuffle manager"),
+      s"the line must say which manager serves the shuffles instead, but read: ${excluded.head}")
+
+    // The kill switch is not an exclusion to report: an operator who left streaming off asked for
+    // precisely this, and a warning on every executor of every sort-based application would be
+    // noise. Likewise a fully active configuration has nothing to say.
+    val quietPostures = Seq(
+      ("the kill switch engaged", gatedOffStreamingConf(), true),
+      ("a fully active streaming configuration", streamingConf(), false))
+    quietPostures.foreach { case (posture, conf, isDriver) =>
+      val quiet = new LogAppender(s"no exclusion notice with $posture")
+      withLogAppender(
+        quiet,
+        loggerNames = Seq(classOf[StreamingShuffleManager].getName),
+        level = Some(Level.WARN)) {
+        withManager(conf, isDriver) { manager =>
+          assert(manager.shuffleBlockResolver != null, s"the manager must construct with $posture")
+        }
+      }
+      val notices = quiet.loggingEvents
+        .map(_.getMessage.getFormattedMessage)
+        .filter(_.contains("Streaming shuffle was requested"))
+      assert(notices.isEmpty,
+        s"nothing may be reported with $posture, but ${notices.mkString("; ")} was")
+    }
+  }
+
   test("stop is idempotent and never throws on both tiers") {
     Seq(
       ("the kill switch engaged", gatedOffStreamingConf(), true),
@@ -506,8 +563,11 @@ class StreamingShuffleManagerSuite extends SparkFunSuite
       (StreamingShuffleFallbackReason.MemoryPressure,
         policy => policy.recordAllocationGrant(requestedBytes = 1024L, grantedBytes = 512L)),
       (StreamingShuffleFallbackReason.NetworkSaturation,
-        policy => policy.recordLinkUtilization(
-          usedBytesPerSecond = 990.0d, capacityBytesPerSecond = 1000.0d)),
+        // Above the ninety percent share across the run of measurement intervals the condition is
+        // sustained over. One reading is not the condition: this subsystem's own pacing bucket must
+        // admit one maximum-sized frame, which reads above the share for one interval on a small
+        // administered link, so a rule tripping on one reading stood healthy shuffles down.
+        policy => driveLinkSaturation(policy, 990.0d, 1000.0d)),
       (StreamingShuffleFallbackReason.ProtocolVersionMismatch,
         policy => policy.checkProtocolVersion((ProtocolVersion + 1).toByte)),
       (StreamingShuffleFallbackReason.ConsumerTooSlow, policy => {
@@ -639,8 +699,12 @@ class StreamingShuffleManagerSuite extends SparkFunSuite
       s"with the policy untripped the manager must produce its own reader, but produced " +
         s"${streamingReader.getClass.getName}")
 
-    manager.degradationPolicy.recordLinkUtilization(
-      usedBytesPerSecond = 990.0d, capacityBytesPerSecond = 1000.0d)
+    // The condition is applied to the very policy the service-provider methods consult, which is
+    // what a writer or a reader on this executor would have done on observing it.
+    // Above the ninety percent share across the sustained run of measurement intervals. Driven
+    // through the shared helper, which supplies every instant, so this works against the policy a
+    // real manager built for itself and whose clock is the system's.
+    driveLinkSaturation(manager.degradationPolicy, 990.0d, 1000.0d)
     assert(manager.degradationPolicy.hasTripped &&
         manager.degradationPolicy.trippedReason
           .contains(StreamingShuffleFallbackReason.NetworkSaturation),
@@ -865,8 +929,9 @@ class StreamingShuffleManagerSuite extends SparkFunSuite
       (StreamingShuffleFallbackReason.MemoryPressure,
         policy => policy.recordAllocationGrant(requestedBytes = 1024L, grantedBytes = 512L)),
       (StreamingShuffleFallbackReason.NetworkSaturation,
-        policy => policy.recordLinkUtilization(
-          usedBytesPerSecond = 990.0d, capacityBytesPerSecond = 1000.0d)),
+        // Above the ninety percent share across the sustained run of measurement intervals, for the
+        // reason given at the first of these tables: one legal burst is not a saturated link.
+        policy => driveLinkSaturation(policy, 990.0d, 1000.0d)),
       (StreamingShuffleFallbackReason.ProtocolVersionMismatch,
         policy => policy.checkProtocolVersion((ProtocolVersion + 1).toByte)),
       (StreamingShuffleFallbackReason.ConsumerTooSlow, policy => {
@@ -2322,6 +2387,55 @@ class StreamingShuffleManagerSuite extends SparkFunSuite
       "the run must have gone through the streaming manager for the comparison to prove anything")
     val observed = groupedOutputAsSet(sc, numPartitions = 4)
     assertNoDataLoss(observed, baseline, "a shuffle run with streaming fully enabled")
+  }
+
+  test("a streaming context leaves the JVM-global Hadoop credentials as it found them") {
+    // The regression guard for a defect whose symptom appeared nowhere near its cause. Streaming
+    // needs authenticated transport, so a fixture that starts a real context sets
+    // `spark.authenticate`; `SparkEnv` then calls `SecurityManager.initializeAuth()`, which for a
+    // `local*` or `yarn` master generates a fresh secret whether or not the configuration already
+    // carries one and stores it in the Hadoop login user's credentials. That store is JVM-global,
+    // and `SecurityManager.getSecretKey()` reads it ahead of every other source, so an unrestored
+    // write
+    // makes every later SecurityManager in the JVM answer with this suite's secret -- and the tests
+    // that then fail belong to pre-existing suites about authentication, not to this package.
+    //
+    // What is asserted is the mechanism the suite-wide bracket is built on, in both directions and
+    // in one place. Naming a victim suite instead would be a weaker test in every respect: it could
+    // only observe the damage indirectly, only when the runner happened to order it after a
+    // streaming suite, and it would report a failure in a suite that had done nothing wrong.
+    //
+    // Both halves matter. Without the first, an implementation that stopped writing the secret at
+    // all would satisfy the second vacuously; without the second there is no restoration to speak
+    // of. The bracket this package mixes into every suite is exactly these two steps applied around
+    // a whole suite instead of around one context.
+    val before = loginUserAuthSecret()
+    try {
+      sc = new SparkContext(
+        withLocalMaster(streamingConf(), "streaming-shuffle-manager-ugi-guard", "local[2]"))
+      assert(SparkEnv.get.shuffleManager.isInstanceOf[StreamingShuffleManager],
+        "the guard is only meaningful if the context really took the streaming path")
+      // Run a shuffle, so the context is exercised rather than merely constructed.
+      groupedOutputAsSet(sc, numPartitions = 2)
+      resetSparkContext()
+      val during = loginUserAuthSecret()
+      assert(during.isDefined,
+        "a streaming context must have installed a secret in the Hadoop login user's " +
+          "credentials, because that is what SecurityManager.initializeAuth does for a local " +
+          "master and it is " +
+          "the write the isolation exists to undo; with nothing written the restoration below " +
+          "would be asserting nothing at all")
+      assert(!sameLoginUserAuthSecret(before, during),
+        s"and it must differ from what the JVM held beforehand, yet both read " +
+          s"${describeLoginUserAuthSecret(before)}")
+    } finally {
+      restoreLoginUserAuthSecret(before)
+    }
+    val after = loginUserAuthSecret()
+    assert(sameLoginUserAuthSecret(before, after),
+      s"restoring must leave the Hadoop login user's Spark secret exactly as it was found, but " +
+        s"the reading went from ${describeLoginUserAuthSecret(before)} to " +
+        s"${describeLoginUserAuthSecret(after)}")
   }
 
   test("on a real cluster executors resolve the driver endpoint and stream correct output") {

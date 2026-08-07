@@ -377,6 +377,19 @@ private[spark] class BackpressureProtocol(
   private val ingressWindow = new BackpressureProtocol.RateWindow(clock)
 
   /**
+   * The run of consecutive measurement intervals in which the link has read over capacity, and the
+   * interval the most recent of them was observed in.
+   *
+   * Two fields rather than one, because a run has both a length and an end: the length is what the
+   * sustained threshold is compared against, and the end is what distinguishes the next observation
+   * continuing the run from it starting a new one. See [[recordSaturatedInterval]].
+   */
+  private val saturatedIntervals = new AtomicLong(0L)
+
+  private val lastSaturatedInterval =
+    new AtomicLong(BackpressureProtocol.NO_SATURATED_INTERVAL)
+
+  /**
    * The link capacity the operator declared, in bytes per second, or zero when none was declared.
    */
   private val declaredLinkCapacityBytesPerSecond: Long =
@@ -384,6 +397,20 @@ private[spark] class BackpressureProtocol(
       .map(mbps => BackpressureProtocol.saturatingMultiply(
         math.max(0L, mbps.toLong), TokenBucketRateLimiter.BYTES_PER_MIB))
       .getOrElse(0L)
+
+  /**
+   * Consecutive over-capacity intervals this executor's declared capacity requires before its
+   * saturation is treated as sustained.
+   *
+   * Derived from the capacity by the fallback policy, and not restated here, because the run has to
+   * absorb the mandatory burst allowance of THIS capacity: a bucket must admit one maximum-sized
+   * frame however small its paced share is, so a small capacity needs a longer run than a large
+   * one. One derivation serves the policy's verdict and this protocol's diagnostic latch, so an
+   * operator cannot be shown a degradation the policy is not acting on.
+   */
+  private val requiredSaturatedIntervals: Long =
+    StreamingShuffleFallbackPolicy.sustainedIntervalsFor(
+      declaredLinkCapacityBytesPerSecond.toDouble)
 
   /**
    * Registers a shuffle with the protocol, recording the reduce partition count that arbitration
@@ -1283,6 +1310,35 @@ private[spark] class BackpressureProtocol(
     if (ledger == null) None else Some(ledger.millisSinceInbound(clock.getTimeMillis()))
   }
 
+  /**
+   * The silence that makes this stream's producer timed out, or `None` while it is still believed
+   * alive.
+   *
+   * The verdict and the interval it was reached against are produced together, from one lookup of
+   * the ledger and one reading of the clock, and that pairing is the whole point of the method. A
+   * caller that asked [[isProducerTimedOut]] and then measured the interval separately could be
+   * answered by a different ledger state, or -- worse, and this is what it did -- could measure a
+   * different interval entirely and report a gap of zero as being past a five-second bound. Every
+   * diagnostic that names the silence behind a timeout must take both facts from here.
+   *
+   * The interval is measured from the last inbound event of any kind, and the ledger starts that
+   * interval running when the stream opens, so this reading covers the case a per-partition reading
+   * cannot: a producer that delivered nothing at all.
+   */
+  def producerSilenceMillis(key: BackpressureStreamKey): Option[Long] = {
+    val ledger = streams.get(key)
+    if (ledger == null) {
+      None
+    } else {
+      val nowMillis = clock.getTimeMillis()
+      if (isProducerTimedOut(ledger, nowMillis)) {
+        Some(ledger.millisSinceInbound(nowMillis))
+      } else {
+        None
+      }
+    }
+  }
+
   /** Milliseconds since this stream's consumer last advanced its position. */
   def millisSinceAck(key: BackpressureStreamKey): Option[Long] = {
     val ledger = streams.get(key)
@@ -1596,14 +1652,99 @@ private[spark] class BackpressureProtocol(
 
   /**
    * Whether the link is saturated beyond ninety percent, which is the third condition under which
-   * streaming steps aside.
+   * streaming steps aside. Latches the reason when it holds, and reports it; the trip decision
+   * belongs to the fallback policy.
+   *
+   * <b>Sustained across consecutive measurement intervals, not on one reading.</b> The condition is
+   * utilisation above [[BackpressureProtocol.LINK_SATURATION_PERCENT]] of the declared capacity,
+   * and the thing that has to be excluded before a reading can be called saturation is this
+   * subsystem's own mandatory burst. A pacing bucket has to be able to admit one maximum-sized
+   * encoded frame -- a bucket that could not hold one would refuse every frame forever, which is a
+   * deadlock rather than a rate limit -- so its burst allowance is at least
+   * `DataBlockMessage.MAX_ENCODED_FRAME_BYTES` however small its paced share is. A bucket that
+   * starts full therefore legitimately delivers that burst plus one interval's refill inside the
+   * first interval, and with several concurrent shuffles the sum of those bursts is a multiple of
+   * the administered capacity for exactly that interval. Treating it as saturation stood streaming
+   * down on links that were never saturated -- measured at nearly one and a half times the
+   * administered capacity with buffer utilisation at nine percent and not one stream throttled --
+   * and the stand-down then invalidated every producer and forced the map stage to be recomputed.
+   *
+   * Requiring consecutive intervals is what distinguishes a burst from saturation, and it is the
+   * same shape the sustained-slowness condition beside it already uses. How many are required is
+   * derived from the declared capacity by `StreamingShuffleFallbackPolicy.sustainedIntervalsFor`,
+   * because the run has to be long enough for THIS capacity's mandatory burst to be amortised into
+   * the headroom a compliant producer has -- a small capacity needs a longer run than a large one.
+   * A link that really is saturated stays over capacity interval after interval and trips inside
+   * [[requiredSaturatedIntervalCount]] of them, which is at worst a minute and therefore never
+   * slower than the sustained-slowness window beside it; a burst clears on the very next interval,
+   * because the bucket it came from is now empty and refills at the paced rate, which is
+   * `TokenBucketRateLimiter.BANDWIDTH_CEILING_PERCENT` of the capacity and therefore below the trip
+   * share by construction.
+   *
+   * What keeps each individual reading honest is the measurement itself: the rate is published from
+   * a whole [[BackpressureProtocol.SATURATION_SAMPLE_WINDOW_MS]] window of observed bytes, and a
+   * window with too little history to publish a rate reports zero rather than a guess, so an
+   * interval that cannot be evaluated cannot read as saturated.
    */
   def isLinkSaturated: Boolean = {
-    val saturated = linkSaturationPercent > BackpressureProtocol.LINK_SATURATION_PERCENT
-    if (saturated) {
+    val over = linkSaturationPercent > BackpressureProtocol.LINK_SATURATION_PERCENT
+    val sustained = if (over) recordSaturatedInterval() else clearSaturatedIntervals()
+    if (sustained) {
       latchDegradation(BackpressureDegradationReason.LinkSaturation)
     }
-    saturated
+    sustained
+  }
+
+  /**
+   * Consecutive measurement intervals the link has read over capacity in, which is what
+   * distinguishes a burst from saturation. Zero once a reading came back inside the tolerated
+   * share.
+   */
+  def saturatedIntervalCount: Long = saturatedIntervals.get()
+
+  /**
+   * Consecutive over-capacity intervals this executor's declared capacity requires before
+   * saturation counts as sustained, derived from that capacity's mandatory burst allowance.
+   */
+  def requiredSaturatedIntervalCount: Long = requiredSaturatedIntervals
+
+  /**
+   * Counts this observation's measurement interval into the run of saturated ones, and reports
+   * whether the run is now long enough for the saturation to count as sustained.
+   *
+   * '''Intervals rather than observations.''' This is polled on the protocol's hundred-millisecond
+   * cadence while the rate is republished once a second, so counting observations would reach any
+   * threshold inside a single interval and count one burst ten times over -- which is exactly how a
+   * sustained rule came to stand streaming down in two or three hundred milliseconds on one legal
+   * burst. Distinct intervals are identified by quantising the observation instant onto the sample
+   * window, on the injected clock, so the bound is deterministic under test rather than dependent
+   * on how fast a caller polls.
+   *
+   * @return true when the link has read over capacity for enough consecutive intervals
+   */
+  private def recordSaturatedInterval(): Boolean = {
+    val interval = clock.getTimeMillis() / BackpressureProtocol.SATURATION_SAMPLE_WINDOW_MS
+    val previous = lastSaturatedInterval.getAndSet(interval)
+    val consecutive =
+      if (previous == interval) {
+        // Same interval as the last observation: already counted. The standing verdict is reported
+        // rather than advanced, so a fast poll cannot reach the threshold inside one interval.
+        saturatedIntervals.get()
+      } else if (previous == interval - 1L) {
+        saturatedIntervals.incrementAndGet()
+      } else {
+        // A gap means at least one interval was not saturated, so the run restarts at this one.
+        saturatedIntervals.set(1L)
+        1L
+      }
+    consecutive >= requiredSaturatedIntervals
+  }
+
+  /** Ends any run of saturated intervals, because this observation was inside the share. */
+  private def clearSaturatedIntervals(): Boolean = {
+    saturatedIntervals.set(0L)
+    lastSaturatedInterval.set(BackpressureProtocol.NO_SATURATED_INTERVAL)
+    false
   }
 
   /**
@@ -1642,10 +1783,22 @@ private[spark] class BackpressureProtocol(
   def degradationReasons: Seq[BackpressureDegradationReason] =
     BackpressureDegradationReason.values.filter(degradations.contains)
 
-  /** Forgets every degradation condition. */
+  /**
+   * Forgets every degradation condition.
+   *
+   * Reasons are latched, because the fallback policy may sample them after the condition that
+   * caused one has passed, so there has to be an explicit way back. Clearing is what a caller does
+   * once it has delegated to the sort-based path and is starting a fresh measurement, and what a
+   * suite does between cases.
+   *
+   * The run of saturated intervals goes with them, because it is evidence for one of those reasons
+   * rather than state of its own: a caller starting a fresh measurement must not inherit two thirds
+   * of a saturation run recorded against the measurement it just abandoned.
+   */
   def clearDegradation(): Unit = {
     degradations.clear()
     reportedDegradations.clear()
+    clearSaturatedIntervals()
   }
 
   /**
@@ -2085,6 +2238,24 @@ private[spark] object BackpressureProtocol {
 
   val LINK_SATURATION_PERCENT: Long = 90L
 
+  /**
+   * The fewest consecutive measurement intervals the link must read over capacity in before its
+   * saturation can be treated as sustained.
+   *
+   * Three, which at a one-second sample window is three seconds, and a floor rather than the rule:
+   * the run actually required is derived from the declared capacity's mandatory burst allowance by
+   * `StreamingShuffleFallbackPolicy.sustainedIntervalsFor`, and is never shorter than this. One
+   * source of truth for the derivation is what keeps the policy's verdict and this protocol's
+   * diagnostic latch describing the same condition, so this constant is deliberately equal to
+   * `StreamingShuffleFallbackPolicy.SATURATION_SUSTAINED_INTERVALS`.
+   */
+  val LINK_SATURATION_SUSTAINED_INTERVALS: Long =
+    StreamingShuffleFallbackPolicy.SATURATION_SUSTAINED_INTERVALS
+
+  /** The interval identifier meaning "no saturated interval has been observed". */
+  val NO_SATURATED_INTERVAL: Long = Long.MinValue
+
+  /** Divisor and multiplier of every percentage this protocol computes. */
   val PERCENT_SCALE: Long = 100L
 
   val STREAM_LEDGER_BASE_BYTES: Long = 512L
@@ -2130,7 +2301,18 @@ private[spark] object BackpressureProtocol {
     def total: Long = bytesTotal.get()
   }
 
-  /** The interval over which link usage is measured before a rate is derived from it. */
+  /**
+   * The interval over which link usage is measured before a rate is derived from it.
+   *
+   * One second, which is long enough for the quotient to describe a link rather than the
+   * instantaneous speed of one two-megabyte memcpy, and short enough that a link which really does
+   * saturate is noticed within a few seconds of doing so. It is also what makes each individual
+   * reading meaningful: the rate describes a whole window of observed bytes rather than one
+   * transfer, and a window with too little history to publish a rate reports zero instead. It is
+   * the unit the saturation run is counted in as well -- see
+   * `StreamingShuffleFallbackPolicy.sustainedIntervalsFor` -- so an observation is attributed to
+   * the window it belongs to rather than to the poll that happened to read it.
+   */
   val SATURATION_SAMPLE_WINDOW_MS: Long = 1000L
 
   /** The pause before the first replay attempt, which each further attempt doubles. */

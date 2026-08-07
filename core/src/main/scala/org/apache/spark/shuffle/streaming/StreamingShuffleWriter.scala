@@ -1227,11 +1227,20 @@ private[spark] class StreamingShuffleWriter[K, V, C](
    * Gives the spill manager its polling opportunity and honours the executor-wide spill verdict.
    */
   private def pollSpill(): Unit = {
-    if (spillManager.pollOnce()) {
-      recordSpillObserved()
-    } else if (backpressure.shouldYield(shuffleId) && spillManager.maybeSpill()) {
-      recordSpillObserved()
+    if (!spillManager.pollOnce() && backpressure.shouldYield(shuffleId)) {
+      spillManager.maybeSpill()
     }
+    // Observed unconditionally, and not only when one of the calls above returned that it had just
+    // evicted something. This writer is not the only thing that can spill its own buffers: the
+    // executor's spill poller evaluates the threshold on its own cadence, and the memory manager
+    // invokes the `MemoryConsumer` spill callback under pressure, so an eviction of this task's
+    // buffers can complete on a thread that never enters this method. Reporting only self-triggered
+    // evictions therefore left the writer claiming "0 spill events" in its summary for a task whose
+    // buffers had just been evicted -- a figure an operator would read as "no pressure occurred" --
+    // and left `spillsObserved` unusable as a pressure signal. The observation is a single atomic
+    // read compared against a local high-water mark on a path that already runs once per
+    // maintenance pass rather than once per record, so making it unconditional costs nothing.
+    recordSpillObserved()
   }
 
   /**

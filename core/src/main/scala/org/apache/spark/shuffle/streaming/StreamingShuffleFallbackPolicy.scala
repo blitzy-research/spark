@@ -200,6 +200,21 @@ private[spark] class StreamingShuffleFallbackPolicy(
 
   private val unevaluableSamples = new AtomicLong(0L)
 
+  /**
+   * The run of consecutive measurement intervals whose utilisation read above the tolerated share,
+   * and the interval the most recent of them belonged to.
+   *
+   * Two fields rather than one, because a run has both a length and an end: the length is what
+   * [[SATURATION_SUSTAINED_INTERVALS]] is compared against, and the end is what distinguishes the
+   * next observation continuing the run from it starting a new one. See
+   * [[recordSaturatedInterval]].
+   */
+  private val saturatedIntervals = new AtomicLong(0L)
+
+  private val lastSaturatedInterval =
+    new AtomicLong(BackpressureProtocol.NO_SATURATED_INTERVAL)
+
+  /** How many samples named a shuffle past [[MAX_TRACKED_SHUFFLES]] and were therefore dropped. */
   private val untrackedShuffleSamples = new AtomicLong(0L)
 
   /** Per-shuffle throughput state, keyed by shuffle id. */
@@ -260,7 +275,36 @@ private[spark] class StreamingShuffleFallbackPolicy(
   /** How many samples were rejected as un-evaluable rather than acted upon. */
   def unevaluableSampleCount: Long = unevaluableSamples.get()
 
-  /** How many samples were dropped because they named a shuffle beyond the tracking bound. */
+  /**
+   * Consecutive measurement intervals whose utilisation read above the tolerated share, which is
+   * what distinguishes one legal burst from a saturated link.
+   *
+   * Zero once a reading came back inside the share. Published so that a caller -- and a test -- can
+   * tell "the link has brushed the share once" from "the link is being held above it", which
+   * [[hasTripped]] cannot express until the run is long enough to trip.
+   */
+  def saturatedIntervalCount: Long = saturatedIntervals.get()
+
+  /**
+   * Consecutive over-share intervals a saturation of the ADMINISTERED capacity has to span before
+   * this policy attributes it to the link rather than to the subsystem's own mandatory burst.
+   *
+   * The floor when no capacity is administered, because saturation is then unevaluable and no run
+   * is ever counted. See [[StreamingShuffleFallbackPolicy.sustainedIntervalsFor]] for how it is
+   * derived.
+   */
+  def administeredSustainedIntervals: Long = {
+    administeredCapacityBytesPerSecond
+      .map(capacity => sustainedIntervalsFor(capacity.toDouble))
+      .getOrElse(SATURATION_SUSTAINED_INTERVALS)
+  }
+
+  /**
+   * How many samples were dropped because they named a shuffle beyond the tracking bound.
+   *
+   * Non-zero here means throughput sampling is no longer complete for this executor, which is worth
+   * knowing: the sustained-slowness condition can only fire for a shuffle that is being tracked.
+   */
   def untrackedShuffleSampleCount: Long = untrackedShuffleSamples.get()
 
   /** How many shuffles currently have throughput state, bounded by [[MAX_TRACKED_SHUFFLES]]. */
@@ -407,8 +451,42 @@ private[spark] class StreamingShuffleFallbackPolicy(
   // Trip 3: network utilisation above 90% of the administered link capacity.
 
   /**
-   * Records observed egress against an explicit link capacity, and trips on the '''first'''
-   * evaluable reading whose utilisation is '''strictly above''' the tolerated share.
+   * Records observed egress against an explicit link capacity, and trips once utilisation
+   * '''strictly above''' the tolerated share has held across
+   * [[StreamingShuffleFallbackPolicy.SATURATION_SUSTAINED_INTERVALS]] consecutive measurement
+   * intervals.
+   *
+   * The specification states the condition as network saturation exceeding
+   * [[StreamingShuffleFallbackPolicy.SATURATION_TRIP_PERCENT]] of the link capacity. What it does
+   * not say, and what only the implementation can know, is that this subsystem is '''required''' to
+   * emit traffic which reads above that share on one interval of a small administered link: a
+   * pacing bucket must be able to admit one maximum-sized encoded frame or it would refuse every
+   * frame forever, so its burst allowance is at least one frame however small its paced share is,
+   * and a bucket that starts full delivers that burst plus one interval's refill inside the first
+   * interval. Measured against a link declared at a few MB/s that is one interval at half again the
+   * capacity -- on a link carrying nothing but correctly paced streaming traffic. Tripping on it
+   * invalidated every producer of a healthy shuffle and forced its map stage to be recomputed.
+   *
+   * A run of intervals is therefore what the condition is evaluated over, and the run is what makes
+   * the reading evidence rather than an artefact. Steady-state egress is held to
+   * [[TokenBucketRateLimiter.BANDWIDTH_CEILING_PERCENT]] of the administered capacity, which is
+   * below the trip share by construction, so a burst clears on the very next interval while a link
+   * that really is saturated stays over capacity interval after interval and trips within the run
+   * [[StreamingShuffleFallbackPolicy.sustainedIntervalsFor]] derives for that capacity -- at worst
+   * a minute, so never slower than the sustained-slowness condition beside it.
+   *
+   * Exactly at the threshold is not saturation. The specification tolerates utilisation up to the
+   * threshold and trips past it, so the comparison is `>` and never `>=`, and a reading at or below
+   * the threshold ends any run in progress.
+   *
+   * Division is guarded rather than attempted: a capacity that is zero, negative or not a finite
+   * number is not a capacity, and a link of unknown capacity cannot be described as saturated. Such
+   * a sample is counted as un-evaluable and never trips, which is also why this method can never
+   * divide by zero and can never produce a NaN comparison. An un-evaluable sample is not evidence
+   * at all, so it neither extends a run nor ends one.
+   *
+   * The sample is attributed to the instant the injected clock reports. Use the three-argument form
+   * when the caller already holds the instant its measurement belongs to.
    *
    * @param usedBytesPerSecond observed egress, in bytes per second
    * @param capacityBytesPerSecond the link capacity the observation is measured against, in
@@ -437,20 +515,74 @@ private[spark] class StreamingShuffleFallbackPolicy(
       unevaluableSamples.incrementAndGet()
     } else {
       val utilization = usedBytesPerSecond / capacityBytesPerSecond
-      if (utilization > SATURATION_TRIP_RATIO) {
-        trip(NetworkSaturation,
-          log"streaming shuffle egress reached " +
+      if (utilization <= SATURATION_TRIP_RATIO) {
+        // Inside the tolerated share, so whatever run was in progress ends here. This is the branch
+        // a correctly paced link takes, because pacing holds egress to eighty percent of the
+        // administered capacity while the trip share is ninety.
+        clearSaturatedIntervals()
+        if (debugEnabled) {
+          logDebug(log"Streaming shuffle egress read " +
             log"${MDC(PERCENT, math.round(utilization * PERCENT_SCALE))}% of the administered " +
-            log"link capacity, ${MDC(NUM_BYTES, usedBytesPerSecond)} bytes/s against " +
-            log"${MDC(MAX_SIZE, capacityBytesPerSecond)} bytes/s, above the " +
-            log"${MDC(THRESHOLD, SATURATION_TRIP_PERCENT)}% this policy tolerates.")
-      } else if (debugEnabled) {
-        logDebug(log"Streaming shuffle egress read " +
-          log"${MDC(PERCENT, math.round(utilization * PERCENT_SCALE))}% of the administered link " +
-          log"capacity, inside the ${MDC(THRESHOLD, SATURATION_TRIP_PERCENT)}% this policy " +
-          log"tolerates")
+            log"link capacity, inside the ${MDC(THRESHOLD, SATURATION_TRIP_PERCENT)}% this " +
+            log"policy tolerates")
+        }
+      } else {
+        val consecutive = recordSaturatedInterval(sampleTimeMillis)
+        val required = sustainedIntervalsFor(capacityBytesPerSecond)
+        if (consecutive >= required) {
+          trip(NetworkSaturation,
+            log"streaming shuffle egress reached " +
+              log"${MDC(PERCENT, math.round(utilization * PERCENT_SCALE))}% of the administered " +
+              log"link capacity, ${MDC(NUM_BYTES, usedBytesPerSecond)} bytes/s against " +
+              log"${MDC(MAX_SIZE, capacityBytesPerSecond)} bytes/s, above the " +
+              log"${MDC(THRESHOLD, SATURATION_TRIP_PERCENT)}% this policy tolerates, across " +
+              log"${MDC(COUNT, consecutive)} consecutive measurement interval(s), which is more " +
+              log"than the mandatory burst allowance of this capacity can account for.")
+        } else if (debugEnabled) {
+          logDebug(log"Streaming shuffle egress read " +
+            log"${MDC(PERCENT, math.round(utilization * PERCENT_SCALE))}% of the administered " +
+            log"link capacity across ${MDC(COUNT, consecutive)} consecutive measurement " +
+            log"interval(s), short of the ${MDC(MAX_SIZE, required)} this capacity's burst " +
+            log"allowance has to be amortised into before saturation can be concluded")
+        }
       }
     }
+  }
+
+  /**
+   * Counts one over-capacity observation into the run of saturated measurement intervals, and
+   * reports how many consecutive intervals the run now spans.
+   *
+   * Intervals are identified by quantising the observation's instant onto
+   * [[BackpressureProtocol.SATURATION_SAMPLE_WINDOW_MS]], so several observations of the same
+   * published rate -- which is what a hundred-millisecond poll of a rate republished once a second
+   * produces -- count once between them. An observation in the interval immediately after the run's
+   * end extends it; a gap means at least one interval was not saturated, so the run restarts at
+   * this one.
+   *
+   * @param sampleTimeMillis the instant the observation belongs to, in milliseconds
+   * @return consecutive saturated intervals observed, at least one
+   */
+  private def recordSaturatedInterval(sampleTimeMillis: Long): Long = {
+    val interval = sampleTimeMillis / BackpressureProtocol.SATURATION_SAMPLE_WINDOW_MS
+    val previous = lastSaturatedInterval.getAndSet(interval)
+    if (previous == interval) {
+      // Already counted, so the standing length is reported rather than advanced. Without this a
+      // fast poll would reach any threshold inside one interval, which is precisely how a sustained
+      // rule came to stand streaming down on a single legal burst.
+      math.max(1L, saturatedIntervals.get())
+    } else if (previous == interval - 1L) {
+      saturatedIntervals.incrementAndGet()
+    } else {
+      saturatedIntervals.set(1L)
+      1L
+    }
+  }
+
+  /** Ends any run of saturated intervals, because this reading was inside the tolerated share. */
+  private def clearSaturatedIntervals(): Unit = {
+    saturatedIntervals.set(0L)
+    lastSaturatedInterval.set(BackpressureProtocol.NO_SATURATED_INTERVAL)
   }
 
   /**
@@ -598,6 +730,9 @@ private[spark] class StreamingShuffleFallbackPolicy(
     observedTripConditions.set(0L)
     unevaluableSamples.set(0L)
     untrackedShuffleSamples.set(0L)
+    // The saturation run is sampling state like the throughput windows below it: a run left
+    // standing across a reset described a link the next workload never used.
+    clearSaturatedIntervals()
     throughputWindows.clear()
     announcedShuffles.clear()
     shuffleFallbacks.clear()
@@ -665,7 +800,9 @@ private[spark] class StreamingShuffleFallbackPolicy(
         log"${MDC(RATIO, CONSUMER_SLOWNESS_RATIO)}x behind for more than " +
         log"${MDC(THRESHOLD, SUSTAINED_SLOWNESS_WINDOW_MS)} ms, on utilisation above " +
         log"${MDC(PERCENT, SATURATION_TRIP_PERCENT)}% of an administered link capacity of " +
-        log"${MDC(MAX_SIZE, capacity)}, and on any protocol version other than " +
+        log"${MDC(MAX_SIZE, capacity)} across " +
+        log"${MDC(COUNT, administeredSustainedIntervals)} consecutive measurement interval(s), " +
+        log"and on any protocol version other than " +
         log"${MDC(VERSION_NUM, StreamingShuffleMessage.CURRENT_PROTOCOL_VERSION)}")
     }
   }
@@ -784,7 +921,94 @@ private[spark] object StreamingShuffleFallbackPolicy {
   /** [[SATURATION_TRIP_PERCENT]] as a fraction, which is the form the comparison actually uses. */
   val SATURATION_TRIP_RATIO: Double = SATURATION_TRIP_PERCENT.toDouble / 100.0d
 
-  /** Whether the notice about an unevaluable saturation condition has already been emitted. */
+  /**
+   * The '''fewest''' consecutive measurement intervals a link must read above the tolerated share
+   * in before its saturation can be treated as sustained.
+   *
+   * Three, which at the protocol's one-second measurement window is three seconds. A floor rather
+   * than the rule: the run actually required is derived from the administered capacity by
+   * [[sustainedIntervalsFor]], and is never shorter than this. Deliberately kept in step with
+   * `BackpressureProtocol.LINK_SATURATION_SUSTAINED_INTERVALS`, which applies the same rule to the
+   * protocol's own view of the same condition.
+   */
+  val SATURATION_SUSTAINED_INTERVALS: Long = 3L
+
+  /**
+   * The '''most''' consecutive intervals a run is ever required to span.
+   *
+   * Sixty, which at a one-second window is one minute -- the same order as the sustained-slowness
+   * window beside it, so no degradation condition is ever slower to be recognised than that one. It
+   * binds only for a capacity so small that the mandatory burst is tens of seconds of traffic at
+   * the paced rate, which `spark.shuffle.streaming.maxBandwidthMBps` cannot express because its
+   * unit is MB/s; it exists so an explicitly supplied capacity cannot make the condition
+   * unreachable.
+   */
+  val SATURATION_MAX_SUSTAINED_INTERVALS: Long = 60L
+
+  /**
+   * The share of the administered capacity that separates compliant pacing from saturation.
+   *
+   * Ten percent, and derived rather than written: it is the gap between the share this policy calls
+   * saturation and the share the egress limiter holds itself to. That gap is the whole of the
+   * headroom a compliant producer has, and it is what the mandatory burst has to be amortised into.
+   */
+  val SATURATION_HEADROOM_RATIO: Double =
+    SATURATION_TRIP_RATIO -
+      TokenBucketRateLimiter.BANDWIDTH_CEILING_PERCENT.toDouble /
+        TokenBucketRateLimiter.PERCENT_SCALE.toDouble
+
+  /**
+   * How many consecutive over-share intervals an administered capacity's saturation must span
+   * before it can be attributed to the link rather than to this subsystem's own mandatory burst.
+   *
+   * <b>Why this is derived and not a constant.</b> A token bucket has to be able to admit one
+   * maximum-sized encoded frame -- a bucket that could not hold one would refuse every frame
+   * forever, which is a deadlock and not a rate limit -- so its burst allowance is at least one
+   * frame however small its paced share is. A bucket that starts full therefore delivers, inside
+   * one measurement interval, its burst plus that interval's refill. Compliant pacing already
+   * occupies [[TokenBucketRateLimiter.BANDWIDTH_CEILING_PERCENT]] of the capacity, so the burst
+   * has only [[SATURATION_HEADROOM_RATIO]] of it to fit into before the reading crosses the trip
+   * share: the run must be long enough for `burst / (capacity * headroom)` intervals, or a
+   * producer doing exactly what it was configured to do reads as a saturated link.
+   *
+   * At a one MB/s capacity that is twenty intervals, because one two-mebibyte frame is two and a
+   * half seconds of traffic at the paced rate. At any capacity large enough for the burst to be one
+   * second of its own paced rate it settles at eight, which is where every realistic configuration
+   * lands. Both are bounded below by [[SATURATION_SUSTAINED_INTERVALS]] and above by
+   * [[SATURATION_MAX_SUSTAINED_INTERVALS]], so the condition is neither instantaneous nor
+   * unreachable, and a link that genuinely stays above the share stands streaming down inside a
+   * minute at worst -- against a sustained-slowness condition that takes a minute by specification.
+   *
+   * A capacity that cannot be reasoned about yields the floor, because such a sample is refused
+   * before it is ever compared and the value is then never used.
+   *
+   * @param capacityBytesPerSecond the administered capacity the observation is measured against
+   * @return intervals the run must span, at least [[SATURATION_SUSTAINED_INTERVALS]]
+   */
+  def sustainedIntervalsFor(capacityBytesPerSecond: Double): Long = {
+    if (!java.lang.Double.isFinite(capacityBytesPerSecond) || capacityBytesPerSecond <= 0.0d) {
+      SATURATION_SUSTAINED_INTERVALS
+    } else {
+      val pacedBytesPerSecond = TokenBucketRateLimiter.applyLinkCapacityCeiling(
+        math.max(1L, capacityBytesPerSecond.toLong))
+      val burstBytes = TokenBucketRateLimiter.burstCapacityBytes(pacedBytesPerSecond).toDouble
+      val amortising = math.ceil(burstBytes / (capacityBytesPerSecond * SATURATION_HEADROOM_RATIO))
+      val bounded =
+        if (amortising >= SATURATION_MAX_SUSTAINED_INTERVALS.toDouble) {
+          SATURATION_MAX_SUSTAINED_INTERVALS
+        } else {
+          amortising.toLong
+        }
+      math.max(SATURATION_SUSTAINED_INTERVALS, bounded)
+    }
+  }
+
+  /**
+   * Whether the notice about an unevaluable saturation condition has already been emitted.
+   *
+   * Process wide rather than per instance, so a JVM that constructs more than one policy states the
+   * fact once rather than once per construction.
+   */
   private[streaming] val saturationNoticeEmitted = new AtomicBoolean(false)
 
   /**

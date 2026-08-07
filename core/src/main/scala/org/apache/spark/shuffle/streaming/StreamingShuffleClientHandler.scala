@@ -1623,6 +1623,32 @@ private[spark] class StreamingShuffleClientHandler(
   /**
    * Writes one control message as the body of a one-way RPC.
    *
+   * This is what `TransportClient.send` constructs, and it is built here rather than delegated to
+   * that method so that the write is observable: `send` returns nothing, and an acknowledgement
+   * that silently failed to leave the socket is indistinguishable, at the producer, from a consumer
+   * that has stopped consuming -- which is the condition its ten-second detector treats as consumer
+   * failure. The transport's encoding, its optional encryption and its frame accounting are used
+   * exactly as they stand.
+   *
+   * <b>Every outbound write carries a completion listener.</b> A write that fails after being
+   * accepted by the channel fails asynchronously, on an I/O thread, with no caller left to observe
+   * it, so without the listener a lost acknowledgement or a lost replay request would strand the
+   * reduce task until some other timer noticed. Recording the cause through the first-error-wins
+   * notifier is what makes the task raise it from `read()`, and it is the same bridge every other
+   * failure this handler sees travels over.
+   *
+   * <b>The write itself is serialised on the channel's own monitor.</b> A `Channel`'s outbound
+   * buffer is a linked list that assumes a single mutator, and Netty upholds that for a socket
+   * channel by handing a write off when the caller is not the event loop -- but an event loop that
+   * reports every thread as its own performs the mutation inline on whichever thread called
+   * instead. Acknowledgements and replay requests are written from the reduce task's own thread
+   * while heartbeats and further acknowledgements are written from a Netty callback, and one
+   * channel carries every handler a consumer multiplexes onto it, so the channel is both the
+   * correct scope and the only object every participant shares. Concurrent mutation corrupts that
+   * list rather than losing a frame, and a cycle in it makes the flush walk non-terminating and
+   * uninterruptible. The critical section is the channel call and nothing else: the frame is built
+   * and the listener attached outside it, and a Netty write enqueues and returns without parking.
+   *
    * @return true if the message was handed to the channel
    */
   private def writeMessage(channel: Channel, message: StreamingShuffleMessage): Boolean = {
@@ -1631,7 +1657,8 @@ private[spark] class StreamingShuffleClientHandler(
     } else {
       try {
         val partitionId = message.partitionId()
-        channel.writeAndFlush(new OneWayMessage(message.toManagedBuffer()))
+        val frame = new OneWayMessage(message.toManagedBuffer())
+        channel.synchronized(channel.writeAndFlush(frame))
           .addListener(new ChannelFutureListener {
             override def operationComplete(future: ChannelFuture): Unit = {
               if (!future.isSuccess) {
@@ -1759,16 +1786,60 @@ private[spark] class StreamingShuffleClientHandler(
    * Whether nothing at all has been received for one partition for longer than the five-second
    * connection timeout, which is the detection the reader turns into a partial-read invalidation
    * and a fetch failure.
+   *
+   * A terminated stream is never silent: its quiet means completion, and recomputing a stage that
+   * had in fact finished would be the worst possible response to it. Both this handler's own
+   * reading and the protocol's are consulted, so a stream the protocol never learned about is still
+   * covered.
+   *
+   * Expressed over [[producerSilence]] rather than repeating its readings, so the verdict and the
+   * evidence an operator is shown for it can never come to disagree.
    */
-  def isProducerSilent(partitionId: Int): Boolean = {
+  def isProducerSilent(partitionId: Int): Boolean = producerSilence(partitionId).isDefined
+
+  /**
+   * The reading that establishes one partition's producer has fallen silent past the five-second
+   * connection timeout, together with the silence it measured, or `None` while the producer is
+   * still believed alive.
+   *
+   * <b>Why the evidence travels with the verdict.</b> Two independent readings can establish
+   * silence and they do not measure the same interval. This handler's own reading measures the gap
+   * since it last accepted something for the partition, and exists only once something has arrived.
+   * The protocol's reading measures the gap since anything at all arrived on the stream and starts
+   * running when the stream opens, so it is the only one that covers the failure that matters most:
+   * a producer that delivered nothing whatsoever. A caller that took the verdict from one reading
+   * and the interval from the other rendered a silence of zero as being past a five-second bound --
+   * a diagnostic that contradicted itself and withheld the one number that distinguishes a dead
+   * producer from a mis-tuned timeout. Returning both together removes the possibility.
+   *
+   * A terminated stream is never silent, for the reason given on [[isProducerSilent]].
+   */
+  def producerSilence(partitionId: Int): Option[ProducerSilence] = {
     val state = partitions.get(Integer.valueOf(partitionId))
     if (state == null || state.terminated.get()) {
-      false
+      None
     } else {
       val lastInbound = state.lastInboundMillis.get()
-      val silentLocally = lastInbound != NO_TIMESTAMP &&
-        clock.getTimeMillis() - lastInbound >= PRODUCER_CONNECTION_TIMEOUT_MS
-      silentLocally || backpressure.isProducerTimedOut(consumerKey(partitionId))
+      val locallySilentFor = if (lastInbound == NO_TIMESTAMP) {
+        None
+      } else {
+        val elapsed = math.max(0L, clock.getTimeMillis() - lastInbound)
+        if (elapsed >= PRODUCER_CONNECTION_TIMEOUT_MS) Some(elapsed) else None
+      }
+      locallySilentFor match {
+        case Some(elapsed) =>
+          Some(ProducerSilence.SinceInbound(elapsed, PRODUCER_CONNECTION_TIMEOUT_MS))
+        case None =>
+          // The protocol's ledger is consulted only once this handler's own reading has declined,
+          // so its interval is reported exactly when its interval is what reached the verdict.
+          backpressure.producerSilenceMillis(consumerKey(partitionId)).map { elapsed =>
+            if (lastInbound == NO_TIMESTAMP) {
+              ProducerSilence.SinceStreamOpened(elapsed, BackpressureProtocol.ACK_TIMEOUT_MS)
+            } else {
+              ProducerSilence.SinceLedgerInbound(elapsed, BackpressureProtocol.ACK_TIMEOUT_MS)
+            }
+          }
+      }
     }
   }
 
@@ -2305,6 +2376,72 @@ private[spark] object StreamingShuffleClientHandler {
 
     /** Five attempts have been spent on this window. */
     case object Exhausted extends ReplayVerdict
+  }
+
+  /**
+   * The silence behind a producer-liveness verdict, and where that silence was measured.
+   *
+   * Three cases and not one, because the three intervals are not interchangeable and an operator
+   * acting on the number has to know which one is being quoted: a gap since the last frame this
+   * consumer accepted, a gap since a stream that has delivered nothing opened, and a gap since the
+   * flow-control ledger last recorded anything for a stream that has delivered something. Each
+   * renders its own sentence, so the reported figure is always the figure that reached the verdict
+   * and always names the reading it came from.
+   */
+  sealed abstract class ProducerSilence {
+
+    /** The silence measured, in milliseconds. Never below [[thresholdMillis]]. */
+    def elapsedMillis: Long
+
+    /** The bound that silence crossed, in milliseconds. */
+    def thresholdMillis: Long
+
+    /**
+     * The silence as an operator reads it, naming the interval, the bound and the reading.
+     *
+     * @param partitionId reduce partition the silence was observed on
+     * @return the clause a diagnostic embeds, without a trailing full stop
+     */
+    def describe(partitionId: Int): String
+  }
+
+  object ProducerSilence {
+
+    /** Silence since the last frame this handler accepted for the partition. */
+    final case class SinceInbound(elapsedMillis: Long, thresholdMillis: Long)
+      extends ProducerSilence {
+
+      override def describe(partitionId: Int): String =
+        s"partition $partitionId received nothing for $elapsedMillis ms, past the " +
+          s"$thresholdMillis ms connection timeout"
+    }
+
+    /**
+     * Silence since the stream opened, for a partition on which nothing has ever arrived. This is
+     * what a producer that crashed or was partitioned away before sending anything looks like, and
+     * it is the case whose interval a per-partition reading cannot supply at all.
+     */
+    final case class SinceStreamOpened(elapsedMillis: Long, thresholdMillis: Long)
+      extends ProducerSilence {
+
+      override def describe(partitionId: Int): String =
+        s"partition $partitionId has received nothing at all since its stream opened " +
+          s"$elapsedMillis ms ago, past the $thresholdMillis ms connection timeout"
+    }
+
+    /**
+     * Silence since the flow-control ledger last recorded anything inbound on the stream -- a
+     * block, a heartbeat or a retransmission request -- for a partition that has delivered
+     * something. Reached when the ledger's interval crosses the bound while this handler's own
+     * per-partition interval has not.
+     */
+    final case class SinceLedgerInbound(elapsedMillis: Long, thresholdMillis: Long)
+      extends ProducerSilence {
+
+      override def describe(partitionId: Int): String =
+        s"the flow-control ledger for partition $partitionId has recorded nothing inbound for " +
+          s"$elapsedMillis ms, past the $thresholdMillis ms connection timeout"
+    }
   }
 
   /**

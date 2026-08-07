@@ -468,16 +468,30 @@ private[spark] object TokenBucketRateLimiter extends Logging {
    * Holds a rate to [[BANDWIDTH_CEILING_PERCENT]] of itself, which is the second of the two steps
    * [[apply]] composes.
    *
-   * Dividing before multiplying is deliberate: an administered capacity is free to be large enough
-   * that multiplying it by eighty first would overflow a Long, whereas dividing first cannot. The
-   * price is a truncation of at most [[BANDWIDTH_CEILING_PERCENT]] minus one bytes per second,
-   * which is immaterial against the mebibyte-scale rates this method is given.
+   * Multiplying before dividing, so the result is the exact eighty percent of the input rather than
+   * eighty percent of it rounded down to a whole hundred bytes per second first. The rounding was
+   * immaterial in size -- sixty bytes per second at a one MB/s cap -- but it made the ceiling
+   * describe itself inaccurately, and a share that is reported as eighty percent should be eighty
+   * percent.
+   *
+   * Overflow is guarded rather than avoided by rounding: the product only exceeds a Long above
+   * roughly 1.15e17 bytes per second, which no administered cap can reach because the configuration
+   * entry is an Int of MB/s and its largest value is 2.25e15 bytes per second, and the branch below
+   * keeps the method total for every non-negative Long regardless. The result is floored at one
+   * byte per second so that a very small cap throttles rather than halts.
    *
    * @param bytesPerSecond the rate to hold down
    * @return the paced rate, never less than one byte per second
    */
   def applyLinkCapacityCeiling(bytesPerSecond: Long): Long = {
-    math.max(1L, (bytesPerSecond / PERCENT_SCALE) * BANDWIDTH_CEILING_PERCENT)
+    val ceiled =
+      if (bytesPerSecond <= Long.MaxValue / BANDWIDTH_CEILING_PERCENT) {
+        (bytesPerSecond * BANDWIDTH_CEILING_PERCENT) / PERCENT_SCALE
+      } else {
+        // Unreachable from any configured cap; kept so the arithmetic cannot wrap for any caller.
+        (bytesPerSecond / PERCENT_SCALE) * BANDWIDTH_CEILING_PERCENT
+      }
+    math.max(1L, ceiled)
   }
 
   /**

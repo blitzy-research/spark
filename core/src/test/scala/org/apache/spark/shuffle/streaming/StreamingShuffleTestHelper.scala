@@ -19,7 +19,7 @@ package org.apache.spark.shuffle.streaming
 
 import java.io.{File, InputStream, RandomAccessFile}
 import java.nio.ByteBuffer
-import java.util.Properties
+import java.util.{Arrays => JArrays, Properties}
 import java.util.concurrent.{Callable, ConcurrentHashMap, CountDownLatch, CyclicBarrier, Semaphore,
   TimeUnit}
 import java.util.concurrent.{Future => JFuture}
@@ -32,14 +32,16 @@ import scala.jdk.CollectionConverters._
 import scala.util.{Failure, Random, Try}
 
 import com.codahale.metrics.{Counter, Gauge}
+import org.apache.hadoop.security.{Credentials, UserGroupInformation}
 import org.apache.logging.log4j.LogManager
 import org.apache.logging.log4j.core.{LogEvent, Logger => Log4jLogger}
 import org.apache.logging.log4j.core.appender.AbstractAppender
 import org.apache.logging.log4j.core.config.Property
-import org.scalatest.Tag
+import org.scalatest.{BeforeAndAfterAll, Suite, Tag}
 
-import org.apache.spark.{HashPartitioner, Partitioner, ShuffleDependency, SparkConf, SparkContext,
-  SparkEnv, TaskContext, TaskContextImpl}
+import org.apache.spark.{HashPartitioner, Partitioner, SecurityManager, ShuffleDependency,
+  SparkConf, SparkContext, SparkEnv, TaskContext, TaskContextImpl}
+import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config.{AUTH_SECRET, NETWORK_AUTH_ENABLED, SHUFFLE_MANAGER,
   SHUFFLE_STREAMING_BUFFER_SIZE_PERCENT, SHUFFLE_STREAMING_DEBUG, SHUFFLE_STREAMING_ENABLED,
   SHUFFLE_STREAMING_MAX_BANDWIDTH_MBPS, SHUFFLE_STREAMING_SPILL_THRESHOLD,
@@ -941,6 +943,40 @@ object StreamingShuffleTestHelper {
 
   val LinkSaturationTripPercent: Long = BackpressureProtocol.LINK_SATURATION_PERCENT
 
+  /**
+   * Consecutive measurement intervals an over-capacity reading must span before saturation counts.
+   *
+   * Taken from the policy rather than restated, so a suite that drives "a sustained saturation"
+   * drives exactly the run the policy requires, and both follow the constant if it ever moves. The
+   * protocol's own constant is asserted equal to it by the numeric-contract case, so one figure
+   * governs both views of the condition.
+   */
+  val SaturationSustainedIntervals: Long =
+    StreamingShuffleFallbackPolicy.SATURATION_SUSTAINED_INTERVALS
+
+  /**
+   * Consecutive over-share intervals a given administered capacity's saturation must span.
+   *
+   * Asked of the production derivation rather than assumed, because the run absorbs the mandatory
+   * burst allowance of that capacity: a small capacity needs a longer run than a large one, and a
+   * suite that drove a fixed number would trip nothing at one capacity and prove nothing at
+   * another.
+   */
+  def saturationIntervalsFor(capacityBytesPerSecond: Double): Long =
+    StreamingShuffleFallbackPolicy.sustainedIntervalsFor(capacityBytesPerSecond)
+
+  /**
+   * The administered capacity, in bytes per second, that the shared saturation driver measures
+   * against, and an egress figure strictly above the trip share of it.
+   *
+   * A hundred, and ninety-nine, because the ratio is the whole of what the condition reads and
+   * round numbers make the arithmetic checkable by eye: ninety-nine over a hundred is ninety-nine
+   * percent, which is above the ninety percent share and below saturating the link outright.
+   */
+  val SaturationCapacityBytesPerSecond: Double = 100.0d
+
+  val SaturatedEgressBytesPerSecond: Double = 99.0d
+
   val BytesPerMebibyte: Long = TokenBucketRateLimiter.BYTES_PER_MIB
 
   val ConsumerSlownessRatio: Double = StreamingShuffleFallbackPolicy.CONSUMER_SLOWNESS_RATIO
@@ -994,9 +1030,99 @@ object StreamingShuffleTestHelper {
   val ThreadSettlementGraceMillis: Long = 10000L
 
   val StuckThreadStackFrames: Int = 12
+  // Progress-watchdog defaults. See StreamingShuffleTestHelper.withProgressWatchdog for why a
+  // watchdog is needed at all and for exactly what it can and cannot do.
+
+  /**
+   * Wall-clock budget a watched body may take before the case fails.
+   *
+   * Chosen generously against the per-test ceiling the base suite imposes: a body that overruns
+   * this has not merely been unlucky on a busy host, it has changed complexity class.
+   */
+  val DefaultProgressBudgetMillis: Long = 300000L
+
+  /** How long a watched body's progress reading may stand still before a diagnosis is recorded. */
+  val DefaultProgressStallMillis: Long = 20000L
+
+  /** How often the watchdog samples the progress reading. */
+  val ProgressPollIntervalMillis: Long = 500L
+
+  /** Frames of the stalled thread's stack recorded in a diagnosis. */
+  val ProgressStackFrames: Int = 24
+
+  /** How long a returning body waits for its watchdog to observe completion and exit. */
+  val ProgressWatchdogJoinMillis: Long = 5000L
 
   /** Starting time of a manual clock, chosen non-zero so a bug that reads zero stands out. */
   val ManualClockEpochMillis: Long = 1000000L
+
+  // ---------------------------------------------------------------------------------------------
+  // JVM-global Hadoop credential isolation. See StreamingShuffleHadoopCredentialIsolation for why
+  // this is needed at all; these two are its mechanism, exposed so that a case can assert on the
+  // very state the bracket protects.
+  // ---------------------------------------------------------------------------------------------
+
+  /**
+   * The secret the Hadoop login user currently holds under Spark's own key, if any.
+   *
+   * Read from the login user rather than from `getCurrentUser`, deliberately: the login user is the
+   * JVM-global one whose credentials survive every context, and it is what `initializeAuth` writes
+   * to and what `getSecretKey` reads back outside a `doAs` block. The returned array is a copy --
+   * `UserGroupInformation.getCredentials` copies -- so a caller holding it cannot mutate the store.
+   */
+  def loginUserAuthSecret(): Option[Array[Byte]] = {
+    Option(UserGroupInformation.getLoginUser().getCredentials()
+      .getSecretKey(SecurityManager.SECRET_LOOKUP_KEY))
+  }
+
+  /** Whether two [[loginUserAuthSecret]] readings describe the same state, absence included. */
+  def sameLoginUserAuthSecret(one: Option[Array[Byte]], other: Option[Array[Byte]]): Boolean = {
+    (one, other) match {
+      case (None, None) => true
+      case (Some(left), Some(right)) => JArrays.equals(left, right)
+      case _ => false
+    }
+  }
+
+  /**
+   * A [[loginUserAuthSecret]] reading rendered for a failure message.
+   *
+   * The secret itself is never rendered. It is a credential, and a test that printed one would put
+   * it in a log file that outlives the run; a length and a short digest identify a reading uniquely
+   * enough to tell two of them apart, which is all a message here needs to do.
+   */
+  def describeLoginUserAuthSecret(secret: Option[Array[Byte]]): String = secret match {
+    case None => "no secret"
+    case Some(bytes) =>
+      f"a ${bytes.length}-byte secret with digest 0x${JArrays.hashCode(bytes) & 0xFFFFFFFFL}%08x"
+  }
+
+  /**
+   * Puts the login user's Spark secret back to a recorded reading, if something has changed it.
+   *
+   * A no-op when nothing changed, which is the common case and keeps the cost of the bracket at one
+   * credential read per suite. When something did change, the login user is discarded so that the
+   * next `getLoginUser()` performs the Hadoop login again and returns a user with empty
+   * credentials, and the recorded secret -- if there was one -- is re-added on top. Removing the
+   * entry in place is not an option: `getCredentials` hands back a copy and the subject holding the
+   * live `Credentials` is not reachable through any public method.
+   *
+   * @param recorded what [[loginUserAuthSecret]] returned before the work that may have changed it
+   */
+  def restoreLoginUserAuthSecret(recorded: Option[Array[Byte]]): Unit = {
+    if (!sameLoginUserAuthSecret(recorded, loginUserAuthSecret())) {
+      UserGroupInformation.setLoginUser(null)
+      recorded.foreach { secret =>
+        val credentials = new Credentials()
+        credentials.addSecretKey(SecurityManager.SECRET_LOOKUP_KEY, secret)
+        UserGroupInformation.getCurrentUser().addCredentials(credentials)
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Pure helpers. None of these touch a SparkContext, so they are usable from anywhere.
+  // ---------------------------------------------------------------------------------------------
 
   /**
    * The aggregate buffer allowance, computed exactly as the specification states it and
@@ -1122,9 +1248,123 @@ object StreamingShuffleTestHelper {
       case StreamingShuffleFallbackReason.MemoryPressure =>
         policy.recordAllocationGrant(MaxBlockSizeBytes.toLong, 0L)
       case StreamingShuffleFallbackReason.NetworkSaturation =>
-        policy.recordLinkUtilization(99.0d, 100.0d)
+        // Ninety-nine percent of the administered link, which is strictly above the trip share,
+        // across the run of measurement intervals the condition is sustained over. One reading is
+        // deliberately not enough: this subsystem's own pacing bucket must admit one maximum-sized
+        // frame, which on a small administered link reads above the share for exactly one interval,
+        // so a rule that tripped on one reading stood healthy shuffles down.
+        driveLinkSaturation(policy, SaturatedEgressBytesPerSecond, SaturationCapacityBytesPerSecond)
       case StreamingShuffleFallbackReason.ProtocolVersionMismatch =>
         policy.checkProtocolVersion((ProtocolVersion + 1).toByte)
+    }
+  }
+
+  /**
+   * Drives a sustained network saturation on a policy, deterministically and without a clock.
+   *
+   * Saturation is evaluated over a run of consecutive measurement intervals rather than over one
+   * reading, so a caller that recorded a single over-capacity sample would leave the policy
+   * untripped -- and would be asserting the behaviour of a rule this feature deliberately does not
+   * have. One place drives it, so no suite has to know how long the run is.
+   *
+   * Every instant is SUPPLIED rather than read from a clock, through the policy's three-argument
+   * recording overload, because intervals are identified by quantising the observation's instant
+   * onto [[SaturationSampleWindowMillis]]. That makes the run exact under test and makes this
+   * usable against the policy a real manager built for itself, whose clock is the system's and
+   * which a test cannot advance. The policy's own clock still supplies the trip instant, which is
+   * why a manual clock is left where it is: a caller asserting `trippedAtTimeMillis` reads the
+   * clock it injected.
+   *
+   * @param policy the policy to saturate
+   * @param usedBytesPerSecond observed egress, which must be strictly above the trip share of the
+   *                           capacity or nothing is being driven at all
+   * @param capacityBytesPerSecond the administered capacity the observation is measured against
+   * @param firstSampleMillis instant the first interval's observation belongs to
+   */
+  def driveLinkSaturation(
+      policy: StreamingShuffleFallbackPolicy,
+      usedBytesPerSecond: Double,
+      capacityBytesPerSecond: Double,
+      firstSampleMillis: Long = ManualClockEpochMillis): Unit = {
+    require(usedBytesPerSecond >
+        capacityBytesPerSecond * LinkSaturationTripPercent.toDouble / PercentScale.toDouble,
+      s"$usedBytesPerSecond bytes/s is not above $LinkSaturationTripPercent percent of " +
+        s"$capacityBytesPerSecond bytes/s, so this would drive no saturation at all")
+    (0L until saturationIntervalsFor(capacityBytesPerSecond)).foreach { interval =>
+      policy.recordLinkUtilization(usedBytesPerSecond, capacityBytesPerSecond,
+        firstSampleMillis + interval * SaturationSampleWindowMillis)
+    }
+  }
+}
+
+/**
+ * Restores the JVM-global Hadoop credentials a streaming suite's own fixtures overwrite.
+ *
+ * ==The problem this exists to solve==
+ *
+ * Streaming shuffle requires authenticated transport, so every fixture that starts a real
+ * `SparkContext` on the streaming path sets `spark.authenticate`. `SparkEnv` then calls
+ * `SecurityManager.initializeAuth()`, and for a `local`, `local[N]`, `local[N,M]` or `yarn` master
+ * that method unconditionally generates a fresh secret -- it does not return early when
+ * `spark.authenticate.secret` is already set -- and stores it in
+ * `UserGroupInformation.getCurrentUser().getCredentials()`. That store is JVM-global and outlives
+ * the context. `SecurityManager.getSecretKey()` consults it *first*, ahead of the local field, the
+ * environment, the configuration and the secret file, so from that moment every later
+ * `SecurityManager` in the same JVM answers with the streaming fixture's secret.
+ *
+ * The consequence is not a streaming failure but a failure somewhere else entirely: pre-existing
+ * suites whose subject is authentication -- one that asserts a missing secret raises, one that
+ * asserts a configured secret is returned verbatim, ones that assert a file-mounted secret is
+ * refused for a UGI-storing master -- all see a secret that is present and is not theirs. Nothing
+ * about the product is at fault: `SecurityManager` is unmodified Spark behaving exactly as
+ * documented. What is at fault is a test fixture mutating process-global state and not putting it
+ * back, so that is what this trait fixes, and it fixes it for every suite in the package at once
+ * rather than one fixture at a time.
+ *
+ * ==Why restoring rather than preventing==
+ *
+ * Preventing the write is not available. The streaming manager only activates with authentication
+ * enabled, `SparkEnv` always calls `initializeAuth()` on the driver, and every master these
+ * fixtures can use for an in-process context is one of the masters that store in the UGI. Spark's
+ * own `SecurityManagerSuite` isolates the same mutation by running inside
+ * `UserGroupInformation.createUserForTesting(...).doAs(...)`, but `doAs` is stack scoped and a
+ * suite spans many independent contexts across many test bodies, so the equivalent here is to
+ * bracket the
+ * suite instead of each statement.
+ *
+ * ==How the restoration is exact==
+ *
+ * The one credential Spark stores under this key is recorded before the suite runs and compared
+ * after it. If the suite changed it, the login user is discarded, which makes the next
+ * `getLoginUser()` perform the Hadoop login again and yield a user whose credentials are empty --
+ * the state the JVM started in -- and the recorded credential is then re-added if there was one.
+ * Discarding the login user is narrower than `UserGroupInformation.reset()`, which Spark core also
+ * uses for this purpose but which additionally clears the Hadoop configuration, the group mapping
+ * and the authentication method that unrelated suites in the same JVM may depend on.
+ *
+ * The bracket is deliberately the outermost one: because this trait is mixed in last, its snapshot
+ * is taken before the suite's own `beforeAll` and its restoration runs after the suite's own
+ * `afterAll`, so a context left running until teardown is still inside the bracket.
+ */
+private[streaming] trait StreamingShuffleHadoopCredentialIsolation extends BeforeAndAfterAll {
+  this: Suite =>
+
+  /** What the login user held under Spark's secret key before this suite ran. */
+  private var recordedAuthSecret: Option[Array[Byte]] = None
+
+  // Public rather than protected, because `LocalSparkContext` and `SharedSparkContext` -- which
+  // several of these suites mix in ahead of this trait -- already widen both hooks to public, and
+  // an override may not narrow what it overrides.
+  override def beforeAll(): Unit = {
+    recordedAuthSecret = StreamingShuffleTestHelper.loginUserAuthSecret()
+    super.beforeAll()
+  }
+
+  override def afterAll(): Unit = {
+    try {
+      super.afterAll()
+    } finally {
+      StreamingShuffleTestHelper.restoreLoginUserAuthSecret(recordedAuthSecret)
     }
   }
 }
@@ -1133,7 +1373,7 @@ object StreamingShuffleTestHelper {
  * Shared fixtures, deterministic barriers and fault-injection hooks for the streaming shuffle
  * suites and benchmark.
  */
-trait StreamingShuffleTestHelper {
+trait StreamingShuffleTestHelper extends Logging {
 
   import StreamingShuffleTestHelper._
 
@@ -1167,8 +1407,39 @@ trait StreamingShuffleTestHelper {
       .set("spark.app.id", TestApplicationId)
   }
 
+  /**
+   * A configuration that selects sort-based shuffle, which is the default and the fallback.
+   *
+   * This is the baseline every zero-data-loss and every latency comparison is measured against.
+   * It carries the same envelope properties as its streaming counterpart -- '''including transport
+   * authentication''' -- because a baseline that ran under a different envelope would be comparing
+   * two things at once.
+   *
+   * <b>Why authentication belongs here even though sort-based shuffle does not require it.</b>
+   * `StreamingShuffleManager.declineReason` refuses to stream when `spark.authenticate` is false,
+   * so the streaming arm has no choice but to enable it. A baseline that left it off would
+   * therefore run in a cheaper transport envelope than the arm it is compared against, and the
+   * difference would be silently attributed to streaming: measured on this feature's own benchmark
+   * master, the cost of authentication was around eight percent on the sort path and around nothing
+   * on the streaming path, which biases every reported latency reduction downward. Setting it on
+   * both sides removes the confound rather than annotating it, and it makes this method's own
+   * contract -- the same envelope as its streaming counterpart -- true rather than aspirational.
+   *
+   * Setting it changes nothing about shuffle behaviour, which is what "unchanged from stock Spark"
+   * refers to: sort-based shuffle serves blocks over an authenticated transport exactly as it
+   * serves them over an unauthenticated one, and every output-equality comparison in this package
+   * is unaffected. A suite that means to exercise a MISSING secret sets `NETWORK_AUTH_ENABLED` to
+   * false explicitly, exactly as the streaming builder documents for its own gate.
+   *
+   * @param loadDefaults whether to pick up ambient `spark.*` system properties
+   * @return a configuration on which shuffle behaviour is unchanged from stock Spark
+   */
   def sortBaselineConf(loadDefaults: Boolean = false): SparkConf = {
-    testEnvelopeConf(loadDefaults).set(SHUFFLE_MANAGER, "sort")
+    testEnvelopeConf(loadDefaults)
+      .set(SHUFFLE_MANAGER, "sort")
+      .set(NETWORK_AUTH_ENABLED, true)
+      .set(AUTH_SECRET, TestAuthenticationSecret)
+      .set("spark.app.id", TestApplicationId)
   }
 
   /** A streaming configuration with every tunable stated explicitly. */
@@ -1441,6 +1712,105 @@ trait StreamingShuffleTestHelper {
       awaitable: Awaitable[T],
       timeoutMillis: Long = DefaultAwaitTimeoutMillis): awaitable.type = {
     ThreadUtils.awaitReady(awaitable, Duration(timeoutMillis, TimeUnit.MILLISECONDS))
+  }
+
+  /**
+   * Runs a body under a wall-clock progress watchdog, and fails the case if it stopped progressing.
+   *
+   * ==Why the project's own safety net is not enough here==
+   *
+   * `SparkFunSuite` wraps every test body in `failAfter(Span(20, Minutes))`, and ScalaTest enforces
+   * that span with a `Signaler` that interrupts the running thread. Interruption is a request, and
+   * a thread executing a tight computational loop with no blocking call never observes it -- so a
+   * case that stops making progress inside such a loop is not bounded by that net at all. It
+   * consumes a core until the process is killed, and because `failAfter` never returns, the suite
+   * reports nothing: no failure, no name, no stack. On a Maven run there is no forked-process
+   * timeout either, so one occurrence spends the entire job budget and produces no result for the
+   * whole module.
+   *
+   * ==What this adds, stated precisely==
+   *
+   * It does not stop such a loop. Nothing inside the JVM can: `Thread.stop` is gone, and a body
+   * moved onto another thread would leave that thread spinning just the same -- and, for these
+   * fixtures, would move `TaskContext`, which is thread confined, out from under the code being
+   * exercised. What it adds is a diagnosis. A daemon watchdog samples a caller-supplied progress
+   * reading, and on a stall it records the stalled thread's own stack trace and the reading that
+   * stopped moving, at warning level, once per stall. So a regression of this shape names itself in
+   * the log while it is happening instead of appearing as a run that mysteriously never finished.
+   *
+   * It also closes the weaker half of the same failure: a body that still terminates but has become
+   * pathologically slow is caught outright, because the elapsed wall time is asserted against
+   * `budgetMillis` once the body returns.
+   *
+   * Wall time is read here deliberately, and it is the one thing in this helper that is allowed to.
+   * The package's discipline is that no *behaviour* depends on elapsed real time -- every window a
+   * component enforces advances through an injected [[ManualClock]] -- and this watchdog asserts on
+   * no behaviour whatever. It measures only whether the case is still moving, which is a property
+   * of the test process rather than of the subsystem, and cannot be expressed on an injected clock
+   * precisely because a stalled body is what stops advancing that clock.
+   *
+   * @param description what the body is doing, used in the diagnosis and in the failure message
+   * @param budgetMillis generous upper bound on the body's own wall-clock duration; exceeding it
+   *                     fails the case
+   * @param stallMillis how long the progress reading may stand still before a diagnosis is recorded
+   * @param progress a cheap, monotonically non-decreasing reading of how far the body has got, for
+   *                 example a record or block counter; a reading that stops moving is the stall
+   * @param body the work to run, on the caller's own thread
+   * @return whatever the body returned
+   */
+  def withProgressWatchdog[T](
+      description: String,
+      budgetMillis: Long = DefaultProgressBudgetMillis,
+      stallMillis: Long = DefaultProgressStallMillis)(
+      progress: => Long)(
+      body: => T): T = {
+    require(budgetMillis > 0L, s"budgetMillis must be positive but was $budgetMillis")
+    require(stallMillis > 0L, s"stallMillis must be positive but was $stallMillis")
+    val watched = Thread.currentThread()
+    val finished = new CountDownLatch(1)
+    val stalls = new AtomicInteger(0)
+    val watchdog = new Thread(
+      () => {
+        var lastReading = Long.MinValue
+        var lastMovedAtMillis = System.currentTimeMillis()
+        while (!finished.await(ProgressPollIntervalMillis, TimeUnit.MILLISECONDS)) {
+          val reading = progress
+          val nowMillis = System.currentTimeMillis()
+          if (reading != lastReading) {
+            lastReading = reading
+            lastMovedAtMillis = nowMillis
+          } else if (nowMillis - lastMovedAtMillis >= stallMillis) {
+            lastMovedAtMillis = nowMillis
+            stalls.incrementAndGet()
+            // Deliberately assembled here and logged in one record: a stalled body cannot report
+            // itself, and the stack of the thread that is not moving is the whole diagnosis.
+            val frames = watched.getStackTrace.take(ProgressStackFrames)
+              .map(frame => s"    at $frame").mkString("\n")
+            logWarning(s"$description has made no progress for at least $stallMillis ms, with " +
+              s"its progress reading standing at $reading on thread '${watched.getName}' in " +
+              s"state ${watched.getState}. A thread in a computational loop ignores the " +
+              s"interruption ScalaTest's failAfter relies on, so this record is the " +
+              s"diagnosis:\n$frames")
+          }
+        }
+      },
+      s"streaming-shuffle-progress-watchdog-${description.replaceAll("[^A-Za-z0-9]+", "-")}")
+    watchdog.setDaemon(true)
+    val startedAtMillis = System.currentTimeMillis()
+    watchdog.start()
+    val result = try {
+      body
+    } finally {
+      finished.countDown()
+      watchdog.join(ProgressWatchdogJoinMillis)
+    }
+    val elapsedMillis = System.currentTimeMillis() - startedAtMillis
+    assert(elapsedMillis <= budgetMillis,
+      s"$description took $elapsedMillis ms against a budget of $budgetMillis ms, having stalled " +
+        s"${stalls.get} time(s); a case of this shape that becomes this slow is the terminating " +
+        "half of a defect whose other half never terminates at all, so the budget is asserted " +
+        "rather than reported")
+    result
   }
 
   /**
