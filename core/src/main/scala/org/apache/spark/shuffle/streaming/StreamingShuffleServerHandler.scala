@@ -34,13 +34,14 @@ import io.netty.channel.{Channel, ChannelFuture, ChannelFutureListener, ChannelI
   ChannelOption, EventLoopGroup}
 import io.netty.channel.socket.SocketChannel
 
-import org.apache.spark.{SecurityManager, SparkConf, SparkEnv, SparkException}
+import org.apache.spark.{SecurityManager, SparkConf, SparkContext, SparkEnv, SparkException}
 import org.apache.spark.internal.{Logging, MessageWithContext}
-import org.apache.spark.internal.LogKeys.{CONFIG, COUNT, DESCRIPTION, DURATION, ERROR, HOST_PORT,
-  MAP_ID, MAX_ATTEMPTS, MAX_SIZE, NUM_BLOCKS, NUM_BYTES, NUM_EVENTS, NUM_FAILURES, NUM_ITERATIONS,
-  NUM_SKIPPED, PARTITION_ID, PORT, PROTOCOL_VERSION, REASON, SESSION_ID, SHUFFLE_ID, STATUS,
-  TASK_ATTEMPT_ID, THRESHOLD, TIMEOUT, VALUE, VERSION_NUM}
-import org.apache.spark.internal.config.{NETWORK_AUTH_ENABLED, SHUFFLE_STREAMING_DEBUG}
+import org.apache.spark.internal.LogKeys.{BIND_ADDRESS, CONFIG, COUNT, DESCRIPTION, DURATION,
+  ERROR, HOST_PORT, MAP_ID, MAX_ATTEMPTS, MAX_SIZE, NUM_BLOCKS, NUM_BYTES, NUM_EVENTS, NUM_FAILURES,
+  NUM_ITERATIONS, NUM_SKIPPED, PARTITION_ID, PORT, PROTOCOL_VERSION, REASON, SESSION_ID, SHUFFLE_ID,
+  STATUS, TASK_ATTEMPT_ID, THRESHOLD, TIMEOUT, VALUE, VERSION_NUM}
+import org.apache.spark.internal.config.{DRIVER_BIND_ADDRESS, NETWORK_AUTH_ENABLED,
+  SHUFFLE_STREAMING_DEBUG}
 import org.apache.spark.network.TransportContext
 import org.apache.spark.network.client.{RpcResponseCallback, TransportClient,
   TransportClientBootstrap}
@@ -4998,18 +4999,30 @@ private[spark] object StreamingShuffleListener extends Logging {
 
   /**
    * A streaming listener's bound transport, with direct ownership of both Netty event-loop groups.
+   *
+   * @param bindAddress the one address this listener listens on, which [[resolveBindAddress]]
+   *     resolves the way the platform resolves the bind address of its own transport servers. It
+   *     is mandatory rather than optional on purpose: the platform's shared server treats a null
+   *     host as "every interface", and a streaming data plane on every interface would be reachable
+   *     past whatever restriction the deployment placed on the interfaces this process may serve.
+   *     Requiring it here makes that wildcard inexpressible instead of merely unused.
    */
   private[streaming] final class BoundServer(
       transportContext: TransportContext,
       transportConf: TransportConf,
       listener: RpcHandler,
-      bootstraps: java.util.List[TransportServerBootstrap])
+      bootstraps: java.util.List[TransportServerBootstrap],
+      bindAddress: String)
     extends AutoCloseable with Logging {
 
     require(transportContext != null, "The streaming transport context must not be null.")
     require(transportConf != null, "The streaming transport configuration must not be null.")
     require(listener != null, "The streaming listener must not be null.")
     require(bootstraps != null, "The streaming server bootstraps must not be null.")
+    require(bindAddress != null && bindAddress.nonEmpty,
+      "The streaming listener's bind address must be a named address, because an absent address " +
+        "would listen on every interface of this host rather than on the one the deployment " +
+        "already permits this process to serve.")
 
     private val closed = new AtomicBoolean(false)
     private val ioMode = IOMode.valueOf(transportConf.ioMode())
@@ -5030,6 +5043,7 @@ private[spark] object StreamingShuffleListener extends Logging {
     private val bootstrap = new ServerBootstrap()
     @volatile private var channelFuture: ChannelFuture = null
     @volatile private var boundPort: Int = -1
+    @volatile private var boundHost: String = null
 
     bind()
 
@@ -5039,6 +5053,18 @@ private[spark] object StreamingShuffleListener extends Logging {
         throw new IllegalStateException("The streaming transport server is not initialized.")
       }
       boundPort
+    }
+
+    /**
+     * The address this listener actually listens on, as the operating system reports it rather than
+     * as it was requested, so an operator -- and this feature's own tests -- can establish that the
+     * socket is confined to one interface instead of inferring it from the requested value.
+     */
+    def getHostAddress: String = {
+      if (boundHost == null) {
+        throw new IllegalStateException("The streaming transport server is not initialized.")
+      }
+      boundHost
     }
 
     /** Whether both event-loop groups have completed termination. */
@@ -5071,10 +5097,21 @@ private[spark] object StreamingShuffleListener extends Logging {
     private def bind(): Unit = {
       try {
         configureBootstrap()
-        channelFuture = bootstrap.bind(new InetSocketAddress(EPHEMERAL_PORT))
+        // The named-host form, which is the form the platform's own transport server uses whenever
+        // it was given an address to bind: only its null-host branch falls back to every interface,
+        // and this listener never takes that branch. The port alone is left to the operating system
+        // because the coordinator publishes whichever one it chose, but the interface is not: a
+        // socket on every interface would put this executor's whole pre-authentication frame path
+        // -- the platform's shared frame decoder included -- within reach of every network this
+        // host is attached to, rather than only of the network the deployment already permits it
+        // to serve its block transfer traffic on.
+        channelFuture = bootstrap.bind(new InetSocketAddress(bindAddress, EPHEMERAL_PORT))
         channelFuture.syncUninterruptibly()
-        boundPort = channelFuture.channel().localAddress()
-          .asInstanceOf[InetSocketAddress].getPort
+        val localAddress = channelFuture.channel().localAddress().asInstanceOf[InetSocketAddress]
+        boundPort = localAddress.getPort
+        boundHost = Option(localAddress.getAddress)
+          .map(_.getHostAddress)
+          .getOrElse(localAddress.getHostString)
       } catch {
         case NonFatal(e) =>
           close()
@@ -5127,6 +5164,48 @@ private[spark] object StreamingShuffleListener extends Logging {
   private val TRANSPORT_SHUTDOWN_TIMEOUT_MS: Long = 10000L
 
   /**
+   * The one address this process's streaming listener listens on.
+   *
+   * Streaming coexists with sort-based shuffle rather than replacing it, and that coexistence
+   * extends to the socket posture: a streaming listener must be reachable on exactly the interface
+   * the platform's own shuffle data plane is already reachable on, and on no other. The platform
+   * expresses that interface in two different places depending on which role this process plays,
+   * so this method reads whichever one applies rather than inventing a third.
+   *
+   * On an executor it is the host that executor already advertises for its block manager. That host
+   * is the executor's `--hostname`, which is also the value `--bind-address` defaults to, so the
+   * streaming listener lands on the very interface the block transfer service binds and publishes.
+   * Binding what is advertised is also the only self-consistent choice for this subsystem: a
+   * consumer resolves a producer through the coordinator, and the coordinator publishes this same
+   * host, so any other interface would either be unreachable to consumers or reachable to peers the
+   * deployment never intended.
+   *
+   * On the driver -- which in local mode is also the process that streams -- it is
+   * `spark.driver.bindAddress`. That is the property an operator sets to confine the driver's
+   * listen sockets, it is what the platform's driver-side RPC and block transfer servers bind, and
+   * its own fallback chain ends at this host's resolved address, so a deployment that configures
+   * nothing still gets a named interface rather than all of them. A process with no live
+   * `SparkEnv` -- a test constructing a listener directly -- resolves the same property.
+   *
+   * The result is never the wildcard address. An ephemeral port on every interface would widen this
+   * executor's pre-authentication frame surface past the restriction `spark.driver.bindAddress`,
+   * `--bind-address` and `SPARK_LOCAL_IP` exist to express, which is why [[BoundServer]] requires a
+   * named address rather than accepting an absent one.
+   *
+   * @param conf the configuration of the process whose listener is being bound
+   * @return the address to bind, never null and never empty
+   */
+  private[streaming] def resolveBindAddress(conf: SparkConf): String = {
+    val advertisedExecutorHost = Option(SparkEnv.get)
+      .filter(_.executorId != SparkContext.DRIVER_IDENTIFIER)
+      .flatMap(env => Option(env.blockManager))
+      .flatMap(blockManager => Option(blockManager.shuffleServerId))
+      .map(_.host)
+      .filter(_.nonEmpty)
+    advertisedExecutorHost.getOrElse(conf.get(DRIVER_BIND_ADDRESS))
+  }
+
+  /**
    * Binds the executor's one streaming shuffle listener.
    *
    * @param conf the executor's configuration
@@ -5140,9 +5219,11 @@ private[spark] object StreamingShuffleListener extends Logging {
       StreamingShuffleServerHandler.streamingTransportConf(conf, security = Some(security))
     val transportContext = new TransportContext(transportConf, listener)
     val server = new BoundServer(transportContext, transportConf, listener,
-      StreamingShuffleServerHandler.streamingServerBootstraps(transportConf, Some(security)))
+      StreamingShuffleServerHandler.streamingServerBootstraps(transportConf, Some(security)),
+      resolveBindAddress(conf))
     logInfo(log"Streaming shuffle listener bound one port for this executor: " +
-      log"${MDC(PORT, server.getPort)}")
+      log"${MDC(PORT, server.getPort)} on the single interface " +
+      log"${MDC(BIND_ADDRESS, server.getHostAddress)}")
     (listener, transportContext, server)
   }
 

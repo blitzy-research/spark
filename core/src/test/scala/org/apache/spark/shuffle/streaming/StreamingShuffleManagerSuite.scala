@@ -18,6 +18,7 @@
 package org.apache.spark.shuffle.streaming
 
 import java.lang.reflect.Modifier
+import java.net.{InetAddress, InetSocketAddress, Socket}
 import java.nio.ByteBuffer
 import java.util.Locale
 
@@ -36,9 +37,9 @@ import org.scalatest.time.SpanSugar._
 import org.apache.spark.{Aggregator, HashPartitioner, LocalSparkContext, MapOutputTrackerMaster,
   Partitioner, SecurityManager, ShuffleDependency, SparkConf, SparkContext, SparkEnv,
   SparkException, SparkFunSuite, SparkIllegalArgumentException, TaskContext}
-import org.apache.spark.internal.config.{AUTH_SECRET, NETWORK_AUTH_ENABLED, SHUFFLE_MANAGER,
-  SHUFFLE_SERVICE_ENABLED, SHUFFLE_STREAMING_BUFFER_SIZE_PERCENT, SHUFFLE_STREAMING_DEBUG,
-  SHUFFLE_STREAMING_ENABLED, SHUFFLE_STREAMING_MAX_BANDWIDTH_MBPS,
+import org.apache.spark.internal.config.{AUTH_SECRET, DRIVER_BIND_ADDRESS, NETWORK_AUTH_ENABLED,
+  SHUFFLE_MANAGER, SHUFFLE_SERVICE_ENABLED, SHUFFLE_STREAMING_BUFFER_SIZE_PERCENT,
+  SHUFFLE_STREAMING_DEBUG, SHUFFLE_STREAMING_ENABLED, SHUFFLE_STREAMING_MAX_BANDWIDTH_MBPS,
   SHUFFLE_STREAMING_SPILL_THRESHOLD}
 import org.apache.spark.metrics.source.StaticSources
 import org.apache.spark.network.TransportContext
@@ -79,6 +80,9 @@ class StreamingShuffleManagerSuite extends SparkFunSuite
   private val DirectConsumerToken: Long = 4711001L
 
   private val unknownShuffleId: Int = 6599
+
+  /** How long a bind-posture probe waits for a loopback connection before it fails the case. */
+  private val ConnectTimeoutMs: Int = 10000
 
   /**
    * The streaming metric handles are a JVM-wide singleton, so a clean baseline is taken before
@@ -2249,12 +2253,16 @@ class StreamingShuffleManagerSuite extends SparkFunSuite
 
     val listener = new StreamingShuffleListener(authConf)
     val transportContext = new TransportContext(transportConf, listener)
+    // The address the listener resolves for itself is also the address this case connects to, so
+    // the handshake is exercised across the one interface the listener actually serves rather than
+    // across whichever interface a second, independently resolved name happened to designate.
+    val listenerAddress = StreamingShuffleListener.resolveBindAddress(authConf)
     var server: StreamingShuffleListener.BoundServer = null
     var authorizedFactory: TransportClientFactory = null
     var unauthenticatedFactory: TransportClientFactory = null
     try {
       server = new StreamingShuffleListener.BoundServer(
-        transportContext, transportConf, listener, serverBootstraps)
+        transportContext, transportConf, listener, serverBootstraps, listenerAddress)
       assert(server.getPort > 0, "the producer server must have bound a port")
 
       // Defense in depth at the listener itself.
@@ -2276,7 +2284,7 @@ class StreamingShuffleManagerSuite extends SparkFunSuite
       directChannel.finishAndReleaseAll()
 
       authorizedFactory = transportContext.createClientFactory(clientBootstraps)
-      val client = authorizedFactory.createClient(Utils.localHostName(), server.getPort)
+      val client = authorizedFactory.createClient(listenerAddress, server.getPort)
       try {
         assert(client.isActive, "an authenticated consumer must hold a live channel")
         assert(client.getClientId === appId,
@@ -2298,7 +2306,7 @@ class StreamingShuffleManagerSuite extends SparkFunSuite
       unauthenticatedFactory = transportContext.createClientFactory(
         java.util.Collections.emptyList[TransportClientBootstrap]())
       val unauthenticated = unauthenticatedFactory.createClient(
-        Utils.localHostName(), server.getPort)
+        listenerAddress, server.getPort)
       try {
         assert(unauthenticated.getClientId == null,
           "the negative client must not have an identity before it sends its frame")
@@ -2321,6 +2329,74 @@ class StreamingShuffleManagerSuite extends SparkFunSuite
       if (unauthenticatedFactory != null) {
         unauthenticatedFactory.close()
       }
+      if (server != null) {
+        server.close()
+        assert(server.isTerminated,
+          "closing the streaming listener must await both owned event-loop termination futures")
+      }
+      transportContext.close()
+      listener.releaseAll()
+    }
+  }
+
+  test("the listener binds the one interface the deployment permits, never every interface") {
+    val loopback = "127.0.0.1"
+
+    // What the listener resolves for itself, before any socket exists.
+    val restrictedConf = streamingConf().set(DRIVER_BIND_ADDRESS, loopback)
+    assert(StreamingShuffleListener.resolveBindAddress(restrictedConf) === loopback,
+      "a process with no executor block manager must bind the address the operator restricted " +
+        "this process's listen sockets to, which is " + DRIVER_BIND_ADDRESS.key)
+    val resolvedDefault = StreamingShuffleListener.resolveBindAddress(streamingConf())
+    assert(resolvedDefault != null && resolvedDefault.nonEmpty,
+      "the resolved bind address must always name an interface, even when nothing is configured")
+    assert(!InetAddress.getByName(resolvedDefault).isAnyLocalAddress,
+      "an unconfigured deployment must still resolve to a named interface rather than to every " +
+        s"interface, but resolved $resolvedDefault")
+
+    val security = new SecurityManager(restrictedConf)
+    val transportConf = StreamingShuffleServerHandler.streamingTransportConf(
+      restrictedConf, security = Some(security))
+    val serverBootstraps = StreamingShuffleServerHandler.streamingServerBootstraps(
+      transportConf, Some(security))
+    val listener = new StreamingShuffleListener(restrictedConf)
+    val transportContext = new TransportContext(transportConf, listener)
+    var server: StreamingShuffleListener.BoundServer = null
+    try {
+      // An absent address is refused outright rather than widened to every interface, so the
+      // wildcard posture is inexpressible instead of merely unused.
+      Seq[String](null, "").foreach { absent =>
+        val refusal = intercept[IllegalArgumentException] {
+          new StreamingShuffleListener.BoundServer(
+            transportContext, transportConf, listener, serverBootstraps, absent)
+        }
+        assert(refusal.getMessage.contains("must be a named address"),
+          "an absent bind address must be refused as such, but was refused with " +
+            refusal.getMessage)
+      }
+
+      server = new StreamingShuffleListener.BoundServer(
+        transportContext, transportConf, listener, serverBootstraps, loopback)
+      assert(server.getPort > 0, "the listener must have bound an ephemeral port")
+      assert(server.getHostAddress === loopback,
+        s"the listener must listen on $loopback alone, but the operating system reports " +
+          server.getHostAddress)
+      assert(!InetAddress.getByName(server.getHostAddress).isAnyLocalAddress,
+        "the listener must never listen on every interface of this host, because that would put " +
+          "its whole pre-authentication frame path within reach of every network this host is " +
+          s"attached to, but it listens on ${server.getHostAddress}")
+
+      // The permitted interface still serves, so confining the socket has not closed the data
+      // plane it exists to carry.
+      val permitted = new Socket()
+      try {
+        permitted.connect(new InetSocketAddress(loopback, server.getPort), ConnectTimeoutMs)
+        assert(permitted.isConnected,
+          s"the listener must still accept a connection on $loopback, the interface it bound")
+      } finally {
+        permitted.close()
+      }
+    } finally {
       if (server != null) {
         server.close()
         assert(server.isTerminated,

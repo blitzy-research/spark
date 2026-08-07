@@ -575,6 +575,19 @@ Three further points:
   Spark services. Peer executors have to reach that address, so firewalls, security groups and
   Kubernetes network policies must allow executor-to-executor application traffic. See
   [Configuring Ports for Network Security](security.html#configuring-ports-for-network-security).
+* **The port is ephemeral, but the interface is not: the listener never binds `0.0.0.0`.** The
+  address is chosen the same way Spark chooses it for its own transport servers, so the streaming
+  data plane is reachable on exactly the interface Spark's block transfer service is already
+  reachable on and on no other. On an executor that is the host the executor advertises for its
+  block manager, which is its `--bind-address`, defaulting to its `--hostname`; on the driver -- and
+  therefore in `local` mode, where the driver is also the process that streams -- it is
+  `spark.driver.bindAddress`, whose own default follows `spark.driver.host`. `SPARK_LOCAL_IP` and
+  `SPARK_LOCAL_HOSTNAME` feed those defaults exactly as they do elsewhere in Spark. A deployment
+  that confines Spark to one interface therefore confines the streaming listener to it too, without
+  any streaming-specific property: there is deliberately no way to ask for the wildcard address,
+  because a listener on every interface would put the pre-authentication frame path -- Spark's
+  shared frame decoder included -- within reach of every network the host is attached to. The
+  interface actually bound is logged once per executor at `INFO` alongside the chosen port.
 * **Nothing here is enabled on your behalf.** The streaming transport installs Spark's existing
   authentication bootstraps and receives Spark's existing RPC SSL options; it adds no credential,
   no key material and no property of its own, and it turns neither authentication nor SSL on.
