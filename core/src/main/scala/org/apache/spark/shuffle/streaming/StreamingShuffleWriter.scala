@@ -1616,10 +1616,18 @@ private[spark] class StreamingShuffleWriter[K, V, C](
       cause: Option[StreamingShuffleStandDownCause]): Option[StreamingShuffleFallbackState] = {
     cause.map { tripped =>
       // A verdict already latched is the same answer the coordinator would give, so it is reported
-      // rather than re-asked: the claim keeps the wire cost at one ask per shuffle per executor
-      // however many participants observe the condition, and the cached state is what every later
-      // caller reads.
-      if (fallbackPolicy.claimFallbackAnnouncement(shuffleId)) {
+      // rather than re-asked, and the cached state is what every later caller reads.
+      fallbackPolicy.knownShuffleFallback(shuffleId).getOrElse {
+        // No verdict is cached, so this participant asks for one -- whether or not another
+        // participant on this executor is asking at this instant. An absence must never be read as
+        // "the shuffle is still streaming": what rests on this answer is whether this attempt may
+        // finish through the sort-based writer, and two producers that trip together would
+        // otherwise have the loser of the announcement claim fail its attempt over an ask that had
+        // not come back yet. The coordinator deduplicates the declaration and returns the same
+        // latched verdict, so the cost of asking again is one round trip on a path that is already
+        // standing the shuffle down; the claim below still keeps a *fire-and-forget* stand-down on
+        // this executor from repeating an ask that has been answered.
+        fallbackPolicy.claimFallbackAnnouncement(shuffleId)
         val state = coordinatorGateway.declareFallback(shuffleId, tripped,
           s"observed by the streaming producer of map $mapId attempt ${context.taskAttemptId()}")
         // Cached on the way back, so every other streaming component of this shuffle on this
@@ -1631,9 +1639,6 @@ private[spark] class StreamingShuffleWriter[K, V, C](
             log"${MDC(REASON, state.reasonName)}")
         }
         state
-      } else {
-        fallbackPolicy.knownShuffleFallback(shuffleId)
-          .getOrElse(StreamingShuffleFallbackState())
       }
     }
   }

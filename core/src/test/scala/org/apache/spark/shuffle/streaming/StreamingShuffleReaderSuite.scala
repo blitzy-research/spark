@@ -691,10 +691,21 @@ class StreamingShuffleReaderSuite
 
     def encodePartition(
         records: Seq[(Int, Int)],
+        mapId: Long = ProducerMapId): Array[Byte] =
+      encodePartitionFor(partitionId, records, mapId)
+
+    /**
+     * Encodes one partition's records under that partition's own block identity, which is what a
+     * case covering a range of partitions needs: the stream wrapper is keyed by block id, so a
+     * payload encoded for one partition cannot be read back as another's.
+     */
+    def encodePartitionFor(
+        encodedPartitionId: Int,
+        records: Seq[(Int, Int)],
         mapId: Long = ProducerMapId): Array[Byte] = {
       val bytes = new ByteArrayOutputStream()
       val wrapped = sc.env.serializerManager.wrapStream(
-        ShuffleBlockId(shuffleId, mapId, partitionId), bytes)
+        ShuffleBlockId(shuffleId, mapId, encodedPartitionId), bytes)
       val serialized = dependency.serializer.newInstance().serializeStream(wrapped)
       records.foreach { record =>
         serialized.writeKey(record._1)
@@ -2752,6 +2763,113 @@ class StreamingShuffleReaderSuite
     assert(stream.handler.isAutoReadEnabled,
       "Reading must resume once the reduce task's acknowledgements have drained the queue below " +
         "the low-water mark")
+  }
+
+  test("a wide coalesced reduce range is admitted rather than overrunning the hand-off queue") {
+    startContext()
+    // Adaptive execution routinely coalesces a wide shuffle into a reduce task that reads a range
+    // of partitions, and one client handler carries every stream of that range. Each stream
+    // contributes its own small block and its own terminator, so a burst on a wide range delivers
+    // far more events than a one-stream allowance would admit -- and the socket cannot help,
+    // because every frame in it is decoded before autoRead can take effect.
+    val partitions = StreamingShuffleClientHandler.INBOUND_QUEUE_CAPACITY + 8
+    val fixture = new ReaderFixture(
+      numPartitions = ReducePartition + partitions,
+      startPartition = ReducePartition,
+      endPartition = ReducePartition + partitions)
+    val records = fixture.reader.read()
+    val stream = fixture.connector.onlyStream
+    val partitionIds = ReducePartition until (ReducePartition + partitions)
+    val expected = partitionIds.map(partitionId => (partitionId, partitionId * 7)).toSet
+
+    // The whole burst arrives before the task consumes anything, which is the shape that overran
+    // the queue: nothing has been polled, so nothing has drained.
+    partitionIds.foreach { partitionId =>
+      val payload = fixture.encodePartitionFor(partitionId, Seq((partitionId, partitionId * 7)))
+      stream.deliver(dataBlock(fixture.shuffleId, ProducerMapId, partitionId, 0L, payload))
+      stream.deliver(streamTermination(fixture.shuffleId, ProducerMapId, partitionId, 1L))
+    }
+
+    assert(stream.handler.queuePressureRefusalCount == 0L,
+      s"a burst of one block per stream across $partitions stream(s) is inside the receive " +
+        s"window this handler is entitled to, but ${stream.handler.queuePressureRefusalCount} " +
+        s"block(s) were withheld while it held ${stream.handler.queuedEventCount} event(s)")
+    assert(stream.handler.reportedEscalationCount == 0L,
+      s"a healthy fan-out must escalate nothing, but " +
+        s"${stream.handler.reportedEscalationCount} failure(s) were escalated to the task thread")
+    assert(readRecords(records) == expected,
+      "every stream of the coalesced range must deliver its records")
+  }
+
+  test("a stream past its data-event ceiling is withheld and replayed, never treated as lost") {
+    val conf = streamingConf()
+    val clock = newManualClock()
+    val connector = new BarrieredStreamingShuffleProducerConnector(conf)
+    val handler = newConnectorHandler(conf, clock)
+    try {
+      val client = connector.connect(connectorLocation(handler.mapId), handler).getOrElse(
+        fail("the producer must open a channel"))
+      val ceiling = StreamingShuffleClientHandler.INBOUND_QUEUE_CAPACITY
+      val surplus = 4
+      val payload = payloadOfLength(handler.mapId, 64)
+      val blocks = (0 until (ceiling + surplus)).map { index =>
+        dataBlock(handler.shuffleId, handler.mapId, ReducePartition, index.toLong, payload)
+      }
+      blocks.foreach(block => handler.receive(client, block.toByteBuffer()))
+      assert(handler.awaitDataPlaneIdle(10000L),
+        "the consumer data plane must settle before the receive window is read")
+
+      assert(handler.queuedEventCount == ceiling,
+        s"a single-stream handler may hold $ceiling data event(s), but it held " +
+          s"${handler.queuedEventCount}")
+    assert(handler.queuePressureRefusalCount > 0L,
+        s"the block(s) past the ceiling must be withheld by the queue [withheld " +
+          s"${handler.queuePressureRefusalCount}, quota refusals " +
+          s"${handler.quotaRefusalCount(ReducePartition)}, accepted " +
+          s"${handler.acceptedBlockCount(ReducePartition)}, duplicates " +
+          s"${handler.duplicateBlockCount(ReducePartition)}, queued " +
+          s"${handler.queuedEventCount}]")
+      assert(handler.reportedEscalationCount == 0L,
+        s"saturation is the consumer being behind rather than the producer being gone, so " +
+          s"nothing may be escalated, but ${handler.reportedEscalationCount} failure(s) were")
+      assert(!handler.isAutoReadEnabled,
+        "a handler at its ceiling must have stopped reading from its socket")
+      assert(handler.currentThrottleCause.contains(
+          StreamingShuffleClientHandler.THROTTLE_CAUSE_QUEUE),
+        s"the throttle must name the queue as its cause, but it named " +
+          s"${handler.currentThrottleCause}")
+      assert(handler.quarantinedPositionCount(ReducePartition) > 0,
+        "a withheld position must be quarantined, or nothing would ever ask for it again")
+      assert(handler.replayRequestCount(ReducePartition) > 0L,
+        "a withheld position must be claimed as a repair, because the block withheld may have " +
+          "been the last of its stream and no later block would reveal the gap")
+
+      // The task drains what it holds, which is what makes room and reopens the socket.
+      (0 until ceiling).foreach { index =>
+        assert(handler.poll().isDefined, s"event $index must be available to the task thread")
+      }
+      assert(handler.isAutoReadEnabled,
+        "reading must resume once the task has drained the queue below the low-water mark")
+      val requestedBefore = handler.replayRequestCount(ReducePartition)
+      clock.advance(2L * BackpressureProtocol.retryBackoffMillis(1))
+      assert(handler.retryDueReplays() > 0,
+        "the repair must be asked for again once its backoff has elapsed")
+      assert(handler.replayRequestCount(ReducePartition) > requestedBefore,
+        "every replay attempt must be counted so an operator can see the repair")
+
+      // The producer replays from its retained window, exactly as it does for a corrupt block.
+      blocks.drop(ceiling).foreach(block => handler.receive(client, block.toByteBuffer()))
+      assert(handler.awaitDataPlaneIdle(10000L), "the replayed blocks must settle")
+      assert(handler.acceptedBlockCount(ReducePartition) == (ceiling + surplus).toLong,
+        s"every block must end up accepted, but only " +
+          s"${handler.acceptedBlockCount(ReducePartition)} of ${ceiling + surplus} were")
+      assert(handler.reportedEscalationCount == 0L,
+        s"the repair must complete without a failure, but " +
+          s"${handler.reportedEscalationCount} were escalated")
+    } finally {
+      handler.close()
+      connector.close()
+    }
   }
 
   test("a callback from a channel this consumer is not bound to is refused before any decode") {

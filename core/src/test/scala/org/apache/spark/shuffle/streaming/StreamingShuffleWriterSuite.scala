@@ -3508,6 +3508,60 @@ class StreamingShuffleWriterSuite
     }
   }
 
+  test("a runtime stand down joins a verdict a concurrent participant is still announcing") {
+    // Two producers on one executor trip together. One of them takes the executor's announcement
+    // claim and its ask is still in flight; the other must not read that absence as "the shuffle is
+    // still streaming" and fail its attempt, because with a single allowed task failure that aborts
+    // the job. It has to obtain the verdict itself -- the coordinator deduplicates the declaration
+    // -- and finish this map output through sort in the same attempt.
+    val delegate = new RecordingSortShuffleWriter(DegradationPartitions)
+    val harness = newHarness(
+      numPartitions = DegradationPartitions,
+      executorMemoryBytes = DegradationExecutorMemoryBytes,
+      sortWriterFactory = Some(() => delegate))
+    withHarness(harness) { fixture =>
+      val records = deterministicRecords(DegradationRecords, seed = 91L, keySpace = 64)
+      var tripped = false
+      val tripping = records.iterator.map { record =>
+        if (!tripped) {
+          tripped = true
+          driveLinkSaturation(fixture.fallbackPolicy, 990.0d, 1000.0d)
+          assert(fixture.fallbackPolicy.hasTripped,
+            "the link saturation condition must trip the policy the writer consults")
+          assert(fixture.fallbackPolicy.claimFallbackAnnouncement(fixture.shuffleId),
+            "the peer must hold the announcement claim, or this case is not about a concurrent " +
+              "trip at all")
+          assert(fixture.fallbackPolicy.knownShuffleFallback(fixture.shuffleId).isEmpty,
+            "no verdict may be cached yet: the peer's ask is what has not come back")
+        }
+        record
+      }
+
+      fixture.writer.write(tripping)
+
+      assert(delegate.writeCallCount === 1,
+        s"the attempt must have been finished by exactly one sort-based write rather than " +
+          s"failed, but the delegate was written to ${delegate.writeCallCount} time(s)")
+      assert(delegate.recordsWritten.size === records.size,
+        s"the sort-based writer must receive every record of this map task's input, but received " +
+          s"${delegate.recordsWritten.size} of ${records.size}")
+      assert(fixture.gateway.declaredFallbacks.contains(
+          StreamingShuffleFallbackReason.NetworkSaturation),
+        s"the writer must have asked for the verdict itself rather than waiting on the claim " +
+          s"holder, but the gateway saw ${fixture.gateway.declaredFallbacks.mkString(", ")}")
+      assert(fixture.fallbackPolicy.shuffleHasFallenBack(fixture.shuffleId),
+        "the verdict it obtained must be cached, so every other component on this executor reads " +
+          "it without an ask of its own")
+      val status = fixture.writer.stop(success = true)
+      assert(status.isDefined,
+        "a degraded attempt must still report a map status, so the shared write path's " +
+          "unconditional dereference succeeds")
+      assert(status.get.location === BlockManagerId("sort-delegate", "delegate-host", 7077),
+        s"the status must be the delegate's own, because the delegate wrote the output; got " +
+          s"${status.get.location}")
+    }
+  }
+
   test("a runtime stand down after a live consumer acknowledged a block invalidates instead") {
     // The case the in-place rewrite above CANNOT serve, and the reason it is proved impossible
     // before the sort-based writer is ever built.

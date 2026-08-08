@@ -581,6 +581,56 @@ class MemorySpillManagerSuite
       "A partition with nothing left in memory must drop out of the order")
   }
 
+  test("a wide durability flush consolidates its partitions into few spill files") {
+    // The shape a wide shuffle takes under an unmodified scheduler: every partition holds a little,
+    // and all of it has to become durable before any reduce task exists to consume it. One file per
+    // partition would spend the executor's retained-file quota on a shuffle with plenty of both
+    // memory and disk left, and standing streaming down for that is the failure this consolidation
+    // exists to prevent.
+    val context = newTrackedTaskContext()
+    val partitions = 2 * MemorySpillManager.MAX_SPILL_SEGMENTS_PER_FILE
+    val manager = new MemorySpillManager(memoryManagerOf(context), streamingConfWithOverrides(),
+      newManualClock(), Some(newQuota(roomyMemoryBytes)), autoPoll = false)
+    manager.registerPartitionCount(partitions)
+    manager.registerCleanup(context)
+    openManagers += manager
+    (0 until partitions).foreach(partitionId => bufferBlocks(manager, partitionId, 1))
+    assert(manager.bufferedBytes === partitions.toLong * blockCharge,
+      s"every partition must be holding its block in memory before the flush, but " +
+        s"${manager.bufferedBytes} of ${partitions.toLong * blockCharge} byte(s) were held")
+
+    val moved = manager.spillAllRetained()
+
+    assert(moved === partitions.toLong * blockCharge,
+      s"the flush must move every buffered byte to disk, but moved $moved of " +
+        s"${partitions.toLong * blockCharge}")
+    assert(manager.bufferedBytes === 0L,
+      s"nothing may be left in memory after a durability flush, but ${manager.bufferedBytes} " +
+        s"byte(s) were")
+    val files = spillFilesOf(manager)
+    val ceiling = (partitions / MemorySpillManager.MAX_SPILL_SEGMENTS_PER_FILE) + 1
+    assert(files.size <= ceiling,
+      s"$partitions partition(s) of one block each must consolidate into at most $ceiling " +
+        s"file(s) at ${MemorySpillManager.MAX_SPILL_SEGMENTS_PER_FILE} segment(s) per file, but " +
+        s"${files.size} were written")
+    val shared = manager.allSpilledBlocks.groupBy(_.file)
+      .exists(entry => entry._2.map(_.partitionId).distinct.size > 1)
+    assert(shared,
+      "at least one file must carry the segments of more than one partition, or nothing was " +
+        "consolidated and the file count above passed for some other reason")
+
+    // Addressed by partition and sequence, which is the whole contract a shared file has to keep.
+    val expected = payloadOfLength(0L, payloadBytes).toSeq
+    (0 until partitions).foreach { partitionId =>
+      assert(manager.spilledBlocks(partitionId).map(_.sequenceNumber) === Seq(0L),
+        s"partition $partitionId must retain exactly its one block as a durable record, but " +
+          s"retained ${manager.spilledBlocks(partitionId).map(_.sequenceNumber)}")
+      assert(manager.retainedPayload(partitionId, 0L).map(_.toSeq) === Some(expected),
+        s"partition $partitionId must read back exactly the payload it spilled, or a shared " +
+          s"file is being read at the wrong offset")
+    }
+  }
+
   test("a block the allowance cannot hold is admitted straight to disk instead") {
     val context = newTrackedTaskContext()
     val manager = newManager(context, newManualClock(), newQuota(roomyMemoryBytes))
@@ -1855,15 +1905,25 @@ class MemorySpillManagerSuite
       assert(manager.spill(Long.MaxValue, trigger) === 0L,
         "an eviction whose every write fails must report no reclaimed bytes")
     }
-    assert(manager.spillFailureCount === 2L,
-      s"both partitions must have failed to spill, but ${manager.spillFailureCount} did")
-    assert(manager.openedWriters.size === 2,
-      s"one writer per partition must have been opened, not ${manager.openedWriters.size}")
+    // Two small partitions are written into one consolidated file, so one write fails and one
+    // failure is reported -- for both of them. What the case is about is unchanged: the record
+    // names its destination block and its failure class, and neither a path nor a trace.
+    assert(manager.spillFailureCount === 1L,
+      s"the one write both partitions shared must have failed once, but " +
+        s"${manager.spillFailureCount} failure(s) were counted")
+    assert(manager.openedWriters.size === 1,
+      s"two partitions small enough to share a file must have opened one writer, not " +
+        s"${manager.openedWriters.size}")
+    assert(manager.bufferedBytesFor(0) === 2L * blockCharge &&
+        manager.bufferedBytesFor(1) === 2L * blockCharge,
+      s"every block of both partitions must be back in memory after the failed write, but " +
+        s"partition 0 holds ${manager.bufferedBytesFor(0)} and partition 1 holds " +
+        s"${manager.bufferedBytesFor(1)} byte(s)")
 
     val records = appender.loggingEvents
       .filter(_.getMessage.getFormattedMessage.contains("Failed to evict streaming shuffle"))
-    assert(records.size === 2,
-      s"both failures must still be reported -- sanitising a diagnostic must not silence it -- " +
+    assert(records.size === 1,
+      s"the failure must still be reported -- sanitising a diagnostic must not silence it -- " +
         s"but ${records.size} record(s) named the eviction failure")
 
     records.foreach { record =>

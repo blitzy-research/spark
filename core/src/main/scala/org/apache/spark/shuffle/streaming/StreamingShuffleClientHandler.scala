@@ -187,13 +187,64 @@ private[spark] class StreamingShuffleClientHandler(
   private val tcpKeepAliveEnabled: Boolean = transportConf.enableTcpKeepAlive()
 
   // The hand-off queue between the event loop and the task thread.
-  private val inbound = new LinkedBlockingQueue[Inbound](INBOUND_QUEUE_CAPACITY)
+  //
+  // Deliberately unbounded as a collection, and bounded instead by [[dataEventCeiling]] through an
+  // explicit reservation taken before a data event is handed on. The two are not the same bound.
+  // A queue that refuses an offer can only report a structural failure to a caller that is holding
+  // a decoded frame, whereas a reservation can be *declined* -- which is what lets legitimate
+  // saturation be answered with backpressure and a replay rather than with a lost producer. The
+  // memory this queue can hold is governed by the payload bytes charged to the executor's shared
+  // receive budget before admission, by the per-stream credit ledger, and by
+  // [[INBOUND_HIGH_WATER_BYTES]]; the event ceiling exists only to bound the per-event bookkeeping
+  // of a stream sending very small blocks, which consumes almost no byte budget.
+  private val inbound = new LinkedBlockingQueue[Inbound]()
+
+  // Data events currently sitting in that queue: the occupancy [[dataEventCeiling]] bounds and the
+  // figure the receive window's water marks are read against, so admission and throttling are
+  // decided from one number rather than from two that can disagree.
+  private val queuedDataEvents = new AtomicInteger(0)
+
+  // Blocks this handler declined to hand on because the queue was at its ceiling. Each one is
+  // quarantined and asked for again, so this counts withheld blocks and never lost ones.
+  private val queueSaturationRefusals = new AtomicLong(0L)
 
   // Payload bytes currently sitting in that queue.
   private val queuedPayloadBytes = new AtomicLong(0L)
 
   // Per-partition bookkeeping.
   private val partitions = new ConcurrentHashMap[Integer, PartitionState]()
+
+  /**
+   * How many of this producer's streams this handler is actually carrying.
+   *
+   * One handler serves every reduce partition of the range its task asked for, and a partition
+   * enters this map on the first frame that names it -- always before that frame is admitted -- so
+   * this figure tracks the fan-out as it is discovered. It is what the receive window is sized
+   * from, because the three bounds below are per-stream allowances rather than per-channel ones: a
+   * task reading fifty coalesced partitions legitimately has fifty streams' worth of blocks and
+   * terminators in flight, and judging that against a one-stream allowance would throttle a healthy
+   * channel on its first burst and then refuse it.
+   */
+  private def streamsServed: Int = math.max(1, partitions.size())
+
+  /** Data events this handler may hold, from the per-stream allowance and the absolute ceiling. */
+  private def dataEventCeiling: Int = scaledBound(INBOUND_QUEUE_CAPACITY)
+
+  /** Queued data events at which this handler stops reading from the socket. */
+  private def queueHighWaterEvents: Int = scaledBound(INBOUND_QUEUE_HIGH_WATER_MARK)
+
+  /** Queued data events at which it may read again, always strictly below the high-water mark. */
+  private def queueLowWaterEvents: Int =
+    math.min(scaledBound(INBOUND_QUEUE_LOW_WATER_MARK), math.max(0, queueHighWaterEvents - 1))
+
+  /**
+   * Scales one per-stream allowance by the streams in hand, under the absolute ceiling.
+   *
+   * @param perStream the allowance one stream contributes, which is also the whole bound for a
+   *     task that reads a single partition
+   */
+  private def scaledBound(perStream: Int): Int =
+    math.min(MAX_INBOUND_DATA_EVENTS.toLong, perStream.toLong * streamsServed.toLong).toInt
 
   // The channel this handler is attached to, captured as early as Netty offers it so that the task
   // thread can acknowledge, request a replay and close without having to be handed a context.
@@ -708,8 +759,10 @@ private[spark] class StreamingShuffleClientHandler(
       // Tested here as well as at admission, so an exhausted executor budget stops the producer at
       // the socket instead of being discovered one refused block at a time.
       THROTTLE_CAUSE_EXECUTOR_QUOTA
-    } else if (inbound.size() >= INBOUND_QUEUE_HIGH_WATER_MARK ||
+    } else if (queuedDataEvents.get() >= queueHighWaterEvents ||
         queuedPayloadBytes.get() >= INBOUND_HIGH_WATER_BYTES) {
+      // The same counter admission reserves against, so the window closes on exactly the occupancy
+      // that would otherwise start refusing blocks.
       THROTTLE_CAUSE_QUEUE
     } else {
       null
@@ -718,7 +771,7 @@ private[spark] class StreamingShuffleClientHandler(
 
   /** Whether both throttling conditions have cleared with margin to spare. */
   private def resumeAllowed(): Boolean = {
-    inbound.size() <= INBOUND_QUEUE_LOW_WATER_MARK &&
+    queuedDataEvents.get() <= queueLowWaterEvents &&
       queuedPayloadBytes.get() <= INBOUND_LOW_WATER_BYTES &&
       !isAnyStreamCreditExhausted &&
       !backpressure.receiveQuotaExhausted
@@ -749,7 +802,7 @@ private[spark] class StreamingShuffleClientHandler(
       if (debugEnabled) {
         logDebug(log"Streaming shuffle consumer stopped reading for shuffle " +
           log"${MDC(SHUFFLE_ID, shuffleId)} because ${MDC(REASON, cause)}, holding " +
-          log"${MDC(COUNT, inbound.size())} block(s) and " +
+          log"${MDC(COUNT, queuedDataEvents.get())} block(s) and " +
           log"${MDC(NUM_BYTES, queuedPayloadBytes.get())} queued byte(s)")
       }
     }
@@ -773,7 +826,8 @@ private[spark] class StreamingShuffleClientHandler(
       }
       if (debugEnabled) {
         logDebug(log"Streaming shuffle consumer resumed reading for shuffle " +
-          log"${MDC(SHUFFLE_ID, shuffleId)} with ${MDC(COUNT, inbound.size())} block(s) and " +
+          log"${MDC(SHUFFLE_ID, shuffleId)} with ${MDC(COUNT, queuedDataEvents.get())} " +
+          log"block(s) and " +
           log"${MDC(NUM_BYTES, queuedPayloadBytes.get())} queued byte(s)")
       }
     }
@@ -1091,11 +1145,12 @@ private[spark] class StreamingShuffleClientHandler(
         if (!decoderReservation) {
           backpressure.releaseReceiveQuota(payloadLength)
         }
-        if (replacement) {
-          // The quarantine must stand: something has to ask for this position again, and the
-          // escalation enqueue() has already recorded is what fails the task if nothing can.
-          state.quarantine(sequenceNumber, sequenceNumber)
-        }
+        // The quarantine must stand, and for every refusal rather than only for a replacement:
+        // whether this hand-off was withheld for queue pressure or dropped because the handler is
+        // closing, the position has not been accepted, so something has to be able to ask for it
+        // again. Quarantining it is what makes the replay protocol do so, and what stops a
+        // terminator that arrives afterwards from claiming a stream that is short of a block.
+        state.quarantine(sequenceNumber, sequenceNumber)
       }
     } finally {
       admissionsInFlight.decrementAndGet()
@@ -1327,6 +1382,13 @@ private[spark] class StreamingShuffleClientHandler(
   /**
    * Places one event on the hand-off queue.
    *
+   * A data event is admitted only against a reservation on [[dataEventCeiling]], and a declined
+   * reservation is a withholding rather than a failure: the caller returns the block's charge and
+   * quarantines its position, the receive window closes, and the position is asked for again once
+   * the task has drained what it already holds. A control event is always admitted, because there
+   * is no one to ask for an end-of-stream or a producer-loss marker again and because their number
+   * is bounded by the streams this handler carries rather than by what a producer chooses to send.
+   *
    * @return true if the event was handed on, which is the condition under which the caller may
    *     commit the bookkeeping that depends on it having been delivered
    */
@@ -1338,21 +1400,89 @@ private[spark] class StreamingShuffleClientHandler(
           log"${MDC(PARTITION_ID, event.partitionId)} because the handler is closed")
       }
       false
-    } else if (inbound.offer(event)) {
-      if (payloadBytes > 0L) {
-        queuedPayloadBytes.addAndGet(payloadBytes)
-      }
-      true
     } else {
-      escalate(
-        new IllegalStateException(s"The streaming shuffle hand-off queue of shuffle $shuffleId " +
-          s"partition ${event.partitionId} is full at ${inbound.size()} event(s) holding " +
-          s"${queuedPayloadBytes.get()} byte(s); the receive window should have closed at " +
-          s"$INBOUND_QUEUE_HIGH_WATER_MARK event(s) or $INBOUND_HIGH_WATER_BYTES byte(s)"),
-        event.partitionId)
-      false
+      val data = event match {
+        case received: BlockReceived => received.block
+        case _ => null
+      }
+      if (data != null && !reserveDataEventSlot()) {
+        refuseForQueuePressure(event.partitionId, data, payloadBytes)
+        false
+      } else {
+        // Unbounded as a collection, so this offer cannot fail: the bound was taken above.
+        inbound.offer(event)
+        if (payloadBytes > 0L) {
+          queuedPayloadBytes.addAndGet(payloadBytes)
+        }
+        true
+      }
     }
   }
+
+  /**
+   * Reserves one of this handler's data-event slots, without ever exceeding the ceiling.
+   *
+   * @return true when the slot is held by this caller, who must see it released by
+   *     [[accountForPolled]] or by [[drainAndRelease]]
+   */
+  private def reserveDataEventSlot(): Boolean = {
+    val ceiling = dataEventCeiling
+    var held = queuedDataEvents.get()
+    var reserved = false
+    var settled = false
+    while (!settled) {
+      if (held >= ceiling) {
+        settled = true
+      } else if (queuedDataEvents.compareAndSet(held, held + 1)) {
+        reserved = true
+        settled = true
+      } else {
+        held = queuedDataEvents.get()
+      }
+    }
+    reserved
+  }
+
+  /**
+   * Withholds one block because this handler is already holding everything it may hold.
+   *
+   * This is the queue's counterpart of [[refuseForQuota]]: the producer keeps the block inside its
+   * unacknowledged window, the socket stops being read so no further block is decoded, and the
+   * replay protocol asks for the position again. Nothing is lost and nothing is escalated, because
+   * a full hand-off queue means the consumer is behind rather than that the producer is gone.
+   *
+   * @param partitionId the stream whose block was withheld
+   * @param payloadBytes the payload that was withheld, for the report
+   */
+  private def refuseForQueuePressure(
+      partitionId: Int,
+      block: DataBlockMessage,
+      payloadBytes: Long): Unit = {
+    queueSaturationRefusals.incrementAndGet()
+    // Stated before the repair, so the socket is already closed by the time the producer is asked
+    // for anything.
+    disableAutoRead(THROTTLE_CAUSE_QUEUE)
+    // Claimed as a repair rather than merely remembered. A quarantined position holds back an
+    // end-of-stream that names it, and the replay protocol's own pacing -- charged from the task
+    // thread as it drains the queue -- is what asks for the position again; a bare quarantine
+    // would depend on some later block arriving to reveal the gap, which the block this handler
+    // just withheld may well have been the last of.
+    if (!requestRetransmission(partitionId, block.sequenceNumber(), block.sequenceNumber())) {
+      partitionStateOf(partitionId).quarantine(block.sequenceNumber(), block.sequenceNumber())
+    }
+    reportBounded(StreamingShuffleClientHandler.queuePressureLogAggregator,
+      queueSaturationRefusals, "withheld block(s)",
+      log"Streaming shuffle consumer for shuffle ${MDC(SHUFFLE_ID, shuffleId)} partition " +
+        log"${MDC(PARTITION_ID, partitionId)} withheld a block of " +
+        log"${MDC(NUM_BYTES, payloadBytes)} byte(s) because its hand-off queue holds " +
+        log"${MDC(COUNT, queuedDataEvents.get())} of ${MDC(THRESHOLD, dataEventCeiling)} " +
+        log"admissible event(s) across ${MDC(NUM_EVENTS, streamsServed)} stream(s); the channel " +
+        log"has stopped reading and the position is requested again once the task has drained " +
+        log"what it holds")
+  }
+
+  /** Blocks this handler has withheld for queue pressure, each of which is asked for again. */
+  def queuePressureRefusalCount: Long = queueSaturationRefusals.get()
 
   /** Takes the next inbound event without waiting, or `None` when nothing has arrived yet. */
   def poll(): Option[Inbound] = accountForPolled(inbound.poll())
@@ -1370,7 +1500,7 @@ private[spark] class StreamingShuffleClientHandler(
   }
 
   /**
-   * Discounts a taken event from the queue's byte accounting and re-evaluates the receive window.
+   * Discounts a taken event from the queue's accounting and re-evaluates the receive window.
    */
   private def accountForPolled(event: Inbound): Option[Inbound] = {
     if (event == null) {
@@ -1378,6 +1508,9 @@ private[spark] class StreamingShuffleClientHandler(
     } else {
       event match {
         case received: BlockReceived =>
+          // The slot and the bytes together: the slot was reserved before this event was handed on,
+          // so releasing one without the other would drift the occupancy the window is judged from.
+          queuedDataEvents.decrementAndGet()
           queuedPayloadBytes.addAndGet(-received.block.payloadLength().toLong)
         case _ =>
           ()
@@ -2104,7 +2237,7 @@ private[spark] class StreamingShuffleClientHandler(
   }
 
   /**
-   * Empties the hand-off queue and rewinds the byte accounting.
+   * Empties the hand-off queue and rewinds its accounting.
    *
    * @return how many events were discarded
    */
@@ -2116,6 +2249,8 @@ private[spark] class StreamingShuffleClientHandler(
       event = inbound.poll()
     }
     inbound.clear()
+    // Both figures, because both are what a subsequent admission or window evaluation reads.
+    queuedDataEvents.set(0)
     queuedPayloadBytes.set(0L)
     discarded
   }
@@ -2285,10 +2420,13 @@ private[spark] object StreamingShuffleClientHandler {
   private[streaming] val wrongDirectionLogAggregator =
     new MemorySpillManager.ExecutorLogAggregator(MemorySpillManager.LOG_AGGREGATION_WINDOW_MS)
 
+  private[streaming] val queuePressureLogAggregator =
+    new MemorySpillManager.ExecutorLogAggregator(MemorySpillManager.LOG_AGGREGATION_WINDOW_MS)
+
   private val logAggregators: Seq[MemorySpillManager.ExecutorLogAggregator] =
     Seq(repairLogAggregator, replayBudgetLogAggregator, foreignChannelLogAggregator,
       misaddressedFrameLogAggregator, lateBlockLogAggregator, rejectedTerminationLogAggregator,
-      wrongDirectionLogAggregator)
+      wrongDirectionLogAggregator, queuePressureLogAggregator)
 
   /** Returns the executor-scoped log aggregation above to its initial state. */
   private[streaming] def resetLogAggregationForTesting(): Unit = {
@@ -2298,13 +2436,33 @@ private[spark] object StreamingShuffleClientHandler {
   /** Silence after which a producer is declared gone. */
   val PRODUCER_CONNECTION_TIMEOUT_MS: Long = BackpressureProtocol.ACK_TIMEOUT_MS
 
-  /** Hard bound on the hand-off queue. */
+  /**
+   * Data events one stream may have waiting on the hand-off queue.
+   *
+   * A per-stream allowance rather than a per-channel one, because a handler carries every reduce
+   * partition of the range its task asked for: adaptive execution routinely coalesces a wide
+   * shuffle into a task that reads dozens of partitions, and each of those streams contributes its
+   * own blocks and its own terminator. A task that reads a single partition is bounded by this
+   * figure, which is what it was before the allowance was made per stream.
+   */
   val INBOUND_QUEUE_CAPACITY: Int = 32
 
+  /** Queued events per stream at which the receive window closes. */
   val INBOUND_QUEUE_HIGH_WATER_MARK: Int = 8
 
   /** Queued events at which it may reopen, low enough that a slow task cannot make it flap. */
   val INBOUND_QUEUE_LOW_WATER_MARK: Int = 4
+
+  /**
+   * Absolute bound on the data events one handler may hold, whatever its fan-out.
+   *
+   * The payload memory those events hold is bounded elsewhere -- by the executor's shared receive
+   * budget, by the per-stream credit ledger and by [[INBOUND_HIGH_WATER_BYTES]] -- so this bounds
+   * only the per-event bookkeeping of a producer sending blocks too small to consume a meaningful
+   * share of the byte budget. Reaching it withholds blocks rather than failing anything, so it is a
+   * throttling point and not a limit a healthy shuffle can break.
+   */
+  val MAX_INBOUND_DATA_EVENTS: Int = 4096
 
   /** Queued payload bytes at which the receive window closes, sixteen mebibytes. */
   val INBOUND_HIGH_WATER_BYTES: Long = 8L * DataBlockMessage.MAX_BLOCK_SIZE_BYTES

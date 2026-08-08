@@ -1315,9 +1315,7 @@ private[spark] class MemorySpillManager(
         0L
       } else {
         // Stage two, monitor released: write.
-        val written = plan.map { case (partitionId, blocks) =>
-          (partitionId, blocks, spillPartitionBlocks(partitionId, blocks))
-        }
+        val written = spillPlan(plan)
         // Stage three, monitor held again: publish what was written, re-attach what was not, and
         // account for exactly the bytes that actually left memory.
         val result = lock.synchronized(publishEvictionLocked(written))
@@ -1438,6 +1436,9 @@ private[spark] class MemorySpillManager(
     var committedDiskBytes = 0L
     var evictedPartitions = 0
     val filesToDelete = new mutable.ArrayBuffer[File]()
+    // Files whose records this pass could not publish, judged against the whole pass rather than
+    // against the entry that met them.
+    val unreferencedCandidates = new mutable.ArrayBuffer[File]()
     val instanceClosed = closed.get()
     val now = clock.getTimeMillis()
     written.foreach { case (partitionId, blocks, outcome) =>
@@ -1488,7 +1489,17 @@ private[spark] class MemorySpillManager(
         case _ =>
           outcome.foreach(records =>
             quota.release(records.size.toLong * SPILLED_RECORD_METADATA_BYTES, MetadataMemory))
-          spilledFiles.foreach(filesToDelete += _)
+          // Collected rather than unlinked here. A spill file may carry the segments of several
+          // partitions, so a file this partition no longer needs may be one another partition has
+          // just published records into -- and the publishing entry can come later in this same
+          // pass. The decision is therefore taken once the whole pass has published, against the
+          // records that actually name each file.
+          spilledFiles.foreach(unreferencedCandidates += _)
+      }
+    }
+    unreferencedCandidates.distinct.foreach { file =>
+      if (!spillFileBlockIds.contains(file)) {
+        filesToDelete += file
       }
     }
     evictionInProgress = false
@@ -1578,7 +1589,7 @@ private[spark] class MemorySpillManager(
     var failed = false
     val iterator = batches.iterator
     while (iterator.hasNext && !failed) {
-      spillBlockBatch(partitionId, iterator.next()) match {
+      spillBlockBatch(iterator.next()) match {
         case Some(written) =>
           records ++= written
           written.headOption.foreach(record => committedFiles += record.file)
@@ -1595,10 +1606,104 @@ private[spark] class MemorySpillManager(
     }
   }
 
-  /** Writes one bounded group of blocks into one quota-reserved spill file. */
-  private def spillBlockBatch(
-      partitionId: Int,
-      blocks: Seq[BufferedBlock]): Option[Seq[SpilledBlock]] = {
+  /**
+   * Writes a whole eviction plan, packing its partitions into as few spill files as the per-file
+   * bounds allow.
+   *
+   * A partition is never split across two shared files: it either fits whole inside the group being
+   * filled, or -- when its own blocks exceed a single file's segment or byte bound -- it is written
+   * on its own through [[spillPartitionBlocks]], which splits it exactly as it always has. That is
+   * what keeps rollback per-partition: a group that fails to write fails precisely the partitions
+   * it was carrying, and their blocks go back into memory together.
+   *
+   * @param plan the victims a planning pass detached, partition by partition
+   * @return one entry per planned partition, in the order it was planned, carrying the records
+   *     written for it or `None` when it could not be written
+   */
+  private def spillPlan(plan: Seq[(Int, List[BufferedBlock])])
+    : Seq[(Int, List[BufferedBlock], Option[Seq[SpilledBlock]])] = {
+    if (plan.isEmpty) {
+      return Nil
+    }
+    if (plan.size == 1) {
+      // A single partition has nothing to be consolidated with, so it takes the direct path and its
+      // metadata reservation, batching and rollback stay exactly as they are elsewhere.
+      val (partitionId, blocks) = plan.head
+      return Seq((partitionId, blocks, spillPartitionBlocks(partitionId, blocks)))
+    }
+    val outcomes = new mutable.HashMap[Int, Option[Seq[SpilledBlock]]]()
+    val groupPartitions = new mutable.ArrayBuffer[Int]()
+    val group = new mutable.ArrayBuffer[BufferedBlock]()
+    var groupBytes = 0L
+
+    // Writes the group being filled, attributing its outcome to every partition inside it.
+    def flushGroup(): Unit = {
+      if (group.nonEmpty) {
+        val blocks = group.toSeq
+        val carried = groupPartitions.toSeq
+        val metadataBytes = blocks.size.toLong * SPILLED_RECORD_METADATA_BYTES
+        val written =
+          if (!quota.tryReserve(metadataBytes, MetadataMemory)) {
+            recordMemoryPressure(metadataBytes, 0L)
+            None
+          } else {
+            spillBlockBatch(blocks) match {
+              case Some(records) =>
+                Some(records)
+              case None =>
+                // `spillBlockBatch` has already reported the failure, rolled the file back and
+                // unlinked it, so only the reservation this call took is left to return.
+                quota.release(metadataBytes, MetadataMemory)
+                None
+            }
+          }
+        val byPartition = written.map(_.groupBy(_.partitionId)).getOrElse(Map.empty)
+        carried.foreach { partitionId =>
+          outcomes(partitionId) =
+            if (written.isEmpty) None else Some(byPartition.getOrElse(partitionId, Seq.empty))
+        }
+        group.clear()
+        groupPartitions.clear()
+        groupBytes = 0L
+      }
+    }
+
+    plan.foreach { case (partitionId, blocks) =>
+      val partitionBytes = blocks.foldLeft(0L)((total, block) => total + block.data.length.toLong)
+      if (blocks.size >= MAX_SPILL_SEGMENTS_PER_FILE ||
+          partitionBytes >= MAX_SPILL_FILE_PAYLOAD_BYTES) {
+        // Too large to share a file with anything, so it keeps the dedicated path.
+        outcomes(partitionId) = spillPartitionBlocks(partitionId, blocks)
+      } else {
+        if (group.nonEmpty && (group.size + blocks.size > MAX_SPILL_SEGMENTS_PER_FILE ||
+            groupBytes + partitionBytes > MAX_SPILL_FILE_PAYLOAD_BYTES)) {
+          flushGroup()
+        }
+        group ++= blocks
+        groupPartitions += partitionId
+        groupBytes += partitionBytes
+      }
+    }
+    flushGroup()
+    plan.map { case (partitionId, blocks) =>
+      (partitionId, blocks, outcomes.getOrElse(partitionId, None))
+    }
+  }
+
+  /**
+   * Writes one bounded group of blocks into one quota-reserved spill file.
+   *
+   * The group may hold blocks of several partitions. Each record it produces names its own
+   * partition and its own byte range inside the file, which is how a shared file stays servable:
+   * every reader of retained output addresses a block by partition and sequence and is answered
+   * from the segment recorded for it, so which file the segment happens to live in is not part of
+   * the contract. Consolidating is what keeps a wide shuffle inside the executor's retained-file
+   * quota -- a two-hundred-partition map task retaining a few hundred bytes per partition would
+   * otherwise cost two hundred files, and twenty such tasks would exhaust the quota and stand
+   * streaming down for a shuffle that had plenty of both memory and disk left.
+   */
+  private def spillBlockBatch(blocks: Seq[BufferedBlock]): Option[Seq[SpilledBlock]] = {
+    val partitionId = blocks.head.partitionId
     val rawBytes = blocks.foldLeft(0L)((total, block) => total + block.data.length.toLong)
     val expandedBytes = saturatingMultiply(rawBytes, DISK_RESERVATION_MULTIPLIER)
     val estimatedBytes =
@@ -1651,7 +1756,8 @@ private[spark] class MemorySpillManager(
         writer.write(block.data, 0, block.data.length)
         writer.recordWritten()
         val segment = writer.commitAndGet()
-        records += SpilledBlock(partitionId, block.sequenceNumber, blockId, tempFile,
+        // The block's own partition, not the group's first: a consolidated group carries several.
+        records += SpilledBlock(block.partitionId, block.sequenceNumber, blockId, tempFile,
           segment.offset, segment.length, block.data.length)
       }
       writer.close()

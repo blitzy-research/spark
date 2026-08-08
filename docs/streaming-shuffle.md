@@ -694,6 +694,16 @@ These are engineering acceptance targets, not guarantees and not CI performance 
   priced from reduce tasks running concurrently with map tasks, which no `ShuffleManager` can
   arrange -- see [What the latency comes from](#what-the-latency-comes-from). Judge it against your
   own partition counts, record sizes and executor memory rather than against this number.
+* **What that objective has actually measured, stated plainly.** On the 100 MiB, 10-partition
+  reference workload the benchmark has reported the scheduled job at or near parity with sort-based
+  shuffle -- a small reduction on some runs and a small regression on others -- and never the 30-50%
+  the objective asks for. That is not a defect in the implementation and no amount of tuning inside
+  this boundary changes it: the objective's mechanism is reduce work overlapping map work, a
+  scheduled reduce task is submitted only after its map stage finishes, and moving that would mean
+  modifying the DAG scheduler, which this feature does not touch. The overlap that *is* deliverable
+  is priced on its own in the benchmark's overlap section -- around a 25-30% reduction on the path
+  the shuffle abstraction owns -- and the report states the same reconciliation next to the figure.
+  Expect the streaming path to buy you pipelining inside the shuffle, not a faster scheduled job.
 * Memory overhead is targeted below 10% on the 100 MiB, 10-partition reference workload.
 * Threshold-driven spill rate is targeted below 5%; the end-of-stream durability flush is reported
   separately because it is not memory-pressure spill.
