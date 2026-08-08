@@ -6049,6 +6049,26 @@
     },
     "sqlState" : "0A000"
   },
+  "STREAMING_SHUFFLE_CHECKSUM_VERIFY_FAILED" : {
+    "message" : [
+      "Checksum verification failed for streaming shuffle block <blockId> of shuffle <shuffleId>.",
+      "Expected checksum: <expected>, computed checksum: <computed>."
+    ],
+    "sqlState" : "XXKST"
+  },
+  "STREAMING_SHUFFLE_INVALID_SEQUENCE_NUMBER" : {
+    "message" : [
+      "Received an out-of-order streaming shuffle block for shuffle <shuffleId> partition <partitionId>.",
+      "Expected sequence number <expected>, but got <actual>."
+    ],
+    "sqlState" : "XXKST"
+  },
+  "STREAMING_SHUFFLE_UNEXPECTED_MESSAGE_TYPE" : {
+    "message" : [
+      "Unexpected streaming shuffle message type. Expected <expected>, but got <actual>."
+    ],
+    "sqlState" : "XXKST"
+  },
   "STREAMING_STATEFUL_OPERATOR_MISSING_STATE_DIRECTORY" : {
     "message" : [
       "Cannot restart streaming query with stateful operators because the state directory is empty or missing.",

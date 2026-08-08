@@ -24,7 +24,13 @@ private[spark] object StaticSources {
    * The set of all static sources. These sources may be reported to from any class, including
    * static classes, without requiring reference to a SparkEnv.
    */
-  val allSources = Seq(CodegenMetrics, HiveCatalogMetrics)
+  // MetricsSystem registers static sources on the driver and executors at startup; sink
+  // configuration remains independent.
+  val allSources =
+    Seq(
+      CodegenMetrics,
+      HiveCatalogMetrics,
+      org.apache.spark.shuffle.streaming.StreamingShuffleMetricsSource)
 }
 
 /**
